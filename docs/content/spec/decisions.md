@@ -11053,6 +11053,73 @@ Settled on the user's delegation 2026-11-11 (built on branch `json-derive`): **J
     `{src,lib}/**`). Review with the user: overlaps the path-helpers item, which also lists `{a,b}`.
   - **`matcher(pattern)` is a function value** reading the pattern once. Alternative: a `Glob`
     class; a function value is all a walk filter needs.
+- Settled on the user's delegation 2026-11-24 (branch `fs-copy-move`): **`avin.fs` copies and moves
+  files, links and trees** ([system library](/spec/system-library/#copying-and-moving)).
+  - **`copy(from, to, replace = true, attributes = false, followLinks = true, createParents =
+    false)`, `copyAll(from, to, merge = false, replace, attributes, followLinks = false,
+    createParents)`, `move(from, to, replace = true, createParents = false)`**: named, defaulted
+    options, as `walker` takes them. `copyAll` of something that is not a directory is `copy` of it,
+    so one call copies whatever is at a path and the cross-device `move` needs nothing else.
+    `copy` follows links by default (copying a link to a file means its bytes), `copyAll` does not (a
+    tree's links stay links and nothing outside the tree is reached). Alternatives: one `copy` with a
+    `recursive` flag (two functions document their different defaults better), an options value
+    (named parameters read as well and need no type).
+  - **Never half-written under the destination's name.** A file is copied to a `pending_name` beside
+    `to` and renamed onto it once whole; a tree copied without `merge` is built under a pending
+    directory and renamed onto `to` in one step, so `to` is the whole copy or as it was, and a
+    failure removes everything the copy made (opening read-only directories it copied, so they do not
+    keep their entries). Merging cannot be one step: it stops at the first failure, keeps the entries
+    already copied (each whole), and names the entry. Alternatives: writing in place (a reader or a
+    crash sees a prefix), rolling a merge back (would have to remember and restore what it replaced).
+    A copy is not synced to the device: `writeBytesAtomic` is the durable write, and a sync per
+    file of a tree costs more than most copies want. Review with the user: a `sync` option is cheap
+    to add if a program asks for durability across a power loss.
+  - **`replace = false` is race-free for files and links**, without waiting for Sysl's exclusive
+    open or `rename_no_replace`: a copied file is placed by a hard link from its pending name (`link`
+    fails with `EEXIST` atomically) and a copied link by `symlink`, which refuses an existing name;
+    `move` of a file links `from` at `to` and then removes `from`, removing the new link again if
+    that fails. A directory (`copyAll` without `merge`, and `move`) can only be checked just before
+    its rename, so a directory another program makes at `to` in that moment can be replaced; the
+    docs say so. It needs hard links, which every local file system avin runs on has. Alternatives:
+    an `Err` for `replace = false` until Sysl ships `rename_no_replace` (the audit's preference;
+    the hard link gets the same guarantee now for the common case), an exists-check for every kind
+    (a race for files too). Switching directories to `rename_no_replace` when it ships changes no
+    behaviour a program sees beyond closing the window.
+  - **Permissions: the nine `rwx` bits always come along; `attributes` adds setuid, setgid, sticky
+    and the modification time** (the access time is set to the same instant until independent times
+    land). A copy that took default bits would turn a `0o600` secret into a world-readable file,
+    which is the wrong default for a server's library; setuid is not carried by default, as copying
+    a program should not make a privileged one. The file is `0o600` while its bytes go in, and a
+    new directory `0o700` until its contents are, so nothing is readable early. The owner is never
+    carried (only the superuser could set it; the ownership item adds `setOwner`). A link's own bits
+    and times are the platform's. Directories get their bits after their contents, so a read-only
+    one still copies. A directory merged into keeps its own bits unless `attributes`. Alternatives:
+    default bits (`sysl.fs.copy_file`'s choice, which leaves the caller to remember), carrying the
+    setuid bit always.
+  - **`to` is replaced as `rename` replaces it**: a file or link by a file or link, an empty
+    directory by a directory; a full directory is `DirectoryNotEmpty`, a directory onto a file
+    `NotADirectory` and a file onto a directory `IsADirectory`, each found before anything is copied.
+    The entry is replaced, so a hard link to the old file keeps the old bytes and a link at `to` is
+    replaced rather than written through. Merging replaces a file by a directory with `replace`, but
+    never removes a directory to put a file there. A file copied onto itself (or onto another name
+    for it) changes nothing, as `rename` does; it never truncates the source.
+  - **Refusals**: a FIFO, a socket or a device is `Other("not a regular file: a FIFO")`, found from
+    the metadata before anything is opened (opening a FIFO would wait for a writer); a destination
+    inside the source (canonical paths, so links and `..` count) is `Other("the destination is
+    inside the source")` before anything is made; following links, a link back to a directory
+    above is `Other("file system loop")`, by device and inode. Errors read `cannot copy <from> to
+    <to>: …`, naming the entry inside a tree, never a pending name. Alternatives: skipping special
+    files (silently partial), copying a FIFO as a new FIFO (needs a `mkfifo` binding; no program has
+    asked).
+  - **`move` across file systems** is `copyAll(attributes = true)` with links as links, then
+    `removeAll(from)`; it runs only when the rename fails with `EXDEV`. A failure while copying
+    leaves `to` as it was and `from` whole; a failure while removing is `cannot finish moving <from>
+    to <to>: …`, `to` then being complete and what could not be removed still at `from`. Hard links
+    inside a tree become separate files, and the owner is not carried. Its test attaches a small disk
+    image on macOS (no privileges needed) and uses `/dev/shm` on Linux; a machine with neither fails
+    the test rather than skipping it. Alternatives: failing on `EXDEV` (every caller would write the
+    same fallback), removing `from` entry by entry as it is copied (a failure would split the tree
+    across two file systems).
 
 ## Proposed
 

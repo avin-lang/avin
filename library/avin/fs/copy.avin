@@ -1,0 +1,384 @@
+module avin.fs
+
+// Copying and moving: one file, one link or a whole tree, each failure an `IoError` naming the entry
+// it stopped at. Nothing is ever left half-written under the destination's name: a file is copied to a
+// new name beside its destination and renamed onto it once complete, and a tree copied anew is built
+// the same way and renamed onto its destination in one step.
+
+import avin.io
+import avin.io.IoError
+
+@sysl("sysl.fs.hard_link")
+private syslHardLink(existing: string, fresh: string) -> Result[unit, SyslError]
+
+// How many bytes one read takes while a file is copied.
+private val CopyChunk = 65536
+
+// Whether a rename or a link failed because its two names are on different file systems (`EXDEV`,
+// 18 on every platform).
+private crossDevice(e: SyslError) -> bool = e match
+  Other(code) -> code == 18
+  _ -> false
+
+// What `path` is, a symbolic link followed or not.
+private look(path: string, followLinks: bool, operation: string, subject: string) -> Result[Metadata, IoError] =
+  (if followLinks then metadata(path) else linkMetadata(path)).mapErr(e -> IoError(e.kind, operation, subject))
+
+// The words for a kind of entry that is not copied.
+private kindWords(kind: FileKind) -> string = kind match
+  Fifo -> "a FIFO"
+  Socket -> "a socket"
+  CharDevice -> "a character device"
+  BlockDevice -> "a block device"
+  UnknownKind(bits) -> f"an entry of type 0o${bits}%o"
+  _ -> "an entry"
+
+// Copies the file `from` to `to`. The copy is written to a new file beside `to` and renamed onto `to`
+// once complete, so a reader of `to` sees all of the old entry or all of the copy, and a failure at
+// any point (a read, a full disk, the rename) removes the new file and leaves `to` as it was.
+//
+// `replace = true` puts the copy in place of whatever file or link is at `to` (the entry is replaced,
+// so other hard links to the old file keep its old contents, and a link at `to` is replaced rather
+// than written through); a directory at `to` is `IsADirectory`. `replace = false` makes the copy only
+// where nothing is at `to`, which is `AlreadyExists` otherwise; the check and the placing are one step,
+// so no other program's file can appear in between and be overwritten. It needs a file system with
+// hard links, which every one avin runs on locally has.
+//
+// The copy always carries the nine `rwx` permission bits of `from`, so it never grants more than the
+// original does. `attributes = true` carries all twelve bits (setuid, setgid and sticky too) and the
+// modification time, the access time being set to the same instant; the owner is never carried.
+//
+// `followLinks = true` copies what a symbolic link at `from` leads to; `false` copies the link itself,
+// a new link at `to` holding the same path, relative or not, whose own bits and times are the
+// platform's defaults. A directory at `from` is `IsADirectory`
+// (`copyAll` copies trees), and a FIFO, a socket or a device is an `Err` of kind `Other` that opens
+// nothing. Copying a file onto itself (the same path, or another name for the same file) changes
+// nothing and succeeds. With `createParents`, the missing directories above `to` are made first.
+copy(
+    from: string,
+    to: string,
+    replace: bool = true,
+    attributes: bool = false,
+    followLinks: bool = true,
+    createParents: bool = false
+) -> Result[unit, IoError]
+  val subject = s"$from to $to"
+  val m = look(from, followLinks, "copy", subject)?
+  m.kind match
+    Directory -> Err(IoError(io.IsADirectory, "copy", subject))
+    _ ->
+      if createParents then makeParents(to)?
+      copyEntry(from, to, m, replace, attributes, true, subject)
+
+// Copies `from` to `to`, a directory with everything in it: `copy`'s options apply to every entry
+// inside, and a file, a link or a FIFO at `from` is copied exactly as `copy` copies it.
+//
+// Without `merge`, the tree is built under a new name beside `to`, readable by the program's user
+// alone until it is complete, and renamed onto `to` in one step at the end: `to` holds the whole copy
+// or is left as it was, and a failure removes everything the copy made. `to` is replaced as `rename`
+// replaces it: it must be absent or an empty directory (replaced when `replace`); a directory holding
+// entries is `DirectoryNotEmpty` and a file or link is `NotADirectory`, both before anything is
+// copied; with `replace = false` anything at `to` is `AlreadyExists`.
+//
+// With `merge = true`, the tree is copied into the directory at `to`, made when it is missing, each
+// directory inside merged with the one of its name: a file is copied over a file or link of its name
+// when `replace`, and is `AlreadyExists` otherwise; a directory over a file or link removes it when
+// `replace`; a file onto a directory is `IsADirectory`, never removing the directory. A failure stops
+// the copy at that entry: the entries copied before it stay, each one whole, and none after it is
+// started.
+//
+// Every directory the copy makes takes the `rwx` bits of the one it copies, set once its contents are
+// in; `attributes = true` carries the twelve bits and modification times of every entry, and sets
+// them on a merged directory that was already there too. Links are copied as links unless
+// `followLinks`, which copies what they lead to and is an `Err` at a link leading back to a directory
+// above it. Entries are copied in code-point order of their names. A destination inside the source
+// is an `Err`, as it would copy itself for ever. Hard links inside the tree become separate files.
+copyAll(
+    from: string,
+    to: string,
+    merge: bool = false,
+    replace: bool = true,
+    attributes: bool = false,
+    followLinks: bool = false,
+    createParents: bool = false
+) -> Result[unit, IoError]
+  val subject = s"$from to $to"
+  val m = look(from, followLinks, "copy", subject)?
+  if createParents then makeParents(to)?
+  m.kind match
+    Directory ->
+      if insideOf(from, to, subject)? then return Err(
+        IoError(io.Other("the destination is inside the source"), "copy", subject)
+      )
+      if merge then mergeTop(from, to, m, replace, attributes, followLinks, subject)
+      else freshTop(from, to, m, replace, attributes, followLinks, subject)
+    _ -> copyEntry(from, to, m, replace, attributes, true, subject)
+
+// Moves `from` to `to`, a file, a link or a directory. Within one file system it is `rename`: one
+// step, a reader seeing the old `to` or the new one, and `to` replaced as `rename` replaces it. Across
+// file systems, where no rename can reach, it copies `from` as `copyAll` does with `attributes` and
+// links kept as links, which replaces `to` by the same rules, and then removes `from`. Hard
+// links inside a tree become separate files, and the owner is not carried. The copy is renamed onto
+// `to` in one step once whole,
+// so a failure while copying leaves `to` as it was and `from` untouched. A failure while removing
+// `from` after that is an `Err` whose operation is `finish moving`: `to` is then complete, and what
+// of `from` could not be removed is still there.
+//
+// `replace = false` is `AlreadyExists` when anything is at `to`. For a file that check and the move are
+// one step (a hard link made at `to`, then `from` removed); for a directory or a link it is a check
+// just before the rename, so an entry another program makes at `to` in between can be replaced. With
+// `createParents`, the missing directories above `to` are made first.
+move(from: string, to: string, replace: bool = true, createParents: bool = false) -> Result[unit, IoError]
+  val subject = s"$from to $to"
+  if createParents then makeParents(to)?
+  if replace then return renameOrCopy(from, to, true, subject)
+  val m = look(from, false, "move", subject)?
+  m.kind match
+    Regular -> syslHardLink(from, to) match
+      Ok(_) -> syslRemoveFile(from) match
+        Ok(_) -> Ok(())
+        Err(e) ->
+          _ = syslRemoveFile(to)
+          Err(failed("move", subject)(e))
+      Err(e) -> if crossDevice(e) then across(from, to, false, subject) else Err(failed("move", subject)(e))
+    _ ->
+      if exists(to, followLinks = false) then return Err(IoError(io.AlreadyExists, "move", subject))
+      renameOrCopy(from, to, false, subject)
+
+// `rename`, or the copy-then-remove of `across` where the two names are on different file systems.
+private renameOrCopy(from: string, to: string, replace: bool, subject: string) -> Result[unit, IoError] =
+  syslRename(from, to) match
+    Ok(_) -> Ok(())
+    Err(e) -> if crossDevice(e) then across(from, to, replace, subject) else Err(failed("move", subject)(e))
+
+// A move between file systems: the whole of `from` copied onto `to`, then `from` removed.
+private across(from: string, to: string, replace: bool, subject: string) -> Result[unit, IoError]
+  copyAll(from, to, replace = replace, attributes = true).mapErr(e -> IoError(e.kind, "move", e.subject))?
+  removeAll(from).mapErr(e -> IoError(e.kind, "finish moving", subject))
+
+// One entry that is not a directory copied: a regular file's bytes, or a link. `sameCheck` asks first
+// whether `to` already is `from`, which a fresh tree never needs to.
+private copyEntry(
+    from: string,
+    to: string,
+    m: Metadata,
+    replace: bool,
+    attributes: bool,
+    sameCheck: bool,
+    subject: string
+) -> Result[unit, IoError] = m.kind match
+  Regular -> copyFile(from, to, m, replace, attributes, sameCheck, subject)
+  Symlink -> copyLink(from, to, replace, subject)
+  Directory -> Err(IoError(io.IsADirectory, "copy", subject))
+  kind -> Err(IoError(io.Other(s"not a regular file: ${kindWords(kind)}"), "copy", subject))
+
+private copyFile(
+    from: string,
+    to: string,
+    m: Metadata,
+    replace: bool,
+    attributes: bool,
+    sameCheck: bool,
+    subject: string
+) -> Result[unit, IoError]
+  if replace && sameCheck
+    isSameFile(from, to) match
+      Ok(same) -> if same then return Ok(())
+      Err(_) -> ()
+  val pending = syslPendingName(to)
+  val written = writeCopy(from, pending, m, attributes, subject)
+  if written.isErr
+    _ = syslRemoveFile(pending)
+    return written
+  place(pending, to, replace, subject)
+
+// Puts the finished entry `pending` at `to`: renamed over what is there when `replace`, or linked
+// where nothing is, in one step that fails with `AlreadyExists` otherwise. `pending` is gone after.
+private place(pending: string, to: string, replace: bool, subject: string) -> Result[unit, IoError]
+  if replace
+    return syslRename(pending, to) match
+      Ok(_) -> Ok(())
+      Err(e) ->
+        _ = syslRemoveFile(pending)
+        Err(failed("copy", subject)(e))
+  val linked = syslHardLink(pending, to)
+  _ = syslRemoveFile(pending)
+  linked.mapErr(failed("copy", subject))
+
+// The bytes of `from` written to the new file `pending`, which only the program's user may read
+// while they go in, then given `from`'s permissions (and times, with `attributes`).
+private writeCopy(
+    from: string,
+    pending: string,
+    m: Metadata,
+    attributes: bool,
+    subject: string
+) -> Result[unit, IoError]
+  val source = syslOpen(from).mapErr(failed("copy", subject))?
+  val target = syslCreate(pending) match
+    Ok(t) -> t
+    Err(e) ->
+      _ = source.release()
+      return Err(failed("copy", subject)(e))
+  val poured = syslSetPermissions(pending, 0o600).mapErr(failed("copy", subject)) match
+    Ok(_) -> pour(source, target, subject)
+    Err(e) -> Err(e)
+  _ = source.release()
+  val closed = target.release().mapErr(failed("copy", subject))
+  poured?
+  closed?
+  carry(pending, m, attributes, subject)
+
+// Every byte of `source` written to `target`, from the start of each.
+private pour(source: SyslFile, target: SyslFile, subject: string) -> Result[unit, IoError]
+  val chunk = Array.fill(CopyChunk, byte(0))
+  var offset: long = 0
+  loop
+    val got = source.readAt(offset, chunk).mapErr(failed("copy", subject))?
+    if got.length == 0 then return Ok(())
+    var done = 0
+    while done < got.length
+      val put = target.writeAt(offset + long(done), got.slice(done, got.length)).mapErr(failed("copy", subject))?
+      if put <= 0 then return Err(IoError(io.Other("the write made no progress"), "copy", subject))
+      done += int(put)
+    offset += long(got.length)
+
+// Gives the copy at `path` the permission bits of the entry `m` read (the nine `rwx` bits, or all
+// twelve with `attributes`) and, with `attributes`, its modification time.
+private carry(path: string, m: Metadata, attributes: bool, subject: string) -> Result[unit, IoError]
+  val bits = if attributes then m.permissions else m.permissions & 0o777
+  syslSetPermissions(path, bits).mapErr(failed("copy", subject))?
+  if attributes then syslSetModified(path, m.modified.epochMicros).mapErr(failed("copy", subject))?
+  Ok(())
+
+// A new link at `to` holding what the link `from` holds.
+private copyLink(from: string, to: string, replace: bool, subject: string) -> Result[unit, IoError]
+  val target = syslReadLink(from).mapErr(failed("copy", subject))?
+  if !replace then return syslSymlink(target, to).mapErr(failed("copy", subject))
+  val pending = syslPendingName(to)
+  syslSymlink(target, pending).mapErr(failed("copy", subject))?
+  place(pending, to, true, subject)
+
+// Whether `to` is `from` or lies inside it, every link above both resolved. `to` need not exist, but
+// the directory that is to hold it must.
+private insideOf(from: string, to: string, subject: string) -> Result[bool, IoError]
+  val source = syslCanonicalize(from).mapErr(failed("copy", subject))?
+  val whole = absolute(to)?
+  val holder = parent(whole) match
+    Some(p) -> p
+    None -> return Ok(components(source) == components(whole))
+  val name = fileName(whole) match
+    Some(n) -> n
+    None -> return Ok(false)
+  val place = join(syslCanonicalize(holder).mapErr(failed("copy", subject))?, name)
+  Ok(components(place).startsWith(components(source)))
+
+// A tree copied anew: built under a pending name beside `to` and renamed onto it once whole.
+private freshTop(
+    from: string,
+    to: string,
+    m: Metadata,
+    replace: bool,
+    attributes: bool,
+    followLinks: bool,
+    subject: string
+) -> Result[unit, IoError]
+  linkMetadata(to) match
+    Ok(there) ->
+      if !replace then return Err(IoError(io.AlreadyExists, "copy", subject))
+      if !there.isDir then return Err(IoError(io.NotADirectory, "copy", subject))
+      if syslEntries(to).map(names -> names.nonEmpty).getOrElse(true)
+        return Err(IoError(io.DirectoryNotEmpty, "copy", subject))
+    Err(_) -> ()
+  val pending = syslPendingName(to)
+  syslMakeDir(pending).mapErr(failed("copy", subject))?
+  val built = syslSetPermissions(pending, 0o700).mapErr(failed("copy", subject)) match
+    Ok(_) -> fill(from, pending, m, false, true, replace, attributes, followLinks, Vector.empty[string](), to)
+    Err(e) -> Err(e)
+  val placed = built match
+    Ok(_) -> syslRename(pending, to).mapErr(failed("copy", subject))
+    Err(e) -> Err(e)
+  if placed.isErr then clear(pending)
+  placed
+
+// A tree merged into the directory at `to`, made when it is missing.
+private mergeTop(
+    from: string,
+    to: string,
+    m: Metadata,
+    replace: bool,
+    attributes: bool,
+    followLinks: bool,
+    subject: string
+) -> Result[unit, IoError]
+  val made = intoDir(to, replace, subject)?
+  fill(from, to, m, true, made, replace, attributes, followLinks, Vector.empty[string](), to)
+
+// Makes sure a directory is at `dir` to merge into: `false` when one is there already, `true` when it
+// was made, a file or link in the way being removed first when `replace`. A directory being made is
+// readable by the program's user alone until its contents are in.
+private intoDir(dir: string, replace: bool, subject: string) -> Result[bool, IoError]
+  metadata(dir) match
+    Ok(there) -> if there.isDir then return Ok(false)
+    Err(_) -> ()
+  if exists(dir, followLinks = false)
+    if !replace then return Err(IoError(io.AlreadyExists, "copy", subject))
+    syslRemoveFile(dir).mapErr(failed("copy", subject))?
+  newDir(dir, subject)
+
+// Makes the directory `dir`, readable by the program's user alone until its contents are in; `true`,
+// as it was made.
+private newDir(dir: string, subject: string) -> Result[bool, IoError]
+  syslMakeDir(dir).mapErr(failed("copy", subject))?
+  syslSetPermissions(dir, 0o700).mapErr(failed("copy", subject))?
+  Ok(true)
+
+// Copies every entry of the directory `from` (whose reading is `m`) into the directory `to`, then
+// gives `to` the bits and times of `from` where it was `made` here or `attributes` asks. `seen` holds
+// the directories above, by device and inode, so a link leading back up is refused.
+private fill(
+    from: string,
+    to: string,
+    m: Metadata,
+    merge: bool,
+    made: bool,
+    replace: bool,
+    attributes: bool,
+    followLinks: bool,
+    seen: Vector[string],
+    shown: string
+) -> Result[unit, IoError]
+  val key = s"${m.device}:${m.inode}"
+  if seen.contains(key)
+    return Err(IoError(io.Other("file system loop"), "copy", from))
+  val above = seen :+ key
+  val names = syslEntries(from).mapErr(failed("copy", s"$from to $shown"))?
+  for name in names.sorted
+    val source = join(from, name)
+    val target = join(to, name)
+    val subject = s"$source to ${join(shown, name)}"
+    val entry = look(source, followLinks, "copy", subject)?
+    entry.kind match
+      Directory ->
+        val fresh = if merge then intoDir(target, replace, subject)? else newDir(target, subject)?
+        fill(source, target, entry, merge, fresh, replace, attributes, followLinks, above, join(shown, name))?
+      _ -> copyEntry(source, target, entry, if merge then replace else true, attributes, merge, subject)?
+  if made || attributes then carry(to, m, attributes, s"$from to $shown") else Ok(())
+
+// Removes what a failed copy built at `dir`, opening each directory to the program's user first so a
+// read-only one copied into it does not keep its entries. Failures are passed over: the copy's own
+// error is the one reported.
+private clear(dir: string)
+  linkMetadata(dir) match
+    Ok(m) ->
+      if m.isDir
+        _ = syslSetPermissions(dir, 0o700)
+        syslEntries(dir) match
+          Ok(names) ->
+            for name in names
+              clear(join(dir, name))
+          Err(_) -> ()
+        _ = syslRemoveDir(dir)
+      else
+        _ = syslRemoveFile(dir)
+    Err(_) -> ()
