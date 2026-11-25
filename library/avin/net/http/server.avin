@@ -347,10 +347,13 @@ private bound(pattern: Vector[string], segments: Vector[string]) -> Option[Vecto
 // a request is read may last `readTimeout`, each wait while a response is written `writeTimeout`,
 // and the wait for the next request on a connection kept alive `idleTimeout`, after which it is
 // closed; and the whole of a request, its line, headers and body, must arrive within
-// `requestTimeout` of its first byte, else it is answered `408` and the connection closed; zero
-// takes a limit away. A request line may be at most `maxHeaderBytes` long, and the request line and
-// headers together as long; a body may be at most `maxBodyBytes`. A `maxHeaderBytes` less than one,
-// a `maxBodyBytes` or `maxConnections` less than zero or one, or a negative `requestTimeout`, traps.
+// `requestTimeout` of its first byte, and its line and headers within `headerTimeout`, counted from
+// the connection's acceptance for its first request (so a client that never sends is closed then)
+// and from its first byte for a later one, else it is answered `408` and the connection closed;
+// zero takes a limit away. A request line may be at most `maxHeaderBytes` long, and the request
+// line and headers together as long, in at most `maxHeaders` header lines; a body may be at most
+// `maxBodyBytes`. A `maxHeaderBytes` or `maxHeaders` less than one, a `maxBodyBytes` or
+// `maxConnections` less than zero or one, or a negative `requestTimeout` or `headerTimeout`, traps.
 // With `tls`, the server speaks HTTPS: each connection begins with a TLS handshake presenting its
 // certificate, each of the handshake's waits lasting at most `readTimeout`, and a connection
 // whose handshake fails is closed. A handler that traps on a TLS connection has it closed without an
@@ -372,17 +375,23 @@ serve(
     tls: Option[TlsServer] = None,
     errors: ErrorPage = plainError,
     date: bool = true,
-    requestTimeout: Duration = seconds(60)
+    requestTimeout: Duration = seconds(60),
+    headerTimeout: Duration = seconds(10),
+    maxHeaders: int = 100
 ) -> Result[TcpServer, IoError]
   if maxHeaderBytes < 1 then fail(s"a header limit of $maxHeaderBytes bytes: it is at least one")
   if maxBodyBytes < 0 then fail(s"a body limit of $maxBodyBytes bytes: it is at least zero")
   if requestTimeout.isNegative then fail(s"a request timeout of $requestTimeout: it is at least zero")
+  if headerTimeout.isNegative then fail(s"a header timeout of $headerTimeout: it is at least zero")
+  if maxHeaders < 1 then fail(s"a limit of $maxHeaders headers: it is at least one")
   val s = Settings(
     readTimeout,
     writeTimeout,
     idleTimeout,
     requestTimeout,
+    headerTimeout,
     maxHeaderBytes,
+    maxHeaders,
     maxBodyBytes,
     errors,
     Streaming(),
@@ -421,7 +430,9 @@ private data Settings(
     writeTimeout: Duration,
     idleTimeout: Duration,
     requestTimeout: Duration,
+    headerTimeout: Duration,
     maxHeaderBytes: int,
+    maxHeaders: int,
     maxBodyBytes: int,
     errors: ErrorPage,
     streaming: Streaming,
@@ -484,10 +495,16 @@ private data Refusal
 // is held in `s.streaming` while it does.
 private converse(stream: ByteStream, server: TcpServer, handler: Handler, s: Settings, marks: bool = true)
   val input = Incoming(stream)
-  var limit = s.readTimeout
+  // A new connection's first request, its line and headers, is due `headerTimeout` after the
+  // connection was accepted, so the wait for its first byte is no longer than that either; a later
+  // one's is due `headerTimeout` after its own first byte, the idle wait before it `idleTimeout`'s.
+  val accepted = monotonic()
+  var first = true
+  var limit = soonest(s.readTimeout, s.headerTimeout)
   while input.awaits(limit, server)
     limit = s.idleTimeout
-    input.begin(s.requestTimeout)
+    input.begin(s.requestTimeout, s.headerTimeout, if first then accepted else monotonic())
+    first = false
     val request = readRequest(input, stream, server, s) match
       Ok(r) -> r
       Err(Quietly) -> return
@@ -676,14 +693,22 @@ private class Incoming(private val stream: ByteStream)
   private var ahead: Array[byte] = Array.empty[byte]()
   private var at = 0
   // When the request being read began, on the monotonic clock, and how long it may take in all;
-  // a zero budget is no limit.
+  // and when its line and headers are due, `Duration.Zero` once they are read or where there is no
+  // such limit. A zero budget is no limit.
   private var started = Duration.Zero
   private var budget = Duration.Zero
+  private var headersDue = Duration.Zero
 
-  // Begins a request, which must be read whole within `limit` from now; zero is no limit.
-  begin(limit: Duration)
+  // Begins a request, which must be read whole within `limit` from now, and its line and headers
+  // within `headers` of `from`, a time on the monotonic clock no later than now; zero is no limit.
+  begin(limit: Duration, headers: Duration, from: Duration)
     started = monotonic()
     budget = limit
+    headersDue = if headers > Duration.Zero then from + headers else Duration.Zero
+
+  // The request's line and headers are read; only its whole bound is left.
+  headersRead()
+    headersDue = Duration.Zero
 
   // Whether a byte is waiting, or arrives within `limit`. The wait is the connection's idle one,
   // through `server.idle`, so a server that stops ends it at once and it answers false.
@@ -699,22 +724,28 @@ private class Incoming(private val stream: ByteStream)
         true
       _ -> false
 
-  // The next line without its terminator, `\r\n` or a bare `\n`, holding at most `room` bytes:
-  // a longer one is answered `tooLong`.
+  // The next line without its terminator, `\r\n`, holding at most `room` bytes: a longer one is
+  // answered `tooLong`. A line ended by a bare `\n`, or holding a control character other than a
+  // tab (a NUL, a bare `\r`, DEL among them), is answered `400`, as RFC 9112 lets a server do, so
+  // no two readers of one request can frame it differently.
   line(limit: Duration, room: int, tooLong: int) -> Result[string, Refusal]
     val out = Buffer[byte]()
+    var cr = false
     loop
       while at < ahead.length
         val b = ahead(at)
         at += 1
-        if b == byte(int('\n'))
-          val bytes = out.toArray()
-          val n = bytes.length
-          return Ok(
-            string.fromUtf8Lossy(if n > 0 && bytes(n - 1) == byte(int('\r')) then bytes.slice(0, n - 1) else bytes)
-          )
-        if out.length >= room then return Err(Answer(tooLong))
-        out.addOne(b)
+        val code = int(b) & 255
+        if code == int('\n')
+          if !cr then return Err(Answer(400))
+          return Ok(string.fromUtf8Lossy(out.toArray()))
+        if cr || code == 127 || (code < 32 && code != int('\t') && code != int('\r'))
+          return Err(Answer(400))
+        if code == int('\r')
+          cr = true
+        else
+          if out.length >= room then return Err(Answer(tooLong))
+          out.addOne(b)
       fill(limit)?
     Err(Quietly)
 
@@ -736,10 +767,15 @@ private class Incoming(private val stream: ByteStream)
   // or failed ends the connection quietly.
   private fill(limit: Duration) -> Result[unit, Refusal]
     var wait = limit
+    val clock = monotonic()
     if budget > Duration.Zero
-      val left = budget - (monotonic() - started)
+      val left = budget - (clock - started)
       if left <= Duration.Zero then return Err(Answer(408))
-      if wait <= Duration.Zero || left < wait then wait = left
+      wait = soonest(wait, left)
+    if headersDue > Duration.Zero
+      val left = headersDue - clock
+      if left <= Duration.Zero then return Err(Answer(408))
+      wait = soonest(wait, left)
     if stream.setTimeout(wait).isErr then return Err(Quietly)
     stream.read(8192) match
       Ok(got) ->
@@ -749,6 +785,10 @@ private class Incoming(private val stream: ByteStream)
         Ok(())
       Err(IoError(TimedOut, _, _)) -> Err(Answer(408))
       Err(_) -> Err(Quietly)
+
+// The nearer of two time limits, where zero or less is none.
+private soonest(a: Duration, b: Duration) -> Duration =
+  if a <= Duration.Zero then b else if b <= Duration.Zero || a < b then a else b
 
 // One request: its request line, its headers and its body.
 private readRequest(
@@ -765,6 +805,7 @@ private readRequest(
     if room <= 0 then return Err(Answer(400))
     first = input.line(s.readTimeout, room, 414)?
   room -= first.byteLength + 2
+  if first.indexOf('\t') >= 0 then return Err(Answer(400))
   val words = first.split(" ")
   if words.length != 3 then return Err(Answer(400))
   val method = words(0)
@@ -776,7 +817,7 @@ private readRequest(
   if targetOf(target).isEmpty then return Err(Answer(400))
   val headers = Buffer[(string, string)]()
   loop
-    if room <= 0 then return Err(Answer(431))
+    if room < 0 then return Err(Answer(431))
     val line = input.line(s.readTimeout, room, 431)?
     room -= line.byteLength + 2
     if line.isEmpty then break
@@ -786,10 +827,17 @@ private readRequest(
     if colon <= 0 then return Err(Answer(400))
     val name = line.slice(0, colon)
     if name.indexWhere(c -> !isTokenChar(c)) >= 0 then return Err(Answer(400))
+    if headers.length >= s.maxHeaders then return Err(Answer(431))
     headers.addOne((name, line.slice(colon + 1, line.byteLength).trim))
+  input.headersRead()
   val all = headers.toVector
   val hosts = all.count(h -> h.0.equalsIgnoreCase("Host"))
   if hosts > 1 || (version == "HTTP/1.1" && hosts == 0) then return Err(Answer(400))
+  // A body's framing read two ways is how one request is smuggled inside another: a
+  // `Transfer-Encoding` in HTTP/1.0, which knows none, or in two field lines, of which a reader
+  // taking only one would see another coding, is refused (RFC 9112 section 6.1).
+  val codings = all.count(h -> h.0.equalsIgnoreCase("Transfer-Encoding"))
+  if codings > 1 || (codings == 1 && version == "HTTP/1.0") then return Err(Answer(400))
   val body = readBody(input, stream, all, version, s)?
   Ok(ServerRequest(method, target, all, body, version, remote = stream.remoteAddress, server = Some(server)))
 

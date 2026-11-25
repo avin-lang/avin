@@ -1,0 +1,107 @@
+// expect: exit 0
+// The HTTP server against malformed framing, the requests by which one request is smuggled inside
+// another, each refused `400` (or `501` and `505` where RFC 9112 says so) with the connection
+// closed, so nothing sent after it is served: `Content-Length` beside `Transfer-Encoding` in either
+// order, two lengths that differ, a length list, a signed, hexadecimal or empty length,
+// `Transfer-Encoding` in HTTP/1.0 or in two field lines, a coding list not ending in `chunked`, a
+// folded header, a line ended by a bare `\n` (request line, header, the blank line, a chunk size), a
+// bare `\r`, a NUL, DEL or other control character in a header value, a target or a header name,
+// whitespace before a header's colon or leading the first header, a method that is not a token, a
+// request line split by tabs or by two spaces, and malformed versions. What stays legal is served:
+// a tab and bytes past ASCII in a header value, `Chunked` in any case, and two equal lengths.
+import avin.io.IoError
+import avin.net.{TcpServer, TcpStream}
+import avin.net.http
+import avin.net.http.{Response, ServerRequest}
+import avin.time
+
+ok[T](r: Result[T, IoError]) -> T = r match
+  Ok(v) -> v
+  Err(e) -> fail(e.message)
+
+echo(r: ServerRequest) -> Response =
+  Response.text(200, s"${r.method} ${r.target} [${r.header("X-A").getOrElse("")}] ${r.body.length}")
+
+// Every response the server answers `text` with until it closes the connection: its status, and
+// the body of a `200`.
+answers(server: TcpServer, text: string) -> string
+  val c = ok(TcpStream.connect("127.0.0.1", server.port()))
+  ok(c.setTimeout(time.seconds(10)))
+  _ = c.writeText(text)
+  val got = c.readAll() match
+    Ok(bytes) -> string.fromUtf8Lossy(bytes)
+    Err(e) -> s"(${e.message})"
+  _ = c.close()
+  val out = Buffer[string]()
+  var rest = got
+  while rest.startsWith("HTTP/1.1 ")
+    val head = rest.indexOf("\r\n\r\n")
+    if head < 0 then break
+    val lines = rest.slice(0, head).split("\r\n")
+    var length = 0
+    for line in lines
+      if line.toLower.startsWith("content-length:") then length = line.slice(15, line.byteLength).trim.toInt()
+    val status = lines(0).slice(9, lines(0).byteLength)
+    val body = rest.slice(head + 4, head + 4 + length)
+    out.addOne(if status.startsWith("200") then s"$status: $body" else status)
+    rest = rest.slice(head + 4 + length, rest.byteLength)
+  if !rest.isEmpty then out.addOne(s"and $rest")
+  out.toVector.mkString(" / ")
+
+val smuggled = "GET /smuggled HTTP/1.1\r\nHost: t\r\n\r\n"
+
+main()
+  val server = ok(http.serve("127.0.0.1", 0, echo, date = false))
+  val refused = [
+    ("length, then coding", "POST / HTTP/1.1\r\nHost: t\r\nContent-Length: 5\r\nTransfer-Encoding: chunked\r\n\r\n0\r\n\r\n" + smuggled),
+    ("coding, then length", "POST / HTTP/1.1\r\nHost: t\r\nTransfer-Encoding: chunked\r\nContent-Length: 5\r\n\r\n0\r\n\r\n" + smuggled),
+    ("two lengths", "POST / HTTP/1.1\r\nHost: t\r\nContent-Length: 0\r\nContent-Length: 38\r\n\r\n" + smuggled),
+    ("a length list", "POST / HTTP/1.1\r\nHost: t\r\nContent-Length: 0, 0\r\n\r\n" + smuggled),
+    ("a signed length", "POST / HTTP/1.1\r\nHost: t\r\nContent-Length: +0\r\n\r\n" + smuggled),
+    ("a hexadecimal length", "POST / HTTP/1.1\r\nHost: t\r\nContent-Length: 0x0\r\n\r\n" + smuggled),
+    ("an empty length", "POST / HTTP/1.1\r\nHost: t\r\nContent-Length:\r\n\r\n" + smuggled),
+    ("a coding in HTTP/1.0", "POST / HTTP/1.0\r\nTransfer-Encoding: chunked\r\n\r\n0\r\n\r\n" + smuggled),
+    ("chunked, then gzip", "POST / HTTP/1.1\r\nHost: t\r\nTransfer-Encoding: chunked\r\nTransfer-Encoding: gzip\r\n\r\n0\r\n\r\n" + smuggled),
+    ("chunked twice", "POST / HTTP/1.1\r\nHost: t\r\nTransfer-Encoding: chunked\r\nTransfer-Encoding: chunked\r\n\r\n0\r\n\r\n" + smuggled),
+    ("gzip last", "POST / HTTP/1.1\r\nHost: t\r\nTransfer-Encoding: chunked, gzip\r\n\r\n0\r\n\r\n" + smuggled),
+    ("a near-chunked coding", "POST / HTTP/1.1\r\nHost: t\r\nTransfer-Encoding: xchunked\r\n\r\n0\r\n\r\n" + smuggled),
+    ("a folded header", "GET / HTTP/1.1\r\nHost: t\r\nX-A: 1\r\n 2\r\n\r\n" + smuggled),
+    ("a bare LF ending the request line", "GET / HTTP/1.1\nHost: t\r\n\r\n" + smuggled),
+    ("a bare LF ending a header", "GET / HTTP/1.1\r\nHost: t\nX-A: 1\r\n\r\n" + smuggled),
+    ("a bare LF ending the head", "GET / HTTP/1.1\r\nHost: t\r\n\n" + smuggled),
+    ("a bare LF ending a chunk size", "POST / HTTP/1.1\r\nHost: t\r\nTransfer-Encoding: chunked\r\n\r\n0\n\r\n" + smuggled),
+    ("a bare CR in a value", "GET / HTTP/1.1\r\nHost: t\r\nX-A: a\rb\r\n\r\n" + smuggled),
+    ("a bare CR ending a line", "GET / HTTP/1.1\r\nHost: t\rX-A: a\r\n\r\n" + smuggled),
+    ("a NUL in a value", "GET / HTTP/1.1\r\nHost: t\r\nX-A: a\u0000b\r\n\r\n" + smuggled),
+    ("a DEL in a value", "GET / HTTP/1.1\r\nHost: t\r\nX-A: a\u007Fb\r\n\r\n" + smuggled),
+    ("an escape in a value", "GET / HTTP/1.1\r\nHost: t\r\nX-A: a\u001Bb\r\n\r\n" + smuggled),
+    ("a NUL in a target", "GET /a\u0000b HTTP/1.1\r\nHost: t\r\n\r\n" + smuggled),
+    ("a NUL in a name", "GET / HTTP/1.1\r\nHost: t\r\nX\u0000A: a\r\n\r\n" + smuggled),
+    ("a tab in a target", "GET /a\tb HTTP/1.1\r\nHost: t\r\n\r\n" + smuggled),
+    ("tabs between words", "GET\t/\tHTTP/1.1\r\nHost: t\r\n\r\n" + smuggled),
+    ("two spaces between words", "GET  / HTTP/1.1\r\nHost: t\r\n\r\n" + smuggled),
+    ("a space ending the line", "GET / HTTP/1.1 \r\nHost: t\r\n\r\n" + smuggled),
+    ("a space before a colon", "GET / HTTP/1.1\r\nHost : t\r\n\r\n" + smuggled),
+    ("a space leading the first header", "GET / HTTP/1.1\r\n Host: t\r\n\r\n" + smuggled),
+    ("a method not a token", "G@T / HTTP/1.1\r\nHost: t\r\n\r\n" + smuggled),
+    ("a version in lower case", "GET / http/1.1\r\nHost: t\r\n\r\n" + smuggled),
+    ("a version too long", "GET / HTTP/1.1x\r\nHost: t\r\n\r\n" + smuggled),
+    ("a version of two digits", "GET / HTTP/01.1\r\nHost: t\r\n\r\n" + smuggled),
+    ("a version of one number", "GET / HTTP/1\r\nHost: t\r\n\r\n" + smuggled),
+    ("HTTP/2.0", "GET / HTTP/2.0\r\nHost: t\r\n\r\n" + smuggled),
+    ("HTTP/1.2", "GET / HTTP/1.2\r\nHost: t\r\n\r\n" + smuggled),
+    ("two hosts", "GET / HTTP/1.1\r\nHost: t\r\nHost: u\r\n\r\n" + smuggled)
+  ]
+  for (name, text) in refused
+    println(s"$name: ${answers(server, text)}")
+
+  val served = [
+    ("a tab in a value", "GET / HTTP/1.1\r\nHost: t\r\nX-A: a\tb\r\nConnection: close\r\n\r\n"),
+    ("UTF-8 in a value", "GET / HTTP/1.1\r\nHost: t\r\nX-A: café ✓\r\nConnection: close\r\n\r\n"),
+    ("Chunked in capitals", "POST / HTTP/1.1\r\nHost: t\r\nTransfer-Encoding: Chunked\r\nConnection: close\r\n\r\n2\r\nab\r\n0\r\n\r\n"),
+    ("two equal lengths", "POST / HTTP/1.1\r\nHost: t\r\nContent-Length: 2\r\nContent-Length: 2\r\nConnection: close\r\n\r\nab"),
+    ("a coding in HTTP/1.1, pipelined", "POST / HTTP/1.1\r\nHost: t\r\nTransfer-Encoding: chunked\r\n\r\n1\r\na\r\n0\r\n\r\n" + "GET /next HTTP/1.1\r\nHost: t\r\nConnection: close\r\n\r\n")
+  ]
+  for (name, text) in served
+    println(s"$name: ${answers(server, text)}")
+  server.shutdown()

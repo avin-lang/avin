@@ -10826,6 +10826,44 @@ Settled on the user's delegation 2026-11-11 (built on branch `json-derive`): **J
     as the default, since a slow client uploading the default largest body of 1 MiB needs about
     17 KB/s, and a server taking larger bodies has to raise it; and whether a TLS handshake, whose
     waits are each `readTimeout`'s, should get a total bound too.
+- Settled on the user's delegation 2026-11-24 (branch `http-hardening`): **`http.serve` is
+  hardened against a hostile client** ([servers](/spec/system-library/#http-server), its
+  Hardening table), every limit with a default, after a review that played each attack against a
+  real server over TCP.
+  - **`headerTimeout`, 10 seconds**, bounds a request's line and headers. *Why*: `requestTimeout`
+    (60 s) covers a body too, so a slowloris trickling headers held a slot for a minute, and with
+    `requestTimeout = 0` for ever. For a connection's first request it counts from the
+    connection's acceptance, so a client that connects and never sends is closed at 10 s rather
+    than at `readTimeout`'s 30; for a later one from its first byte, the idle wait being
+    `idleTimeout`'s. Zero is no limit; negative traps. Alternatives weighed: counting from the first
+    byte always (a silent connection then holds its slot for `readTimeout`); a minimum data rate
+    (harder to state and to test); folding it into `requestTimeout` (a long upload would need a
+    long header bound too).
+  - **`maxHeaders`, 100 header lines**, else `431`. *Why*: `maxHeaderBytes` alone let 4,000 tiny
+    headers through, each a tuple and two strings to hold and to search. Less than one traps
+    (HTTP/1.1 needs `Host`). Alternatives: no count (the byte bound alone); 50 or 128.
+  - **Strict line framing**: a line ends in `\r\n` only; a bare `\n`, a bare `\r`, or any control
+    character but a tab (NUL, DEL, ESC) in a line is `400`, and a tab in the request line too.
+    This reverses the earlier leniency, which passed a bare `\n` as a line end, as RFC 9112
+    section 2.2 allows. *Why*: a proxy in front that frames by `\r\n` and this server framing by
+    `\n` read one byte stream as different requests, which is how requests are smuggled; and a NUL
+    or bare `\r` in a value reached the handler. The RFC lets a server refuse either. Alternative:
+    replace a bare `\r` with a space, as the RFC also allows (it still hides the client's error).
+  - **`Transfer-Encoding` in HTTP/1.0, or in more than one field line, is `400`** (RFC 9112
+    section 6.1 says the first is faulty framing). The second was a real smuggling hole: the
+    server read only the first line, so `chunked` then `gzip` was read as chunked while a reader
+    joining the lines saw `gzip` last. Alternative: join the lines as one list (then `chunked,
+    gzip` is refused by the coding rule); refusing is simpler and no client sends two.
+  - **The header byte bound counts line ends exactly**: the request line and headers, with their
+    `\r\n`s, may fill `maxHeaderBytes` exactly; before, the last two bytes could not be used.
+  - **No new bound on connections or pipelining**: `maxConnections` (1024) already holds the
+    excess unaccepted in the listener's backlog, which costs the server nothing, rather than
+    accepting and answering `503` (which costs a thread and a write per refused client, under
+    exactly the flood it guards against); a connection's requests are read one at a time with
+    8 KiB read ahead, so pipelining has one request in flight and `writeTimeout` closes a client
+    that never reads. Review with the user: whether `writeTimeout`, which bounds each wait and not
+    a whole response, should gain a whole-response bound or a minimum rate, since a client reading
+    a byte every few seconds holds a connection for as long as a large response lasts.
 
 - Settled on the user's delegation 2026-11-23 (branch `http-forms`): **form bodies in
   `avin.net.http`** ([HTTP server](/spec/system-library/#http-server)): `ServerRequest.form()`
