@@ -1,0 +1,478 @@
+module avin.sqlite
+@link("sqlite3")
+@include("<sqlite3.h>")
+
+// SQLite's C interface as the standard library's `avin.sqlite` reaches it: a connection, a prepared
+// statement, the values a row holds, and SQLite's failures as a code to match on and a sentence.
+//
+// The Avin module above is the API; this layer converts, and decides nothing a caller sees beyond
+// what SQLite itself says. Every number SQLite defines is read from the header of the machine being
+// built for, in the `c const` blocks below, so none is written down here to drift from SQLite's.
+//
+// A `Connection` closes when its last reference goes, and a `Statement` holds its connection's, so
+// a connection outlives every statement compiled on it and `sqlite3_close_v2` never meets one.
+
+import sysl.buf.{Buf, buf}
+import sysl.slices.as_ptr
+import sysl.text.{cstring, from_cstring, from_utf8}
+
+opaque struct CDb
+opaque struct CStmt
+// The statements the collector freed while their connection was busy, which `shim.c` keeps.
+opaque struct CPending
+
+c const
+    OPEN_READONLY: int = "SQLITE_OPEN_READONLY"
+    OPEN_READWRITE: int = "SQLITE_OPEN_READWRITE"
+    OPEN_CREATE: int = "SQLITE_OPEN_CREATE"
+    OPEN_URI: int = "SQLITE_OPEN_URI"
+    OPEN_FULLMUTEX: int = "SQLITE_OPEN_FULLMUTEX"
+    PREPARE_PERSISTENT: int = "SQLITE_PREPARE_PERSISTENT"
+
+c const
+    OK: int = "SQLITE_OK"
+    ERROR: int = "SQLITE_ERROR"
+    INTERNAL: int = "SQLITE_INTERNAL"
+    PERM: int = "SQLITE_PERM"
+    ABORT: int = "SQLITE_ABORT"
+    BUSY: int = "SQLITE_BUSY"
+    LOCKED: int = "SQLITE_LOCKED"
+    NOMEM: int = "SQLITE_NOMEM"
+    READONLY: int = "SQLITE_READONLY"
+    INTERRUPT: int = "SQLITE_INTERRUPT"
+    IOERR: int = "SQLITE_IOERR"
+    CORRUPT: int = "SQLITE_CORRUPT"
+    NOTFOUND: int = "SQLITE_NOTFOUND"
+    FULL: int = "SQLITE_FULL"
+    CANTOPEN: int = "SQLITE_CANTOPEN"
+    PROTOCOL: int = "SQLITE_PROTOCOL"
+    EMPTY: int = "SQLITE_EMPTY"
+    SCHEMA: int = "SQLITE_SCHEMA"
+    TOOBIG: int = "SQLITE_TOOBIG"
+    CONSTRAINT: int = "SQLITE_CONSTRAINT"
+    MISMATCH: int = "SQLITE_MISMATCH"
+    MISUSE: int = "SQLITE_MISUSE"
+    NOLFS: int = "SQLITE_NOLFS"
+    AUTH: int = "SQLITE_AUTH"
+    FORMAT: int = "SQLITE_FORMAT"
+    RANGE: int = "SQLITE_RANGE"
+    NOTADB: int = "SQLITE_NOTADB"
+    NOTICE: int = "SQLITE_NOTICE"
+    WARNING: int = "SQLITE_WARNING"
+    ROW: int = "SQLITE_ROW"
+    DONE: int = "SQLITE_DONE"
+
+c const
+    CONSTRAINT_CHECK: int = "SQLITE_CONSTRAINT_CHECK"
+    CONSTRAINT_COMMITHOOK: int = "SQLITE_CONSTRAINT_COMMITHOOK"
+    CONSTRAINT_FOREIGNKEY: int = "SQLITE_CONSTRAINT_FOREIGNKEY"
+    CONSTRAINT_FUNCTION: int = "SQLITE_CONSTRAINT_FUNCTION"
+    CONSTRAINT_NOTNULL: int = "SQLITE_CONSTRAINT_NOTNULL"
+    CONSTRAINT_PRIMARYKEY: int = "SQLITE_CONSTRAINT_PRIMARYKEY"
+    CONSTRAINT_TRIGGER: int = "SQLITE_CONSTRAINT_TRIGGER"
+    CONSTRAINT_UNIQUE: int = "SQLITE_CONSTRAINT_UNIQUE"
+    CONSTRAINT_VTAB: int = "SQLITE_CONSTRAINT_VTAB"
+    CONSTRAINT_ROWID: int = "SQLITE_CONSTRAINT_ROWID"
+    CONSTRAINT_PINNED: int = "SQLITE_CONSTRAINT_PINNED"
+    CONSTRAINT_DATATYPE: int = "SQLITE_CONSTRAINT_DATATYPE"
+
+c const
+    INTEGER: int = "SQLITE_INTEGER"
+    FLOAT: int = "SQLITE_FLOAT"
+    TEXT: int = "SQLITE_TEXT"
+    BLOB: int = "SQLITE_BLOB"
+    NULL_TYPE: int = "SQLITE_NULL"
+
+extern "sqlite3_open_v2" c_open(path: *u8, db: **CDb, flags: int, vfs: *u8) -> int
+extern "sqlite3_close_v2" c_close(db: *CDb) -> int
+extern "sqlite3_errmsg" c_errmsg(db: *CDb) -> *u8
+extern "sqlite3_errstr" c_errstr(code: int) -> *u8
+extern "sqlite3_extended_errcode" c_extended_errcode(db: *CDb) -> int
+extern "sqlite3_extended_result_codes" c_extended_result_codes(db: *CDb, on: int) -> int
+extern "sqlite3_busy_timeout" c_busy_timeout(db: *CDb, ms: int) -> int
+extern "sqlite3_changes64" c_changes(db: *CDb) -> long
+extern "sqlite3_total_changes64" c_total_changes(db: *CDb) -> long
+extern "sqlite3_last_insert_rowid" c_last_insert_rowid(db: *CDb) -> long
+extern "sqlite3_get_autocommit" c_get_autocommit(db: *CDb) -> int
+extern "sqlite3_exec" c_exec(db: *CDb, sql: *u8, callback: *u8, arg: *u8, errmsg: **u8) -> int
+extern "sqlite3_next_stmt" c_next_stmt(db: *CDb, stmt: *CStmt) -> *CStmt
+extern "sqlite3_libversion" c_libversion() -> *u8
+
+extern "sqlite3_prepare_v3" c_prepare(db: *CDb, sql: *u8, n: int, flags: int, stmt: **CStmt, tail: **u8) -> int
+extern "sqlite3_step" c_step(stmt: *CStmt) -> int
+extern "sqlite3_reset" c_reset(stmt: *CStmt) -> int
+extern "sqlite3_finalize" c_finalize(stmt: *CStmt) -> int
+extern "sqlite3_clear_bindings" c_clear_bindings(stmt: *CStmt) -> int
+extern "sqlite3_stmt_readonly" c_stmt_readonly(stmt: *CStmt) -> int
+extern "sqlite3_sql" c_sql(stmt: *CStmt) -> *u8
+
+extern "sqlite3_bind_parameter_count" c_bind_parameter_count(stmt: *CStmt) -> int
+extern "sqlite3_bind_parameter_index" c_bind_parameter_index(stmt: *CStmt, name: *u8) -> int
+extern "sqlite3_bind_parameter_name" c_bind_parameter_name(stmt: *CStmt, index: int) -> *u8
+extern "sqlite3_bind_null" c_bind_null(stmt: *CStmt, index: int) -> int
+extern "sqlite3_bind_int64" c_bind_int64(stmt: *CStmt, index: int, value: long) -> int
+extern "sqlite3_bind_double" c_bind_double(stmt: *CStmt, index: int, value: real) -> int
+extern "avin_sqlite_bind_text" c_bind_text(stmt: *CStmt, index: int, value: *u8, n: long) -> int
+extern "avin_sqlite_bind_blob" c_bind_blob(stmt: *CStmt, index: int, value: *u8, n: long) -> int
+extern "avin_sqlite_pending_new" c_pending_new() -> *CPending
+extern "avin_sqlite_release" c_release(db: *CDb, pending: *CPending, stmt: *CStmt)
+extern "avin_sqlite_drain" c_drain(pending: *CPending)
+extern "avin_sqlite_pending_free" c_pending_free(pending: *CPending)
+
+extern "sqlite3_column_count" c_column_count(stmt: *CStmt) -> int
+extern "sqlite3_column_name" c_column_name(stmt: *CStmt, col: int) -> *u8
+extern "sqlite3_column_type" c_column_type(stmt: *CStmt, col: int) -> int
+extern "sqlite3_column_int64" c_column_int64(stmt: *CStmt, col: int) -> long
+extern "sqlite3_column_double" c_column_double(stmt: *CStmt, col: int) -> real
+extern "sqlite3_column_text" c_column_text(stmt: *CStmt, col: int) -> *u8
+extern "sqlite3_column_blob" c_column_blob(stmt: *CStmt, col: int) -> *u8
+extern "sqlite3_column_bytes" c_column_bytes(stmt: *CStmt, col: int) -> int
+
+// Which constraint a `SQLITE_CONSTRAINT` failure broke, from its extended code.
+enum ConstraintKind
+    Check
+    CommitHook
+    ForeignKey
+    UserFunction
+    NotNull
+    PrimaryKey
+    Trigger
+    Unique
+    VirtualTable
+    RowId
+    Pinned
+    DataType
+    // Plain `SQLITE_CONSTRAINT`, or an extended code this SQLite has and the header did not.
+    Unspecified
+
+// A SQLite result code that is a failure, by its primary code; a constraint carries which one.
+enum Code
+    Failed
+    Internal
+    Permission
+    Abort
+    Busy
+    Locked
+    NoMemory
+    ReadOnly
+    Interrupted
+    IoFailure
+    Corrupt
+    NotFound
+    Full
+    CantOpen
+    Protocol
+    Empty
+    Schema
+    TooBig
+    Constraint(kind: ConstraintKind)
+    Mismatch
+    Misuse
+    NoLfs
+    Auth
+    Format
+    ParameterRange
+    NotADatabase
+    Notice
+    Warning
+    Other(code: int)
+
+// The `Code` an extended result code is.
+code_of(extended: int) -> Code
+    val primary = extended & 255
+    primary match
+        ERROR -> Failed
+        INTERNAL -> Internal
+        PERM -> Permission
+        ABORT -> Abort
+        BUSY -> Busy
+        LOCKED -> Locked
+        NOMEM -> NoMemory
+        READONLY -> ReadOnly
+        INTERRUPT -> Interrupted
+        IOERR -> IoFailure
+        CORRUPT -> Corrupt
+        NOTFOUND -> NotFound
+        FULL -> Full
+        CANTOPEN -> CantOpen
+        PROTOCOL -> Protocol
+        EMPTY -> Empty
+        SCHEMA -> Schema
+        TOOBIG -> TooBig
+        CONSTRAINT -> Constraint(constraint_of(extended))
+        MISMATCH -> Mismatch
+        MISUSE -> Misuse
+        NOLFS -> NoLfs
+        AUTH -> Auth
+        FORMAT -> Format
+        RANGE -> ParameterRange
+        NOTADB -> NotADatabase
+        NOTICE -> Notice
+        WARNING -> Warning
+        _ -> Other(extended)
+
+private constraint_of(extended: int) -> ConstraintKind = extended match
+    CONSTRAINT_CHECK -> Check
+    CONSTRAINT_COMMITHOOK -> CommitHook
+    CONSTRAINT_FOREIGNKEY -> ForeignKey
+    CONSTRAINT_FUNCTION -> UserFunction
+    CONSTRAINT_NOTNULL -> NotNull
+    CONSTRAINT_PRIMARYKEY -> PrimaryKey
+    CONSTRAINT_TRIGGER -> Trigger
+    CONSTRAINT_UNIQUE -> Unique
+    CONSTRAINT_VTAB -> VirtualTable
+    CONSTRAINT_ROWID -> RowId
+    CONSTRAINT_PINNED -> Pinned
+    CONSTRAINT_DATATYPE -> DataType
+    _ -> Unspecified
+
+// A failure: its code, the extended code SQLite gave, and the connection's sentence about it, taken
+// when the failure happened, since the next failure on the connection overwrites it.
+struct Failure
+    code: Code
+    extended_code: int
+    message: string
+
+// A value of a row: one of SQLite's five storage classes.
+enum Value
+    SqlNull
+    SqlInteger(value: long)
+    SqlReal(value: real)
+    SqlText(value: string)
+    SqlBlob(value: Buf[u8])
+
+// The failures `avin.sqlite` reports itself, each under the code SQLite gives the same mistake: a
+// statement or connection used wrongly, a parameter that is not the statement's, a value that is not
+// the type asked for, and a transaction SQLite rolled back.
+misuse(message: string) -> Failure = Failure(Misuse, MISUSE, message)
+
+parameter_range(message: string) -> Failure = Failure(ParameterRange, RANGE, message)
+
+mismatch(message: string) -> Failure = Failure(Mismatch, MISMATCH, message)
+
+aborted(message: string) -> Failure = Failure(Abort, ABORT, message)
+
+// A database connection, opened serialized, so a statement the collector finalizes on another
+// thread takes the connection's mutex rather than racing a call on it.
+struct Connection
+    handle: *CDb
+    pending: *CPending
+
+    // Compiles the one statement `sql` holds. Text holding a second statement is refused rather
+    // than having the rest ignored, and so is text holding none. `persistent` tells SQLite the
+    // statement is kept for reuse.
+    prepare(&self, sql: string, persistent: bool) -> Result[&Statement, Failure]
+        c_drain(self.pending)
+        var stmt: *CStmt = null
+        val n = sql.len
+        if n > 2147483646usize then
+            return Err(Failure(TooBig, TOOBIG, "the SQL text is longer than SQLite takes"))
+        // SQLite reads text only to its first zero byte, so SQL holding one would lose what follows.
+        for b in sql.bytes
+            if b == 0u8 then
+                return Err(Failure(Misuse, MISUSE, "the SQL holds a zero byte: bind text holding one as a parameter"))
+        val code = c_prepare(self.handle, as_ptr(sql.bytes), int(n), if persistent then PREPARE_PERSISTENT else 0, &stmt, null)
+        if code != OK then
+            return Err(failure(self.handle, code))
+        if stmt == null then
+            return Err(Failure(Misuse, MISUSE, "the SQL holds no statement"))
+        // SQLite keeps the text it compiled, which runs from the start to where it stopped, so what
+        // follows that is the rest; the rest holding a statement, or failing to compile, refuses it.
+        val p = c_sql(stmt)
+        var used = 0usize
+        if p != null then
+            while p[used] != 0u8
+                used += 1
+        if used < n then
+            var rest: *CStmt = null
+            val rest_code = c_prepare(self.handle, as_ptr(sql.bytes[used..]), int(n - used), 0, &rest, null)
+            if rest != null then
+                _ = c_finalize(rest)
+            if rest_code != OK || rest != null then
+                _ = c_finalize(stmt)
+                return Err(Failure(Misuse, MISUSE, "the SQL holds more than one statement: run several with `executeScript`"))
+        Ok(Statement(stmt, self))
+
+    // Runs every statement `sql` holds, in order, stopping at the first that fails.
+    exec(&self, sql: string) -> Result[unit, Failure]
+        for b in sql.bytes
+            if b == 0u8 then
+                return Err(Failure(Misuse, MISUSE, "the SQL holds a zero byte: bind text holding one as a parameter"))
+        c_drain(self.pending)
+        val text = cstring(sql)
+        val code = c_exec(self.handle, text.ptr, null, null, null)
+        if code == OK then Ok(()) else Err(failure(self.handle, code))
+
+    busy_timeout(&self, ms: int) -> Result[unit, Failure]
+        val code = c_busy_timeout(self.handle, ms)
+        if code == OK then Ok(()) else Err(failure(self.handle, code))
+
+    changes(&self) -> long = c_changes(self.handle)
+
+    total_changes(&self) -> long = c_total_changes(self.handle)
+
+    last_insert_rowid(&self) -> long = c_last_insert_rowid(self.handle)
+
+    // Whether no transaction is open.
+    autocommit(&self) -> bool = c_get_autocommit(self.handle) != 0
+
+    // How many statements compiled on the connection are not yet finalized.
+    open_statements(&self) -> long
+        c_drain(self.pending)
+        var count = 0
+        var at = c_next_stmt(self.handle, null)
+        while at != null
+            count += 1
+            at = c_next_stmt(self.handle, at)
+        count
+end Connection
+
+// Nothing else holds the connection once this runs, statements included, so what is pending is
+// finalized and the connection closed here.
+impl Drop for Connection
+    drop(self)
+        c_pending_free(self.pending)
+        _ = c_close(self.handle)
+    end drop
+
+// A prepared statement. It holds its connection, so the connection is closed only after it is
+// finalized.
+struct Statement
+    handle: *CStmt
+    db: &Connection
+
+    // Runs the statement to its next row: `true` where there is one to read, `false` where it has
+    // finished.
+    step(&self) -> Result[bool, Failure]
+        val code = c_step(self.handle)
+        if code == ROW then return Ok(true)
+        if code == DONE then return Ok(false)
+        Err(failure(self.db.handle, code))
+
+    // The current row's values, each as the storage class it holds. Text that is not UTF-8 is a
+    // `Mismatch`, since an Avin string is UTF-8.
+    row(&self) -> Result[Buf[Value], Failure]
+        val n = c_column_count(self.handle)
+        var out: Buf[Value] = buf()
+        for col in 0..<n
+            val kind = c_column_type(self.handle, col)
+            if kind == INTEGER then
+                out.push(SqlInteger(c_column_int64(self.handle, col)))
+            elif kind == FLOAT then
+                out.push(SqlReal(c_column_double(self.handle, col)))
+            elif kind == TEXT then
+                val p = c_column_text(self.handle, col)
+                val len = c_column_bytes(self.handle, col)
+                if p == null || len <= 0 then
+                    out.push(SqlText(""))
+                else
+                    from_utf8(p[0..<usize(len)]) match
+                        Ok(s) -> out.push(SqlText(s))
+                        Err(_) -> return Err(mismatch(f"column ${col} holds text that is not UTF-8: select it `cast(... as blob)` to read its bytes"))
+            elif kind == BLOB then
+                val p = c_column_blob(self.handle, col)
+                val len = c_column_bytes(self.handle, col)
+                var bytes: Buf[u8] = buf()
+                if p != null && len > 0 then bytes.extend(p[0..<usize(len)])
+                out.push(SqlBlob(bytes))
+            else
+                out.push(SqlNull)
+        Ok(out)
+
+    column_names(&self) -> Buf[string]
+        val n = c_column_count(self.handle)
+        var out: Buf[string] = buf()
+        for col in 0..<n
+            val p = c_column_name(self.handle, col)
+            out.push(if p == null then "" else from_cstring(p).unwrap_or(""))
+        out
+
+    parameter_count(&self) -> int = c_bind_parameter_count(self.handle)
+
+    // The index of the parameter named `name`, written with its `:`, `@` or `$`, or 0 where the
+    // statement has none of that name.
+    parameter_index(&self, name: string) -> int
+        val text = cstring(name)
+        c_bind_parameter_index(self.handle, text.ptr)
+
+    // The name of the parameter at `index`, with its prefix, or "" for one written `?` or `?NNN`.
+    parameter_name(&self, index: int) -> string
+        val p = c_bind_parameter_name(self.handle, index)
+        if p == null then "" else from_cstring(p).unwrap_or("")
+
+    bind_null(&self, index: int) -> Result[unit, Failure] = self.checked(c_bind_null(self.handle, index))
+
+    bind_long(&self, index: int, value: long) -> Result[unit, Failure] = self.checked(c_bind_int64(self.handle, index, value))
+
+    bind_real(&self, index: int, value: real) -> Result[unit, Failure] = self.checked(c_bind_double(self.handle, index, value))
+
+    bind_text(&self, index: int, value: string) -> Result[unit, Failure] =
+        self.checked(c_bind_text(self.handle, index, as_ptr(value.bytes), long(value.len)))
+
+    bind_blob(&self, index: int, value: []const u8) -> Result[unit, Failure] =
+        self.checked(c_bind_blob(self.handle, index, as_ptr(value), long(value.len)))
+
+    // Back to before its first step, keeping its parameters.
+    reset(&self)
+        _ = c_reset(self.handle)
+
+    clear_bindings(&self)
+        _ = c_clear_bindings(self.handle)
+
+    // Whether the statement changes nothing in the database.
+    readonly(&self) -> bool = c_stmt_readonly(self.handle) != 0
+
+    sql(&self) -> string
+        val p = c_sql(self.handle)
+        if p == null then "" else from_cstring(p).unwrap_or("")
+
+    private checked(&self, code: int) -> Result[unit, Failure] =
+        if code == OK then Ok(()) else Err(failure(self.db.handle, code))
+end Statement
+
+// Finalized now where the connection is idle, or at the connection's next call where a call on
+// another thread holds it.
+impl Drop for Statement
+    drop(self)
+        c_release(self.db.handle, self.db.pending, self.handle)
+    end drop
+
+// The failure SQLite reports on `db`: the code, extended where SQLite says more, and its sentence.
+private failure(db: *CDb, code: int) -> Failure
+    val extended = c_extended_errcode(db)
+    val chosen = if extended & 255 == code & 255 then extended else code
+    val p = c_errmsg(db)
+    val said = if p == null then "" else from_cstring(p).unwrap_or("")
+    Failure(code_of(chosen), chosen, if said == "" then text_of(chosen) else said)
+
+private text_of(code: int) -> string
+    val p = c_errstr(code)
+    if p == null then "SQLite failed" else from_cstring(p).unwrap_or("SQLite failed")
+
+// Opens the database at `path` with SQLite's open flags `flags`. A connection reports extended result
+// codes, so a constraint's failure says which constraint.
+open(path: string, flags: int) -> Result[&Connection, Failure]
+    val name = cstring(path)
+    var db: *CDb = null
+    val code = c_open(name.ptr, &db, flags, null)
+    if code != OK then
+        val why = if db == null then Failure(code_of(code), code, text_of(code)) else failure(db, code)
+        if db != null then _ = c_close(db)
+        return Err(why)
+    _ = c_extended_result_codes(db, 1)
+    val pending = c_pending_new()
+    if pending == null then
+        _ = c_close(db)
+        return Err(Failure(NoMemory, NOMEM, "out of memory"))
+    Ok(Connection(db, pending))
+
+// The flags `open` takes, from what a caller asks for: `mode` 0 reads only, 1 reads and writes an
+// existing database, 2 also creates it; `uri` reads `path` as a `file:` URI.
+open_flags(mode: int, uri: bool) -> int
+    val access = if mode == 0 then OPEN_READONLY elif mode == 1 then OPEN_READWRITE else OPEN_READWRITE | OPEN_CREATE
+    access | OPEN_FULLMUTEX | (if uri then OPEN_URI else 0)
+
+// The version of the SQLite the program runs with, as `3.45.1`.
+version() -> string
+    val p = c_libversion()
+    if p == null then "" else from_cstring(p).unwrap_or("")

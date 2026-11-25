@@ -4781,6 +4781,129 @@ failed connection (beneath TLS too), which may succeed later, and `e.permanent` 
 all. After a failure of the connection or the protocol, and after a `421`, the session is closed and
 every operation answers an error. A password is never part of an error.
 
+## `avin.sqlite`
+
+SQLite databases ([settled](/spec/decisions/#settled)). `sqlite.open(path, options)` opens a file,
+or `":memory:"` for a private database in memory, and answers a `Connection`; every failure is a
+`SqliteError`.
+
+```text run
+import avin.sqlite
+import avin.sqlite.{FromRow, SqliteError}
+
+data Note(id: long, body: string, stars: Option[long]) derives FromRow
+
+main() -> Result[unit, SqliteError]
+  val db = sqlite.open(":memory:")?
+  db.execute("create table notes (id integer primary key, body text not null unique, stars int)")?
+  db.execute("insert into notes (body, stars) values (?, ?)", "first", 3)?
+  val unrated: Option[long] = None
+  val added = db.execute(
+    "insert into notes (body, stars) values (:body, :stars)",
+    {"body": "second", "stars": unrated}
+  )?
+  println(s"added row ${added.lastInsertRowid}")
+  db.execute("insert into notes (body) values (?)", "first") match
+    Err(e) -> println(s"refused: ${e.isUniqueViolation}, ${e.message}")
+    Ok(_) -> println("a duplicate went in")
+  val kept = db.transaction(tx ->
+    tx.execute("insert into notes (body) values ('third')")?
+    tx.queryValue[long]("select count(*) from notes")
+  )?
+  println(s"$kept notes after the transaction")
+  for note in db.queryAs[Note]("select id, body, stars from notes order by id")?
+    println(note)
+  Ok(())
+```
+
+```text output
+added row 2
+refused: true, UNIQUE constraint failed: notes.body
+3 notes after the transaction
+Note(1, first, Some(3))
+Note(2, second, None)
+Note(3, third, None)
+```
+
+**Opening.** `OpenOptions` holds `readOnly` (`false`), `create` (`true`: make the file where it is not
+there), `wal` (`true`: a database that is written is put in write-ahead logging, where readers and
+the writer do not wait for one another), `busyTimeout` (5 seconds: how long a statement waits for a
+lock another connection holds before failing with `Busy`), `foreignKeys` (`true`: the schema's
+foreign keys are enforced), `statementCacheSize` (64) and `uri` (`false`: read the path as a `file:`
+URI with its parameters). A negative cache size or busy timeout is a `Misuse`. `close()` closes the
+connection; closing again does nothing, and any other use after it is a `Misuse`.
+
+**Statements.** `execute(sql, params…)` runs one statement and answers `Changes(rows,
+lastInsertRowid)`: the rows it inserted, updated or deleted (0 for one that only reads) and the
+rowid of the last row inserted on the connection; a statement returning rows, `INSERT … RETURNING`
+among them, is run to its end. `query` answers every row, `queryOne` the first or `None`, `queryAs[T]`
+each row as a `T`, `queryValue[T]` the first column of the first row (no row is a `Mismatch`), and
+`each(sql, params, f)` hands each row to `f` as it is read, without holding them all, and answers
+how many there were. `executeScript(sql)` runs every statement of a schema or a migration in order,
+without parameters, stopping at the first that fails. Each of the others runs **exactly one
+statement**: SQL holding none, two (`select 1; drop table t`), or a zero byte is a `Misuse`, so text
+after the first statement is never silently dropped; a trailing `;`, space or comment is allowed.
+
+**Parameters** are given after the SQL, by position, `?` and `?NNN`, one value for each parameter
+the statement has, no more and no fewer (`ParameterRange` otherwise). A map instead gives them by
+name, `{":id": 7}`, the name's `:`, `@` or `$` optional, and every parameter the statement has must
+then be named, and every name be one of them; an unnamed `?` cannot be given by name. A value is any
+`ToSql`: `int`, `long`, `real`, `bool` (stored as 1 and 0), `string`, `Vector[byte]` (a blob),
+`Option` of one (`None` is NULL) and `SqlValue`. A string is bound as UTF-8 of its whole length, so
+text holding a zero byte is stored whole.
+
+**Rows.** A `Row` holds its column `names` and its `values`, each a `SqlValue`: `SqlNull`,
+`SqlInteger(long)`, `SqlReal(real)`, `SqlText(string)` or `SqlBlob(Vector[byte])`, the storage class
+the value has (SQLite keeps the class with the value, not the column). `get[T](index)` and
+`get[T](name)` read one as any `FromSql` type: an `int` from an integer it holds, a `long`, a `real`
+from a real or from an integer a real holds exactly, a `bool` from 0 and 1 only, a `string` from text,
+a `Vector[byte]` from a blob, an `Option` of any of these, `None` for NULL. A value of another class,
+NULL read as a type without one, and a column the row does not have are each a `Mismatch` naming the
+column. Text that is not UTF-8 is a `Mismatch` too; `cast(column as blob)` reads its bytes.
+`derive FromRow` reads a `data` type from a row (`queryAs[T]`, `row.decode[T]()`): each field from
+the column of its name, or the name its `@SqlColumn("name")` gives, a field whose column is absent
+taking its default where it has one.
+
+**Errors.** A `SqliteError` is an `Error` holding `code`, a `SqliteCode` named after SQLite's primary
+result code (`Failed` for `SQLITE_ERROR`, `Busy`, `Locked`, `ReadOnly`, `CantOpen`, `Misuse`,
+`ParameterRange`, `Mismatch`, `NotADatabase` and the rest, `Other(code)` for one it does not name),
+`extendedCode`, SQLite's extended result code, and `message`, SQLite's sentence about the failure,
+taken when it happened. A broken constraint is `Constraint(kind)`, the kind telling `Unique`,
+`PrimaryKey`, `NotNull`, `Check`, `ForeignKey`, `DataType` (a `STRICT` table's column) and the rest
+apart; `isConstraint`, `isUniqueViolation` and `isBusy` ask the common questions.
+
+**Transactions.** `transaction(f)` begins a transaction, runs `f` with the connection, and commits
+where `f` answers `Ok` and rolls back where it answers `Err` or the thread running it is cancelled,
+answering what `f` answered. `transaction(mode, f)` begins it `Deferred` (the default), `Immediate`
+(the write lock at once, so a writing transaction never fails part way for want of it) or
+`Exclusive`. A transaction inside another, or `savepoint(f)` anywhere, is a savepoint: its rollback
+undoes its own work and keeps the outer transaction's, and the outer one's rollback undoes everything.
+Where SQLite has rolled a transaction back by itself (a full disk), a body answering `Ok` is an
+`Abort`, since nothing was committed. `inTransaction` sees the program's own `BEGIN` too.
+
+**Prepared statements.** Each statement `execute` and the queries run is prepared once and kept, by
+its text, in the connection's cache, up to `statementCacheSize`, the least recently used finalized
+first; one in use (inside `each`) is not taken, and the same text inside runs a statement of its own.
+`prepare(sql)` makes a `Statement` of the program's own, with the same `execute`, `query`,
+`queryOne`, `queryAs`, `queryValue` and `each`, its `sql`, `parameterCount`, `columnNames` and
+`isReadOnly`, kept until `close()`. A statement nothing holds is finalized when the collector frees
+it; one whose connection is in a call on another thread at that moment is finalized at that
+connection's next call, so a collection never waits for SQLite. `openStatements` counts what is not
+yet finalized.
+
+**Threads.** A connection belongs to one owner at a time, as a [handle](/spec/sysl-bindings/#handles)
+does: it moves with what is handed to another thread, and its previous owner's next use traps. Threads
+that each use a database open a connection each, or share a `threads.Pool[Connection, SqliteError]`,
+which lends one to one thread at a time. A call that waits for SQLite (a lock another connection holds,
+the disk) is a [blocking call](/spec/sysl-bindings/#calls-that-wait): the lightweight thread waiting
+leaves its worker to the others, and a collection does not wait for it.
+
+SQLite is the machine's own, 3.37 or newer (macOS ships it; `libsqlite3-dev` on Debian and Ubuntu,
+`sqlite-devel` on Fedora), reached through the library's Sysl package `sqlite` in
+`library/sysl/sqlite`, which pkg-config finds it for; a program's shims depend on it only where a
+binding the program compiles reaches it, so a program that never imports `avin.sqlite` never links
+SQLite. `sqlite.version()` answers the version the program runs with.
+
 ## Concurrency
 
 Futures and promises stay in [`avin.threads`](/spec/threads/#futures), beside the
