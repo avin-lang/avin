@@ -13329,3 +13329,49 @@ Settled on the user's delegation 2026-11-11 (built on branch `json-derive`): **J
   `=` as an empty-named cookie (6265bis; no server needs it). A cookie jar (domain/path matching,
   expiry, public suffixes) is a later item. Review with the user: strict value octets on `Cookie`
   (a client sending `a=b,c` loses that cookie).
+- Settled on the user's delegation 2026-11-24 (branch `crypto-password`): **password hashing is
+  `avin.crypto.password`, over the Argon2 reference implementation and Openwall's crypt_blowfish,
+  vendored as C sources in a Sysl package the standard library carries** (`library/sysl/password`,
+  named by directory in `library.hocon`). The source was picked in the order the item set: (1)
+  OpenSSL's Argon2 KDF: the installed OpenSSL (4.1) has `ARGON2ID`, but sysl:openssl 0.2.5 binds no
+  `EVP_KDF` call, and binding one means a release of that package, outside this repository; it would
+  also tie password hashing to OpenSSL 3.2 or later, which many current Linux releases do not ship.
+  (2) The reference implementation (phc-winner-argon2, CC0) as vendored C: taken. Avin's own C-source
+  support (`c-libraries.sources`) is a package manifest's, and the standard library's `library.hocon`
+  carries only `sysl-dependencies`, so the C is reached the way the library already reaches OpenSSL:
+  through a Sysl package, here one in the library's own tree whose `c` block compiles the upstream
+  files byte for byte, with one C shim (`shim.c`) that fills Argon2's context from scalars and gives
+  bcrypt's C strings their NULs. A program that never imports `avin.crypto.password` never builds
+  it. (3) Pure Avin was not needed. bcrypt verification uses crypt_blowfish 1.3 (public domain), the
+  implementation most C libraries' `crypt` use for `$2b$`. *Alternatives weighed*: sysl:monocypher
+  0.4.1, which binds Argon2id too (the audit row saying "Argon2i only" is out of date) and is audited,
+  but computes lanes one after another and is not the source the item named; libsodium or libargon2
+  installed through a package manager (a dependency to install everywhere); a library manifest that
+  carries `c-libraries` (a compiler feature for something a Sysl package already does). Review with
+  the user: whether the standard library should grow `c-libraries` of its own, which would make the
+  Sysl package unnecessary.
+- Settled on the user's delegation 2026-11-24 (branch `crypto-password`): **the password API.**
+  `hashPassword(password, params = Argon2Params(), secret = [])` returns a PHC string;
+  `verifyPassword(password, encoded, secret = [], limits = PasswordLimits()) -> Result[bool,
+  PasswordHashError]`, where `Ok(false)` is a wrong password and `Err` a hash that could not be checked
+  (`Malformed`, `Unsupported`, `OverLimit`, `Failed`), so a corrupted row never reads as an intruder;
+  `needsRehash(encoded, params)`; `argon2(...)` the raw primitive; `parseArgon2Hash` and
+  `Argon2Hash.encode` for the PHC string. Choices: (1) defaults are OWASP's first Argon2id setting,
+  19456 KiB, t=2, p=1, 16-byte salt, 32-byte hash. (2) `needsRehash` is true when any parameter
+  differs (variant, version, m, t, p, salt and hash length), not only when one is lower, as other
+  libraries do, so a server may lower a cost too; every bcrypt hash needs rehashing. (3) Verification
+  limits are checked before anything is computed: 1 GiB, 32 passes, 16 lanes, bcrypt cost 16 by
+  default, so a forged or corrupted string cannot pin a login for minutes. (4) There is no password
+  length limit: Argon2 reads the password once through BLAKE2b, so a long one costs microseconds, and
+  a request body is already bounded by the server. (5) Version 1.0 hashes (`v=16`, or no `v=`) are
+  verified, never written. (6) The PHC reader is strict: fields in the order `m,t,p`, decimals with no
+  sign or leading zero and at most ten digits, canonical unpadded base64, no `keyid`/`data`; anything
+  else is `Malformed`. (7) bcrypt accepts `2a`, `2b` and `2y` and refuses `2x` (the setting that
+  reproduces a sign-extension bug) as `Unsupported`; it compares only the 31 hash characters, so a
+  salt whose last character carries nonzero unused bits still verifies; a key ends at its first zero
+  byte and at 72 bytes, as bcrypt defines. (8) Both bindings are `blocking`: the hashing thread is safe
+  for the collector and the scheduler moves the other lightweight threads off its worker. Lanes are
+  computed on at most 16 threads. (9) Argon2's `secret` (a pepper) is a parameter of hash and verify;
+  bcrypt ignores it. *Alternatives weighed*: `verifyPassword -> bool` (hides malformed rows);
+  `needsRehash` only on weaker costs; a `Result` from `hashPassword` (its parameters are the server's
+  own, so a bad one is a programming error and traps, as `pbkdf2HmacSha256`'s do).
