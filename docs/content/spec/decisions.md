@@ -10991,6 +10991,95 @@ Settled on the user's delegation 2026-11-11 (built on branch `json-derive`): **J
   - **`matcher(pattern)` is a function value** reading the pattern once. Alternative: a `Glob`
     class; a function value is all a walk filter needs.
 
+- **`avin.sqlite`, SQLite in the standard library** (branch `sqlite`, 2026-11-24;
+  [`avin.sqlite`](/spec/system-library/#avinsqlite)). Each entry below is settled on the user's
+  delegation 2026-11-24.
+  - **A module of the standard library, not a package.** The user's goal of 2026-11-23, that the
+    standard library have everything a server needs, is the later word on what belongs there, and an
+    embedded database is the store a server reaches for first; the cost the JSON and PostgreSQL
+    packages avoided does not arise, since a program that never imports `avin.sqlite` builds and links
+    nothing of SQLite's (its Sysl package joins a program only where a binding reaches it, as
+    OpenSSL's does). Alternatives: the package `dev.avinlang.sqlite` in its own repository (the JSON
+    and `pg` precedent; a dependency to add for what a server takes as given, and a repository and
+    release of its own). **Review with the user**: the JSON decision of 2026-11-13 moved a module out
+    of the library, and this one goes the other way.
+  - **The machine's SQLite, through a Sysl package of the library's own** (`library/sysl/sqlite`,
+    named by its directory in `library/library.hocon`; `pkg-config sqlite3` finds it). macOS ships
+    3.43 or newer in its SDK and every Linux distribution packages it, so nothing is compiled; 3.37 is
+    the floor, for `STRICT` tables, `sqlite3_changes64` and the constraint codes `DataType` and
+    `Pinned`, and has `RETURNING` (3.35) and the JSON functions (built in since 3.38, an option
+    before). The package is the library's own because the binding needs what `sysl:sqlite3` does not
+    have (named parameters, extended result codes, `prepare_v3`, deferred finalizing) and a change
+    there is another repository's. Alternatives: `sysl:sqlite3` (above, and its floor is Sysl
+    0.6.0); a vendored `sqlite3.c` compiled by C `sources` (pins the version and every feature, but
+    only a package's manifest has `sources`, not the library's, and it adds 9 MB of C and a long
+    compile to every first build); Avin C bindings straight to `libsqlite3` (the library's manifest
+    has no `c-libraries`, and a library entry would have to be reached per module rather than linked
+    into every program; `SQLITE_TRANSIENT` needs C glue either way). **Review with the user**:
+    vendoring for a pinned SQLite, which would also need `sources` for the library's manifest.
+  - **A connection belongs to one owner at a time, and a call that waits is `blocking`.** The
+    connection and its statements are Sysl handles, so the owner check every handle has keeps two
+    threads off one connection; threads use a connection each or a `threads.Pool` of them. `open`,
+    `prepare`, `step` and `executeScript` are `blocking`, so a statement waiting out the busy timeout
+    or the disk leaves its worker to other lightweight threads and holds up no collection. The
+    connection is opened serialized (`SQLITE_OPEN_FULLMUTEX`). Alternatives: a connection shared by
+    threads behind SQLite's mutex (the owner check would have to be lifted, and a busy wait would hold
+    every thread using it); a thread of its own serving each connection (a hand-off per statement).
+  - **A statement the collector frees is finalized without waiting.** A finalizer runs on the
+    collecting thread while the statement's connection may be in a blocking call on another, holding
+    the connection's mutex for up to the busy timeout; finalizing there would hold up the collection,
+    and every thread with it. So the finalizer takes the connection's mutex only where it is free
+    (`sqlite3_mutex_try`), and otherwise puts the statement on the connection's pending list, under
+    a lock of its own never held across a wait, which the connection finalizes at its next `prepare`,
+    `executeScript` or `openStatements`. A statement holds its connection, so a connection closes only
+    after its statements, with `sqlite3_close_v2`. Alternatives: finalizing in the finalizer (the
+    stall above); a connection with no mutex (a finalizer racing a call).
+  - **Defaults for a server**: `wal` on (readers and the writer do not block one another; a
+    read-only connection and `:memory:` are left as they are), `foreignKeys` on (SQLite's own default
+    is off only for compatibility), `busyTimeout` 5 seconds (SQLite's is 0, failing at the first
+    lock), a statement cache of 64. Alternatives: SQLite's own defaults throughout (a server's
+    concurrent writers then fail with `Busy` at once and its foreign keys go unchecked). **Review with
+    the user**: WAL by default leaves `-wal` and `-shm` files beside the database and does not suit a
+    database on a network file system.
+  - **One statement per call.** `execute` and the queries refuse SQL holding a second statement, or
+    a zero byte, as a `Misuse`, rather than run the first and drop the rest as `sqlite3_prepare`
+    does; `executeScript` runs several, without parameters. Alternatives: SQLite's behaviour (a
+    statement silently not run); running every statement (parameters would have no clear owner).
+  - **Parameters by position must all be given, and by name all named.** A count that differs, a
+    name the statement lacks, or a named parameter left out is a `ParameterRange`, since SQLite would
+    bind NULL to what is left out with nothing said. Names may be given without their `:`, `@` or
+    `$`. Alternatives: SQLite's leniency.
+  - **Errors** are one data type, `SqliteError(code, extendedCode, message)`, the code a `SqliteCode`
+    named after SQLite's primary result codes (`Failed` for `SQLITE_ERROR`, since `Error` is the
+    trait; `ParameterRange` for `SQLITE_RANGE`, since `Range` is the library's type) and a broken
+    constraint `Constraint(kind)`, so a unique violation is matched as `Constraint(Unique)`. The
+    module's own failures take the code SQLite gives the same mistake (`Misuse`, `ParameterRange`,
+    `Mismatch`, `Abort`). Alternatives: a variant per module failure beside SQLite's (two ways to say
+    one mistake); the extended code alone (a number to match on).
+  - **Values and rows follow `pg`**: `SqlValue` is the five storage classes, `ToSql` and `FromSql`
+    the conversions, `Row` with `get[T]` by index or name, and `derive FromRow` with `@SqlColumn`, as
+    `dev.avinlang.pg` has them, so code moves between the two. `bool` is 1 and 0 and reads only from
+    those; a `real` reads from an integer a real holds exactly; text that is not UTF-8 is a
+    `Mismatch`, read with `cast(… as blob)`. Alternatives: lenient reads as SQLite's own `column_*`
+    functions do (`'apple'` read as an integer is 0, with nothing said).
+  - **Transactions as `pg`'s**: `transaction(f)` commits on `Ok`, rolls back on `Err` or
+    cancellation, and nests as savepoints; `transaction(mode, f)` takes `Deferred`, `Immediate` or
+    `Exclusive`; `savepoint(f)` is a savepoint anywhere. A body answering `Ok` after SQLite rolled the
+    transaction back by itself answers an `Abort`. The body's error is a `SqliteError`, as `pg`'s is a
+    `PgError`. Alternatives: a body of any error type (then `BEGIN` and `COMMIT`'s own failures need
+    a conversion into it).
+- Settled on the user's delegation 2026-11-24 (branch `sqlite`, a bug `avin.sqlite` met): **a
+  collection literal given to an overloaded function is tried against each candidate's parameter
+  where no candidate takes it as checked by itself.** `execute(sql, {":b": "x"})`, with overloads
+  taking `ToSql*` and `Map[string, ToSql]`, was refused: the literal was checked alone, as a
+  `Map[string, string]`, and only literals built around integers were tried again against the
+  candidates, though [overloading](/spec/declarations/#default-and-named-arguments) says a literal
+  argument fits any overload whose parameter it can become, as it does a single function's. Now a
+  sequence, set or map literal that leaves no candidate fitting is tried against each, and the one
+  that takes it is chosen; where two can, the call is still refused. Alternatives: trying every
+  collection literal against every candidate first (a literal that fits as it stands would then
+  choose differently than it did).
+
 ## Proposed
 
 - Settled on the user's delegation 2026-11-23 (branch `fs-handle`): **`File` has positioned
