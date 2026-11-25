@@ -10991,6 +10991,27 @@ Settled on the user's delegation 2026-11-11 (built on branch `json-derive`): **J
   - **`matcher(pattern)` is a function value** reading the pattern once. Alternative: a `Glob`
     class; a function value is all a walk filter needs.
 
+- **A delayed argument lives in the caller's frame; capturing a by-name parameter copies it to the
+  heap** (by-name chapter, § Representation). Settled on the user's delegation 2026-11-24 (branch
+  `byname-stack`). Every delayed argument used to be a heap closure, so a disabled
+  `logger.debug(message, fields)` cost about 14 ns and 16 bytes against 1.8 ns for the guarded
+  call. Now a delayed argument written at a call of a program function (by name, through a method
+  table, or of a function value) is a `StackObject` in the caller's frame, and a `Keep` after the
+  call keeps what it holds alive, since the collector does not follow references into frames (the
+  disabled call: 3.3 ns, no allocation). Escape is decided where it can happen rather than by an
+  analysis across functions: a closure that captures a by-name value copies it to the heap
+  (`avin_rt_keep_delayed`, a shallow copy) where the closure is made, so no closure ever holds one
+  in a frame, and no function's code depends on what another function's body does, which keeps
+  the instance cache's keys local. The cost lands on code that keeps the expression or captures it
+  in a further delayed argument (`twice(value + 1)`): one allocation, as before. A self tail call,
+  lowered as a jump that reuses the frame, and an operation the compiler lowers in place keep heap
+  closures. Alternatives: an interprocedural escape analysis that would also put the nested case on
+  the stack, but makes a caller's code depend on its callees' bodies, a fixpoint over the program
+  and a cache dependency on every callee; teaching the collector to trace objects in frames, which
+  needs a way to tell a frame object from any other pointer outside the heap; a deep copy that
+  follows by-name fields, which needs the descriptor to say which fields are delayed expressions.
+  Review with the user: the nested capture still allocates, and the deep copy would remove that.
+
 ## Proposed
 
 - Settled on the user's delegation 2026-11-23 (branch `fs-handle`): **`File` has positioned
