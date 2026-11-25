@@ -8,10 +8,10 @@ module avin.net.http
 // machine's trusted authorities and those the request's `TlsClient` adds. The server, `serve`, is in
 // `server.avin` beside this file; a `Response` is what its handlers answer.
 
-import avin.io.IoError
+import avin.io.{IoError, TimedOut}
 import avin.net.{ByteStream, TcpStream, Url, UrlError}
 import avin.net.tls.{TlsClient, TlsError, TlsStream, Transport}
-import avin.time.{Duration, seconds}
+import avin.time.{Duration, monotonic, seconds}
 
 // Why a request has no response.
 data HttpError
@@ -39,19 +39,23 @@ impl Error for HttpError
     Tls(e) -> e.message
 
 // A request: its method, its URL as text, the headers sent besides the ones the client writes, its
-// body, how long a read or write on its connection may wait, and the TLS settings an `https` URL is
-// fetched with, by redirect too. A method is a token, such as `GET`, a header's name is a token and
-// its value holds no line break; a request where one does not hold traps as it is made, its headers
-// given to the constructor as much as those added by `withHeader`.
+// body, how long a read or write on its connection may wait, the TLS settings an `https` URL is
+// fetched with, by redirect too, and how long looking the host up, connecting and an `https` URL's
+// TLS handshake may take together, for each connection the request makes. A method is a token, such
+// as `GET`, a header's name is a token and its value holds no line break; a request where one does
+// not hold, or whose `connectTimeout` is negative, traps as it is made, its headers given to the
+// constructor as much as those added by `withHeader`.
 class Request(
     val method: string,
     val url: string,
     val headers: Vector[(string, string)] = Vector.empty[(string, string)](),
     val body: Array[byte] = Array.empty[byte](),
     val timeout: Option[Duration] = None,
-    val tls: TlsClient = TlsClient()
+    val tls: TlsClient = TlsClient(),
+    val connectTimeout: Duration = seconds(30)
 )
   if method.isEmpty || method.indexWhere(c -> !isTokenChar(c)) >= 0 then fail(s"`$method` is not an HTTP method")
+  if connectTimeout.isNegative then fail(s"a connect timeout of $connectTimeout: it is at least zero")
   for (name, value) in headers
     checkHeader(name, value)
 
@@ -63,25 +67,27 @@ class Request(
     headers :+ (name, value),
     body,
     timeout,
-    tls
+    tls,
+    connectTimeout
   )
 
   // The value of the first header of `name`, compared without regard to case.
   header(name: string) -> Option[string] = headerIn(headers, name)
 
   // The request with the headers of `more` added after the ones it has, in order.
-  withHeaders(more: Vector[(string, string)]) -> Request = Request(method, url, headers ++ more, body, timeout, tls)
+  withHeaders(more: Vector[(string, string)]) -> Request =
+    Request(method, url, headers ++ more, body, timeout, tls, connectTimeout)
 
   // The request with the query parameter `name=value` added after any its URL has, each encoded by
   // `Url.encode`, and before the URL's fragment.
   withQueryParam(name: string, value: string) -> Request =
-    Request(method, withParam(url, name, value), headers, body, timeout, tls)
+    Request(method, withParam(url, name, value), headers, body, timeout, tls, connectTimeout)
 
   // The request with `text`, as UTF-8, for its body.
-  withBody(text: string) -> Request = Request(method, url, headers, utf8(text), timeout, tls)
+  withBody(text: string) -> Request = Request(method, url, headers, utf8(text), timeout, tls, connectTimeout)
 
   // The request with `bytes` for its body.
-  withBody(bytes: Array[byte]) -> Request = Request(method, url, headers, bytes, timeout, tls)
+  withBody(bytes: Array[byte]) -> Request = Request(method, url, headers, bytes, timeout, tls, connectTimeout)
 
   // The request with `pairs` for its body, written as `application/x-www-form-urlencoded` by
   // `Url.formEncode`, and that for its `Content-Type`, replacing any it has.
@@ -112,11 +118,16 @@ class Request(
 
   // The request with a read or write on its connection, the TLS handshake's included, failing with
   // `TimedOut` after waiting `d`.
-  withTimeout(d: Duration) -> Request = Request(method, url, headers, body, Some(d), tls)
+  withTimeout(d: Duration) -> Request = Request(method, url, headers, body, Some(d), tls, connectTimeout)
 
   // The request fetching an `https` URL with `client`'s settings: the machine's trusted
   // authorities and those `client` adds.
-  withTls(client: TlsClient) -> Request = Request(method, url, headers, body, timeout, client)
+  withTls(client: TlsClient) -> Request = Request(method, url, headers, body, timeout, client, connectTimeout)
+
+  // The request with looking the host up, connecting and an `https` URL's TLS handshake together
+  // failing with `TimedOut` once they have taken `d`, on each connection it makes; zero takes the
+  // limit away, and a negative `d` traps.
+  withConnectTimeout(d: Duration) -> Request = Request(method, url, headers, body, timeout, tls, d)
 
 // A response: its status and reason, its headers as they came, name and value, and its body. A
 // response a server writes may instead be `streamed`, its body written as the handler makes it,
@@ -354,7 +365,8 @@ private exchange(request: Request, url: Url) -> Result[Response, HttpError]
   val host = url.host.getOrElse("")
   if host.isEmpty then return Err(Unsupported(s"a URL without a host: $url"))
   val port = url.portOrDefault.getOrElse(if secure then 443 else 80)
-  val tcp = TcpStream.connect(addressOf(host), port).mapErr(e -> Io(e))?
+  val start = monotonic()
+  val tcp = TcpStream.connect(addressOf(host), port, request.connectTimeout).mapErr(e -> Io(e))?
   request.timeout match
     Some(d) ->
       tcp.setTimeout(d) match
@@ -369,7 +381,7 @@ private exchange(request: Request, url: Url) -> Result[Response, HttpError]
     val answer = over(tcp, request, url, host)
     _ = tcp.close()
     return answer
-  val stream = TlsStream.client(tcp, addressOf(host), request.tls) match
+  val stream = handshaken(tcp, addressOf(host), request.tls, start, request.connectTimeout) match
     Ok(s) -> s
     Err(e) ->
       _ = tcp.close()
@@ -519,6 +531,21 @@ private withoutHeader(headers: Vector[(string, string)], name: string) -> Vector
 // The host as a connection names it: an IPv6 address without its brackets, its zone's `%25` as `%`.
 private addressOf(host: string) -> string =
   if host.startsWith("[") then host.slice(1, host.byteLength - 1).replace("%25", "%") else host
+
+// TLS as the client over `tcp`, a connection to `host` begun at `start` on the monotonic clock, its
+// handshake done within what is left of `limit`; zero is no limit. A `limit` already spent is a
+// `Transport` error of kind `TimedOut`, and `tcp` is left for the caller to close.
+private handshaken(
+    tcp: TcpStream,
+    host: string,
+    settings: TlsClient,
+    start: Duration,
+    limit: Duration
+) -> Result[TlsStream, TlsError]
+  if limit == Duration.Zero then return TlsStream.client(tcp, host, settings)
+  val left = limit - (monotonic() - start)
+  if left <= Duration.Zero then return Err(Transport(IoError(TimedOut, "handshake with", host)))
+  TlsStream.client(tcp, host, settings, left)
 
 // A character a method or a header's name may hold: a letter, a digit, or one of RFC 9110's marks.
 private isTokenChar(c: char) -> bool =
