@@ -10990,6 +10990,70 @@ Settled on the user's delegation 2026-11-11 (built on branch `json-derive`): **J
     `{src,lib}/**`). Review with the user: overlaps the path-helpers item, which also lists `{a,b}`.
   - **`matcher(pattern)` is a function value** reading the pattern once. Alternative: a `Glob`
     class; a function value is all a walk filter needs.
+- Settled on the user's delegation 2026-11-24 (branch `crypto-sign`): **signatures, keys,
+  authenticated encryption, HKDF, SHA-224/384 and HMAC-SHA-1/224/384 in `avin.crypto`.**
+  - **The signing and the ciphers are OpenSSL's libcrypto, through a Sysl package the standard
+    library carries** (`library/sysl-packages/avincrypto`, named by directory in `library.hocon`), not
+    through `sysl:openssl` 0.2.5's `sign.sysl`. That file is shaped for JOSE (an `Algorithm` enum that
+    fixes P-521 to SHA-512 and answers ECDSA as `r || s`, PEM only) and has no Ed25519, no key
+    generation, no DER, no AEAD; extending it meant a release of another repository for every change.
+    The package is a small set of stateless calls over bytes, linked only into a program that reaches
+    one (as TLS is). Alternatives weighed: extending `sysl:openssl` (the better long-term home; the
+    package can move there unchanged, which needs only the binding targets renamed); `@c` bindings in
+    the library (the library's manifest has no `c-libraries`, and out-parameters such as `EVP_PKEY **`
+    want Sysl's pointers anyway); Ed25519 from `sysl:monocypher` and the rest from OpenSSL (two
+    libraries for one module). Review with the user: whether the package should become a
+    `sysl:openssl` release.
+  - **A key is a value, held as its DER and parsed again at each use** (`opaque type PrivateKey =
+    KeyParts`, the kind and the PKCS#8 or SubjectPublicKeyInfo bytes). A key read at startup is then
+    used by every thread at once, needs no `close`, and has no finalizer. The price is one DER parse
+    per signature: a few microseconds, beside an RSA signature's millisecond but comparable to an
+    Ed25519 one's tens. Alternatives weighed: a handle on an `EVP_PKEY` (one owner thread by the handle
+    rules, so a server's shared signing key traps on its second thread); a process-wide table of
+    parsed keys (a lock on every signature, and keys that are never freed). Review with the user: a
+    shared parsed form once handles may be shared between threads.
+  - **Nine named schemes rather than a key kind plus a digest plus a padding**: `Ed25519`,
+    `EcdsaP256Sha256`, `EcdsaP384Sha384`, `RsaPkcs1Sha256/384/512`, `RsaPssSha256/384/512`, the TLS
+    1.3 and JOSE set. The caller always names the scheme; nothing reads it from the data. P-521,
+    secp256k1, Ed448 and RSA-PSS-restricted keys are refused (`InvalidKey`). Alternatives: separate
+    parameters (lets a program pair P-256 with SHA-512, which no protocol asks for); P-521 (no
+    server protocol in common use needs it; a variant can be added).
+  - **`verify` is `Result[bool, CryptoError]`**: `Ok(false)` for every signature that does not check,
+    malformed ones included, and `Err(KeyMismatch(kind, scheme))` for a scheme the key does not sign
+    with, checked in Avin before the call. Alternatives: `bool` with a mismatch trapping (a key from a
+    JWKS of the wrong kind would bring a server down) or answering `false` (a misconfiguration would
+    read as a forgery).
+  - **ECDSA signatures are DER**, with `ecdsaFixedSignature`/`ecdsaDerSignature` for the fixed-width
+    form, which accept only one canonical DER signature of non-negative integers that fit. DER is what
+    X.509, TLS and WebAuthn carry and what OpenSSL makes. Alternative: the fixed form by default
+    (JOSE's), or a scheme per encoding (eighteen schemes).
+  - **PSS uses a salt the digest's length and MGF1 over the same digest**, in signing and checking;
+    other salt lengths do not check. Alternative: `RSA_PSS_SALTLEN_AUTO` on verify (accepts any
+    salt; RFC 8017 leaves it to the application, and every protocol here fixes it).
+  - **Limits**: RSA from 2048 to 16384 bits, read and made; generation outside that traps (a constant
+    in the program), reading answers `InvalidKey`. Encrypted keys are refused with a reason, never asked
+    a passphrase. PEM is read in Avin (the first block of an accepted label; a body with RFC 1421
+    headers is an encrypted key), so OpenSSL only ever sees DER and never prompts.
+  - **Key generation is a `blocking` binding**, so the collector runs for the other threads while an
+    RSA key is made.
+  - **`Display` of a key is its kind** (`PrivateKey(RSA 2048)`, `AeadKey(AES-256-GCM)`); an opaque
+    type derives no `Debug`, so nothing prints the bytes. `toPem`, `toDer` and `toBytes` are the only
+    ways out. The runtime does not wipe a key's bytes when it is collected (they are ordinary
+    collected memory); decryption wipes its own buffer when a tag does not check.
+  - **AEAD is AES-128-GCM, AES-256-GCM and ChaCha20-Poly1305 with 12-byte nonces and 16-byte tags**,
+    as an `Aead` data type whose `key(bytes)` answers `InvalidKey` for a wrong length and an opaque
+    `AeadKey`. `seal`/`open` put a random nonce in front (`nonce || ciphertext || tag`);
+    `sealWithNonce`/`openWithNonce` take the caller's, and a nonce that is not 12 bytes traps (a
+    constant of the protocol). Alternatives weighed: XChaCha20-Poly1305 (24-byte nonces, safe to draw
+    at random without limit; OpenSSL has no HChaCha20, so it would be a Sysl implementation of its
+    own, the earlier `crypto-aead` item's plan, still open); AES-GCM-SIV (not in OpenSSL's EVP for
+    every version shipped); nonces as a counter kept by the key (state in a value meant to be shared).
+    Review with the user: XChaCha20-Poly1305 as the random-nonce default once it exists.
+  - **HKDF over SHA-256, SHA-384 and SHA-512, whole and in halves**, bound to `sysl.crypto`; a length
+    below 1 or past 255 digests traps, as PBKDF2's does, and Expand traps on a pseudorandom key shorter
+    than a digest (RFC 5869 § 2.3's requirement). HKDF-SHA-1 and -SHA-224 are left out (no protocol in
+    use wants them). SHA-224 and SHA-384 come with streaming `Sha224`/`Sha384`; HMAC-SHA-1 (TOTP),
+    -SHA-224 and -SHA-384 join HMAC-SHA-256 and -SHA-512.
 
 ## Proposed
 
