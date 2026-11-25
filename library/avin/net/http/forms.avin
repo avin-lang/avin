@@ -3,9 +3,11 @@ module avin.net.http
 // Form bodies: `application/x-www-form-urlencoded`, read by `ServerRequest.form()` and written by
 // `Request.withForm`, and `multipart/form-data` (RFC 7578), read by `ServerRequest.multipart` or
 // `Multipart.parse` and written by `Request.withMultipart` or `Multipart.encoded`. A multipart body
-// is read whole, from a body the server has already buffered within its body limit, under limits of
-// its own: how many parts, how many bytes of headers a part may have, and how many bytes in all.
+// is read whole here, from a body the server has already buffered within its body limit, or a part at
+// a time by a `MultipartReader`, under limits of its own: how many parts, how many bytes of headers a
+// part may have, and how many bytes in all.
 
+import avin.io.IoError
 import avin.net.{InvalidUtf8, Url, UrlError}
 import avin.random.SecureRandom
 
@@ -25,6 +27,9 @@ data FormError
   PartHeadersTooLarge(limit: int)
   // A multipart body of more than `limit` bytes.
   FormTooLarge(limit: int)
+  // A multipart body read as it arrives whose source failed: a connection that ended or waited too
+  // long, a request body over its limit, or a reader's own failure.
+  BodyUnreadable(error: IoError)
 
 impl Error for FormError
   // A sentence saying what is wrong, for the client.
@@ -37,9 +42,11 @@ impl Error for FormError
     TooManyParts(limit) -> s"the multipart body has more parts than its limit of $limit"
     PartHeadersTooLarge(limit) -> s"a part's headers are longer than their limit of $limit bytes"
     FormTooLarge(limit) -> s"the multipart body is longer than its limit of $limit bytes"
+    BodyUnreadable(e) -> s"the multipart body could not be read: ${e.message}"
 
 // A form error is answered with its message: `415` for a body that is not the form asked for, `413`
-// for one over a limit, and `400` for one that is malformed.
+// for one over a limit, and `400` for one that is malformed or could not be read. (A request body the
+// server streams and finds over its limit, malformed or too slow is answered by the server itself.)
 impl ToResponse for FormError
   toResponse() -> Response = Response.text(statusOf(self), s"${message}\n")
 
@@ -51,6 +58,7 @@ private statusOf(e: FormError) -> int = e match
   BadEncoding(_) -> 400
   NoBoundary -> 400
   BadMultipart(_) -> 400
+  BodyUnreadable(_) -> 400
 
 // The fields of an urlencoded form, in the order they came, a name given more than once kept each
 // time.
@@ -411,7 +419,13 @@ private partOf(body: Array[byte], from: int, until: int, limits: MultipartLimits
     )
   if headEnd - from > limits.maxHeaderBytes then return Err(PartHeadersTooLarge(limits.maxHeaderBytes))
   val bodyStart = if headEnd == from then from + 2 else headEnd + 4
-  val head = string.fromUtf8(body.slice(from, headEnd)) match
+  val h = partHeadOf(body.slice(from, headEnd))?
+  Ok(Part(h.name, h.filename, h.contentType, h.headers, body.slice(bodyStart, until)))
+
+// A part's head, its header lines without the blank line after them, read: each line a header, a
+// `Content-Disposition` of `form-data` with a `name`, a `filename*` preferred to a `filename`.
+private partHeadOf(bytes: Array[byte]) -> Result[PartHead, FormError]
+  val head = string.fromUtf8(bytes) match
     Ok(t) -> t
     Err(_) -> return Err(BadMultipart("a part's headers are not UTF-8"))
   val headers = Buffer[(string, string)]()
@@ -440,7 +454,7 @@ private partOf(body: Array[byte], from: int, until: int, limits: MultipartLimits
     None -> None
   val filename = extended.orElse(paramIn(ps, "filename"))
   val contentType = headerIn(headers.toVector, "Content-Type").getOrElse("text/plain")
-  Ok(Part(name, filename, contentType, headers.toVector, body.slice(bodyStart, until)))
+  Ok(PartHead(name, filename, contentType, headers.toVector))
 
 // The first offset at or after `from` where `needle` stands whole in `hay` before `until`, or -1.
 private find(hay: Array[byte], needle: Array[byte], from: int, until: int) -> int

@@ -10879,6 +10879,67 @@ Settled on the user's delegation 2026-11-11 (built on branch `json-derive`): **J
     `pairs` keeps the vector). Review with the user: the default limits, and whether a `formAs[T]`
     mirroring `queryAs[T]` is wanted.
 
+- Settled on the user's delegation 2026-11-24 (branch `http-request-stream`): **streamed request
+  bodies on the server** ([system library](/spec/system-library/#http-server), *Streamed request
+  bodies*).
+  - **The opt-in is the route's, told to the server by a predicate**: `route.streaming()` marks a
+    route, and `serve(…, streamsBody: @sendable (ServerRequest) -> bool = bufferedBodies)` is asked
+    of each request once its head is read, `router.streamsBody` answering for the route `handle`
+    would choose. *Why*: the server must decide before it reads the body, and a `Handler` is a
+    function the server cannot look into; a predicate keeps `Handler`, middleware and every existing
+    `serve` call as they were, and lets a program without a `Router` decide by method or path.
+    *Alternatives*: a lazily read `body` (the buffered path's `413`/`400` would turn into traps or
+    silent failures inside handlers); a second handler type (middleware written twice); a `serve`
+    overload taking a `Router` (thirteen parameters repeated, and it would bind `serve` to
+    `Router`); one server-wide switch (every route would lose the buffered body). Review with the
+    user: forgetting `streamsBody = router.streamsBody` leaves a streaming route reading a buffered
+    body within `maxBodyBytes`, which works but is not what was asked.
+  - **`BodyReader` is an `io.Reader`**, its failures `IoError`s, so `json.decode`, a file copy or a
+    `MultipartReader` reads an upload as it arrives. *Alternatives*: a reader of its own error type
+    (no reuse by any `Reader` consumer).
+  - **The limit is the handler's, per request**: `bodyReader(maxBytes = 104857600)`, counted over the
+    whole body, in place of `maxBodyBytes`, which keeps bounding the routes that did not ask. *Why*:
+    the route that opts in is the one that knows how large its uploads are; 100 MiB is a finite
+    default for code that has asked for large bodies. *Alternatives*: a server-wide
+    `maxStreamedBodyBytes` (one more knob, and still the wrong size for most routes); no default
+    limit (unbounded by default). Review with the user: the 100 MiB default.
+  - **`100 Continue` is sent at the first read, and only where the length fits**, so a handler
+    refusing a request (authentication, a type it does not take) never invites the body. RFC 9110
+    lets a server answer without it.
+  - **A failed body is answered by the server, in place of the handler's response**: `413`, `400`,
+    `431` or `408` through the error page, as the buffered path answers, the connection closed; a
+    client gone closes it unanswered. *Why*: the handler cannot go on with a broken body, the
+    connection's framing is lost, and one place answers these the same way for both paths.
+    *Alternatives*: the handler answers (each would have to map `IoError`s to statuses, and a `200`
+    sent after a framing error would be wrong).
+  - **`requestTimeout` covers the whole request, the handler's time between reads included**, as it
+    bounds a buffered request from its first byte. A slow consumer (a proxy) raises it.
+    *Alternatives*: pausing the budget while the handler runs (a client could be held open by a slow
+    handler indefinitely).
+  - **A body left unread is dropped if at most 64 KiB is left, else the connection is closed** after
+    the response, gently (shut, then read and drop for half a second), as is one whose client waits
+    for a `100 Continue` it was never sent and one under a streamed response (whose write function
+    may still read it). *Why*: the next request on the connection must never be read out of a body;
+    64 KiB keeps the connection for handlers that refuse small bodies without reading them, and stops
+    a server reading a large upload nobody wants. *Alternatives*: always closing (loses keep-alive for
+    every early refusal); always draining (a server reads gigabytes to throw away).
+  - **A streamed request's `body` is empty**, `bodyStreamed` saying why, rather than trapping, so
+    middleware that logs a body's size runs unchanged. A request with no source (made by a program,
+    or on a route that did not ask) answers a `bodyReader` over its buffered body, each reader from
+    its start, so a handler written for a stream serves both.
+  - **Multipart streams as the forms decision planned**: `MultipartReader` (`next()` → `PartHead`,
+    `read(max)`, `readAll()`) beside `Multipart.parse`, sharing `MultipartLimits`, `FormError` and the
+    head and disposition readers (`partHeadOf`), over any `io.Reader`, `request.multipartReader`
+    passing `bodyReader(limits.maxBytes)`. Every multipart case of the forms tests is read by both,
+    at source pieces of 1, 2, 3, 5, 64 and 65536 bytes, and must agree. Where they may differ, by
+    design: a fault is named where it is read (a malformed body with two faults may be refused for
+    the other one); the epilogue past the closing delimiter is not read, so not counted against
+    `maxBytes`; a delimiter's line may carry at most 1024 spaces and tabs (beyond that,
+    `BadMultipart`), so a hostile run of padding cannot make the reader hold or rescan it without
+    bound. A source failure is the new `FormError.BodyUnreadable(IoError)`, `400`. *Alternatives*: a
+    callback per part (inverts control; a handler cannot stop between parts); a part body as an
+    `io.Reader` (its failures would have to be `IoError`s, losing `FormError`'s statuses).
+
 - Settled on the user's delegation 2026-11-23 (branch `avin-log`): **`avin.log`, structured logging
   in the standard library** ([system library](/spec/system-library/#avinlog)).
   - **The central API: a `Sendable` class `Logger`, reached as a given.** The record functions

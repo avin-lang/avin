@@ -2,11 +2,12 @@
 // `Request.withForm`, `Url.formDecode` and `Url.formEncode` beneath them, and `multipart/form-data`
 // read by `ServerRequest.multipart` and `Multipart.parse` and written by `Multipart.encoded` and
 // `Request.withMultipart`, with its limits, its boundary rules and its filenames.
+import avin.io.{IoError, Reader}
 import avin.net.{Url, UrlError, BadPercent, InvalidUtf8}
 
 import avin.net.http.{
-  BadEncoding, BadMultipart, Form, FormError, FormTooLarge, Multipart, MultipartLimits, NoBoundary, NotAForm, Part,
-  PartHeadersTooLarge, Request, ServerRequest, TooManyParts
+  BadEncoding, BadMultipart, BodyUnreadable, Form, FormError, FormTooLarge, Multipart, MultipartLimits, MultipartReader,
+  NoBoundary, NotAForm, Part, PartHeadersTooLarge, Request, ServerRequest, TooManyParts
 }
 
 // The UTF-8 bytes of `text`.
@@ -35,6 +36,7 @@ variant(e: FormError) -> string = e match
   TooManyParts(limit) -> s"TooManyParts($limit)"
   PartHeadersTooLarge(limit) -> s"PartHeadersTooLarge($limit)"
   FormTooLarge(limit) -> s"FormTooLarge($limit)"
+  BodyUnreadable(e) -> s"BodyUnreadable(${e.message})"
 
 // A part written out: name, filename, type, body and headers.
 shownPart(p: Part) -> string = s"${p.name}|${p.filename.getOrElse("-")}|${p.contentType}|${p.text}|${p.headers}"
@@ -43,9 +45,50 @@ shown(r: Result[Multipart, FormError]) -> string = r match
   Ok(m) -> m.parts.map(shownPart).mkString(" ; ")
   Err(e) -> s"error: ${variant(e)}"
 
-// A multipart body of the boundary `b`, read with `limits`.
+// A multipart body of the boundary `b`, read with `limits`: by `Multipart.parse`, and by a
+// `MultipartReader` from a source handing it 1, 2, 3, 5, 64 and 65536 bytes at a time, which must
+// read the same parts or fail the same way.
 multipartOf(body: string, b: string = "XyZ", limits: MultipartLimits = MultipartLimits()) -> string =
-  shown(Multipart.parse(bytes(body), s"multipart/form-data; boundary=$b", limits))
+  agreed(bytes(body), s"multipart/form-data; boundary=$b", limits)
+
+agreed(body: Array[byte], contentType: string, limits: MultipartLimits = MultipartLimits()) -> string
+  val whole = shown(Multipart.parse(body, contentType, limits))
+  for size in [1, 2, 3, 5, 64, 65536]
+    assertEq(streamed(body, contentType, limits, size), whole)
+  whole
+
+// `body` read by a `MultipartReader` from a source handing it `size` bytes at a time, each part's body
+// read `size` bytes at a time too, written as `shown` writes the parts `parse` reads.
+streamed(body: Array[byte], contentType: string, limits: MultipartLimits, size: int) -> string
+  val reader = MultipartReader.over(Pieces(body, size), contentType, limits) match
+    Ok(r) -> r
+    Err(e) -> return s"error: ${variant(e)}"
+  val parts = Buffer[Part]()
+  loop
+    val head = reader.next() match
+      Ok(Some(h)) -> h
+      Ok(None) -> break
+      Err(e) -> return s"error: ${variant(e)}"
+    val out = Buffer[byte]()
+    loop
+      val got = reader.read(size) match
+        Ok(g) -> g
+        Err(e) -> return s"error: ${variant(e)}"
+      if got.length == 0 then break
+      out.addAll(got)
+    parts.addOne(Part(head.name, head.filename, head.contentType, head.headers, out.toArray()))
+  parts.toVector.map(shownPart).mkString(" ; ")
+
+// A source handing out `bytes` at most `size` at a time.
+class Pieces(private val bytes: Array[byte], private val size: int): Reader
+  private var at = 0
+
+  override read(max: int) -> Result[Array[byte], IoError]
+    val n = if size < max then size else max
+    val end = if bytes.length - at > n then at + n else bytes.length
+    val out = bytes.slice(at, end)
+    at = end
+    Ok(out)
 
 // The parts `m` read back after being written with `boundary` and parsed from that body.
 roundTrip(m: Multipart, boundary: string) -> string =

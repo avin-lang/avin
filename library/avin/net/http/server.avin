@@ -22,7 +22,8 @@ import avin.time.{Duration, Instant, millis, monotonic, now, seconds}
 // wait in a way the server's stopping ends; one made without a server never stops. It knows the
 // client's address, `remote`, where its connection has one, and `route`, the pattern of the route a
 // router chose for it, once one has. A request also carries the values middleware handed on with
-// `withValue`, one of each type.
+// `withValue`, one of each type. A request whose route takes its body as a stream arrives with its
+// body unread, read through `bodyReader`.
 class ServerRequest(
     val method: string,
     val target: string,
@@ -33,7 +34,8 @@ class ServerRequest(
     val remote: Option[string] = None,
     val route: Option[string] = None,
     private val server: Option[TcpServer] = None,
-    private val values: Vector[Any] = Vector.empty[Any]()
+    private val values: Vector[Any] = Vector.empty[Any](),
+    private val source: Option[BodySource] = None
 )
   private val parts: Target = targetOf(target) match
     Some(t) -> t
@@ -66,6 +68,21 @@ class ServerRequest(
   // `Content-Type` that is not that type, or none, is `NotAForm`.
   multipart(limits: MultipartLimits = MultipartLimits()) -> Result[Multipart, FormError] =
     multipartOf(body, header("Content-Type"), limits)
+
+  // Whether the body is streamed: left on the connection for `bodyReader`, the route having asked
+  // for it so. A streamed request's `body` is empty.
+  bodyStreamed -> bool = source.isDefined
+
+  // A reader of the body within `maxBytes` (100 MiB unless given), counted over the whole of it: of
+  // a streamed request, the body read as it arrives; of a buffered one, the body held. A limit less
+  // than zero traps.
+  bodyReader(maxBytes: long = streamedBodyLimit) -> BodyReader = BodyReader(source, body, maxBytes)
+
+  // The body read as `multipart/form-data` within `limits` a part at a time, as
+  // `MultipartReader.over` reads it, through `bodyReader(limits.maxBytes)`. A `Content-Type` that is
+  // not that type, or none, is `NotAForm`.
+  multipartReader(limits: MultipartLimits = MultipartLimits()) -> Result[MultipartReader, FormError] =
+    multipartReaderOf(bodyReader(long(limits.maxBytes)), header("Content-Type"), limits)
 
   // The value the route bound to the parameter `name`, written `:name` in its pattern; traps where
   // the route has no such parameter.
@@ -116,7 +133,8 @@ class ServerRequest(
     remote,
     route,
     server,
-    values
+    values,
+    source
   )
 
   // The request as the route of `pattern` takes it, binding `bound`.
@@ -130,7 +148,8 @@ class ServerRequest(
     remote,
     Some(pattern),
     server,
-    values
+    values,
+    source
   )
 
   // The request with every header of `name`, compared without regard to case, replaced by one of
@@ -139,7 +158,7 @@ class ServerRequest(
   withHeaderReplaced(name: string, value: string) -> ServerRequest
     checkHeader(name, value)
     val kept = headers.filter(h -> !h.0.equalsIgnoreCase(name))
-    ServerRequest(method, target, kept :+ (name, value), body, version, params, remote, route, server, values)
+    ServerRequest(method, target, kept :+ (name, value), body, version, params, remote, route, server, values, source)
 
   // The request carrying `value` as its `T`, so a middleware hands what it learned to the handlers
   // inside it: a user it authenticated, a request id. The type is the key, compared exactly as a
@@ -157,7 +176,8 @@ class ServerRequest(
     remote,
     route,
     server,
-    values.filter(v -> v is not _: Carried[T]) :+ Carried(value)
+    values.filter(v -> v is not _: Carried[T]) :+ Carried(value),
+    source
   )
 
   // The value the request carries as its `T`, handed on by `withValue`; `None` where it carries none.
@@ -227,9 +247,10 @@ fromResult(@sendable answer: (ServerRequest) -> Result[Response, ToResponse]) ->
   Ok(response) -> response
   Err(failure) -> failure.toResponse()
 
-// A route: `handler` for requests of `method` whose path matches `pattern`. The method is a token
-// and the pattern begins with `/`; either traps where it does not.
-class Route(val method: string, val pattern: string, val handler: Handler): Sendable
+// A route: `handler` for requests of `method` whose path matches `pattern`, its body read by the
+// server before the handler is called unless `streamsBody`. The method is a token and the pattern
+// begins with `/`; either traps where it does not.
+class Route(val method: string, val pattern: string, val handler: Handler, val streamsBody: bool = false): Sendable
   if method.isEmpty || method.indexWhere(c -> !isTokenChar(c)) >= 0 then fail(s"`$method` is not an HTTP method")
   if !pattern.startsWith("/") then fail(s"the route pattern `$pattern` does not begin with `/`")
 
@@ -241,11 +262,17 @@ class Route(val method: string, val pattern: string, val handler: Handler): Send
 
   // The route with its handler passed through `middleware`, which runs around it: wrapping again
   // puts the newer middleware outside, so it runs first.
-  wrap(@sendable middleware: (Handler) -> Handler) -> Route = Route(method, pattern, middleware(handler))
+  wrap(@sendable middleware: (Handler) -> Handler) -> Route =
+    Route(method, pattern, middleware(handler), streamsBody)
 
   // The route under `prefix`: its pattern `prefix` followed by its own, a pattern of `/` becoming
   // `prefix` itself.
-  under(prefix: string) -> Route = Route(method, joined(prefix, pattern), handler)
+  under(prefix: string) -> Route = Route(method, joined(prefix, pattern), handler, streamsBody)
+
+  // The route taking its body as a stream: its handler is called once the request's head is read,
+  // and reads the body through `ServerRequest.bodyReader`. A server asks a router which of its
+  // routes do so through `Router.streamsBody`, given to `serve` as its `streamsBody`.
+  streaming() -> Route = Route(method, pattern, handler, true)
 
 object Route
   // A route for `GET`, which answers `HEAD` too.
@@ -322,6 +349,22 @@ class Router(private val routes: Vector[Route], private val errors: ErrorPage = 
     if allowed.contains("GET") && !allowed.contains("HEAD") then allowed.addOne("HEAD")
     rendered(errors, 405).withHeader("Allow", allowed.mkString(", "))
 
+  // Whether the route `handle` would choose for the request takes its body as a stream: given to
+  // `serve` as its `streamsBody`, it is asked of each request once its head is read. A request no
+  // route takes has its body read as any other's.
+  streamsBody(request: ServerRequest) -> bool
+    chosen(request, request.method) match
+      Some(r) -> return r.streamsBody
+      None -> ()
+    if request.method == "HEAD" then return chosen(request, "GET").exists(r -> r.streamsBody)
+    false
+
+  // The first route for `method` whose pattern matches the request's path.
+  private chosen(request: ServerRequest, method: string) -> Option[Route]
+    for r in routes
+      if r.method == method && r.matches(request.segments).isDefined then return Some(r)
+    None
+
   // The response of the first route for `method` whose pattern matches the request's path.
   private answer(request: ServerRequest, method: string) -> Option[Response]
     for r in routes
@@ -358,7 +401,16 @@ private bound(pattern: Vector[string], segments: Vector[string]) -> Option[Vecto
 // handler; so does one that traps while it streams a response, whose head is already sent. The
 // answers the server makes itself for an error status are rendered by `errors`. Each response
 // carries a `Date` header, the time it is sent as an HTTP-date, unless the handler gave one or `date`
-// is false; the `101` answer of an upgrade carries none.
+// is false; the `101` answer of an upgrade carries none. A request `streamsBody` answers true for,
+// asked once its head is read, is handed to `handler` with its body unread, which `handler` reads
+// through `ServerRequest.bodyReader` under the same `readTimeout` and `requestTimeout`, within the
+// limit it gives there rather than `maxBodyBytes`; an `Expect: 100-continue` is answered `100
+// Continue` at its first read, so a handler that answers without reading tells the client not to
+// send it. A body whose read failed, over its limit, malformed or too slow, is answered by the
+// server as a buffered one would be, the handler's response not sent. Once the handler is done, a
+// body left unread is read and dropped where at most 64 KiB of it is left and the response is not
+// streamed; otherwise, or where the client was never told to continue, the connection is closed after
+// the response, so no byte of the body is read as a request.
 serve(
     host: string,
     port: int,
@@ -372,7 +424,8 @@ serve(
     tls: Option[TlsServer] = None,
     errors: ErrorPage = plainError,
     date: bool = true,
-    requestTimeout: Duration = seconds(60)
+    requestTimeout: Duration = seconds(60),
+    streamsBody: @sendable (ServerRequest) -> bool = bufferedBodies
 ) -> Result[TcpServer, IoError]
   if maxHeaderBytes < 1 then fail(s"a header limit of $maxHeaderBytes bytes: it is at least one")
   if maxBodyBytes < 0 then fail(s"a body limit of $maxBodyBytes bytes: it is at least zero")
@@ -386,7 +439,8 @@ serve(
     maxBodyBytes,
     errors,
     Streaming(),
-    if date then Some(DateHeader()) else None
+    if date then Some(DateHeader()) else None,
+    streamsBody
   )
   tls match
     None -> TcpServer.start(
@@ -425,8 +479,12 @@ private data Settings(
     maxBodyBytes: int,
     errors: ErrorPage,
     streaming: Streaming,
-    date: Option[DateHeader]
+    date: Option[DateHeader],
+    streamsBody: @sendable (ServerRequest) -> bool
 )
+
+// The `streamsBody` of a server whose every request has its body read before its handler is called.
+bufferedBodies(request: ServerRequest) -> bool = false
 
 // The date a server's responses carry, as the text of a `Date` header: the HTTP-date of the clock's
 // now, formatted once for each second and handed to every connection that asks within it. The latest
@@ -488,7 +546,7 @@ private converse(stream: ByteStream, server: TcpServer, handler: Handler, s: Set
   while input.awaits(limit, server)
     limit = s.idleTimeout
     input.begin(s.requestTimeout)
-    val request = readRequest(input, stream, server, s) match
+    val (request, source) = readRequest(input, stream, server, s) match
       Ok(r) -> r
       Err(Quietly) -> return
       Err(Answer(status)) ->
@@ -498,10 +556,24 @@ private converse(stream: ByteStream, server: TcpServer, handler: Handler, s: Set
       refuse(stream, 503, s)
       return
     val response = handler(request)
+    // A streamed body that failed is answered as a buffered one is, in place of the handler's answer.
+    if source is Some(b)
+      b.refusal match
+        Some(Answer(status)) ->
+          refuse(stream, status, s)
+          return
+        Some(Quietly) -> return
+        None -> ()
     if response.upgraded is Some(upgrade)
+      // The bytes after the request are its body's, not the other protocol's.
+      if source.exists(b -> !b.ended) then return
       upgradedOut(stream, server, response, upgrade, input.rest(), s, marks)
       return
-    val keep = keepsAlive(request) && !server.isStopping() && !asksToClose(response.headers)
+    // Whether the body has been read to its end, so what follows on the connection is a request.
+    val whole = source match
+      None -> true
+      Some(b) -> if response.streamed.isDefined then b.ended else b.drained(drainBytes)
+    val keep = whole && keepsAlive(request) && !server.isStopping() && !asksToClose(response.headers)
     val headOnly = request.method == "HEAD"
     val kept = response.streamed match
       None -> written(stream, headOnly, response, keep, request.version, s.writeTimeout, dated(s)) && keep
@@ -520,7 +592,11 @@ private converse(stream: ByteStream, server: TcpServer, handler: Handler, s: Set
         )
         if marks then _ = s.streaming.release(stream)
         going
-    if !kept then return
+    if !kept
+      // A body left unread is still arriving; the connection is shut gently, so the answer is not
+      // lost to a reset.
+      if !whole && source.forall(b -> b.refusal.isEmpty) then lingered(stream)
+      return
 
 // Sends the `101` of `response` and hands the connection to `upgrade`, with the bytes the client sent
 // after its request, which were read ahead; the connection is no longer HTTP's, so the server reads
@@ -567,18 +643,23 @@ private connectionWords(headers: Vector[(string, string)]) -> Vector[string] =
 // reset and a client still trickling bytes does not hold the connection.
 private refuse(stream: ByteStream, status: int, s: Settings)
   if written(stream, false, rendered(s.errors, status), false, "HTTP/1.1", s.writeTimeout, dated(s))
-    if stream.shutdownOutput().isErr then return
-    val start = monotonic()
-    var left = 1 << 20
-    while left > 0
-      val wait = millis(500) - (monotonic() - start)
-      if wait <= Duration.Zero then return
-      if stream.setTimeout(wait).isErr then return
-      stream.read(65536) match
-        Ok(got) ->
-          if got.length == 0 then return
-          left -= got.length
-        Err(_) -> return
+    lingered(stream)
+
+// Shuts the server's side of the connection, then reads and drops what the client still sends, for
+// half a second in all.
+private lingered(stream: ByteStream)
+  if stream.shutdownOutput().isErr then return
+  val start = monotonic()
+  var left = 1 << 20
+  while left > 0
+    val wait = millis(500) - (monotonic() - start)
+    if wait <= Duration.Zero then return
+    if stream.setTimeout(wait).isErr then return
+    stream.read(65536) match
+      Ok(got) ->
+        if got.length == 0 then return
+        left -= got.length
+      Err(_) -> return
 
 // The `Date` header's value for the response about to be written, where the server sends one.
 private dated(s: Settings) -> Option[string] = s.date.map(d -> d.value())
@@ -731,6 +812,14 @@ private class Incoming(private val stream: ByteStream)
       at = end
     Ok(out.toArray())
 
+  // Up to `max` bytes, at least one: those read ahead, or else the next piece to arrive.
+  some(max: int, limit: Duration) -> Result[Array[byte], Refusal]
+    if at == ahead.length then fill(limit)?
+    val end = if ahead.length - at > max then at + max else ahead.length
+    val out = ahead.slice(at, end)
+    at = end
+    Ok(out)
+
   // Reads the next piece, waiting at most `limit` and no later than the request's budget allows: a
   // wait that runs out, or a budget already spent, is answered `408`, and a peer that has finished
   // or failed ends the connection quietly.
@@ -750,13 +839,14 @@ private class Incoming(private val stream: ByteStream)
       Err(IoError(TimedOut, _, _)) -> Err(Answer(408))
       Err(_) -> Err(Quietly)
 
-// One request: its request line, its headers and its body.
+// One request: its request line, its headers and its body, or, where `s.streamsBody` answers true for
+// its head, its body's source, left on the connection.
 private readRequest(
     input: Incoming,
     stream: ByteStream,
     server: TcpServer,
     s: Settings
-) -> Result[ServerRequest, Refusal]
+) -> Result[(ServerRequest, Option[BodySource]), Refusal]
   var room = s.maxHeaderBytes
   var first = input.line(s.readTimeout, room, 414)?
   // Empty lines before a request line are passed over, counted against the limit.
@@ -790,8 +880,23 @@ private readRequest(
   val all = headers.toVector
   val hosts = all.count(h -> h.0.equalsIgnoreCase("Host"))
   if hosts > 1 || (version == "HTTP/1.1" && hosts == 0) then return Err(Answer(400))
-  val body = readBody(input, stream, all, version, s)?
-  Ok(ServerRequest(method, target, all, body, version, remote = stream.remoteAddress, server = Some(server)))
+  val framing = framingOf(all)?
+  val continues = headerIn(all, "Expect").isDefined && version == "HTTP/1.1"
+  val head = ServerRequest(method, target, all, version = version, remote = stream.remoteAddress, server = Some(server))
+  if s.streamsBody(head)
+    val source = BodySource(input, stream, s, framing, continues)
+    val request = ServerRequest(
+      method,
+      target,
+      all,
+      version = version,
+      remote = stream.remoteAddress,
+      server = Some(server),
+      source = Some(source)
+    )
+    return Ok((request, Some(source)))
+  val body = readBody(input, stream, framing, continues, s)?
+  Ok((ServerRequest(method, target, all, body, version, remote = stream.remoteAddress, server = Some(server)), None))
 
 // `HTTP/` and a digit, a dot and a digit.
 private isVersion(text: string) -> bool =
@@ -801,18 +906,12 @@ private isVersion(text: string) -> bool =
 
 private isDigit(b: byte) -> bool = int('0') <= int(b) <= int('9')
 
-// The body the headers announce: chunked, of a `Content-Length`, or none. An `Expect: 100-continue`
-// is answered `100 Continue` once the body is known to fit, and any other expectation `417`.
-private readBody(
-    input: Incoming,
-    stream: ByteStream,
-    headers: Vector[(string, string)],
-    version: string,
-    s: Settings
-) -> Result[Array[byte], Refusal]
+// How the headers frame the body: chunked, of a `Content-Length`, or none. A request whose framing
+// could be read two ways, or does not read, is answered `400`, a coding other than `chunked` `501`,
+// and an expectation other than `100-continue` `417`.
+private framingOf(headers: Vector[(string, string)]) -> Result[BodyFraming, Refusal]
   val expect = headerIn(headers, "Expect")
   if expect is Some(e) && !e.equalsIgnoreCase("100-continue") then return Err(Answer(417))
-  val continues = expect.isDefined && version == "HTTP/1.1"
   val lengths = headers.filter(h -> h.0.equalsIgnoreCase("Content-Length")).map(h -> h.1)
   headerIn(headers, "Transfer-Encoding") match
     Some(encoding) ->
@@ -821,19 +920,34 @@ private readBody(
       val codings = encoding.split(",").map(c -> c.trim.toLower)
       if codings(codings.length - 1) != "chunked" then return Err(Answer(400))
       if codings.length > 1 then return Err(Answer(501))
-      if continues then sayContinue(stream, s)?
-      readChunked(input, s)
+      Ok(ChunkCoded)
     None ->
-      if lengths.isEmpty then return Ok(Array.empty[byte]())
+      if lengths.isEmpty then return Ok(NoBody)
       val n = lengthOf(lengths(0)) match
         Some(k) -> k
         None -> return Err(Answer(400))
       for other in lengths
         if lengthOf(other) != Some(n) then return Err(Answer(400))
+      Ok(if n == 0 then NoBody else Announced(n))
+
+// The body `framing` announces, read whole. Where `continues`, the client's `Expect: 100-continue`
+// is answered `100 Continue` once the body is known to fit.
+private readBody(
+    input: Incoming,
+    stream: ByteStream,
+    framing: BodyFraming,
+    continues: bool,
+    s: Settings
+) -> Result[Array[byte], Refusal]
+  framing match
+    NoBody -> Ok(Array.empty[byte]())
+    Announced(n) ->
       if n > long(s.maxBodyBytes) then return Err(Answer(413))
-      if n == 0 then return Ok(Array.empty[byte]())
       if continues then sayContinue(stream, s)?
       input.bytes(int(n), s.readTimeout)
+    ChunkCoded ->
+      if continues then sayContinue(stream, s)?
+      readChunked(input, s)
 
 // Tells the client to go on and send the body it waits to send.
 private sayContinue(stream: ByteStream, s: Settings) -> Result[unit, Refusal]
