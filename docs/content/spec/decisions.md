@@ -1990,8 +1990,8 @@ their words are reserved.
     each can fail; `readAll()` is added beside `read` and `readLine`, and `TcpListener` has `close()`.
   - A read, write or `accept` after `close()` answers `Other("the connection is closed")` (or "the
     listener is closed") rather than trapping, as a closed handle's method does.
-  - A host that resolves to no address is `Other(s"no address found for $host")`, not `NotFound`,
-    whose message speaks of files. A port outside 0 to 65535, and `read(max)` with `max` below one,
+  - A host that resolves to no address is `HostNotFound` (`cannot resolve <host>: no address found
+    for the name`), the kind `lookup` answers too, not `NotFound`, whose message speaks of files. A port outside 0 to 65535, and `read(max)` with `max` below one,
     trap at the call, as a `Url`'s `withPort` does with a port it cannot hold.
   - `ConnectionReset` also covers a write to a connection the other end has closed (`EPIPE`).
   - `setTimeout` sets the read and the write limit together, in whole milliseconds rounded up; zero
@@ -11896,6 +11896,47 @@ Settled on the user's delegation 2026-11-11 (built on branch `json-derive`): **J
   name). Not sniffed: universal Mach-O/Java `CAFEBABE` (ambiguous), BMP's `BM` (two letters match
   too much text), UTF-16 (no charset to name in the table's form); `Result[Option]` over a bare
   `Option` because a missing or unreadable file is a failure, not "unknown".
+- Settled on the user's delegation 2026-11-24 (branch `net-dns-udp`): **`avin.net` has `lookup`,
+  `IpAddress` and `UdpSocket`.** The choices, each with what was weighed:
+  - `lookup(host) -> Result[Vector[IpAddress], IoError]`, not a bare vector: a resolver fails in
+    more ways than "no address". It reuses the runtime's `resolve_host` (helper threads, a
+    cancellation ending the wait), unchanged; addresses come back deduplicated, in the platform's
+    order. A numeric address is parsed in Avin and answered at once, asking no helper.
+  - **A new `ErrorKind`, `HostNotFound`** ("no address found for the name"), for a name with no
+    address, `TcpStream.connect`'s and `bind`'s resolving included. Alternatives: `NotFound`, whose
+    sentence speaks of files and would print `cannot look up x: no such file or directory`; or
+    `Other("no address found")`, which a program can only tell apart by its text. Review with the
+    user: a new case of a shared error type, as `NoTerminal` was.
+  - **Names refused before the resolver sees them**: empty (which the system's resolver answers
+    with the loopback), longer than `HostNameMost` = 254 bytes (the DNS's 253 and a trailing dot),
+    or holding white space, a control character or a zero byte (which would cut the name short in
+    C). Alternative: pass everything through, as the system does.
+  - `IpAddress` is a class with private fields (the bytes, four or sixteen, and a numeric scope),
+    made by `parse`, `fromBytes`, `v4` and the four constants. `parse` is strict: no leading zeros,
+    no short forms like `127.1` or `0x7f.0.0.1` that the C resolver accepts, no brackets or ports,
+    and a zone only as an interface number (`%4`), never a name (`%en0`), since turning a name into
+    a number is a system call the system layer does not offer. Display is the system layer's RFC
+    5952 text. An IPv4-mapped IPv6 address is an IPv6 address, not equal to the IPv4 one.
+    Alternatives: a `data` type (its constructor would take any vector, and its fields would be
+    the API), and a text-backed address.
+  - `UdpSocket.bind(host | IpAddress, port, reusePort = false)` binds at once, as `TcpListener.bind`
+    does; there is no unbound socket. A socket of one version refuses an address of the other with
+    an `Err` naming both, rather than mapping IPv4 into IPv6. `sendTo` and `connect` also take a
+    host's name, using its first address of the socket's version.
+  - **Truncation is reported** by receiving into one byte more than asked: a datagram that filled
+    the extra byte was longer, and is cut back to `max` with `truncated = true`. The length of the
+    whole datagram is not known (the system layer's `recv_from` has no `MSG_TRUNC`). Receives go
+    through the carrier's buffer, so a `receiveFrom(65535)` of a small datagram costs what the
+    datagram does. `max` below one traps, as `TcpStream.read`'s does.
+  - **A send longer than the version carries (65507 over IPv4, 65527 over IPv6) fails in the
+    library**, without reaching the platform: macOS accepts an IPv6 send of 65536 bytes and more,
+    and a server should get the same answer everywhere. **A new socket's send buffer is raised to at
+    least 69632 bytes** where the platform's default is smaller (9216 on macOS), so any legal
+    datagram can be sent; the receive buffer is left to the platform and `setReceiveBufferSize`.
+  - Not offered: multicast groups, broadcast, the hop limit, and reverse lookups (an address to a
+    name). The system layer the runtime binds (`sysl.net`) has none of them, and reaching past it
+    with raw `setsockopt` calls and per-platform constants is the workaround the project's rules
+    forbid; each is a `sysl.net` item first. Review with the user: mDNS/DNS-SD needs multicast.
 - Settled on the user's delegation 2026-11-23 (branch `fs-handle`): **`File` has positioned
   `readAt`/`writeAt`, `setLength` (alias `truncate`), `sync`/`syncData`/`fullSync` and
   `deleteOnClose`.** Positioned calls never move the position and hand over or give up what the

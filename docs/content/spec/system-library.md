@@ -880,6 +880,7 @@ data ErrorKind
   ConnectionReset
   TimedOut
   NoTerminal
+  HostNotFound
   Other(text: string)
 ```
 
@@ -896,6 +897,7 @@ data ErrorKind
 | `ConnectionReset` | The other end reset or closed a connection while it was in use. | `connection reset by peer` |
 | `TimedOut` | A read or write on a connection waited past its timeout. | `timed out` |
 | `NoTerminal` | The program has no controlling terminal to read from or write to. | `there is no terminal` |
+| `HostNotFound` | A host's name stands for no address: the resolver found none, or the name could not be a host's (see [`lookup`](#ip-addresses-and-lookups)). | `no address found for the name` |
 | `Other(text)` | Any other failure, described in words. | `text` |
 
 **An `IoError` names its subject.** `operation` is what was being done, in words that follow
@@ -3188,6 +3190,67 @@ never dropped. `ReadAhead`, the bytes a connection has read
 beyond what its caller asked for and the line reading over them, is public for a connection of
 one's own: `pending` says whether any are still to be read, and `keep(bytes)` adds bytes that
 arrived before anything asked for them.
+
+### IP addresses and lookups
+
+An `IpAddress` is a value: version 4 or version 6, without a port, equal to another and hashing
+alike where both are of one version with the same bytes and, for version 6, the same scope. It is
+sendable, so it is a `Map` key or a `Set` member as it stands and crosses to any thread. It displays
+in the numeric form RFC 5952 sets out (`127.0.0.1`, `::1`, `2001:db8::1`, `fe80::1%4`,
+`::ffff:10.0.0.1`), and its `Debug` form is `IpAddress(::1)`.
+
+| Function | Meaning |
+| --- | --- |
+| `lookup(host: string) -> Result[Vector[IpAddress], IoError]` | Every address `host` stands for, in the order the platform prefers them, each once. A numeric address is its own answer and asks nothing of the network. A name the resolver finds nothing for is `HostNotFound`, and so is one that could not be a host's, refused before anything is asked: empty, longer than `HostNameMost` (254) bytes, or holding white space or a control character. The lookup runs on one of the runtime's helper threads and is waited for as a socket is: a lightweight thread parks, and a cancellation or a `withTimeout` deadline ends the wait at once. |
+| `IpAddress.parse(text: string) -> Option[IpAddress]` | The address `text` writes: dotted decimal, four parts of at most 255 with no leading zeros; or eight groups of one to four hexadecimal digits in either case, one run of zero groups written `::`, the last two groups perhaps an IPv4 address, then perhaps `%` and the number of the interface it is scoped to. `None` for anything else: brackets, a port, white space, a short form such as `127.1`, or an interface named rather than numbered. |
+| `IpAddress.v4(a: int, b: int, c: int, d: int) -> IpAddress` | The address `a.b.c.d`; a part outside 0 to 255 traps. |
+| `IpAddress.fromBytes(bytes: Vector[byte]) -> Option[IpAddress]` | The address of four bytes or sixteen, the most significant first; `None` for any other number. |
+| `IpAddress.Localhost`, `LocalhostV6`, `Unspecified`, `UnspecifiedV6` | `127.0.0.1`, `::1`, `0.0.0.0` and `::`. |
+| `a.isIpv4`, `a.isIpv6 -> bool` | Its version. |
+| `a.bytes() -> Vector[byte]` | Its four or sixteen bytes, the most significant first. |
+| `a.scopeId -> int` | The interface a version 6 address is scoped to, zero for none. |
+| `a.isLoopback`, `a.isUnspecified`, `a.isMulticast -> bool` | Whether it is in `127.0.0.0/8` or is `::1`; is `0.0.0.0` or `::`; is in `224.0.0.0/4` or `ff00::/8`. |
+
+### UDP
+
+A `UdpSocket` sends and receives datagrams: each `sendTo` is one datagram and each `receiveFrom`
+takes one whole, with who sent it. A datagram may be lost, two may arrive in either order, and one
+longer than the room a receive gives loses its rest, which the `Datagram` says. A socket is sendable
+and owned by one thread at a time, as a TCP connection is, and a receive, or a send waiting for room,
+parks a lightweight thread on the runtime's poller, ended by a cancellation like any other wait.
+
+| Function | Meaning |
+| --- | --- |
+| `UdpSocket.bind(host: string, port: int, reusePort: bool = false) -> Result[UdpSocket, IoError]` | A socket bound to `port` on the host's first address: `127.0.0.1` or `::1` for this machine alone, `0.0.0.0` or `::` for all of its addresses; port `0` lets the platform choose. With `reusePort`, several sockets that each ask for it share one port, the platform dividing the datagrams among them. |
+| `UdpSocket.bind(address: IpAddress, port: int, reusePort: bool = false)` | The same, on an address. |
+| `u.port() -> int`, `u.localAddress() -> IpAddress` | Where it is bound. |
+| `u.sendTo(bytes: Array[byte], to: IpAddress, port: int) -> Result[unit, IoError]` | Sends `bytes` as one datagram, empty ones included. The address must be of the socket's own version. A datagram longer than the version carries, `DatagramMostIpv4` (65507) or `DatagramMostIpv6` (65527) bytes, fails without being sent. |
+| `u.sendTo(bytes: Array[byte], host: string, port: int)` | The same, to the host's first address of the socket's version. |
+| `u.receiveFrom(max: int) -> Result[Datagram, IoError]` | Waits for the next datagram and answers up to `max` of its bytes in a `Datagram(bytes, sender, senderPort, truncated)`; `truncated` says it was longer and the rest is lost. `max` is at least one (zero traps); a `max` of `DatagramMost` (65535) or more never truncates. |
+| `u.connect(to: IpAddress, port: int)`, `u.connect(host: string, port: int)` `-> Result[unit, IoError]` | Points the socket at one peer: `send` goes there, and only its datagrams arrive. A port there that nothing listens on may make a later receive answer `ConnectionRefused`. |
+| `u.connectedTo() -> Option[(IpAddress, int)]` | Where `connect` pointed it. |
+| `u.send(bytes: Array[byte]) -> Result[unit, IoError]` | Sends one datagram to where it is connected; an `Err` where it is not. |
+| `u.setTimeout(d: Duration)`, `u.timeout` | As a TCP connection's: a receive or a send that waits longer fails with `TimedOut`; zero or less takes the limit away. |
+| `u.setReceiveBufferSize(bytes: int)`, `u.receiveBufferSize()`, `u.setSendBufferSize(bytes: int)`, `u.sendBufferSize()` | Asks the platform for buffers of a size, and says what it gave. A new socket's send buffer has room for the longest datagram. |
+| `u.readable()`, `u.readinessDescriptor()`, `u.writable()`, `u.writabilityDescriptor()` | As a TCP connection's, for a [`select`](/spec/threads/#select)'s `u.readable()` and `u.writable()` arms. |
+| `u.close() -> Result[unit, IoError]` | Closes it and answers `Ok`; closing again does nothing, and every other operation afterwards answers an `Err`. |
+
+```text
+import avin.io.IoError
+import avin.net.{IpAddress, UdpSocket}
+import avin.threads.spawn
+
+main() -> Result[unit, IoError]
+  val server = UdpSocket.bind("127.0.0.1", 0)?
+  val port = server.port()
+  val echo = spawn(() ->
+    server.receiveFrom(1500).flatMap(d -> server.sendTo(d.bytes, d.sender, d.senderPort)))
+  val client = UdpSocket.bind(IpAddress.Localhost, 0)?
+  client.sendTo("ping".utf8, IpAddress.Localhost, port)?
+  val reply = client.receiveFrom(1500)?
+  println(s"${string.fromUtf8Lossy(reply.bytes)} from ${reply.sender}")
+  echo.join()
+```
 
 ### TLS
 
