@@ -1865,6 +1865,38 @@ their words are reserved.
   the walk for a type that cannot reach a handle).
   **Review with the user:** `Channel.send` walking each message to move handle ownership costs every
   channel; the compiler skipping the walk for types that cannot reach a handle is the mitigation.
+- Settled on the user's delegation 2026-11-24 (branch `file-threads`): **a channel's send puts what
+  its value reaches in transit, and a lock hands its value's handles on between bodies.** The send
+  half is the decision above, built: every way into a channel (`send`, its timed form, `trySend`, a
+  select's send arm, a hand-over on a channel of capacity zero) gives up the handles the value
+  reaches that the sending code owns before a receiver can see it, and the receiver takes them by
+  using them; a value a send did not deliver (a `trySend` answering `false`) is still the sender's,
+  who takes its handles back the same way. A `Mutex` or `RwLock` gives up its value's handles once
+  when it is made (the code that made the value may never use it) and again whenever a body ends,
+  `update` included, or waits on the mutex's condition (`wait`, `waitFor`, a select's arm), so
+  whichever thread holds the lock takes them by using them. A body only gives up what its own thread
+  owns, so two readers of an `RwLock` cannot share a handle: the second to use it traps. **Only the
+  handles a value's type shows are handed on**: the value is one, or its fields, a tuple's parts, a
+  data type's variants or a standard collection's type arguments are declared to show one; a
+  function value, `Any`, a trait, an open or abstract class, a union and a variant hiding types count
+  as showing none. This is decided per type where the program is compiled (`shows_handles`, the
+  threads' intrinsic beside the actors' `holds_handles`), so a channel or a lock of numbers,
+  strings, plain objects, callbacks or a trait's objects pays nothing. Why the narrower rule than a
+  send's: a lock is entered far more often than an actor is sent to, and the library's own registries
+  (every actor's core, the timers, the exit hooks) are locks of traits and functions — walking them
+  made a lock's every entry cost the whole registry, and ten thousand actors starting took longer
+  than the suite allows. A handle hidden in a closure a lock keeps traps at another thread's use, as
+  it did before (`file_mutex_hidden_trap.avin`). Why: the settled rule made a value inside a `Mutex` usable only by the code
+  that made it, contradicting what a mutex is for, and a connection or file sent on a channel trapped
+  at its receiver, so a server could not hand accepted connections to workers through a queue.
+  Alternatives weighed: claiming every handle for the thread taking the lock, whoever owns it (would
+  take a handle from a thread that got a sendable one out with `get()` and is using it, so two
+  threads could use one counted reference at once); handing over at the receive (the receiver cannot
+  take from the sender safely for the same reason); making the program call `handOff` itself (a step
+  every user of a lock or channel would have to remember, and a trap where one forgets).
+  **Review with the user:** a value in transit is taken by its first user, so a sender that uses a
+  handle again before the receiver does takes it back and the receiver traps, unlike an actor's send,
+  which hands it straight to the actor.
 - Settled on the user's delegation 2026-11-05: [Executors](/spec/threads/#executors) (2026-11-04): `Executor.fixed(n)` keeps at most `n` tasks
   working at once and starts its workers as work comes, as the shared pool does, a worker waiting in
   `await` or `blocking` leaving its place to another; `n` below one traps. After `shutdown()`,
@@ -4056,8 +4088,8 @@ spelling is better, as each entry says.
   library marks the types shared between owners `@keeps_owners` — `ActorRef`, `Timer`, `Future`,
   `Promise`, `Executor`, `Channel`, `Mutex`, `Condition`, `Once`, `Atomic`, `Thread`, `Scope` — and
   their type records carry the mark, at which every walk (a send, `spawn`, a thread's or a future's
-  body, completing a future) stops: their handles keep their owners, as a channel's values already
-  do. `Behaviour` is walked, since its start's captures are what the new actor owns. The mark is the
+  body, completing a future) stops: their handles keep their owners (a channel's values and a
+  lock's value are handed on by the channel's send and the lock's bodies, 2026-11-24). `Behaviour` is walked, since its start's captures are what the new actor owns. The mark is the
   standard library's alone. Alternatives weighed: a walk the compiler writes for each type (exact,
   but a collection's nodes are untyped to it); a marker trait instead of an annotation (visible to
   every program, which could then hide its own handles from a send).
@@ -4462,10 +4494,19 @@ spec did not settle, each settled on the user's delegation 2026-11-06. Review wi
   ALTERNATIVES: an `OpenMode` argument (one function, but a mode a program can get wrong at runtime
   and a longer call for the common case); only read, create and append (no way to overwrite part of a
   file).
-- Settled on the user's delegation 2026-11-06: **a `File` is not `Sendable`.** WHY: its Sysl handle belongs to the thread that opened it,
-  and a program that wants another thread to use a file opens it there; `TcpStream`'s hand-over
-  machinery buys nothing for a file a program can reopen. ALTERNATIVES: make it `Sendable` with the
-  owner check a `TcpStream` has. Review with the user if a file must move between actors.
+- Settled on the user's delegation 2026-11-24 (branch `file-threads`), replacing "a `File` is not
+  `Sendable`" of 2026-11-06: **a `File` is `Sendable`, and moves between threads as a `TcpStream`
+  does.** It keeps a runtime token named for it (`@sysl("avin.rt.Token", named: "File")`), and every
+  call, on an open file or a closed one, first checks it, so the code that handed the file over traps
+  with "`File` belongs to another thread" before any of the file's own fields (the bytes read ahead,
+  the closed flag) are read. WHY: the earlier rule made a file unusable from any thread but its
+  opener, even behind a `Mutex`, so the log's file sink reopened the file for every line (an open and
+  a close per line) and a server could not hand an open file to a worker; "reopen it there" is not
+  possible for an unlinked or `deleteOnClose` scratch file, and loses the position and read-ahead.
+  ALTERNATIVES weighed: keeping it unsendable and only letting a `Mutex` hand its handles on (fixes the
+  sink, but not a file handed to a worker or an actor); checking only the Sysl file's own handle
+  (a closed file has none, and the read-ahead bytes would be read before any check, as with the
+  connection before `thread-ownership`).
 - Settled on the user's delegation 2026-11-06: **seeking is from the start only, plus `seekToEnd()`; a negative offset is an `Err`, a
   seek past the end is allowed.** WHY: following a log needs "start at the end", and a tail needs
   absolute offsets, which `size()` gives; offsets back from the end are `size() - n`, with no second
@@ -10917,14 +10958,23 @@ Settled on the user's delegation 2026-11-11 (built on branch `json-derive`): **J
     Colour paints only the level's name, only where `colour` is asked and the sink takes it (the
     standard sinks: a terminal, `NO_COLOR` unset, `TERM` not `dumb`, through `sysl.posix.tty`).
   - **Sinks** are a `Sendable` `Sink(write, colours)` called once a line with its `\n`, so one call
-    is one write and lines never interleave, as `println` keeps them. **The file sink appends each
-    line under a lock with the file opened for that line** (`fs.appendText`), rather than holding a
-    `File` open: an open `File` belongs to the thread that opened it and traps when another thread
-    writes it, even inside a `Mutex`; and reopening per line also survives a log rotator moving the
-    file away. A line that cannot be written is dropped: logging never stops the program it reports
-    on. Alternatives: a writer thread owning the file behind a channel (a thread to start and stop,
-    and lines not yet written when the record's call returns); a `File` behind a `Mutex` (refused by
-    the file's thread ownership, above).
+    is one write and lines never interleave, as `println` keeps them. A line that cannot be written
+    is dropped: logging never stops the program it reports on.
+  - Settled on the user's delegation 2026-11-24 (branch `file-threads`), replacing a file opened for
+    each line: **the file sink keeps one `File` open in a `Mutex`**, writing and flushing each line,
+    so a line is one write and is in the file when the record's call returns. **At most once every
+    `recheck` (default one second) it compares the device and inode `path` names with the file it
+    opened**, and opens `path` again where a rotator moved the file away or put another there, keeping
+    the open file where the new open fails; a `recheck` of zero or less looks before every line.
+    Why: an open and a close per line cost two system calls and a path lookup per record, and the
+    reopen-per-line had been forced by the file's thread ownership, which a `Mutex` now hands on
+    ("a channel's send puts what its value reaches in transit, and a lock hands its value's handles
+    on", 2026-11-24). Alternatives weighed: reopening per line (as before; correct but slow); never looking
+    again, with a `reopen()` for the program to call on a signal (a sink then needs a handle the
+    program keeps, and a rotator that does not signal leaves the log writing into a moved file for
+    ever); a writer thread owning the file behind a channel (a thread to start and stop, and lines
+    not yet written when the call returns). Review with the user: the one-second default, and that a
+    rotation is noticed only by the next line after it.
   - **The HTTP access log** gains an overload `accessLog(logger, clock, ids)`, writing an `Info`
     record `request` with its fields; the sink form is unchanged.
 - **File conveniences in `avin.fs` (branch `fs-conveniences`).** Settled on the user's delegation

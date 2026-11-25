@@ -176,19 +176,26 @@ private class Lock(): Sendable
 // reaches the value, it is made in the argument that makes the mutex, and a body gives back only a
 // sendable value; both are `@isolating`, using only sendable values from around them and reaching no
 // module-level mutable state, where the value could be left for code that does not take the lock.
+//
+// The Sysl handles the value reaches, an open file or a connection, belong to whichever thread holds
+// the lock: they are given up when the mutex is made and whenever a body ends, or waits on one of the
+// mutex's conditions, and the next thread to use one inside its body takes it. So any thread may write
+// a file a mutex holds.
 @trusted_sendable("its value is reached only under its lock, by `@isolating` bodies")
 @keeps_owners
 class Mutex[T](@isolating private var value: T): Sendable
   private val lock = Lock()
+  private val given = loosened(value)
 
   // Runs `body` with the value while holding the lock, and gives back what it returns.
   with[R: Sendable](@isolating body: (T) -> R) -> R
     lock.acquire()
     defer lock.release()
+    defer giveUp(value)
     body(value)
 
   // A new condition to wait for with this mutex held.
-  condition() -> Condition = Condition(lock, PlainWait, true)
+  condition() -> Condition = Condition(lock, PlainWait, true, () -> giveUp(value))
 
 // A sendable value may leave the lock and be put back whole, since no thread can change it.
 impl[T: Sendable] Mutex[T]
@@ -202,8 +209,15 @@ impl[T: Sendable] Mutex[T]
   update(f: (T) -> T) -> T
     lock.acquire()
     defer lock.release()
+    defer giveUp(value)
     value = f(value)
     value
+
+// `value` with its handles given up, which a lock does once at its making: the code that made the
+// value may not be the first to use it.
+private loosened[T](value: T) -> bool
+  giveUp(value)
+  true
 
 // A place for threads to wait, inside their mutex's `with`, until another says something has changed.
 // `wait` lets the mutex go while it sleeps and holds it again before it returns, so the state it
@@ -217,20 +231,27 @@ impl[T: Sendable] Mutex[T]
 // of the `with` body run under it, and the `with` lets it go after them.
 @trusted_sendable("its handle is a runtime condition, made to be waited on and notified from any thread")
 @keeps_owners
-class Condition(private val lock: Lock, kind: int = 2, private val held: bool = false): Sendable
+class Condition(
+    private val lock: Lock,
+    kind: int = 2,
+    private val held: bool = false,
+    private val letGo: () -> unit = () -> ()
+): Sendable
   private val handle = if kind == PlainWait then conditionNew() else conditionNewKind(kind)
 
-  // Lets the mutex go, sleeps until notified, and holds the mutex again.
+  // Lets the mutex go, sleeps until notified, and holds the mutex again. The handles the mutex's value
+  // reaches are given up first, for whichever thread holds the mutex meanwhile.
   wait()
+    letGo()
     if held then _ = lock.awaitHeld(handle, -1) else lock.await(handle)
 
   // `wait` for at most `timeoutMillis` milliseconds: `false` where the time ran out before a
   // notification, `true` where the wait ended sooner, which may also be with nothing having changed.
   // A time that is not positive answers `false` at once, holding the mutex throughout.
-  waitFor(timeoutMillis: long) -> bool =
-    if !held then lock.awaitFor(handle, timeoutMillis)
-    elif timeoutMillis <= 0 then false
-    else lock.awaitHeld(handle, timeoutMillis)
+  waitFor(timeoutMillis: long) -> bool
+    if held && timeoutMillis <= 0 then return false
+    letGo()
+    if held then lock.awaitHeld(handle, timeoutMillis) else lock.awaitFor(handle, timeoutMillis)
 
   // `wait` for at most `timeout`, as `waitFor(timeoutMillis)` does, a part of a millisecond waited
   // for as a whole one.
@@ -247,7 +268,9 @@ class Condition(private val lock: Lock, kind: int = 2, private val held: bool = 
 impl Condition
   // Enlists arm `index` of the select waiting as `wait` on the condition and lets its mutex go,
   // which this thread holds.
-  enlist(wait: Selecting, index: int) = lock.enlist(wait, index, handle)
+  enlist(wait: Selecting, index: int)
+    letGo()
+    lock.enlist(wait, index, handle)
 
 // Initialization run exactly once, whichever threads ask for it and however many at once: the first
 // call of `run` runs its body, every other waits until that body has returned and then returns
