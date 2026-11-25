@@ -13366,3 +13366,39 @@ Settled on the user's delegation 2026-11-11 (built on branch `json-derive`): **J
   `=` as an empty-named cookie (6265bis; no server needs it). A cookie jar (domain/path matching,
   expiry, public suffixes) is a later item. Review with the user: strict value octets on `Cookie`
   (a client sending `a=b,c` loses that cookie).
+- Settled on the user's delegation 2026-11-23 (branch `http-static`): **static files are served by
+  `FileServer` in `avin.net.http`, mounted by `server.at(prefix)`, a `GET` route of the new last
+  pattern segment `*name`.** `*name` binds the rest of the path joined by `/`; the server itself
+  reads the request's decoded segments past the mount (from `request.route`), never the joined text,
+  so an escaped `/` inside a segment is still seen and refused. A `*name` before the last segment
+  traps; a bare `*` stays literal. Choices, each the smallest safe one:
+  the **ETag is weak**, `W/"<size hex>-<mtime micros hex>"`, needing no read of the file, so by RFC
+  9110's strong comparison `If-Match` succeeds only for `*` and an `If-Range` entity tag never keeps
+  the range (the whole file is sent, which is always correct); an `If-Range` date keeps it when it
+  equals `Last-Modified` and that is at least a second old (RFC 9110 §13.1.5's strong-date rule).
+  **Several ranges are answered `200` with the whole file**, not `multipart/byteranges` (RFC 9110
+  lets a server ignore `Range`; multipart is rarely used, costs a boundary writer and a length
+  computed over parts, and is a known amplification vector); a malformed `Range`, another unit, or a
+  zero-length file asked for a non-zero suffix is likewise `200`. **Traversal**: a decoded segment
+  `.`, `..`, or holding `/`, `\` or NUL is `400` (a client normalizes dot segments before sending, so
+  one that arrives is an attack or a broken client); links are followed while their canonical target
+  stays under the canonical root, and one leading outside is `403` unless `linksOutside` (the index
+  file is held to the same check); **dotfiles are `404` by default**, `.well-known` included, unless
+  `dotfiles`. A directory asked for without its final `/` is redirected `301` (relative links in its
+  index need it), leading `//` folded to one `/` in the `Location` so it cannot name another host.
+  **Listing is off by default**; on, it is a plain HTML list with names escaped. Every `text/` type
+  in the table carries `; charset=utf-8`; JSON, XML and the rest carry none (their media types define
+  their own encoding). `HEAD` never opens the file; a `GET` opens it in the handler, so a file that
+  cannot be opened is answered `403`/`404` before the head is sent. Alternatives weighed: a strong
+  ETag from the same fields (what several servers send, but the bytes may change within the mtime's
+  resolution without the tag changing, which a strong tag promises cannot happen); a content hash
+  (reads the whole file per request, or needs a cache); `multipart/byteranges`; serving `..` by
+  normalizing it (accepts attack traffic quietly); refusing every link (breaks deployments that link
+  into a release directory). Review with the user: the weak ETag's effect on `If-Range` resumption
+  (date-based `If-Range` still works), and dotfiles hidden including `.well-known`.
+- Settled on the user's delegation 2026-11-23 (branch `http-static`): **a sendable method value is
+  held to its receiver's value, not to what the receiver expression uses.** The receiver is
+  evaluated where the value is made, so `Router([FileServer(dir.path).at("/")]).handle` is accepted
+  though `dir` is not sendable (it was refused), and `Counter().bump`, a receiver that is not
+  sendable built on the spot, is refused (it was accepted, since the expression used nothing from
+  around it). The error names it as "it carries its receiver, a `Counter`, ...".

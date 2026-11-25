@@ -1,0 +1,461 @@
+// expect: exit 0
+// The static file server, tried without a connection and then over one: each status it answers
+// (`200`, `206`, `301`, `304`, `400`, `403`, `404`, `405`, `412`, `416`), its headers, the content
+// type of the common files of the web, a directory's index and listing, every path traversal it
+// refuses (plain, escaped, `/` and `\` and NUL in a segment, an absolute URL, a link leading out of
+// the root, through an index too), dotfiles, the order of conditional requests, byte ranges at their
+// edges and malformed, `If-Range` by entity tag and by date, `HEAD`, `Cache-Control`, and the `*name`
+// route pattern it is mounted by.
+import avin.fs
+import avin.net.http
+import avin.net.http.{FileServer, MimeTypes, Response, Route, Router, ServerRequest}
+import avin.time.{epochSeconds}
+
+ok[T, E: Error](r: Result[T, E]) -> T = r match
+  Ok(v) -> v
+  Err(e) -> fail(e.message)
+
+// The status of a response and the headers a file server sets, as one line.
+shown(r: Response) -> string
+  val out = Buffer[string]()
+  out.addOne(r.status.toString())
+  for name in [
+    "Content-Type",
+    "ETag",
+    "Last-Modified",
+    "Accept-Ranges",
+    "Content-Range",
+    "Cache-Control",
+    "Location",
+    "Allow"
+  ]
+    if r.header(name) is Some(v) then out.addOne(s"$name=$v")
+  if r.streamed is Some(s) then out.addOne(s"length=${s.length.getOrElse(-1)}")
+  out.mkString(" ")
+
+// The entity tag `files` gives the file at `target`.
+tagOf(files: FileServer, target: string) -> string = files.handle(asked("GET", target)).header("ETag").getOrElse("none")
+
+// A request of `method` for `target` with `headers`.
+asked(
+    method: string,
+    target: string,
+    headers: Vector[(string, string)] = Vector.empty[(string, string)]()
+) -> ServerRequest =
+  ServerRequest(method, target, headers)
+
+// The fixed modification time every file is given, so entity tags and dates are the same each run.
+val When = epochSeconds(1700000000)
+
+// Writes `text` to `file` and gives it the fixed modification time.
+put(file: string, text: string)
+  ok(fs.writeText(file, text))
+  ok(fs.setModified(file, When))
+
+// A tree to serve under `top/site`, with a file and a directory outside it that links lead to.
+built(top: string) -> string
+  val site = fs.join(top, "site")
+  val outside = fs.join(top, "outside")
+  ok(fs.createDirAll(fs.join(site, "sub")))
+  ok(fs.createDirAll(fs.join(site, "bare")))
+  ok(fs.createDirAll(fs.join(site, "escape")))
+  ok(fs.createDirAll(fs.join(site, ".well-known")))
+  ok(fs.createDirAll(outside))
+  put(fs.join(site, "hello.txt"), "hello, world\n")
+  put(fs.join(site, "index.html"), "<p>home</p>\n")
+  put(fs.join([site, "sub", "index.html"]), "<p>sub</p>\n")
+  put(fs.join([site, "sub", ".hidden"]), "hidden\n")
+  put(fs.join([site, "bare", "a&b <c>.txt"]), "x")
+  put(fs.join([site, "bare", ".dot"]), "x")
+  ok(fs.createDirAll(fs.join([site, "bare", "inner"])))
+  put(fs.join(site, ".secret"), "secret\n")
+  put(fs.join([site, ".well-known", "token"]), "token\n")
+  put(fs.join(site, "empty.txt"), "")
+  put(fs.join(site, "app.JS"), "let x = 1\n")
+  put(fs.join(site, "noext"), "plain\n")
+  put(fs.join(site, "café.txt"), "é\n")
+  put(fs.join(outside, "private.txt"), "private\n")
+  put(fs.join(outside, "index.html"), "<p>outside</p>\n")
+  ok(fs.symlink(fs.join(site, "hello.txt"), fs.join(site, "inside-link")))
+  ok(fs.symlink("hello.txt", fs.join(site, "relative-link")))
+  ok(fs.symlink(fs.join(outside, "private.txt"), fs.join(site, "outside-link")))
+  ok(fs.symlink("../outside", fs.join(site, "outside-dir")))
+  ok(fs.symlink(fs.join(outside, "index.html"), fs.join([site, "escape", "index.html"])))
+  site
+
+// The type of each common file, by extension, case aside.
+mimeTypes()
+  println("-- types")
+  val t = MimeTypes.standard
+  for name in [
+    "a.html",
+    "A.HTM",
+    "s.css",
+    "app.JS",
+    "m.mjs",
+    "c.cjs",
+    "r.txt",
+    "d.md",
+    "t.csv",
+    "t.tsv",
+    "c.ics",
+    "s.vtt",
+    "d.json",
+    "x.map",
+    "l.jsonld",
+    "m.webmanifest",
+    "x.xml",
+    "x.xhtml",
+    "f.rss",
+    "f.atom",
+    "c.yaml",
+    "c.yml",
+    "c.toml",
+    "w.wasm",
+    "d.pdf",
+    "a.zip",
+    "a.tar.gz",
+    "a.tar",
+    "b.bin",
+    "i.svg",
+    "i.png",
+    "i.apng",
+    "i.jpg",
+    "i.JPEG",
+    "i.gif",
+    "i.webp",
+    "i.avif",
+    "favicon.ico",
+    "i.bmp",
+    "i.tif",
+    "i.tiff",
+    "f.woff",
+    "f.woff2",
+    "f.ttf",
+    "f.otf",
+    "a.mp3",
+    "a.ogg",
+    "a.oga",
+    "a.opus",
+    "a.wav",
+    "a.flac",
+    "a.m4a",
+    "a.aac",
+    "v.mp4",
+    "v.m4v",
+    "v.webm",
+    "v.ogv",
+    "v.mov"
+  ]
+    println(s"$name: ${t.typeOf(name)}")
+  for name in ["noext", ".bashrc", "trailing.", "x.unknown", "dir.d/file", "dir/a.css", "", "é.html"]
+    println(s"`$name`: ${t.typeOf(name)}")
+  val more = t.with("AVIN", "text/x-avin; charset=utf-8").with("txt", "text/x-other").withFallback("text/plain")
+  println(s"extended: ${more.typeOf("m.avin")} ${more.typeOf("r.txt")} ${more.typeOf("r.css")} ${more.typeOf("none")}")
+  println(s"original kept: ${t.typeOf("m.avin")} ${t.typeOf("r.txt")} ${t.get("PNG")} ${t.get("nope")}")
+  println(s"fallback: ${t.fallback} / ${more.fallback}")
+
+// Files, directories and the method.
+statuses(site: string)
+  println("-- statuses")
+  val files = FileServer(site)
+  for (method, target) in [
+    ("GET", "/hello.txt"),
+    ("HEAD", "/hello.txt"),
+    ("GET", "/"),
+    ("GET", "/sub"),
+    ("GET", "/sub?x=1&y=2"),
+    ("GET", "/sub/"),
+    ("GET", "/bare/"),
+    ("GET", "/bare"),
+    ("GET", "/hello.txt/"),
+    ("GET", "/missing"),
+    ("GET", "/missing/deeper"),
+    ("GET", "/hello.txt/deeper"),
+    ("GET", "/app.JS"),
+    ("GET", "/noext"),
+    ("GET", "/empty.txt"),
+    ("GET", "//hello.txt"),
+    ("GET", "/sub//index.html"),
+    ("GET", "/caf%C3%A9"),
+    ("GET", "/caf%C3%A9.txt"),
+    ("GET", "//sub"),
+    ("GET", "///sub?q"),
+    ("GET", "http://h/sub?q"),
+    ("POST", "/hello.txt"),
+    ("PUT", "/missing"),
+    ("DELETE", "/")
+  ]
+    println(s"$method $target: ${shown(files.handle(asked(method, target)))}")
+  println(s"no index: ${shown(FileServer(site, index = None).handle(asked("GET", "/")))}")
+  println(s"other index: ${shown(FileServer(site, index = Some("hello.txt")).handle(asked("GET", "/")))}")
+  println(s"index missing: ${shown(FileServer(site, index = Some("none.html")).handle(asked("GET", "/sub/")))}")
+  println(s"no root: ${shown(FileServer(fs.join(site, "nowhere")).handle(asked("GET", "/hello.txt")))}")
+  println(s"root a file: ${shown(FileServer(fs.join(site, "hello.txt")).handle(asked("GET", "/")))}")
+  val listed = FileServer(site, listing = true)
+  val page = listed.handle(asked("GET", "/bare/"))
+  println(s"listing: ${shown(page)}")
+  print(page.text)
+  println(s"listing with an index: ${shown(listed.handle(asked("GET", "/sub/")))}")
+  val all = FileServer(site, listing = true, dotfiles = true).handle(asked("GET", "/bare/"))
+  println(s"listing dotfiles: ${all.text.contains(".dot")}")
+  val cached = FileServer(site, cacheControl = Some("public, max-age=60"))
+  println(s"cache 200: ${shown(cached.handle(asked("GET", "/hello.txt")))}")
+  val tag = tagOf(cached, "/hello.txt")
+  println(s"cache 304: ${shown(cached.handle(asked("GET", "/hello.txt", [("If-None-Match", tag)])))}")
+  println(s"cache 404: ${shown(cached.handle(asked("GET", "/missing")))}")
+  val json = FileServer(site, errors = s -> Response.json(s, s"{\"status\": $s}"))
+  val missing = json.handle(asked("GET", "/missing"))
+  println(s"error page: ${shown(missing)} ${missing.text}")
+
+// Every way out of the root, and the names not served.
+traversal(site: string)
+  println("-- traversal")
+  val files = FileServer(site)
+  for target in [
+    "/..",
+    "/../outside/private.txt",
+    "/sub/../hello.txt",
+    "/%2e%2e/outside/private.txt",
+    "/%2E%2E/outside/private.txt",
+    "/sub/%2e%2e/%2e%2e/outside/private.txt",
+    "/.%2e/outside/private.txt",
+    "/%2e",
+    "/sub/%2e/index.html",
+    "/%2e%2e%2foutside%2fprivate.txt",
+    "/sub%2F..%2F..%2Foutside%2Fprivate.txt",
+    "/a%5C..%5Chello.txt",
+    "/hello.txt%00.html",
+    "/%00",
+    "//etc/passwd",
+    "/%2Fetc%2Fpasswd",
+    "http://h/%2e%2e/outside/private.txt",
+    "http://h/hello.txt",
+    "/.secret",
+    "/sub/.hidden",
+    "/.well-known/token",
+    "/%2esecret",
+    "/inside-link",
+    "/relative-link",
+    "/outside-link",
+    "/outside-dir/private.txt",
+    "/outside-dir/",
+    "/escape/",
+    "/escape/index.html"
+  ]
+    println(s"$target: ${files.handle(asked("GET", target)).status}")
+  val open = FileServer(site, dotfiles = true, linksOutside = true)
+  for target in [
+    "/.secret",
+    "/sub/.hidden",
+    "/.well-known/token",
+    "/outside-link",
+    "/outside-dir/private.txt",
+    "/escape/",
+    "/%2e%2e/x"
+  ]
+    println(s"allowed $target: ${open.handle(asked("GET", target)).status}")
+
+// RFC 9110 §13.2.2's order: `If-Match`, `If-Unmodified-Since`, `If-None-Match`, `If-Modified-Since`.
+conditions(site: string)
+  println("-- conditions")
+  val files = FileServer(site)
+  val tag = tagOf(files, "/hello.txt")
+  val strong = tag.stripPrefix("W/")
+  val date = When.toHttpDate()
+  val before = epochSeconds(1600000000).toHttpDate()
+  val after = epochSeconds(1800000000).toHttpDate()
+  for (label, headers) in [
+    ("none", Vector.empty[(string, string)]()),
+    ("INM tag", [("If-None-Match", tag)]),
+    ("INM strong form", [("If-None-Match", strong)]),
+    ("INM list", [("If-None-Match", s"\"a\", $tag , \"b\"")]),
+    ("INM *", [("If-None-Match", "*")]),
+    ("INM other", [("If-None-Match", "\"other\"")]),
+    ("INM empty", [("If-None-Match", "")]),
+    ("IMS equal", [("If-Modified-Since", date)]),
+    ("IMS before", [("If-Modified-Since", before)]),
+    ("IMS after", [("If-Modified-Since", after)]),
+    ("IMS rfc850", [("If-Modified-Since", "Tuesday, 14-Nov-23 22:13:20 GMT")]),
+    ("IMS asctime", [("If-Modified-Since", "Tue Nov 14 22:13:20 2023")]),
+    ("IMS invalid", [("If-Modified-Since", "yesterday")]),
+    ("INM other beats IMS after", [("If-None-Match", "\"other\""), ("If-Modified-Since", after)]),
+    ("INM tag beats IMS before", [("If-None-Match", tag), ("If-Modified-Since", before)]),
+    ("IM *", [("If-Match", "*")]),
+    ("IM weak tag", [("If-Match", tag)]),
+    ("IM strong form", [("If-Match", strong)]),
+    ("IM other", [("If-Match", "\"other\"")]),
+    ("IUS equal", [("If-Unmodified-Since", date)]),
+    ("IUS after", [("If-Unmodified-Since", after)]),
+    ("IUS before", [("If-Unmodified-Since", before)]),
+    ("IUS invalid", [("If-Unmodified-Since", "never")]),
+    ("IM * skips IUS before", [("If-Match", "*"), ("If-Unmodified-Since", before)]),
+    ("IM other beats INM tag", [("If-Match", "\"other\""), ("If-None-Match", tag)]),
+    ("IUS before beats IMS after", [("If-Unmodified-Since", before), ("If-Modified-Since", after)]),
+    ("INM tag beats Range", [("If-None-Match", tag), ("Range", "bytes=0-0")]),
+    ("IM other beats Range", [("If-Match", "\"other\""), ("Range", "bytes=0-0")])
+  ]
+    println(s"$label: ${shown(files.handle(asked("GET", "/hello.txt", headers)))}")
+  println(s"HEAD INM tag: ${shown(files.handle(asked("HEAD", "/hello.txt", [("If-None-Match", tag)])))}")
+  println(s"index INM: ${files.handle(asked("GET", "/", [("If-None-Match", tag)])).status}")
+  val other = tagOf(files, "/noext")
+  println(s"tags differ by size: ${other != tag}")
+  ok(fs.setModified(fs.join(site, "noext"), epochSeconds(1700000001)))
+  val moved = tagOf(files, "/noext")
+  println(s"tags differ by time: ${moved != other}")
+
+// Byte ranges of `hello.txt`, 13 bytes, and of an empty file.
+ranges(site: string)
+  println("-- ranges")
+  val files = FileServer(site)
+  for spec in [
+    "bytes=0-0",
+    "bytes=0-12",
+    "bytes=12-12",
+    "bytes=5-",
+    "bytes=-5",
+    "bytes=-1",
+    "bytes=-13",
+    "bytes=-999",
+    "bytes=0-999",
+    "bytes=7-99999999999999999999999",
+    "bytes=13-",
+    "bytes=13-20",
+    "bytes=99999999999999999999999-",
+    "bytes=-0",
+    "bytes=5-2",
+    "bytes=a-b",
+    "bytes=1",
+    "bytes=-",
+    "bytes=",
+    "bytes",
+    "items=0-1",
+    "bytes=0-1,3-4",
+    "bytes=0-1,99-",
+    "bytes=+1-2",
+    "bytes=0x1-2",
+    "bytes=0-1-2",
+    "BYTES=0-1",
+    " bytes = 0-1 ",
+    "bytes=0-1,",
+    "bytes=, 2-3"
+  ]
+    println(s"`$spec`: ${shown(files.handle(asked("GET", "/hello.txt", [("Range", spec)])))}")
+  for spec in ["bytes=0-", "bytes=0-0", "bytes=-5", "bytes=-0"]
+    println(s"empty `$spec`: ${shown(files.handle(asked("GET", "/empty.txt", [("Range", spec)])))}")
+  println(s"HEAD ignores Range: ${shown(files.handle(asked("HEAD", "/hello.txt", [("Range", "bytes=0-0")])))}")
+  val tag = tagOf(files, "/hello.txt")
+  val date = When.toHttpDate()
+  for (label, value) in [
+    ("weak tag", tag),
+    ("strong form of the tag", tag.stripPrefix("W/")),
+    ("other tag", "\"other\""),
+    ("the date", date),
+    ("an earlier date", epochSeconds(1600000000).toHttpDate()),
+    ("a later date", epochSeconds(1800000000).toHttpDate()),
+    ("not a date", "soon")
+  ]
+    println(
+      s"If-Range $label: ${shown(files.handle(asked("GET", "/hello.txt", [("Range", "bytes=0-4"), ("If-Range", value)])))}"
+    )
+  println(s"If-Range without Range: ${shown(files.handle(asked("GET", "/hello.txt", [("If-Range", date)])))}")
+
+// The `*name` pattern that mounts a server, and the server under a prefix.
+mounted(site: string)
+  println("-- mounted")
+  val echo = Router(
+    [
+      Route.get("/files/*path", r -> Response.text(200, s"[${r.param("path")}]")),
+      Route.get("/u/:id/*rest", r -> Response.text(200, s"${r.param("id")} [${r.param("rest")}]")),
+      Route.get("/*all", r -> Response.text(200, s"all [${r.param("all")}]")),
+      Route.get("/*", r -> Response.text(200, "literal star"))
+    ]
+  )
+  for target in [
+    "/files",
+    "/files/",
+    "/files/a",
+    "/files/a/b/c",
+    "/files/a%2Fb",
+    "/u/7/x/y",
+    "/u/7",
+    "/u//x",
+    "/",
+    "/other/x",
+    "/*"
+  ]
+    println(s"$target: ${echo.handle(asked("GET", target)).text}")
+  val grouped = Router(Route.group("/g", [Route.get("/*rest", r -> Response.text(200, s"<${r.param("rest")}>"))]))
+  println(s"group: ${grouped.handle(asked("GET", "/g/x/y")).text} ${grouped.handle(asked("GET", "/g")).text}")
+  val files = FileServer(site)
+  val router = Router(
+    [
+      files.at("/static"),
+      FileServer(fs.join(site, "sub")).at("/"),
+      Route.post("/static/upload", _ -> Response.text(201, "made"))
+    ]
+  )
+  for (method, target) in [
+    ("GET", "/static/hello.txt"),
+    ("GET", "/static"),
+    ("GET", "/static?v=2"),
+    ("GET", "/static/"),
+    ("GET", "/static/sub"),
+    ("GET", "/static/sub/"),
+    ("GET", "/static/%2e%2e/outside/private.txt"),
+    ("GET", "/static/../outside/private.txt"),
+    ("GET", "/static/.secret"),
+    ("HEAD", "/static/hello.txt"),
+    ("POST", "/static/hello.txt"),
+    ("POST", "/static/upload"),
+    ("GET", "/index.html"),
+    ("GET", "/"),
+    ("GET", "/hello.txt")
+  ]
+    val r = router.handle(asked(method, target))
+    println(s"$method $target: ${shown(r)}")
+  val nested = Router(Route.group("/v1", [files.at("/assets")]))
+  println(s"nested: ${shown(nested.handle(asked("GET", "/v1/assets/hello.txt")))}")
+
+// Bodies as a client receives them.
+served(site: string)
+  println("-- served")
+  val router = Router([FileServer(site, listing = true).at("/static")])
+  val server = ok(http.serve("127.0.0.1", 0, router.handle))
+  val base = s"http://127.0.0.1:${server.port()}/static"
+  for (label, path, headers) in [
+    ("whole", "/hello.txt", Vector.empty[(string, string)]()),
+    ("index", "/", Vector.empty[(string, string)]()),
+    ("range", "/hello.txt", [("Range", "bytes=7-11")]),
+    ("first byte", "/hello.txt", [("Range", "bytes=0-0")]),
+    ("suffix", "/hello.txt", [("Range", "bytes=-6")]),
+    ("open", "/hello.txt", [("Range", "bytes=12-")]),
+    ("unsatisfiable", "/hello.txt", [("Range", "bytes=50-")]),
+    ("multiple", "/hello.txt", [("Range", "bytes=0-1,3-4")]),
+    ("empty", "/empty.txt", Vector.empty[(string, string)]()),
+    ("not modified", "/hello.txt", [("If-Modified-Since", When.toHttpDate())]),
+    ("traversal", "/%2e%2e/outside/private.txt", Vector.empty[(string, string)]()),
+    ("link out", "/outside-link", Vector.empty[(string, string)]()),
+    ("dotfile", "/.secret", Vector.empty[(string, string)]())
+  ]
+    val r = ok(http.get(base + path, headers))
+    println(s"$label: ${r.status} length=${r.header("Content-Length").getOrElse("-")} [${r.text.replace("\n", "/")}]")
+  val h = ok(http.head(base + "/hello.txt"))
+  println(
+    s"HEAD: ${h.status} length=${h.header("Content-Length").getOrElse("-")} body=${h.body.length} type=${h.header("Content-Type").getOrElse("-")}"
+  )
+  val hr = ok(http.head(base + "/hello.txt", [("Range", "bytes=0-0")]))
+  println(s"HEAD with Range: ${hr.status} length=${hr.header("Content-Length").getOrElse("-")} body=${hr.body.length}")
+  server.shutdown()
+
+main()
+  val top = ok(fs.tempDir("avin-files"))
+  val site = built(top.path)
+  mimeTypes()
+  statuses(site)
+  traversal(site)
+  conditions(site)
+  ranges(site)
+  mounted(site)
+  served(site)
+  ok(top.close())

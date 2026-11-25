@@ -9550,6 +9550,28 @@ private made_sendable(c: *Checker, root: usize, e: &TExpr) -> bool
                 _ -> false
         _ -> false
 
+// Whether `e` is a method value whose receiver is held in a local of no name before the closure
+// capturing it.
+private is_method_value(c: *Checker, root: usize, e: &TExpr) -> bool
+    e.kind match
+        Block(items) ->
+            if items.len() != 2 || !(items[1].kind is FunctionValue(_, _)) then return false
+            items[0].kind match
+                Let(x, _) -> x < c.locals[root].len() && c.locals[root][x].name == ""
+                _ -> false
+        _ -> false
+
+// What of `e` goes with it to another thread: a method value's closure without the receiver
+// expression, which runs where the value is made, and anything else whole. A receiver that is a
+// local or a parameter is kept, so an error names it; its value is what the closure carries.
+private sent_part(c: *Checker, root: usize, e: &TExpr) -> &TExpr
+    if is_method_value(c, root, e)
+        if e.kind is Block(items)
+            if items[0].kind is Let(_, value)
+                if value.kind is Local(_) || value.kind is Param(_) then return e
+            return items[1]
+    e
+
 /** `e`, or the argument it stands for where it is a local holding one evaluated before the call. */
 private held_value(e: &TExpr, held: *Buf[HeldArgument]) -> &TExpr
     if e.kind is Local(x)
@@ -9632,7 +9654,10 @@ private is_match_function_literal(c: *Checker, e: &TExpr) -> bool
 private first_send_problem(c: *Checker, root: usize, e: &TExpr, mark: int, k: usize, held: *Buf[HeldArgument]) -> Option[string]
     var uses: Buf[SendUse] = buf()
     var bound: Buf[usize] = buf()
-    collect_send_uses(c, e, &uses, &bound, held)
+    // A method value's receiver is evaluated where the value is made, so what the receiver expression
+    // uses stays here; what the closure carries is the receiver's value, held in a local of no name
+    // and checked by its type.
+    collect_send_uses(c, sent_part(c, root, e), &uses, &bound, held)
     for u in uses
         if !u.param && contains_index(bound, u.index) then continue
         var seen: Buf[usize] = buf()
@@ -9694,6 +9719,8 @@ private send_use_problem(c: *Checker, root: usize, u: SendUse, mark: int, k: usi
                     // `val` to make it sendable.
                     if has_states(c.classes[id]) then return Some(s"it uses the state of the actor `${held[ActorClassPrefix.bytes.len..]}`, which only the actor's own code reaches; copy what it needs into a `val` first")
                     return Some(s"it uses the state of the actor `${held[ActorClassPrefix.bytes.len..]}`, ${nested_reason(why)}")
+            // The local of no name holds a method value's receiver.
+            if name == "" then return Some(s"it carries its receiver, ${quoted_type(ty)}, ${nested_reason(why)}")
             Some(s"it uses `$name`, ${quoted_type(ty)}, ${nested_reason(why)}")
         _ -> None
 
@@ -9884,7 +9911,7 @@ private scan_thread_bodies(c: *Checker, id: usize, root: usize, e: &TExpr, k: us
             c.note(c.symbols[id].unit, e.span, s"a `match` function passed for a type argument bounded by `Sendable` may run on another thread, which shares the program's module-level state, but $why")
         return
     if made_sendable(c, root, e)
-        if module_state_path(c, e, k, direct) is Some(why)
+        if module_state_path(c, sent_part(c, root, e), k, direct) is Some(why)
             c.note(c.symbols[id].unit, e.span, s"${sendable_made(c, c.symbols[id].unit, e)} may run on another thread, which shares the program's module-level state, but $why")
         if e.kind is Block(items)
             if items.len() == 2 then scan_thread_bodies(c, id, root, items[0], k, direct, held)
@@ -9912,7 +9939,7 @@ private thread_body_arguments(c: *Checker, id: usize, root: usize, f: usize, arg
         val arg = held_value(args[i], held)
         // A function made as a `@sendable` one is checked where it is made.
         if made_sendable(c, root, arg) then continue
-        if module_state_path(c, arg, k, direct) is Some(why)
+        if module_state_path(c, sent_part(c, root, arg), k, direct) is Some(why)
             val what = s"what is passed for `${c.symbols[f].param_names[i]}` of `${c.symbols[f].name}`"
             // What an `@isolating` argument makes leaves isolated, so code outside must not reach it
             // through module-level state.
