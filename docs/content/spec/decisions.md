@@ -13051,6 +13051,27 @@ Settled on the user's delegation 2026-11-11 (built on branch `json-derive`): **J
   `*` there, and an echo of any origin with credentials is an open door, so `allowOrigin` must be
   asked for). Review with the user: empty `headers` reflecting any requested header is the
   common default but allows more than a closed list would.
+- Settled on the user's delegation 2026-11-24 (built on branch `http-trusted-proxy`): **Trusted-proxy
+  middleware.** `TrustedProxies(trusted, maxHops = 32)` with a `middleware`, `Cidr` blocks, a
+  `Forwarding` value carried on the request, and `ServerRequest.forwarding`, `scheme`, `host`,
+  `withRemote` and `withHeaderRemoved`. The default trusts nothing. Headers from an untrusted peer
+  are removed rather than merely ignored, so no later code reads a spoofed one. The client is the
+  first untrusted address walking from the nearest hop, so a prepended entry never wins; scheme and
+  host come from the entry the outermost trusted proxy wrote (as many places from the end as there
+  are trusted hops), not from the front of the list, which a client controls. `Forwarded` wins over
+  `X-Forwarded-*`. The client's address is normalised (shortest IPv6, mapped IPv4 as IPv4, port
+  dropped) so one client is one rate-limit key; `remote` is replaced by it so the access log and
+  rate limiter work unchanged, and the socket's address stays in `forwarding.peer`. A malformed
+  walked entry, `unknown`/obfuscated nodes, or bad `Forwarded` syntax make the headers worthless
+  (peer is the client) rather than guessing; a bad scheme or host alone is just not given. A hop
+  limit bounds the list a client can make long. Alternatives weighed: a trust-everything flag or a
+  hop count instead of CIDR blocks (a count trusts whatever the first hop is, and cannot tell a
+  proxy from a client that connects directly); the leftmost address as the client (a client sets
+  it); trusting the leftmost scheme or host (same); keeping the headers on untrusted requests;
+  skipping a malformed entry and reading on (it lets a client choose where the walk resumes);
+  `scheme` as a string defaulting to `http` (the server cannot see whether its own listener is TLS,
+  so `None` is the honest answer). Review with the user: the rule that a malformed entry makes the
+  whole header worthless trades availability of the real address for safety.
 - Settled on the user's delegation 2026-11-15 (built on branch `resolve-blocking`): **which library
   bindings are [blocking](/spec/sysl-bindings/#calls-that-wait).** Name resolution
   (`sysl.net.resolve`, which `TcpStream.connect` calls; since 2026-11-16 made on a helper thread

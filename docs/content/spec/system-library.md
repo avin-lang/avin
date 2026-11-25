@@ -2820,6 +2820,43 @@ seconds) and the origin and credentials headers; asking for more, or from an ori
 carries none. `*` together with `credentials`, and a negative `maxAge`, trap where the policy is
 made.
 
+**Trusted proxies.** `TrustedProxies(trusted = [], maxHops = 32)` is a middleware (`.middleware`)
+that reads where a request came from behind a reverse proxy. `trusted` is a list of CIDR blocks
+(`Cidr` texts: `10.0.0.0/8`, `2001:db8::/32`, or one address); a block that is not one traps where
+the middleware is made, as does a `maxHops` below one. Forwarding headers are believed only from a
+connection whose address is in `trusted`; on any other request (or one with no known address) they
+are removed, so `Forwarded` and the `X-Forwarded-` headers are never a client's claim downstream.
+From a trusted peer, `Forwarded` (RFC 7239: `for`, `proto`, `host`, quoted values, several
+elements) is read where present, else `X-Forwarded-For`, `-Proto` and `-Host`; several header lines
+are one list and empty entries are skipped. The client is found by walking the addresses from the
+nearest hop towards the first, each trusted address being another proxy and the first untrusted
+one the client, so entries a client prepended are never believed. An address is IPv4, IPv6 (in
+brackets or not) with an optional port that is dropped, and is given in its shortest form, IPv4-mapped
+as IPv4. The scheme (`http` or `https`) and the host (a name or IP literal with an optional port)
+are those the outermost trusted proxy wrote, in lower case; an invalid one is not given. An entry
+walked that is not an address (`unknown`, `_hidden`), more than `maxHops` entries, or malformed
+`Forwarded` syntax makes the headers worthless: the client is the peer and no scheme or host is
+given. The request handed on has `remote` set to the client, and `forwarding` (`Option[Forwarding]`:
+`peer`, `address`, `scheme`, `host`), `scheme` and `host` (the forwarded one, else the `Host`
+header) answer on every `ServerRequest`; `withRemote` and `withHeaderRemoved` make the changed
+copies. `Cidr(text)` has `network`, `prefix` and `contains(address)`; an IPv4 address and its
+`::ffff:` form are one address, the bits past the prefix are ignored, and a zone or a prefix out of
+range traps. `trusted.isTrusted(address)` asks the list.
+
+```avin
+import avin.net.http.{Handler, Response, ServerRequest, TrustedProxies}
+
+main()
+  val proxies = TrustedProxies(["10.0.0.0/8"])
+  val handler: Handler = r -> Response.text(200, s"${r.remote.getOrElse("-")} ${r.scheme.getOrElse("http")}")
+  val app = proxies.middleware(handler)
+  val headers = [("X-Forwarded-For", "6.6.6.6, 203.0.113.9"), ("X-Forwarded-Proto", "https")]
+  println(app(ServerRequest("GET", "/", headers, remote = Some("10.0.0.5"))).text)
+  println(app(ServerRequest("GET", "/", headers, remote = Some("198.51.100.7"))).text)
+```
+
+This prints `203.0.113.9 https`, then `198.51.100.7 http`: the second peer is not a proxy.
+
 **Streamed responses.** `Response.stream(status, contentType, write)` answers a response whose body
 `write` writes as it goes, through the `BodyWriter` it is given, each write sent to the client at
 once; its `body` is empty. Its head says `Transfer-Encoding: chunked` and each write is a chunk, the
