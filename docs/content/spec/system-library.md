@@ -2431,10 +2431,9 @@ closing one is skipped, every line ends in CRLF, a delimiter's line may end in s
 bytes that resemble the boundary but are not followed by `--` or the end of the line stay in the
 part. A name or filename is read as the WHATWG HTML standard writes one, quoted with `%22`, `%0D`
 and `%0A` standing for `"`, CR and LF and no backslash escapes; a `filename*` (RFC 5987) in UTF-8 or
-ISO-8859-1 is preferred to `filename`, and one in another charset or malformed is ignored. The body
-is read whole, as the server has buffered it; a streaming reader for large uploads will come beside
-`parse`, with the same limits and errors
-([decided](/spec/decisions/#settled)).
+ISO-8859-1 is preferred to `filename`, and one in another charset or malformed is ignored. `parse`
+and `multipart()` read a body whole; a large upload is read a part at a time by a `MultipartReader`
+on a streamed body, under the same rules, limits and errors (see *Streamed request bodies* below).
 
 ```text
 upload(r: ServerRequest) -> Result[Response, ToResponse]
@@ -2638,6 +2637,69 @@ lost to a reset and a client that goes on trickling is closed all the same.
 | `501` | A transfer coding besides `chunked` |
 | `503` | A request read once the server is stopping |
 | `505` | A version other than 1.0 and 1.1 |
+
+**Streamed request bodies.** A route made with `route.streaming()` (kept through `wrap`, `under` and
+`group`) takes its body as a stream, once the server is told so: `serve(…, streamsBody =
+router.streamsBody)`, a `@sendable (ServerRequest) -> bool` asked of each request once its head is
+read, answering for the route `handle` would choose (a `GET` one for `HEAD`). The handler is called
+with the body still on the connection, `request.bodyStreamed` true and `request.body` empty, and
+reads it through `request.bodyReader(maxBytes = 104857600)`, a `BodyReader`: an `io.Reader` whose
+`read(max)` answers up to `max` bytes, waiting for at least one, and an empty array at the end, by
+`Content-Length` or chunked; `length` is the `Content-Length` (zero without a body, `None` when
+chunked) and `readAll()` the rest within the limit. The limit is the handler's, counted over the whole
+body, in place of `maxBodyBytes`, which still bounds every route that did not ask; each wait lasts at
+most `readTimeout`, and the whole request, the handler's time between reads included, `requestTimeout`
+from its first byte. A `Content-Length` over the limit fails the first read before any of the body is
+asked for, so an `Expect: 100-continue` is answered `100 Continue` at the first read and only where the
+body fits: a handler that answers without reading never tells the client to send it. A read that
+fails (over the limit, a malformed chunk, a wait too long, the client gone) fails every read after
+it, and once the handler returns **the server answers the failure itself, `413`, `400`, `431` or
+`408` as for a buffered body, in place of the handler's response**, or closes the connection
+unanswered where the client went. A body left unread when the handler returns is read and dropped
+where at most 64 KiB of it is left, so the connection carries the next request; one longer, one
+whose client was never told to continue, or one under a streamed response is not, and the
+connection is closed after the response, so no byte of a body is ever read as a request. A request
+made without a server, or whose route did not ask, has a `bodyReader` over its buffered body, so a
+handler written for a stream serves both.
+
+`request.multipartReader(limits)` reads a streamed (or buffered) `multipart/form-data` body a part at
+a time through `bodyReader(limits.maxBytes)`, and `MultipartReader.over(source, contentType, limits)`
+reads any `io.Reader`. `next()` answers the next part's `PartHead` (`name`, `filename`,
+`contentType`, `headers`, `header(name)`, `isFile`), passing over what was left of the part before,
+and `None` past the closing delimiter; `read(max)` and `readAll()` read that part's body. It reads by
+`Multipart.parse`'s rules and limits, counted as it goes: parts as each begins, a head's bytes as it
+grows, and every byte taken from the source, the epilogue after the closing delimiter, never read,
+not counted. A fault is named where it is read, so a body with two may be refused for another than
+`parse` names; a source that fails is `FormError.BodyUnreadable(IoError)` (`400`); every read after a
+fault fails alike; and a delimiter's line may carry at most 1024 spaces and tabs after its boundary.
+
+```avin
+import avin.net.http
+import avin.net.http.{Response, Route, Router, ServerRequest, ToResponse}
+
+// Counts an upload's file bytes as they arrive, holding at most 64 KiB of it at once.
+upload(r: ServerRequest) -> Result[Response, ToResponse]
+  val parts = r.multipartReader()?
+  var total = 0
+  loop
+    val head = parts.next()? match
+      Some(h) -> h
+      None -> break
+    if head.isFile
+      loop
+        val piece = parts.read(65536)?
+        if piece.length == 0 then break
+        total += piece.length
+  Ok(Response.text(200, s"$total bytes\n"))
+
+main()
+  val router = Router([Route.post("/upload", upload).streaming()])
+  http.serve("127.0.0.1", 0, router.handle, streamsBody = router.streamsBody) match
+    Ok(server) ->
+      println("serving")
+      server.shutdown()
+    Err(e) -> println(e.message)
+```
 
 A connection waiting for a first request waits `readTimeout`, and for a later one `idleTimeout`,
 then is closed without an answer. **Shutting down**, the server answers the request in flight with
