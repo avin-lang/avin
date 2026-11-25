@@ -3384,8 +3384,8 @@ main()
 readTimeout = seconds(30), writeTimeout = seconds(30), idleTimeout = seconds(5), maxHeaderBytes =
 16384, maxBodyBytes = 1048576, tls: Option[TlsSource] = None, errors: ErrorPage = plainError,
 date: bool = true, requestTimeout = seconds(60), handshakeTimeout = seconds(10), listen: ListenOptions
-= http.ServerListen, streamsBody: @sendable (ServerRequest) -> bool = http.bufferedBodies) ->
-Result[TcpServer, IoError]` listens as `TcpServer.start` does, with the
+= http.ServerListen, streamsBody: @sendable (ServerRequest) -> bool = http.bufferedBodies,
+headerTimeout = seconds(10), maxHeaders = 100) -> Result[TcpServer, IoError]` listens as `TcpServer.start` does, with the
 [socket options](#socket-options) `listen`. **`http.ServerListen`** is the listener's defaults with
 each connection's `noDelay` on, since a response is written in pieces a client waits on whole, and
 `keepAlive` `Some(KeepAlive())`, so a connection whose client vanished, a stream of events or a
@@ -3406,12 +3406,15 @@ wait while a request is read may last `readTimeout`, each wait while a response 
 whole of a request, its line, headers and body, must arrive within `requestTimeout` of its first
 byte, so a client trickling bytes just faster than `readTimeout` cannot hold a connection, and its
 slot among `maxConnections`, for ever. Each request on a kept-alive connection has a bound of its
-own, and the idle wait before it is no part of it. With `tls`, each connection's TLS handshake,
-from the connection's acceptance, must be done within `handshakeTimeout`, each of its waits also
-bounded by `readTimeout`; a connection whose handshake runs out of time is closed unanswered, since
-no HTTP answer can reach it before TLS is set up, and its slot freed. Zero takes any of these limits
-away. A `maxHeaderBytes` less than one, a `maxBodyBytes` less than zero or a negative
-`requestTimeout` or `handshakeTimeout` traps.
+own, and the idle wait before it is no part of it. A request's line and headers must arrive within
+`headerTimeout`, counted for a connection's first request from its acceptance, so a client that
+connects and never sends is closed then, and for a later one from its first byte. With `tls`, each
+connection's TLS handshake, from the connection's acceptance, must be done within
+`handshakeTimeout`, each of its waits also bounded by `readTimeout`; a connection whose handshake
+runs out of time is closed unanswered, since no HTTP answer can reach it before TLS is set up, and
+its slot freed. Zero takes any of these limits away. A `maxHeaderBytes` or `maxHeaders` less than
+one, a `maxBodyBytes` less than zero or a negative `requestTimeout`, `headerTimeout` or
+`handshakeTimeout` traps.
 A server taking bodies larger than the default `maxBodyBytes` from slow clients raises
 `requestTimeout` with it. The
 wait for a connection's next request, its first among them, is made through `idle`, so a shutdown
@@ -3854,7 +3857,9 @@ be sent. A request made without a server never stops, and `wait` is then run as 
 **The connection.** Requests are read one after another, so several are kept alive on one
 connection and pipelined ones are answered in order: in HTTP/1.1 unless either side says
 `Connection: close`, in HTTP/1.0 only on `Connection: keep-alive`, which the response then repeats.
-Empty lines before a request line are passed over, and a line may end in a bare `\n`. A body is read
+Empty lines before a request line are passed over. Every line ends in `\r\n`: a bare `\n`, a bare
+`\r` or another control character than a tab is refused, so no two readers frame a request
+differently (RFC 9112 sections 2.2 and 5). A body is read
 by `Content-Length` or chunked (extensions and trailers passed over); an `Expect: 100-continue` is
 answered `100 Continue` once the body is known to fit. The server writes `Content-Length` and
 `Connection` itself, in place of any the handler gave, every response as `HTTP/1.1`, and no body for
@@ -3867,12 +3872,12 @@ lost to a reset and a client that goes on trickling is closed all the same.
 
 | Status | When |
 | --- | --- |
-| `400` | A request line that is not three words, a method that is not a token, a malformed version, a target that is not one (a fragment, an escape that is not UTF-8 among them), no `Host` in HTTP/1.1 or two, a header without a colon, with a name that is not a token or folded onto a second line, a `Content-Length` that is not digits or two that differ, one beside `Transfer-Encoding`, a coding list not ending in `chunked`, a malformed chunk |
-| `408` | A wait while a request is read outlasts `readTimeout`, or the request is not read whole within `requestTimeout` of its first byte |
+| `400` | A request line that is not three words split by single spaces, a method that is not a token, a malformed version, a target that is not one (a fragment, an escape that is not UTF-8 among them), no `Host` in HTTP/1.1 or two, a header without a colon, with a name that is not a token or folded onto a second line, a line ended by a bare `\n` or holding a bare `\r`, a NUL, DEL or another control character than a tab (a tab in the request line too), a `Content-Length` that is not digits or two that differ, one beside `Transfer-Encoding`, a `Transfer-Encoding` in HTTP/1.0 or in two field lines, a coding list not ending in `chunked`, a malformed chunk |
+| `408` | A wait while a request is read outlasts `readTimeout`, the request's line and headers are not read within `headerTimeout`, or the request is not read whole within `requestTimeout` of its first byte |
 | `413` | A body longer than `maxBodyBytes`, by its length before it is read, or as its chunks arrive |
 | `414` | A request line longer than `maxHeaderBytes` |
 | `417` | An `Expect` other than `100-continue` |
-| `431` | The request line and headers together, or a chunked body's trailers, longer than `maxHeaderBytes` |
+| `431` | The request line and headers together, with their line ends, or a chunked body's trailers, longer than `maxHeaderBytes`, or more than `maxHeaders` header lines |
 | `500` | The handler traps: it fails its connection alone, as a `TcpServer`'s `serve` does (over TLS, or once a streamed response's head is sent, the connection is closed unanswered) |
 | `501` | A transfer coding besides `chunked` |
 | `503` | A request read once the server is stopping |
@@ -3941,10 +3946,52 @@ main()
     Err(e) -> println(e.message)
 ```
 
-A connection waiting for a first request waits `readTimeout`, and for a later one `idleTimeout`,
-then is closed without an answer. **Shutting down**, the server answers the request in flight with
+A connection waiting for a first request waits `readTimeout` or `headerTimeout`, whichever is
+shorter, and for a later one `idleTimeout`, then is closed without an answer. **Shutting down**, the
+server answers the request in flight with
 `Connection: close`, and one arriving on a kept-alive connection `503`; a connection waiting for its
 next request ends when its idle limit runs out, and `join()` waits for that.
+
+**Hardening.** Everything a client controls is bounded, by default, so a server started with no
+options is safe to face the open network. Each limit is a parameter of `serve`:
+
+| Limit | Default | What a hostile client meets |
+| --- | --- | --- |
+| `maxConnections` | 1024 | Connections past it wait unaccepted in the listener's backlog until one ends; none is accepted and then refused, so a flood costs the server no memory and no thread past the limit |
+| `headerTimeout` | 10 s | A request line and headers trickled a byte at a time (slowloris) are `408` at the bound; a connection that never sends is closed then |
+| `readTimeout` | 30 s | Each wait for a byte while a request is read; `408` |
+| `requestTimeout` | 60 s | The whole of a request, body included, from its first byte; `408` |
+| `idleTimeout` | 5 s | The wait for the next request on a kept-alive connection; closed unanswered |
+| `writeTimeout` | 30 s | Each wait while a response is written: a client that pipelines and never reads is closed once one write cannot finish |
+| `maxHeaderBytes` | 16 KiB | A request line longer is `414`; the line and headers together longer, with their line ends, `431` |
+| `maxHeaders` | 100 | More header lines are `431` |
+| `maxBodyBytes` | 1 MiB | A body longer is `413`, by its length before it is read |
+
+Requests on one connection are read and answered one at a time, the server reading at most 8 KiB
+ahead, so a client pipelining without end has one request in flight and its unread responses held
+by the socket buffers, not by the server. A request refused is answered and its connection closed,
+the drain after it half a second in all. A connection's memory is what its one request holds:
+requests kept alive one after another leave none behind.
+
+```avin
+import avin.net.http
+import avin.net.http.Response
+import avin.time.{millis, seconds}
+
+main()
+  // A server for slow clients on a trusted network: a longer header bound, a shorter idle one.
+  val server = http.serve(
+    "127.0.0.1",
+    0,
+    _ -> Response.text(200, "ok"),
+    idleTimeout = millis(500),
+    headerTimeout = seconds(30),
+    maxHeaders = 50
+  )
+  server match
+    Ok(s) -> s.shutdown()
+    Err(e) -> println(e.message)
+```
 
 **Upgrades.** `Response.upgrade(protocol, take)` answers `101 Switching Protocols` with `Upgrade:
 protocol` and `Connection: Upgrade` (the protocol a token, else it traps), and once that head is

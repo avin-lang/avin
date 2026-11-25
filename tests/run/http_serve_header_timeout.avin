@@ -1,0 +1,162 @@
+// expect: exit 0
+// The HTTP server's `headerTimeout`, the bound on a request's line and headers, against a hostile
+// client: one trickling its headers a byte at a time, each byte well inside `readTimeout`, is answered
+// `408` at about the bound, with no `requestTimeout` to save the server; a request line trickled
+// alike is too; a connection that never sends is closed, unanswered, at about the bound from its
+// acceptance; one silent for part of the bound has only the rest of it for its first request; a body
+// trickled after headers sent in time is no part of the bound; on a connection kept alive each later
+// request's bound begins at its own first byte, the idle wait before it no part of it; with
+// `maxConnections` two, clients that never send and clients trickling without end each hold a slot
+// only until the bound, and a client queued behind them is served; and a bound of zero is no limit.
+import avin.io.IoError
+import avin.net.{StreamReader, StreamWriter, TcpServer, TcpStream}
+import avin.net.http
+import avin.net.http.{Response, ServerRequest}
+import avin.threads.{Atomic, Thread, sleep, spawn}
+import avin.time
+import avin.time.{Duration, millis, monotonic}
+
+ok[T](r: Result[T, IoError]) -> T = r match
+  Ok(v) -> v
+  Err(e) -> fail(e.message)
+
+echoLength(r: ServerRequest) -> Response = Response.text(200, s"${r.method} ${r.target} ${r.body.length}")
+
+started(headerTimeout: Duration, maxConnections: int = 1024) -> TcpServer =
+  ok(
+    http.serve(
+      "127.0.0.1",
+      0,
+      echoLength,
+      maxConnections,
+      readTimeout = time.seconds(5),
+      date = false,
+      requestTimeout = Duration.Zero,
+      headerTimeout = headerTimeout
+    )
+  )
+
+// Writes `head` at once, then `tail` a byte at a time, `every` apart, until all is sent, a write
+// fails or `stop` is set.
+trickle(w: StreamWriter, head: string, tail: string, every: Duration, stop: Atomic[bool])
+  if !head.isEmpty && w.writeText(head).isErr then return
+  for c in tail.chars
+    sleep(every)
+    if stop.load() || w.writeText(c.toString()).isErr then return
+
+// What a client trickling `tail` after `head`, 50 ms a byte, is answered: the status line, and
+// whether it came within `lo` and `hi` of the connection.
+slowly(server: TcpServer, head: string, tail: string, lo: Duration, hi: Duration) -> string
+  val start = monotonic()
+  val (r, w) = ok(TcpStream.connect("127.0.0.1", server.port())).split()
+  ok(r.setTimeout(time.seconds(10)))
+  val stop = Atomic(false)
+  val writer = spawn(() -> trickle(w, head, tail, millis(50), stop))
+  val line = ok(r.readLine()).getOrElse("")
+  val took = monotonic() - start
+  stop.store(true)
+  _ = writer.join()
+  s"$line, within the bound: ${lo <= took < hi}"
+
+open(server: TcpServer) -> TcpStream
+  val c = ok(TcpStream.connect("127.0.0.1", server.port()))
+  ok(c.setTimeout(time.seconds(10)))
+  c
+
+// The status line and body of one response read from `c`.
+response(c: TcpStream) -> string
+  val first = ok(c.readLine()).getOrElse("")
+  var length = 0
+  while true
+    val line = ok(c.readLine()).getOrElse("")
+    if line.isEmpty then break
+    if line.toLower.startsWith("content-length:") then length = line.slice(15, line.byteLength).trim.toInt()
+  val body = Buffer[byte]()
+  while body.length < length
+    body.addAll(ok(c.read(length - body.length)))
+  s"$first ${string.fromUtf8Lossy(body.toArray())}"
+
+// Sends `text` on `c` in `pieces` pieces, `every` apart, until a write fails.
+inPieces(c: TcpStream, text: string, pieces: int, every: Duration)
+  val size = (text.byteLength + pieces - 1) / pieces
+  var at = 0
+  while at < text.byteLength
+    if at > 0 then sleep(every)
+    val end = if at + size < text.byteLength then at + size else text.byteLength
+    if c.writeText(text.slice(at, end)).isErr then return
+    at = end
+
+main()
+  val bound = millis(300)
+  val late = time.seconds(3)
+  val strict = started(bound)
+
+  // Slowloris: the headers, then the request line itself, a byte every 50 ms, far inside
+  // `readTimeout` (five seconds), with no whole-request bound: each is answered `408` at the bound.
+  println(slowly(strict, "GET /slow HTTP/1.1\r\n", s"Host: t\r\nX-Slow: ${"a".repeat(200)}\r\n\r\n", bound, late))
+  println(slowly(strict, "", "GET /line HTTP/1.1\r\nHost: t\r\n\r\n", bound, late))
+
+  // A connection that never sends is closed, with nothing written, at about the bound.
+  val start = monotonic()
+  val silent = open(strict)
+  val nothing = ok(silent.readAll())
+  val took = monotonic() - start
+  println(s"silent: ${nothing.length} bytes, closed within the bound: ${bound <= took < late}")
+  _ = silent.close()
+
+  // Silent for 200 ms of the 300, then a request sent in two pieces 200 ms apart: the first
+  // request's bound began at the connection, so it is `408`.
+  val dawdler = open(strict)
+  sleep(millis(200))
+  inPieces(dawdler, "GET /dawdle HTTP/1.1\r\nHost: t\r\n\r\n", 2, millis(200))
+  println(s"dawdler: ${ok(dawdler.readLine()).getOrElse("")}")
+  _ = dawdler.close()
+
+  // Headers sent at once, then a body trickled for 500 ms: the bound is the headers' alone.
+  val body = open(strict)
+  ok(body.writeText("POST /body HTTP/1.1\r\nHost: t\r\nContent-Length: 10\r\n\r\n"))
+  inPieces(body, "0123456789", 10, millis(50))
+  println(s"body: ${response(body)}")
+
+  // Kept alive after that, idle 500 ms (past the bound, inside `idleTimeout`), then a request in
+  // two pieces 100 ms apart: its bound began at its first byte, so it is served.
+  sleep(millis(500))
+  inPieces(body, "GET /kept HTTP/1.1\r\nHost: t\r\n\r\n", 2, millis(100))
+  println(s"kept: ${response(body)}")
+  // A later request trickled past its own bound is `408`.
+  inPieces(body, "GET /kept-slow HTTP/1.1\r\nHost: t\r\n\r\n", 4, millis(150))
+  println(s"kept, slow: ${ok(body.readLine()).getOrElse("")}")
+  _ = body.close()
+  strict.shutdown()
+
+  // Two slots, held by two clients that never send and two trickling without end, with a client
+  // queued behind all four: each holds its slot only until the bound, and the client is served.
+  val pair = started(bound, maxConnections = 2)
+  val quiet = [open(pair), open(pair)]
+  val stop = Atomic(false)
+  val tricklers = Buffer[(StreamReader, Thread[unit])]()
+  for _ in 0 ..< 2
+    val (r, w) = ok(TcpStream.connect("127.0.0.1", pair.port())).split()
+    ok(r.setTimeout(time.seconds(10)))
+    tricklers.addOne((r, spawn(() -> trickle(w, "", "GET /forever HTTP/1.1\r\n" + "X".repeat(1000), millis(50), stop))))
+  val queued = monotonic()
+  val last = open(pair)
+  ok(last.writeText("GET /last HTTP/1.1\r\nHost: t\r\nConnection: close\r\n\r\n"))
+  println(s"queued: ${response(last)}, soon: ${monotonic() - queued < time.seconds(5)}")
+  for c in quiet
+    println(s"quiet: ${ok(c.readAll()).length} bytes")
+    _ = c.close()
+  for (r, _) in tricklers
+    println(s"trickler: ${ok(r.readLine()).getOrElse("")}")
+  stop.store(true)
+  for (_, writer) in tricklers do _ = writer.join()
+  _ = last.close()
+  pair.shutdown()
+
+  // A bound of zero is no limit: a request trickled for 600 ms is served.
+  val unbounded = started(Duration.Zero)
+  val c = open(unbounded)
+  inPieces(c, "GET /unbounded HTTP/1.1\r\nHost: t\r\n\r\n", 4, millis(200))
+  println(s"zero: ${response(c)}")
+  _ = c.close()
+  unbounded.shutdown()
