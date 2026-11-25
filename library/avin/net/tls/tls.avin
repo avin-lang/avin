@@ -7,7 +7,9 @@ module avin.net.tls
 //
 // A client trusts the machine's certificate store and whatever authorities `TlsClient.trust` adds;
 // nothing lowers the bar. It always checks the host name against the certificate, sends the name
-// for the server to choose a certificate by, and speaks TLS 1.2 or newer.
+// for the server to choose a certificate by, and speaks TLS 1.2 or newer: either end may narrow the
+// versions it speaks to TLS 1.3 alone, and none can widen them below TLS 1.2. Either end may offer
+// application protocols (ALPN), and a connection says which one the two ends agreed on.
 
 import avin.io
 import avin.io.IoError
@@ -103,14 +105,27 @@ private data TlsSent
   Took(n: long)
   Wants
 
-// The settings a client's connections share: the protocol versions and the trusted authorities.
+// A protocol version as OpenSSL names it, the two it no longer allows by default among them.
+@sysl("sh.sysl.openssl.Version")
+private data SslVersion
+  Tls10
+  Tls11
+  Tls12
+  Tls13
+
+// The settings a client's connections share: the protocol versions, the application protocols
+// offered and the trusted authorities.
 @sysl("sh.sysl.openssl.Client", named: "TlsClient")
 private class ClientContext
   trust(pem: Array[byte]) -> Result[unit, TlsFailure]
+  offer(protocols: Vector[string]) -> Result[unit, TlsFailure]
+  versions(min: SslVersion, max: SslVersion) -> Result[unit, TlsFailure]
 
-// A server's certificate and key.
+// A server's certificate and key, the protocol versions and the application protocols it accepts.
 @sysl("sh.sysl.openssl.Server", named: "TlsServer")
 private class ServerContext
+  offer(protocols: Vector[string]) -> Result[unit, TlsFailure]
+  versions(min: SslVersion, max: SslVersion) -> Result[unit, TlsFailure]
 
 // Who a `TlsStream` belongs to: a Sysl handle holding nothing else, which moves between threads with
 // the stream, so the code that handed the stream over traps at its next use. Its traps name the
@@ -164,6 +179,10 @@ private class Engine
   receive(out: Array[byte]) -> Result[TlsReceived, TlsFailure]
   @sysl("close")
   notifyClose() -> TlsStep
+  // The application protocol the handshake settled on, if any.
+  protocol() -> Option[string]
+  // The protocol version the handshake settled on, or `None` before it is done.
+  version() -> Option[SslVersion]
 
 @sysl("sh.sysl.openssl.client")
 private newClientContext() -> Result[ClientContext, TlsFailure]
@@ -200,15 +219,86 @@ private closedError(operation: string, peer: string) -> IoError =
 // `text` as UTF-8 bytes.
 private utf8Of(text: string) -> Array[byte] = Array.tabulate(text.byteLength, i -> text.byteAt(i))
 
+// A TLS protocol version a connection may speak, oldest first. TLS 1.2 is the oldest there is:
+// nothing older can be asked for.
+data TlsVersion
+  Tls12
+  Tls13
+
+impl TlsVersion
+  // The version as it is written, `TLS 1.2`.
+  name -> string = self match
+    Tls12 -> "TLS 1.2"
+    Tls13 -> "TLS 1.3"
+
+impl Display for TlsVersion
+  display(out: Writer, spec: FormatSpec) = out.writeField(name, spec)
+
+// Where `version` stands among the versions, oldest lowest.
+private rank(version: TlsVersion) -> int = version match
+  Tls12 -> 2
+  Tls13 -> 3
+
+// `version` as OpenSSL names it.
+private sslOf(version: TlsVersion) -> SslVersion = version match
+  Tls12 -> SslVersion.Tls12
+  Tls13 -> SslVersion.Tls13
+
+// The version a finished handshake settled on. Every context allows TLS 1.2 and 1.3 alone, so no
+// other can be settled on.
+private settledOn(version: Option[SslVersion]) -> TlsVersion = version match
+  Some(SslVersion.Tls13) -> TlsVersion.Tls13
+  Some(SslVersion.Tls12) -> TlsVersion.Tls12
+  _ -> fail("a TLS connection settled on no version TLS 1.2 or newer")
+
+// Traps where `protocols` holds a name ALPN cannot carry, one empty or over 255 bytes long, or more
+// than the 65535 bytes ALPN carries in all, each name with its length byte.
+private checkProtocols(protocols: Vector[string])
+  var wire = 0
+  for p in protocols
+    if !(1 <= p.byteLength <= 255)
+      fail(s"the application protocol name \"$p\" of ${p.byteLength} bytes: it is 1 to 255 bytes long")
+    wire += 1 + p.byteLength
+  if wire > 65535 then fail(s"application protocol names of $wire bytes in all: ALPN carries at most 65535")
+
+// Traps where `min` is newer than `max`, which leaves no version to speak.
+private checkVersions(min: TlsVersion, max: TlsVersion)
+  if rank(min) > rank(max) then fail(s"TLS versions from $min to $max: the oldest is newer than the newest")
+
 // The settings of a client's TLS connections: the machine's trusted authorities and the ones added
-// here, as PEM text.
-class TlsClient(val trusted: Vector[string] = Vector.empty[string]()): Sendable
+// here, as PEM text; the application protocols offered, most preferred first, none by default; and
+// the oldest and newest protocol versions spoken, TLS 1.2 and TLS 1.3 by default. A server that
+// chooses none of the protocols offered leaves the connection's `protocol` `None`; one that refuses
+// them all, or speaks no version between `minVersion` and `maxVersion`, fails the handshake as
+// `Handshake`. A protocol name ALPN cannot carry, or a `minVersion` newer than `maxVersion`, traps,
+// in `offer` and `versions`, and at the first connection of a client made directly.
+class TlsClient(
+    val trusted: Vector[string] = Vector.empty[string](),
+    val protocols: Vector[string] = Vector.empty[string](),
+    val minVersion: TlsVersion = Tls12,
+    val maxVersion: TlsVersion = Tls13
+): Sendable
   // A client that also trusts the authorities in `pem`, which may hold several certificates.
   // Trust only grows: nothing here accepts a certificate the machine's store and these refuse.
-  trust(pem: string) -> TlsClient = TlsClient(trusted :+ pem)
+  trust(pem: string) -> TlsClient = TlsClient(trusted :+ pem, protocols, minVersion, maxVersion)
+
+  // A client offering the application protocols `names`, most preferred first, in place of those it
+  // offered; an empty vector offers none. A name empty or over 255 bytes long, or names over 65535
+  // bytes in all, trap.
+  offer(names: Vector[string]) -> TlsClient
+    checkProtocols(names)
+    TlsClient(trusted, names, minVersion, maxVersion)
+
+  // A client speaking the protocol versions from `min` to `max`, both included. A `min` newer than
+  // `max` traps.
+  versions(min: TlsVersion, max: TlsVersion) -> TlsClient
+    checkVersions(min, max)
+    TlsClient(trusted, protocols, min, max)
 
 // A context for one of `client`'s connections; a PEM that cannot be read is `Credentials`.
 private clientContext(client: TlsClient) -> Result[ClientContext, TlsError]
+  checkProtocols(client.protocols)
+  checkVersions(client.minVersion, client.maxVersion)
   val c = newClientContext().mapErr(f -> Credentials(f.message))?
   for pem in client.trusted
     c.trust(utf8Of(pem)) match
@@ -216,24 +306,105 @@ private clientContext(client: TlsClient) -> Result[ClientContext, TlsError]
       Err(f) ->
         c.close()
         return Err(Credentials(f.message))
-  Ok(c)
+  tuned(c, client.protocols, client.minVersion, client.maxVersion) match
+    Ok(_) -> Ok(c)
+    Err(f) ->
+      c.close()
+      Err(Handshake(f.message))
 
-// A server's certificate, a chain leaf first, and its private key, as PEM text. `TlsServer.of`
-// checks they go together; a server made directly is checked at its first connection.
-class TlsServer(val certificate: string, val key: string): Sendable
+// `c` with its versions and application protocols set.
+private tuned(c: ClientContext, protocols: Vector[string], min: TlsVersion, max: TlsVersion) -> Result[unit, TlsFailure]
+  c.versions(sslOf(min), sslOf(max))?
+  if protocols.isEmpty then Ok(()) else c.offer(protocols)
+
+// Where a server's TLS settings come from: asked for them afresh as each connection's handshake
+// begins, which keeps them for as long as it lasts.
+trait TlsSource: Sendable
+  // The settings the next connection takes.
+  current -> TlsServer
+
+// A server's certificate, a chain leaf first, and its private key, as PEM text; the application
+// protocols it accepts, in its order of preference, none by default; and the oldest and newest
+// protocol versions it speaks, TLS 1.2 and TLS 1.3 by default. `TlsServer.of` checks the
+// certificate and key go together; a server made directly is checked at its first connection.
+// Where the client and the server both offer protocols the server chooses the first of its own the
+// client offered, and where none is offered by both the handshake fails, as RFC 7301 asks; where
+// either offers none the connection's `protocol` is `None`. A protocol name ALPN cannot carry, or a
+// `minVersion` newer than `maxVersion`, traps, in `offer` and `versions`, and at the first
+// connection of a server made directly. It is its own `TlsSource`, the same for every connection.
+class TlsServer(
+    val certificate: string,
+    val key: string,
+    val protocols: Vector[string] = Vector.empty[string](),
+    val minVersion: TlsVersion = Tls12,
+    val maxVersion: TlsVersion = Tls13
+): Sendable, TlsSource
+  // The server itself.
+  override current -> TlsServer = self
+
+  // A server accepting the application protocols `names`, most preferred first, in place of those
+  // it accepted; an empty vector accepts none. A name empty or over 255 bytes long, or names over
+  // 65535 bytes in all, trap.
+  offer(names: Vector[string]) -> TlsServer
+    checkProtocols(names)
+    TlsServer(certificate, key, names, minVersion, maxVersion)
+
+  // A server speaking the protocol versions from `min` to `max`, both included. A `min` newer than
+  // `max` traps.
+  versions(min: TlsVersion, max: TlsVersion) -> TlsServer
+    checkVersions(min, max)
+    TlsServer(certificate, key, protocols, min, max)
 
 object TlsServer
   // A server with `certificate` and `key`, or `Credentials` where either is not PEM or the key does
   // not go with the certificate.
-  of(certificate: string, key: string) -> Result[TlsServer, TlsError]
-    val made = TlsServer(certificate, key)
-    val c = serverContext(made)?
-    c.close()
-    Ok(made)
+  of(certificate: string, key: string) -> Result[TlsServer, TlsError] = checked(TlsServer(certificate, key))
+
+// `server` where its certificate and key go together, else `Credentials`.
+private checked(server: TlsServer) -> Result[TlsServer, TlsError]
+  val c = serverContext(server)?
+  c.close()
+  Ok(server)
 
 // A context for one of `server`'s connections.
-private serverContext(server: TlsServer) -> Result[ServerContext, TlsError] =
-  newServerContext(utf8Of(server.certificate), utf8Of(server.key)).mapErr(f -> Credentials(f.message))
+private serverContext(server: TlsServer) -> Result[ServerContext, TlsError]
+  checkProtocols(server.protocols)
+  checkVersions(server.minVersion, server.maxVersion)
+  val c = newServerContext(utf8Of(server.certificate), utf8Of(server.key)).mapErr(f -> Credentials(f.message))?
+  tuned(c, server.protocols, server.minVersion, server.maxVersion) match
+    Ok(_) -> Ok(c)
+    Err(f) ->
+      c.close()
+      Err(Handshake(f.message))
+
+// `c` with its versions and application protocols set.
+private tuned(c: ServerContext, protocols: Vector[string], min: TlsVersion, max: TlsVersion) -> Result[unit, TlsFailure]
+  c.versions(sslOf(min), sslOf(max))?
+  if protocols.isEmpty then Ok(()) else c.offer(protocols)
+
+// A server's TLS settings that may be replaced while it serves. Each connection takes the settings
+// current as its handshake begins and keeps them, so a replacement changes what the connections
+// accepted after it present, and every connection already open goes on as it was. It may be shared
+// between threads: what one replaces, the next handshake on any takes.
+class ReloadableTlsServer(initial: TlsServer): TlsSource
+  private val held = Atomic(initial)
+
+  // The settings the next connection takes.
+  override current -> TlsServer = held.load()
+
+  // Replaces the settings with `next`.
+  reload(next: TlsServer) = held.store(next)
+
+  // Replaces the certificate and key with `certificate` and `key`, keeping the protocols and
+  // versions; where either is not PEM or the key does not go with the certificate, the answer is
+  // `Credentials` and the settings stay as they were. A replacement made meanwhile is kept, its
+  // protocols and versions with this certificate and key.
+  reload(certificate: string, key: string) -> Result[unit, TlsError]
+    while true
+      val now = held.load()
+      val next = checked(TlsServer(certificate, key, now.protocols, now.minVersion, now.maxVersion))?
+      if held.compareAndSet(now, next) then return Ok(())
+    Ok(())
 
 // A TLS connection over a `TcpStream`, made by `TlsStream.connect`, `TlsStream.client` or
 // `TlsStream.server`. Its reads and writes are a TCP connection's, of plaintext: bytes `readLine`
@@ -265,6 +436,9 @@ class TlsStream(
   private var pending = Array.empty[byte]()
   // Where TLS puts the plaintext of a read, kept from one read to the next.
   private var room = Array.empty[byte]()
+  // What the handshake settled, kept once the TLS state is released or handed to the halves.
+  private var agreed: Option[string] = None
+  private var spoken: Option[TlsVersion] = None
 
   // Whether a read would answer now, without waiting: plaintext is buffered, TLS holds decrypted
   // plaintext or has a whole record of it among what has arrived, the peer has closed TLS or the
@@ -324,6 +498,24 @@ class TlsStream(
 
   // The address of the other end of the TCP connection beneath.
   override remoteAddress -> Option[string] = tcp.remoteAddress
+
+  // The application protocol the two ends agreed on in the handshake (ALPN), or `None` where one
+  // of them offered none or the server chose none. Known once the connection is made, and still
+  // after it is closed or split.
+  protocol -> Option[string]
+    owner.held()
+    if closed || halved then agreed else engine.protocol()
+
+  // The protocol version the handshake settled on. Known once the connection is made, and still
+  // after it is closed or split.
+  version -> TlsVersion
+    owner.held()
+    if closed || halved then spoken.get else settledOn(engine.version())
+
+  // Keeps what the handshake settled, before the TLS state is released or handed to the halves.
+  private keepSettled()
+    agreed = engine.protocol()
+    spoken = Some(settledOn(engine.version()))
 
   // Up to `max` bytes, waiting for at least one; an empty array once the other end has finished
   // sending. `max` is at least one.
@@ -411,6 +603,7 @@ class TlsStream(
   override close() -> Result[unit, IoError]
     owner.held()
     if closed || halved then return Ok(())
+    keepSettled()
     closed = true
     engine.notifyClose()
     val told = flush()
@@ -429,6 +622,7 @@ class TlsStream(
     owner.held()
     if halved then fail("a connection is split once, and this one has been split already")
     if closed then fail("a closed connection cannot be split")
+    keepSettled()
     halved = true
     val fd = tcp.writabilityDescriptor()
     val (r, w) = tcp.split()

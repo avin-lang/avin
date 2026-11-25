@@ -1,0 +1,182 @@
+// expect: exit 0
+// A `ReloadableTlsServer` replaced while connections are open: each connection keeps the settings it
+// began with and goes on working, and each one after takes the new certificate, protocols and
+// versions. A certificate and key that do not go together leave the settings as they were; a
+// reload by certificate and key keeps the protocols and versions. Reloads from one thread while
+// another connects are each seen whole. `http.serve` takes one, reloaded under a running server,
+// and speaks `http/1.1` by ALPN where the settings offer no protocol of their own.
+import avin.fs
+import avin.io.IoError
+import avin.net.http
+import avin.net.http.{HttpError, Request, Response, ServerRequest, Tls}
+
+import avin.net.tls.{
+  Certificate, Credentials, Handshake, ReloadableTlsServer, Tls12, Tls13, TlsClient, TlsError, TlsServer, TlsSource,
+  TlsStream, Transport
+}
+
+import avin.net.{TcpListener, TcpStream}
+import avin.threads.{Atomic, Thread, spawn}
+import avin.time
+
+ok[T](r: Result[T, IoError]) -> T = r match
+  Ok(v) -> v
+  Err(e) -> fail(s"unexpected error: ${e.message}")
+
+tls[T](r: Result[T, TlsError]) -> T = r match
+  Ok(v) -> v
+  Err(e) -> fail(s"unexpected error: ${e.message}")
+
+// A test certificate or key, from the repository root or from `compiler/`.
+fixture(name: string) -> string
+  val here = "tests/fixtures/tls/" + name
+  ok(fs.readText(if fs.exists(here) then here else "../" + here))
+
+// The server presenting `certificate`, each test certificate's key being `localhost.key`.
+presenting(certificate: string) -> TlsServer = tls(TlsServer.of(fixture(certificate), fixture("localhost.key")))
+
+// A client trusting only the test authority, which issued `localhost.pem`.
+authority() -> TlsClient = TlsClient().trust(fixture("ca.pem"))
+
+// A client trusting only `selfsigned.pem`.
+selfSigned() -> TlsClient = TlsClient().trust(fixture("selfsigned.pem"))
+
+kind(e: TlsError) -> string = e match
+  Transport(_) -> "transport"
+  Certificate(_, _) -> "certificate refused"
+  Handshake(_) -> "handshake failed"
+  Credentials(_) -> "credentials"
+
+shown(p: Option[string]) -> string = p match
+  Some(name) -> s"\"$name\""
+  None -> "none"
+
+// A listener whose next `count` connections each take `source`'s current settings, and the thread
+// serving them, echoing each line until the client closes.
+serving(source: TlsSource, count: int) -> (int, Thread[unit])
+  val listener = ok(TcpListener.bind("127.0.0.1", 0))
+  val port = listener.port()
+  val accepting = spawn(() ->
+    defer listener.close()
+    var echoes = Vector.empty[Thread[unit]]()
+    for _ in 0 ..< count
+      val tcp = ok(listener.accept())
+      ok(tcp.setTimeout(time.seconds(20)))
+      echoes = echoes :+ spawn(() -> echo(tcp, source.current))
+    for e in echoes
+      e.join())
+  (port, accepting)
+
+echo(tcp: TcpStream, server: TlsServer)
+  TlsStream.server(tcp, server) match
+    Ok(s) ->
+      defer s.close()
+      while true
+        ok(s.readLine()) match
+          Some(line) -> ok(s.writeText(s"$line\n"))
+          None -> return
+    Err(_) -> _ = tcp.close()
+
+// Says whether a connection under `client` is made, and what it settled.
+tried(label: string, port: int, client: TlsClient)
+  TlsStream.connect("localhost", port, client) match
+    Ok(c) ->
+      ok(c.writeText("ping\n"))
+      println(s"$label: connected, ${shown(c.protocol)} over ${c.version}, echoed ${ok(c.readLine()).getOrElse("?")}")
+      _ = c.close()
+    Err(e) -> println(s"$label: ${kind(e)}")
+
+// Echoes `text` over the open connection `c`.
+echoed(c: TlsStream, text: string) -> string
+  ok(c.writeText(s"$text\n"))
+  ok(c.readLine()).getOrElse("?")
+
+main()
+  val source = ReloadableTlsServer(presenting("selfsigned.pem"))
+  println(s"current is the one given: ${source.current.certificate == fixture("selfsigned.pem")}")
+  val (port, served) = serving(source, 29)
+
+  // A connection under the first settings, kept open across every reload below.
+  val first = tls(TlsStream.connect("localhost", port, selfSigned()))
+  println(s"first: ${echoed(first, "before")}")
+  tried("the self-signed client before", port, selfSigned())
+  tried("the authority's client before", port, authority())
+
+  // Reloading by certificate and key.
+  println(s"reloaded: ${source.reload(fixture("localhost.pem"), fixture("localhost.key")).isOk}")
+  println(s"first, after the reload: ${echoed(first, "after")}")
+  tried("the self-signed client after", port, selfSigned())
+  tried("the authority's client after", port, authority())
+
+  // A key for another certificate, and text that is not PEM, leave the settings as they were.
+  println(s"a mismatched key: ${kind(source.reload(fixture("localhost.pem"), fixture("other.key")).err.get)}")
+  println(s"not PEM: ${kind(source.reload("nonsense", fixture("localhost.key")).err.get)}")
+  println(s"an empty key: ${kind(source.reload(fixture("localhost.pem"), "").err.get)}")
+  tried("the authority's client after the refusals", port, authority())
+
+  // Reloading whole settings, then by certificate and key, which keeps the protocols and versions.
+  source.reload(presenting("localhost.pem").offer(["h2", "http/1.1"]).versions(Tls12, Tls12))
+  tried("after a reload of protocols and versions", port, authority().offer(["http/1.1", "h2"]))
+  println(s"reloaded: ${source.reload(fixture("selfsigned.pem"), fixture("localhost.key")).isOk}")
+  println(s"kept: ${source.current.protocols}, ${source.current.minVersion} to ${source.current.maxVersion}")
+  tried("the self-signed client, protocols kept", port, selfSigned().offer(["h2"]))
+  tried("TLS 1.3 alone, refused by the kept versions", port, selfSigned().versions(Tls13, Tls13))
+  source.reload(presenting("localhost.pem"))
+  println(s"first, at the end: ${echoed(first, "still")}, ${shown(first.protocol)} over ${first.version}")
+  _ = first.close()
+
+  // Reloads on one thread while another connects: each connection takes one settings whole, so a
+  // client trusting both certificates always connects.
+  val both = authority().trust(fixture("selfsigned.pem"))
+  val flips = Atomic(0)
+  val flipping = spawn(() ->
+    for i in 0 ..< 200
+      val which = if i % 2 == 0 then "selfsigned.pem" else "localhost.pem"
+      if source.reload(fixture(which), fixture("localhost.key")).isOk then _ = flips.add(1))
+  var made = 0
+  for _ in 0 ..< 20
+    TlsStream.connect("localhost", port, both) match
+      Ok(c) ->
+        if echoed(c, "racing") == "racing" then made += 1
+        _ = c.close()
+      Err(e) -> println(s"a racing connection: ${kind(e)}")
+  flipping.join()
+  println(s"connections made while reloading: $made of 20, reloads: ${flips.load()}")
+  served.join()
+
+  // `http.serve` under a reloadable source, reloaded while it runs.
+  val site = ReloadableTlsServer(presenting("selfsigned.pem"))
+  val server = ok(http.serve("127.0.0.1", 0, r -> Response.text(200, s"hello ${r.target}"), tls = Some(site)))
+  val base = s"https://localhost:${server.port()}"
+  println(s"https before: ${fetch(Request("GET", s"$base/a").withTls(selfSigned()))}")
+  println(s"https before, the authority's client: ${fetch(Request("GET", s"$base/b").withTls(authority()))}")
+  _ = site.reload(fixture("localhost.pem"), fixture("localhost.key"))
+  println(s"https after, the authority's client: ${fetch(Request("GET", s"$base/c").withTls(authority()))}")
+  println(s"https after, the self-signed client: ${fetch(Request("GET", s"$base/d").withTls(selfSigned()))}")
+  // ALPN under `serve`: `http/1.1` where the settings offer none.
+  alpn("offering h2 and http/1.1", server.port(), authority().offer(["h2", "http/1.1"]))
+  alpn("offering h2 alone", server.port(), authority().offer(["h2"]))
+  alpn("offering none", server.port(), authority())
+  site.reload(presenting("localhost.pem").offer(["x-mine", "http/1.1"]))
+  alpn("the settings' own protocols", server.port(), authority().offer(["http/1.1", "x-mine"]))
+  server.stop()
+
+  // A plain `TlsServer` is still a `tls` for `serve`.
+  val fixed = ok(http.serve("127.0.0.1", 0, r -> Response.text(200, "fixed"), tls = Some(presenting("localhost.pem"))))
+  println(
+    s"https from a fixed server: ${fetch(Request("GET", s"https://localhost:${fixed.port()}/").withTls(authority()))}"
+  )
+  fixed.stop()
+
+fetch(request: Request) -> string = http.send(request) match
+  Ok(response) -> s"${response.status} ${response.text}"
+  Err(Tls(e)) -> kind(e)
+  Err(e) -> s"other: ${e.message}"
+
+// What a raw TLS connection to an HTTPS server under `client` settles.
+alpn(label: string, port: int, client: TlsClient)
+  TlsStream.connect("localhost", port, client) match
+    Ok(c) ->
+      println(s"$label: ${shown(c.protocol)}")
+      _ = c.close()
+    Err(e) -> println(s"$label: ${kind(e)}")

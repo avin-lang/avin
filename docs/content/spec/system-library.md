@@ -2656,6 +2656,13 @@ negative `timeout` traps.
 | `s.close() -> Result[unit, IoError]` | Closes TLS as far as the peer can be told without waiting, then the connection; the `Err` is a failure to send that notice, the connection being closed either way. Again does nothing and answers `Ok`. |
 | `TlsClient(trusted = [])`, `c.trust(pem: string) -> TlsClient` | The machine's trusted authorities and those added: `trust` answers a client that also trusts the certificates in `pem`. |
 | `TlsServer(certificate, key)`, `TlsServer.of(certificate, key) -> Result[TlsServer, TlsError]` | A server's certificate (a chain, leaf first) and private key as PEM text; `of` checks they can be used and go together, and one made directly is checked at its first connection. |
+| `c.offer(names: Vector[string])`, `server.offer(names)` | The settings offering the application protocols `names` by ALPN, most preferred first, in place of those offered before; `[]` offers none, the default. A name empty or over 255 bytes long, or names over 65535 bytes in all, each with its length byte, trap. |
+| `c.versions(min: TlsVersion, max: TlsVersion)`, `server.versions(min, max)` | The settings speaking the protocol versions from `min` to `max`, both included; `Tls12` to `Tls13` by default. A `min` newer than `max` traps. |
+| `protocols`, `minVersion`, `maxVersion` | The settings' fields, also parameters of `TlsClient(…)` and `TlsServer(…)` after their own, defaulted; one made directly with a name ALPN cannot carry, or `minVersion` newer than `maxVersion`, traps at its first connection. |
+| `s.protocol -> Option[string]`, `s.version -> TlsVersion` | The application protocol the two ends agreed on, `None` where one offered none or the server chose none, and the protocol version spoken; still known after `close` and `split`. |
+| `TlsVersion`: `Tls12`, `Tls13`; `v.name` | A protocol version, its `name` and display `TLS 1.2` or `TLS 1.3`. Nothing older can be named. |
+| `trait TlsSource`, `source.current -> TlsServer` | Where a server's settings come from, asked as each connection's handshake begins. A `TlsServer` is its own, the same every time. |
+| `ReloadableTlsServer(initial: TlsServer)`, `r.reload(next: TlsServer)`, `r.reload(certificate, key) -> Result[unit, TlsError]` | Settings that may be replaced while a server runs, from any thread. Each connection keeps the settings it began with, so a reload changes the connections that follow and none already open. `reload(certificate, key)` keeps the protocols and versions; `Credentials`, the settings unchanged, where the two cannot be used together. |
 
 **What a client checks, and what cannot be turned off.** The server's certificate must chain to an
 authority the client trusts: the machine's store, read through OpenSSL's default paths (on macOS
@@ -2664,6 +2671,43 @@ must cover the host connected to, a name or an address. The host's name is sent 
 choose a certificate by, and the oldest protocol spoken is TLS 1.2. `trust` only adds: there is no
 way to accept a certificate these refuse, a private authority, a corporate one and a test's own
 being the same case. The choices are [proposed](/spec/decisions/#proposed).
+
+**Versions and application protocols.** Either end speaks TLS 1.2 and TLS 1.3 unless `versions`
+narrows that, to TLS 1.3 alone for instance; nothing widens it below TLS 1.2, and two ends whose
+ranges do not meet fail the handshake as `Handshake`. Each end may offer application protocols by
+ALPN. Where both do, the server chooses the first of its own the client offered, so its order wins,
+and where none is offered by both the handshake fails as `Handshake`, as RFC 7301 asks; where either
+offers none, or the server chooses none, the connection's `protocol` is `None` and it goes on.
+Names are compared byte for byte: `h2` is not `H2`, nor `h2c`.
+
+**Reloading a certificate.** A `ReloadableTlsServer` holds a server's settings and may be
+replaced while it serves, a renewed certificate for instance; `http.serve` takes one as its `tls`,
+as it takes a `TlsServer`. Each connection takes the settings current as its handshake begins and
+keeps them, so the connections accepted after a reload present the new certificate and every
+connection already open goes on, unbroken. A certificate and key that do not go together are
+refused and the old settings kept:
+
+```text
+import avin.fs
+import avin.io.IoError
+import avin.net.http
+import avin.net.http.Response
+import avin.net.tls.{ReloadableTlsServer, TlsError, TlsServer}
+import avin.signal
+
+main() -> Result[unit, TlsError | IoError]
+  val identity = TlsServer.of(fs.readText("cert.pem")?, fs.readText("key.pem")?)?
+  val tls = ReloadableTlsServer(identity.offer(["http/1.1"]))
+  _ = http.serve("0.0.0.0", 8443, r -> Response.text(200, "hello"), tls = Some(tls))?
+  // A hangup reads the certificate and key again; the connections open go on as they were.
+  val hangup = signal.watch(signal.Hangup)?
+  while true
+    hangup.wait()
+    tls.reload(fs.readText("cert.pem")?, fs.readText("key.pem")?) match
+      Ok(_) -> println("reloaded")
+      Err(e) -> println(s"kept the old certificate: ${e.message}")
+  Ok(())
+```
 
 **After the handshake a connection is a `ByteStream`**: a failure of TLS itself while reading or
 writing is an `IoError` of kind `Other` whose text begins `TLS:`, and the connection's end, by the peer's
@@ -2679,7 +2723,7 @@ host", "the certificate has expired", "the certificate is not yet valid", "the c
 trusted", "the certificate was refused (code N)"); `Handshake(text)`, the two ends did not agree,
 as with a peer that does not speak TLS or ends the connection in the handshake; and
 `Credentials(text)`, a certificate or key given to this end cannot be used. `message` says it in
-words. Each `TlsStream`, `TlsClient` and `TlsServer` is sendable, a stream belonging to one thread
+words. Each `TlsStream`, `TlsClient`, `TlsServer` and `ReloadableTlsServer` is sendable, a stream belonging to one thread
 at a time as a `TcpStream` does.
 
 ### Servers
@@ -2766,7 +2810,7 @@ main()
 `type Handler = @sendable (ServerRequest) -> Response` names what answers a request.
 `http.serve(host, port, handler: Handler, maxConnections = 1024,
 readTimeout = seconds(30), writeTimeout = seconds(30), idleTimeout = seconds(5), maxHeaderBytes =
-16384, maxBodyBytes = 1048576, tls: Option[TlsServer] = None, errors: ErrorPage = plainError,
+16384, maxBodyBytes = 1048576, tls: Option[TlsSource] = None, errors: ErrorPage = plainError,
 date: bool = true, requestTimeout = seconds(60), handshakeTimeout = seconds(10), listen: ListenOptions
 = http.ServerListen) -> Result[TcpServer, IoError]` listens as `TcpServer.start` does, with the
 [socket options](#socket-options) `listen`. **`http.ServerListen`** is the listener's defaults with
@@ -2807,7 +2851,11 @@ presenting the `TlsServer`'s certificate, each of its waits lasting at most `rea
 serves its requests over the `TlsStream` exactly as over TCP, kept alive and pipelined alike. A
 connection whose handshake fails, a client speaking plain HTTP among them, is closed, and the server
 goes on. A handler that traps on a TLS connection has it closed without the `500`, since the answer
-would have to be written through TLS the handler's turn held.
+would have to be written through TLS the handler's turn held. `tls` is a `TlsSource`, a `TlsServer`
+or a `ReloadableTlsServer`, whose settings each handshake takes as it begins, so a reload while the
+server runs changes the connections that follow and leaves those open as they were. Settings that
+offer no application protocol of their own offer `http/1.1` by ALPN, so a client offering `h2` and
+`http/1.1` is answered `http/1.1`, and one offering `h2` alone is refused in the handshake.
 
 A `ServerRequest` has its `method`, its `target` as the request line gave it, its `version`
 (`HTTP/1.1` or `HTTP/1.0`), its `headers` in order with `header(name)` looking one up without regard

@@ -11,7 +11,7 @@ module avin.net.http
 
 import avin.io.{IoError, TimedOut}
 import avin.net.{ByteStream, KeepAlive, ListenOptions, TcpOptions, TcpServer, TcpStream, Url}
-import avin.net.tls.{TlsServer, TlsStream}
+import avin.net.tls.{TlsServer, TlsSource, TlsStream}
 import avin.threads.{Atomic, Mutex}
 import avin.time.{Duration, Instant, millis, monotonic, now, seconds}
 
@@ -405,6 +405,11 @@ private bound(pattern: Vector[string], segments: Vector[string]) -> Option[Vecto
 // carries a `Date` header, the time it is sent as an HTTP-date, unless the handler gave one or `date`
 // is false; the `101` answer of an upgrade carries none. The server listens with the socket options
 // `listen`, `ServerListen` unless given others.
+//
+// Each TLS handshake takes the settings `tls` holds as it begins, so a `ReloadableTlsServer`
+// reloaded while the server runs changes the certificate the connections accepted after it present
+// and leaves those already open as they were. A `TlsServer` that accepts no application protocol of
+// its own accepts `http/1.1` by ALPN.
 serve(
     host: string,
     port: int,
@@ -415,7 +420,7 @@ serve(
     idleTimeout: Duration = seconds(5),
     maxHeaderBytes: int = 16384,
     maxBodyBytes: int = 1048576,
-    tls: Option[TlsServer] = None,
+    tls: Option[TlsSource] = None,
     errors: ErrorPage = plainError,
     date: bool = true,
     requestTimeout: Duration = seconds(60),
@@ -522,23 +527,27 @@ private checkedSettings(
 // WebSocket above all, which no idle timeout ends, is found out within two minutes.
 val ServerListen: ListenOptions = ListenOptions(connections = TcpOptions(noDelay = true, keepAlive = Some(KeepAlive())))
 
-// A connection served over TLS: the handshake, done within `handshake` in all, then its requests as
-// `converse` serves them.
+// A connection served over TLS: the handshake, under the settings `identity` holds as it begins and
+// done within `handshake` in all, then its requests as `converse` serves them.
 private secured(
     tcp: TcpStream,
     server: TcpServer,
     handler: Handler,
     s: Settings,
-    identity: TlsServer,
+    identity: TlsSource,
     handshake: Duration
 )
   if tcp.setTimeout(s.readTimeout).isErr then return
-  TlsStream.server(tcp, identity, handshake) match
+  TlsStream.server(tcp, forHttp(identity.current), handshake) match
     Ok(stream) ->
       converse(stream, server, handler, s, false)
       // The conversation is over; a close notice the client never reads changes nothing.
       _ = stream.close()
     Err(_) -> ()
+
+// `server`, accepting `http/1.1` by ALPN where it accepts no application protocol of its own.
+private forHttp(server: TlsServer) -> TlsServer =
+  if server.protocols.isEmpty then server.offer(["http/1.1"]) else server
 
 // The limits a server was started with, the error page it renders its own answers by, the
 // connections streaming a response, and the source of its `Date` header where it sends one.
