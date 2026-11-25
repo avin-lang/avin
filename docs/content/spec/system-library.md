@@ -2369,7 +2369,7 @@ uses it again.
 
 | Function | Meaning |
 | --- | --- |
-| `TcpStream.connect(host: string, port: int, timeout: Duration = Duration.Zero) -> Result[TcpStream, IoError]` | A connection to the first of the host's addresses that answers; where none does, the last one's error. The lookup and the connecting, to every address tried, must be done within `timeout`, else the error is `TimedOut`; zero leaves the waits to the system's own limits, and a negative `timeout` traps. |
+| `TcpStream.connect(host: string, port: int, timeout: Duration = Duration.Zero, options: TcpOptions = TcpOptions()) -> Result[TcpStream, IoError]` | A connection to the first of the host's addresses that answers; where none does, the last one's error. The lookup and the connecting, to every address tried, must be done within `timeout`, else the error is `TimedOut`; zero leaves the waits to the system's own limits, and a negative `timeout` traps. Its socket is given `options` before it connects; see [socket options](#socket-options). |
 | `s.read(max: int) -> Result[Array[byte], IoError]` | Up to `max` bytes, at least one, waiting for at least one; empty when the other end has finished sending. |
 | `s.readLine() -> Result[Option[string], IoError]` | The next line, as standard input reads one, `None` at the end. |
 | `s.readAll() -> Result[Array[byte], IoError]` | Everything until the other end has finished sending. |
@@ -2384,9 +2384,11 @@ uses it again.
 | `s.writable() -> bool` | Whether a write would send something now, without waiting: the socket has room, or the connection has failed or is closed. Never waits. A [`select`](/spec/threads/#select)'s `s.writable()` arm waits for it. |
 | `s.writabilityDescriptor() -> int` | The descriptor that arm watches; `-1` once closed. |
 | `s.split() -> (StreamReader, StreamWriter)` | The connection divided into a reading half and a writing half, for two threads to use at once; see [split connections](#split-connections). |
-| `TcpListener.bind(host: string, port: int) -> Result[TcpListener, IoError]` | Listens on the host's first address (`127.0.0.1` for this machine alone, `0.0.0.0` for all of its addresses); port `0` lets the platform choose. |
+| `s.localAddress() -> Result[string, IoError]`, `s.localPort() -> Result[int, IoError]` | This end's address, numerically without its port, and its port. |
+| `TcpListener.bind(host: string, port: int, options: ListenOptions = ListenOptions()) -> Result[TcpListener, IoError]` | Listens on the host's first address (`127.0.0.1` for this machine alone, `0.0.0.0` for all of its addresses); port `0` lets the platform choose. It is given `options` before it binds. |
 | `l.port() -> int` | The port it listens on. |
-| `l.accept() -> Result[TcpStream, IoError]` | Waits for the next connection. |
+| `l.options -> ListenOptions`, `l.reusePort() -> Result[bool, IoError]` | The options it was bound with, and whether it shares its port, as the system says. |
+| `l.accept() -> Result[TcpStream, IoError]` | Waits for the next connection, which is given `options.connections`. |
 | `l.close() -> Result[unit, IoError]` | Stops listening and answers `Ok`; closing again does nothing. |
 
 ```text
@@ -2404,6 +2406,55 @@ main()
     Err(e) -> eprintln(e.message)
 ```
 
+### Socket options
+
+A connection's options are a `TcpOptions` given to `connect`, or to a listener for every connection
+it accepts, and each has a method on the connection that changes it and one that reads it back from
+the system, so what a read answers is what the socket has.
+
+| Type or member | Meaning |
+| --- | --- |
+| `data TcpOptions(noDelay = false, keepAlive: Option[KeepAlive] = None, sendBuffer = 0, receiveBuffer = 0)` | A connection's options. A buffer size of zero leaves the system's own. |
+| `data KeepAlive(idle = seconds(60), interval = seconds(10), count = 6)` | Probing an idle connection (`SO_KEEPALIVE`): the first probe after `idle` with nothing received, the next every `interval`, and `count` unanswered ones end the connection, its next read or write failing. |
+| `data ListenOptions(backlog = 128, reuseAddress = true, reusePort = false, connections = TcpOptions())` | A listener's options. |
+| `s.setNoDelay(on: bool)`, `s.noDelay() -> Result[bool, IoError]` | Sending each write at once (`TCP_NODELAY`) rather than holding a small one back to join the next. |
+| `s.setKeepAlive(k: Option[KeepAlive])`, `s.keepAlive() -> Result[Option[KeepAlive], IoError]` | Probing while idle, or not for `None`; read back in whole seconds. |
+| `s.setSendBuffer(bytes: int)`, `s.sendBuffer() -> Result[int, IoError]` | The send buffer asked for, and the size the system gave. |
+| `s.setReceiveBuffer(bytes: int)`, `s.receiveBuffer() -> Result[int, IoError]` | The same for the receive buffer. |
+| `s.configure(options: TcpOptions) -> Result[unit, IoError]` | Every option at once: `noDelay` and `keepAlive` as they say, each buffer size that is not zero. |
+
+- **A new connection holds small writes back and is not probed**, the system's defaults; a
+  listener's `connections` changes that for every connection it accepts, and `http.serve` turns
+  both on (see [HTTP server](#http-server)).
+- **Keep-alive times are whole seconds**, a part of one counting as one: `millis(1500)` is two.
+  An `idle` or `interval` of zero or less, or a `count` less than one, traps where the options are
+  used; a value past the platform's own limit is its `Err`.
+- **The system may give a buffer of another size than asked**: Linux doubles it and caps it,
+  macOS caps it. `connect` sets the buffer sizes before it connects and a listener before it
+  listens, so a large receive buffer is in place when the connection's window is agreed. A
+  negative size in options, or a size less than one asked of a connection, traps.
+- **`reuseAddress`** (`SO_REUSEADDR`) lets a listener take a port a listener stopped a moment ago
+  still holds, so a server restarts at once; it is on unless turned off. **`reusePort`**
+  (`SO_REUSEPORT`) lets several listeners, in one program or several, bind the same address and
+  port, each of them setting it, the system sharing the connections among them; one that does not
+  set it is refused the port. **`backlog`** is how many connections the system queues before they
+  are accepted, lowered to the platform's own limit where it is larger; less than one traps.
+- Options no socket can be given trap before anything is looked up. A closed or split connection,
+  and a closed listener, answers each option's read and change with an error.
+
+```text
+import avin.net.{KeepAlive, ListenOptions, TcpListener, TcpOptions, TcpStream}
+import avin.time.seconds
+
+main()
+  val fast = TcpOptions(noDelay = true, keepAlive = Some(KeepAlive(idle = seconds(30))))
+  val l = TcpListener.bind("127.0.0.1", 0, ListenOptions(reusePort = true, connections = fast)).ok.get
+  val c = TcpStream.connect("127.0.0.1", l.port(), options = fast).ok.get
+  println(c.noDelay(), c.keepAlive().map(k -> k.map(a -> a.idle)))
+  _ = c.close()
+  _ = l.close()
+```
+
 ### Unix domain sockets
 
 A `UnixStream` and a `UnixListener` connect two programs on one machine by a path in the file system
@@ -2416,8 +2467,9 @@ safe for the collector, as TCP's are.
 | Function | Meaning |
 | --- | --- |
 | `UnixStream.connect(path: string) -> Result[UnixStream, IoError]` | A connection to the program listening at `path`; a path with nothing at it is `NotFound`, and a socket file nobody listens on any more is `ConnectionRefused`. |
-| `UnixListener.bind(path: string) -> Result[UnixListener, IoError]` | Listens at `path`, which must name nothing yet: a path already holding anything is `AlreadyExists`. |
-| `UnixListener.bindReplacing(path: string) -> Result[UnixListener, IoError]` | As `bind`, but a socket file left behind by a program that is gone (a connection to it is refused) is removed first. A live listener's path and anything that is not a socket file is `AlreadyExists` and untouched. |
+| `UnixListener.bind(path: string, backlog = 128) -> Result[UnixListener, IoError]` | Listens at `path`, which must name nothing yet: a path already holding anything is `AlreadyExists`. The system queues up to `backlog` connections, lowered to its own limit; less than one traps. |
+| `UnixListener.bindReplacing(path: string, backlog = 128) -> Result[UnixListener, IoError]` | As `bind`, but a socket file left behind by a program that is gone (a connection to it is refused) is removed first. A live listener's path and anything that is not a socket file is `AlreadyExists` and untouched. |
+| `s.peerCredentials() -> Result[PeerCredentials, IoError]` | Who is at the other end, as the system vouches for it: `data PeerCredentials(user: long, group: long, process: Option[long])`, the ids `process.userId()` and `process.groupId()` answer and the peer's process id, `None` where the system does not say. How a server learns which user of the machine talks to it, with no password; a closed or split connection answers an error. |
 | `l.path() -> string` | The path it listens at. |
 | `l.accept() -> Result[UnixStream, IoError]` | Waits for the next connection. |
 | `l.close() -> Result[unit, IoError]` | Stops listening and answers `Ok`; closing again does nothing. The socket file stays; `fs.remove` or `bindReplacing` clears it. |
@@ -2648,8 +2700,10 @@ main()
 
 | Member | Meaning |
 | --- | --- |
-| `TcpServer.start(host, port, serve: @sendable (TcpStream, TcpServer) -> unit, maxConnections = 1024, timeout = Duration.Zero, failed: @sendable (TcpStream) -> unit = _ -> ()) -> Result[TcpServer, IoError]` | Listens as `TcpListener.bind` does and serves each connection by `serve`, given the connection and the server. |
-| `s.port() -> int` | The port it listens on, the one the platform chose for port 0. |
+| `TcpServer.start(host, port, serve: @sendable (TcpStream, TcpServer) -> unit, maxConnections = 1024, timeout = Duration.Zero, failed: @sendable (TcpStream) -> unit = _ -> (), listen = ListenOptions()) -> Result[TcpServer, IoError]` | Listens as `TcpListener.bind` does with the [options](#socket-options) `listen`, and serves each connection by `serve`, given the connection and the server. |
+| `TcpServer.startUnix(path, serve: @sendable (UnixStream, TcpServer) -> unit, maxConnections = 1024, timeout = Duration.Zero, failed: @sendable (UnixStream) -> unit = _ -> (), backlog = 128, replacing = false) -> Result[TcpServer, IoError]` | Listens at a Unix socket as `UnixListener.bind` does with `backlog`, or `bindReplacing` where `replacing`, and serves each connection as `start` does. The socket file stays once it stops. |
+| `trait Listener[S: ByteStream]: Sendable, io.Close` | What a server accepts from, with `accept() -> Result[S, IoError]`: `TcpListener` is a `Listener[TcpStream]`, `UnixListener` a `Listener[UnixStream]`. |
+| `s.port() -> int` | The port it listens on, the one the platform chose for port 0; zero for a Unix socket's. |
 | `s.connections() -> int` | How many connections it holds now. |
 | `s.isStopping() -> bool` | Whether it has been asked to stop, for code serving a connection to finish early. |
 | `s.idle[T: Sendable](@sendable wait: () -> T) -> Option[T]` | Runs `wait`, a connection's wait for its next piece of work, on a thread of its own; `Some` of its result, or `None` where the server stops first, which cancels `wait`. |
@@ -2713,8 +2767,16 @@ main()
 `http.serve(host, port, handler: Handler, maxConnections = 1024,
 readTimeout = seconds(30), writeTimeout = seconds(30), idleTimeout = seconds(5), maxHeaderBytes =
 16384, maxBodyBytes = 1048576, tls: Option[TlsServer] = None, errors: ErrorPage = plainError,
-date: bool = true, requestTimeout = seconds(60), handshakeTimeout = seconds(10)) ->
-Result[TcpServer, IoError]` listens as `TcpServer.start` does. **Each
+date: bool = true, requestTimeout = seconds(60), handshakeTimeout = seconds(10), listen: ListenOptions
+= http.ServerListen) -> Result[TcpServer, IoError]` listens as `TcpServer.start` does, with the
+[socket options](#socket-options) `listen`. **`http.ServerListen`** is the listener's defaults with
+each connection's `noDelay` on, since a response is written in pieces a client waits on whole, and
+`keepAlive` `Some(KeepAlive())`, so a connection whose client vanished, a stream of events or a
+WebSocket above all, which no idle timeout ends, is found out within two minutes. A server behind a
+proxy on the same machine serves at a Unix socket with **`http.serveUnix(path, handler, …)`**, which
+takes every parameter of `serve` but `host`, `port`, `tls`, `handshakeTimeout` and `listen`, and
+`backlog = 128` and `replacing = false` as `TcpServer.startUnix` does; its requests' `remote` is
+`None`. **Each
 response carries a `Date` header** (RFC 9110 section 6.6.1), the time it is sent as an IMF-fixdate
 (`Sun, 06 Nov 1994 08:49:37 GMT`, as `Instant.toHttpDate()` writes it), on every status: a
 handler's, the server's own `400` or `503`, sized, chunked, closing and event-stream responses

@@ -1,0 +1,102 @@
+// expect: exit 0
+// A listener's options, by what they do: listeners that each set `reusePort` share one port, the
+// connections going to whichever is left, while one that does not set it is refused the port, as is
+// one setting it on a port a listener without it holds; `reuseAddress` off and a backlog of one
+// still listen. `TcpServer.start`'s `listen` options are its listener's and every connection's, and
+// `http.serve` listens with `http.ServerListen` unless given others: its connections send each write
+// at once and are probed once idle, and its port is shared only where its options say so.
+import avin.io.IoError
+import avin.net.{KeepAlive, ListenOptions, TcpListener, TcpOptions, TcpServer, TcpStream}
+import avin.net.http
+import avin.net.http.{Response, ServerRequest}
+import avin.threads.{Channel, spawn}
+
+ok[T](r: Result[T, IoError]) -> T = r match
+  Ok(v) -> v
+  Err(e) -> fail(e.message)
+
+val shared: ListenOptions = ListenOptions(reusePort = true)
+
+// Connects to `port`, where `l` accepts, and says what came across.
+exchange(l: TcpListener, port: int) -> string
+  val accepting = spawn(() ->
+    val s = ok(l.accept())
+    val line = ok(s.readLine())
+    _ = s.close()
+    (l, line))
+  val c = ok(TcpStream.connect("127.0.0.1", port))
+  ok(c.writeText("across\n"))
+  val (_, line) = accepting.join()
+  _ = c.close()
+  line.getOrElse("nothing")
+
+hello(r: ServerRequest) -> Response = Response.text(200, "hello")
+
+main()
+  val a = ok(TcpListener.bind("127.0.0.1", 0, shared))
+  val port = a.port()
+  println("first shares", ok(a.reusePort()), a.options.reusePort)
+  val b = ok(TcpListener.bind("127.0.0.1", port, shared))
+  println("second shares the port", b.port() == port, ok(b.reusePort()))
+  println("one not sharing is refused it", TcpListener.bind("127.0.0.1", port).isErr)
+  ok(a.close())
+  println("the second accepts once the first is gone:", exchange(b, port))
+  ok(b.close())
+
+  val plain = ok(TcpListener.bind("127.0.0.1", 0))
+  println("sharing a port held without it is refused", TcpListener.bind("127.0.0.1", plain.port(), shared).isErr)
+  println("and so is a second plain one", TcpListener.bind("127.0.0.1", plain.port()).isErr)
+  ok(plain.close())
+
+  val strict = ok(TcpListener.bind("127.0.0.1", 0, ListenOptions(reuseAddress = false)))
+  println("without reusing an address:", strict.options.reuseAddress, exchange(strict, strict.port()))
+  ok(strict.close())
+  val narrow = ok(TcpListener.bind("127.0.0.1", 0, ListenOptions(backlog = 1)))
+  println("backlog of one:", narrow.options.backlog, exchange(narrow, narrow.port()))
+  ok(narrow.close())
+  val wide = ok(TcpListener.bind("127.0.0.1", 0, ListenOptions(backlog = int.MaxValue)))
+  println(
+    "the largest backlog, lowered by the system:",
+    wide.options.backlog == int.MaxValue,
+    exchange(wide, wide.port())
+  )
+  ok(wide.close())
+
+  // A server's options are its listener's and every connection's.
+  val seen = Channel[string]()
+  val options = ListenOptions(reusePort = true, connections = TcpOptions(noDelay = true, keepAlive = Some(KeepAlive())))
+  val server = ok(TcpServer.start("127.0.0.1", 0, (s, _) ->
+    val k = ok(s.keepAlive()).map(k -> k.count).getOrElse(0)
+    seen.send(s"no delay ${ok(s.noDelay())}, $k probes"), listen = options))
+  val beside = TcpListener.bind("127.0.0.1", server.port(), shared)
+  println("the server's port is shared", beside.isOk)
+  beside match
+    Ok(l) -> ok(l.close())
+    Err(_) -> ()
+  val client = ok(TcpStream.connect("127.0.0.1", server.port()))
+  println("served with", seen.receive().getOrElse("nothing"))
+  _ = client.close()
+  server.shutdown()
+  val alone = ok(TcpServer.start("127.0.0.1", 0, (s, _) -> seen.send(s"no delay ${ok(s.noDelay())}")))
+  println("a server's port is its own by default", TcpListener.bind("127.0.0.1", alone.port(), shared).isErr)
+  val other = ok(TcpStream.connect("127.0.0.1", alone.port()))
+  println("served with", seen.receive().getOrElse("nothing"))
+  _ = other.close()
+  alone.shutdown()
+
+  // HTTP's own defaults.
+  val d = http.ServerListen
+  println("http:", d.backlog, d.reuseAddress, d.reusePort, d.connections.noDelay)
+  println(d.connections.keepAlive == Some(KeepAlive()), d.connections.sendBuffer, d.connections.receiveBuffer)
+  val web = ok(http.serve("127.0.0.1", 0, hello, date = false))
+  println("http's port is its own", TcpListener.bind("127.0.0.1", web.port(), shared).isErr)
+  println("it answers", http.get(s"http://127.0.0.1:${web.port()}/").map(r -> r.text).getOrElse("nothing"))
+  web.shutdown()
+  val sharing = ok(http.serve("127.0.0.1", 0, hello, date = false, listen = shared))
+  val next = TcpListener.bind("127.0.0.1", sharing.port(), shared)
+  println("http's port shared where its options say", next.isOk)
+  next match
+    Ok(l) -> ok(l.close())
+    Err(_) -> ()
+  println("it answers", http.get(s"http://127.0.0.1:${sharing.port()}/").map(r -> r.text).getOrElse("nothing"))
+  sharing.shutdown()
