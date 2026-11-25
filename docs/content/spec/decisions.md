@@ -10991,6 +10991,79 @@ Settled on the user's delegation 2026-11-11 (built on branch `json-derive`): **J
   - **`matcher(pattern)` is a function value** reading the pattern once. Alternative: a `Glob`
     class; a function value is all a walk filter needs.
 
+- Settled on the user's delegation 2026-11-24 (branch `smtp`): **mail messages in `avin.net.mail`,
+  an SMTP client in `avin.net.smtp`, quoted-printable in `avin.encoding`**
+  ([mail messages](/spec/system-library/#mail-messages), [SMTP](/spec/system-library/#smtp)).
+  - **Two modules under `avin.net`**: the message builder is of use without SMTP (a message
+    written to a file, or handed to another transport) and SMTP is of use with messages written
+    elsewhere (`sendData`), as `avin.net.http`'s forms are beside its client. Alternatives: one
+    module (`avin.net.smtp` holding `Message`), or a top-level `avin.mail` or `avin.mime`, which
+    would add a module beside `avin.net` for a protocol family that lives on the network.
+    Quoted-printable is an encoding of bytes as text, so it joins base64 in `avin.encoding`.
+  - **A `Message` is a `data` type with named, defaulted fields**, rendered by `render()` into a
+    `string` with CR LF line breaks, rather than a builder with setters: a message is a value, and
+    the defaults read as a builder's calls would. `date`, `messageId` and `boundary` are fields so
+    that a rendering can be reproduced (the golden tests rely on it); unset, they are `now()`, a
+    random UUID at the sender's domain (`localhost` for a domain beyond ASCII) and a random UUID's
+    hex. Alternative: a builder, which would add a type for nothing a value cannot say.
+  - **A line break in anything that goes into a header is an `Err`, never stripped or encoded**:
+    header injection is a vulnerability, and an error tells the caller its data is not what it
+    thought. Values that are not printable ASCII are encoded (RFC 2047) rather than refused.
+  - **Encoded-words are always UTF-8 and base64**, the whole value encoded where any of it needs
+    it, each word at most 39 bytes of text (64 characters) and holding whole characters, so a word
+    after `Subject: ` keeps the line within RFC 2047's 76. Alternatives: `Q` encoding, more
+    readable for mostly-Latin text and longer for everything else; encoding only the words that
+    need it, smaller output for a cost in rules about which spaces survive. Text that looks like an
+    encoded-word (`=?`) is encoded too, so a reader cannot be misled.
+  - **A body is `7bit` where it can be, quoted-printable otherwise, never `8bit`**: every message
+    is 7-bit clean, so it goes to any server; the only bytes beyond ASCII ever written are those
+    of an address beyond ASCII, which needs SMTPUTF8 anyway. A body is `7bit` where it is ASCII
+    without NUL, its lines at most 998, and it holds no `=_`, the boundaries' prefix, which
+    quoted-printable and base64 can never write — so no content can hold a boundary. Alternative:
+    `8bit` with 8BITMIME, saving a third on non-Latin text and needing two renderings.
+  - **The structure is the common one**: `multipart/alternative` (plain first, as RFC 2046 orders
+    by increasing faithfulness), wrapped with inline parts in `multipart/related`, wrapped with
+    attachments in `multipart/mixed`; no body at all is an empty `text/plain`.
+  - **Filenames are RFC 2231 where not short printable ASCII**, with numbered sections for long
+    ones, in both `Content-Type`'s `name` and `Content-Disposition`'s `filename`. Alternative: RFC
+    2047 words in a quoted `filename`, which RFC 2047 forbids but many senders write.
+  - **`decodeHeaderValue` decodes `B` and `Q` words in UTF-8, US-ASCII and ISO-8859-1** and keeps
+    any other word as it is, as RFC 2047 says; it is there to read back what is written and the
+    commonest of what others write. Review with the user: whether a fuller reader of messages
+    (parsing a whole message, more character sets) belongs in the library.
+  - **Security is `StartTls` by default, and a server not offering it is an error**; there is no
+    opportunistic mode that falls back to the clear, since a network attacker strips STARTTLS from
+    `EHLO`'s reply. `ImplicitTls` is port 465's; `Unencrypted`, by name, port 25's to a local relay.
+    Bytes after the `220` to STARTTLS are a `Protocol` error (the response-injection attack). A
+    password goes only over TLS unless `authWithoutTls`.
+  - **AUTH PLAIN, else LOGIN**, the mechanism asked for winning; PLAIN with its initial response,
+    and the empty `334` prompt of a server that takes none answered. Alternatives weighed: CRAM-MD5
+    and SCRAM, which no common submission server needs over TLS, and XOAUTH2, which needs a token
+    flow outside the library. Review with the user: whether XOAUTH2 (a bearer token in place of a
+    password) is wanted for the big mail providers.
+  - **Every line break in the data is sent CR LF**, a lone CR or LF included, and dot-stuffed, so a
+    message cannot end its data early with `\n.\n` or `\r\n.\r` (the SMTP smuggling attack); a line
+    over 998 bytes is an error rather than being broken, since breaking it would change the
+    message.
+  - **One recipient refused refuses the message**, the transaction reset with `RSET`: for the mail a
+    program sends, a partial delivery is a failure the program should see. Alternative: send to the
+    recipients accepted and report the refused, as some clients do. Review with the user: whether a
+    partial-delivery mode is wanted for bulk mail.
+  - **Timeouts**: `connectTimeout` 30 seconds (as `TlsStream.connect`'s on the
+    `tls-handshake-timeout` branch) for the lookup and connection, by `withTimeout`, and for each
+    wait of a TLS handshake; `commandTimeout` 5 minutes and `dataTimeout` 10 minutes, RFC 5321
+    § 4.5.3.2's suggestions, each the whole of a reply's wait from its command, so a server
+    trickling bytes cannot hold a session; zero no limit, negative a trap. Review with the user: a
+    handshake's bound becomes total once `TlsStream.client` takes one.
+  - **Replies are bounded**: a line of at most `maxReplyLine`, 1000 bytes (RFC 5321's 512 doubled,
+    with room for servers that exceed it), and at most `maxReplyLines`, 100, lines; past either is a
+    `Protocol` error. The client reads replies itself, by `read`, so a line never grows past the
+    bound in memory.
+  - **Errors carry the class**: `Rejected(command, Reply)` with the code and RFC 3463's enhanced
+    status, `transient` for 4xx and for transport failures, `permanent` otherwise. A password is
+    never part of an error. No PIPELINING: a session sends a command and waits, which keeps the
+    error for each command exact. Alternative: pipelining MAIL and RCPT, a round trip or two saved.
+
 ## Proposed
 
 - Settled on the user's delegation 2026-11-23 (branch `fs-handle`): **`File` has positioned

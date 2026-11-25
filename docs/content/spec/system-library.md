@@ -1824,6 +1824,8 @@ main()
 | `toBase32Unpadded(x) -> string` | `x` in base32 with no padding. |
 | `toBase32Lower(x) -> string` | `x` in base32 in lower case (`a`–`z`, `2`–`7`) with no padding: sixteen bytes are 26 characters. |
 | `fromBase32(text) -> Result[Vector[byte], DecodeError]` | The bytes base32 spells, in upper, lower or mixed case, padded to a multiple of eight or not padded at all. |
+| `toQuotedPrintable(x) -> string` | `x` in quoted-printable (RFC 2045 § 6.7), for a mail body: a CR LF stays a line break; printable ASCII but `=` is itself, a space or tab too except at a line's end; every other byte, a lone CR or LF included, is `=XX` in capitals; a line is broken by a soft break, `=` CR LF, to at most 76 characters, never inside an `=XX`. |
+| `fromQuotedPrintable(text) -> Result[Vector[byte], DecodeError]` | The bytes quoted-printable spells, as RFC 2045 says to read it: `=XX` in either case, `=` and optional spaces before a line break or the end as a soft break, spaces and tabs before a line break or the end dropped. An `=` followed by anything else is `BadCharacter` at the `=`, one with a single digit before the end `Truncated`. |
 
 Encoding never fails, and the empty input encodes as the empty text and decodes back from it.
 
@@ -1835,7 +1837,9 @@ bytes, which matters for a token or a signature carried as text. Text wrapped ac
 line breaks taken out before it is decoded. `fromBase32` is as strict, except that a digit's case
 carries no bits, so either case is read, and the `=` padding is optional: a padded text must be padded
 to a multiple of eight with the right number of `=`, and an unpadded one must end on a whole number of
-bytes (2, 4, 5 or 7 digits past a multiple of eight, not 1, 3 or 6).
+bytes (2, 4, 5 or 7 digits past a multiple of eight, not 1, 3 or 6). Quoted-printable is the
+exception: RFC 2045 has a reader drop the spaces a mail relay may add at a line's end, so its decoder
+is as lenient as the RFC asks and no more.
 
 **A refusal is a `DecodeError`**, an `Error` whose `at` is a byte offset in the text. The checks run
 in order, the characters first, then the padding, the length and the unused bits, so the offset
@@ -2874,6 +2878,144 @@ keeping the request's TLS settings. TLS lives in the Sysl package `openssl`, whi
 names in `library/library.hocon`, its own `sysl-dependencies`; a program's shims depend on it only
 where a binding the program compiles reaches it, which `avin.net.http` and `avin.net.tls` do and
 `avin.net` alone does not ([proposed](/spec/decisions/#proposed)).
+
+### Mail messages
+
+`avin.net.mail` writes a mail message as RFC 5322 and MIME (RFC 2045 to 2049) define it, ready for
+[SMTP](#smtp) to send. A `Message` is data: who it is from and to, a subject, a plain-text body, an
+HTML one or both, attachments and further headers; `render()` writes it, or says why it cannot.
+
+```text run
+import avin.net.mail.{Attachment, MailError, Mailbox, Message, decodeHeaderValue}
+
+main() -> Result[unit, MailError]
+  val m = Message(
+    Mailbox("ada@example.com", "Ada Lovelace"),
+    to = [Mailbox("charles@example.com", "Charles Babbage")],
+    bcc = [Mailbox("archive@example.com")],
+    subject = "Notes on the engine — draft",
+    text = Some("The notes are attached.\n"),
+    html = Some("<p>The notes are <b>attached</b>.</p>\n"),
+    attachments = [Attachment("notes.txt", "text/plain; charset=utf-8", "Note G\n".bytes)]
+  )
+  val lines = m.render()?.split("\r\n")
+  for line in lines
+    if line.startsWith("From:") || line.startsWith("To:") || line.startsWith("Subject:") then println(line)
+  println(decodeHeaderValue(lines.find(l -> l.startsWith("Subject:")).getOrElse("").drop(9)))
+  println(s"recipients: ${m.recipients}, Bcc written: ${lines.exists(l -> l.startsWith("Bcc"))}")
+  Ok(())
+```
+
+```text output
+From: Ada Lovelace <ada@example.com>
+To: Charles Babbage <charles@example.com>
+Subject: =?UTF-8?B?Tm90ZXMgb24gdGhlIGVuZ2luZSDigJQgZHJhZnQ=?=
+Notes on the engine — draft
+recipients: [charles@example.com, archive@example.com], Bcc written: false
+```
+
+| Member | Meaning |
+| --- | --- |
+| `Mailbox(address, name = "")` | An address and the name a reader sees, written `Ada Lovelace <ada@example.com>`, or the address alone. |
+| `Attachment(filename, contentType, content: Vector[byte], inline = false, contentId = "")` | A file; an inline one is shown in the body, which refers to it as `cid:<contentId>`. `contentType` is `type/subtype`, parameters allowed. |
+| `Message(from, to = [], cc = [], bcc = [], replyTo = [], subject = "", text = None, html = None, attachments = [], headers = [], date = None, messageId = None, boundary = None)` | A message. `headers` are further `(name, value)` pairs, written after the message's own. `date` is `now()` where none is given, `messageId` (without angle brackets) a random one at the sender's domain, `boundary` (1 to 60 of `A–Z a–z 0–9 '()+_,-./:=?`) a random one. |
+| `m.render() -> Result[string, MailError]` | The message as it goes over the wire, every line ending in CR LF and none longer than 998 characters. |
+| `m.recipients -> Vector[string]` | Every address of `to`, `cc` and `bcc`, in that order, each once: the envelope's recipients. |
+| `m.needsUtf8 -> bool` | Whether an address of the message is beyond ASCII, so the server must take SMTPUTF8. |
+| `decodeHeaderValue(value) -> string` | A header's value as a reader sees it: folding removed and RFC 2047 encoded-words (`B` or `Q`; UTF-8, US-ASCII, ISO-8859-1) decoded, space between two words dropped; a word it cannot decode kept as it is. |
+| `mailDate(t: Instant) -> string` | RFC 5322's date in UTC, `Thu, 01 Jan 1970 00:00:00 +0000`. |
+| `checkedAddress(header, address) -> Result[string, MailError]` | The check every address meets: `local@domain` around the last `@`, a local part of at most 64 bytes, at most 254 in all, no space, control character or `<>()",;\`. An address beyond ASCII is kept for SMTPUTF8. |
+
+**How it writes.** The headers come in the order `Date`, `From`, `Reply-To`, `To`, `Cc`, `Subject`,
+`Message-ID`, `MIME-Version: 1.0`, then the caller's; `Bcc` is never written, its addresses being
+recipients alone. A subject, a display name or a caller's value that is printable ASCII is written
+as itself, folded at its spaces before 78 columns; anything else, and text a reader would take for
+an encoded-word, is written as RFC 2047 encoded-words in UTF-8 and base64, each holding whole
+characters and at most 64 characters long. A name of words is written bare, other plain text as a
+quoted string. The body is `text/plain` or `text/html` in UTF-8, `multipart/alternative` of the two
+where both are given (plain first), inline attachments beside it in `multipart/related` and the
+others after it in `multipart/mixed`; with no body at all it is an empty `text/plain`. Line breaks
+in a body (CR LF, CR or LF) are written CR LF; a body is `7bit` where it is ASCII with lines of at
+most 998, and quoted-printable otherwise. An attachment is base64 in lines of 76, and a filename
+that is not short printable ASCII is an RFC 2231 parameter, `filename*=UTF-8''r%C3%A9sum%C3%A9.pdf`,
+in numbered sections where it is long. Each boundary is `=_`, the base and a number, which neither
+quoted-printable nor base64 can hold.
+
+**Nothing can be smuggled into a header.** A CR or LF in anything that would go into a header (a
+subject, a name, an address, a filename, a content type or ID, a message ID, a caller's header name or
+value) is an `Err`, never written: `MailError` is `LineBreak(header)`, `BadAddress(header, address,
+why)` or `BadHeader(header, why)` (a name that is not a field name or is one of the message's own, a
+value with a word too long for 998 columns, a bad content type, ID or boundary); `message` says it in
+words.
+
+Quoted-printable itself is in [`avin.encoding`](#avinencoding): `toQuotedPrintable(bytes)` and
+`fromQuotedPrintable(text)`.
+
+### SMTP
+
+`avin.net.smtp` hands mail to a server by SMTP (RFC 5321), with STARTTLS (RFC 3207), `AUTH PLAIN` and
+`LOGIN` (RFC 4954), `SIZE`, `8BITMIME` and `SMTPUTF8`. An `SmtpClient` says how to reach the server;
+`send` opens a session, sends one message and quits, and `open` gives a session that sends several.
+
+```text
+import avin.net.mail.{Mailbox, Message}
+import avin.net.smtp.{SmtpClient, SmtpError}
+import avin.process
+
+main() -> Result[unit, SmtpError]
+  val client = SmtpClient("smtp.example.com", user = "ada", password = process.env("SMTP_PASSWORD").getOrElse(""))
+  val m = Message(
+    Mailbox("ada@example.com"),
+    to = [Mailbox("charles@example.com")],
+    subject = "Hello",
+    text = Some("Hi.\n")
+  )
+  client.send(m)
+```
+
+| Member | Meaning |
+| --- | --- |
+| `SmtpClient(host, port = 0, security = StartTls, tls = TlsClient(), user = "", password = "", mechanism = None, authWithoutTls = false, helo = "localhost", connectTimeout = seconds(30), commandTimeout = minutes(5), dataTimeout = minutes(10), maxReplyLine = 1000, maxReplyLines = 100)` | How to reach the server. Port zero is the security's own: 587 for `StartTls`, 465 for `ImplicitTls`, 25 for `Unencrypted`. A negative timeout traps. |
+| `client.open() -> Result[SmtpSession, SmtpError]` | Connects, reads the greeting, says `EHLO`, upgrades by STARTTLS (and says `EHLO` again) or speaks TLS from the start, and authenticates where `user` is given. |
+| `client.send(message) -> Result[unit, SmtpError]` | `open`, `send` and `quit`. |
+| `session.send(message) -> Result[unit, SmtpError]` | Renders the message and sends it from its sender to its `recipients`, Bcc included. |
+| `session.sendData(from, recipients, data: Array[byte])` | Sends a message already written; an empty `from` is the null sender `<>`. |
+| `session.reset()`, `session.quit()`, `session.close()` | `RSET`; `QUIT` and then the connection closed whatever the answer; the connection closed without a word. |
+| `session.extensions`, `session.offers(keyword)`, `session.sizeLimit`, `session.encrypted` | What `EHLO` answered (keywords upper case), whether one is offered, `SIZE`'s limit, whether TLS is on. |
+
+**Secure by default.** `StartTls` sends nothing but `EHLO` before upgrading, and a server not
+offering STARTTLS is `Unsupported("STARTTLS")`, never a reason to go on in the clear; bytes the server
+sends after its `220` to STARTTLS are a `Protocol` error, since they would be read as if they came
+over TLS. The certificate is checked for `host` as every [`TlsStream`](#tls) checks it, against the
+machine's authorities and the client's `tls`. Only `Unencrypted`, asked for by name, sends without
+TLS, and a password is never sent without it unless `authWithoutTls` is `true` (`NotSecure`
+otherwise). The mechanism is the one asked for, or `PLAIN` where offered and else `LOGIN`.
+
+**What it sends.** `MAIL FROM` carries `SIZE=` where the server offers SIZE, `BODY=8BITMIME` for data
+beyond ASCII and `SMTPUTF8` for an address beyond it; a message larger than the server's SIZE is
+`TooLarge` before anything is sent, and one needing an extension the server lacks is `Unsupported`.
+Every address is checked as `checkedAddress` checks it, so a CR, LF or `>` can never add a command.
+The data is dot-stuffed (a `.` doubled at the start of a line) and every line break in it, a lone CR
+or LF too, is sent CR LF, so nothing in a message can end its data early; a line longer than 998
+bytes is `Invalid`. One recipient refused refuses the message: the transaction is reset with `RSET`
+and the session can send the next.
+
+**Every wait is bounded, and so is every reply.** Connecting (the lookup with it) must be done within
+`connectTimeout`, and each wait of a TLS handshake too; each reply must have come whole within
+`commandTimeout` of its command, so a server sending a byte at a time cannot hold a session; the
+message's data is sent with each wait within `dataTimeout`, and its reply must come within it.
+Zero takes a limit away. A reply line longer than `maxReplyLine` bytes or a reply of more than
+`maxReplyLines` lines is a `Protocol` error, so a hostile server cannot make the client hold what it
+sends.
+
+`SmtpError` says what went wrong: `Transport(IoError)`, the connection failed, broke, closed or timed
+out (`TimedOut`); `Tls(TlsError)`; `Rejected(command, reply)`, the server refused, with its
+`Reply(code, lines)`, `reply.enhanced` its RFC 3463 status (`5.1.1`) where it gives one;
+`Protocol(text)`; `Unsupported(text)`; `NotSecure`; `TooLarge(size, limit)`; `BadMessage(MailError)`;
+`Invalid(text)`. `e.code` is a refusal's code, `e.transient` is true for a 4xx refusal and for a
+failed connection (beneath TLS too), which may succeed later, and `e.permanent` for everything else, a 5xx above
+all. After a failure of the connection or the protocol, and after a `421`, the session is closed and
+every operation answers an error. A password is never part of an error.
 
 ## Concurrency
 
