@@ -535,12 +535,13 @@ example_directories_split()
     assert(ran > 0)
     assert(ran < program_cases(tc, "examples").len())
 
-/** A program a documentation page shows: the line its fence opens on, its text, and the output the
- * page says it prints. */
+/** A program a documentation page shows: the line its fence opens on, its text, the output the page
+ * says it prints, and whether it is a literate document, a fence whose language is `lavin`. */
 private struct DocProgram
     line: int
     program: string
     output: string
+    literate: bool
 
 /** The programs a page marks, and what is wrong with its marks, one line per problem, or "". */
 private struct DocPrograms
@@ -575,6 +576,12 @@ private fence_kind(info: string) -> string
         if word != "" then first = false
     kind
 
+/** A fence's language, the first word of its info string, or "" when it names none. */
+private fence_language(info: string) -> string
+    for word in info.trim().split(" ")
+        if word != "" then return word
+    ""
+
 /** The programs marked on the page `page`, whose text is `text`: each `run` fence paired with the
  * `output` fence after it. A `run` fence followed by any other fence, or by none, an `output` fence
  * with no `run` fence before it, and a marked fence never closed are problems. */
@@ -583,10 +590,12 @@ private doc_programs(page: string, text: string) -> DocPrograms
     var problems = ""
     var marker = ""
     var kind = ""
+    var literate = false
     var body = ""
     var opened = 0
     var waiting = false
     var program = ""
+    var program_literate = false
     var program_line = 0
     var n = 0
     for line in text.split("\n")
@@ -595,17 +604,19 @@ private doc_programs(page: string, text: string) -> DocPrograms
             marker = fence_marker(line)
             if marker != ""
                 kind = fence_kind(line[marker.bytes.len..])
+                literate = fence_language(line[marker.bytes.len..]) == "lavin"
                 body = ""
                 opened = n
         elif closes_fence(line, marker)
             if kind == "output"
-                if waiting then programs.push(DocProgram(program_line, program, body))
+                if waiting then programs.push(DocProgram(program_line, program, body, program_literate))
                 else problems = problems + s"$page:$opened: this `output` fence follows no `run` fence\n"
                 waiting = false
             else
                 if waiting then problems = problems + s"$page:$program_line: this `run` fence has no `output` fence after it\n"
                 waiting = kind == "run"
                 program = body
+                program_literate = literate
                 program_line = opened
             marker = ""
         else body = body + line + "\n"
@@ -631,7 +642,7 @@ private run_doc_page(tc: Toolchain, page: string, text: string, scratch: string)
     var t = tally()
     if found.problems != "" then t = record(t, found.problems)
     for p in found.programs
-        val file = s"$scratch/shown_${p.line}.avin"
+        val file = s"$scratch/shown_${p.line}." + (if p.literate then "lavin" else "avin")
         write_text(file, p.program).unwrap()
         write_text(s"$scratch/shown_${p.line}.out", p.output).unwrap()
         val program = case_at(file)
@@ -653,9 +664,15 @@ docs_programs_run()
     val pages = markdown_pages(tc.root + "/docs/content")
     assert(pages.len() > 0)
     var t = tally()
+    // The Avin Book's pages are counted apart too, so a run says how many of its programs it ran.
+    var book = tally()
     for page in pages
-        t = add_tally(t, run_doc_page(tc, page, read_text(page).unwrap(), scratch))
+        val ran = run_doc_page(tc, page, read_text(page).unwrap(), scratch)
+        t = add_tally(t, ran)
+        if page.starts_with(tc.root + "/docs/content/book/") then book = add_tally(book, ran)
     assert(doc_programs("_index.md", read_text(tc.root + "/docs/content/_index.md").unwrap()).programs.len() > 0)
+    assert(book.passed + book.failed > 0)
+    print(summary("docs, in The Avin Book", book))
     finish("docs", t)
 
 @test("a `run` fence pairs with the `output` fence after it, prose between them, and only the words after the language mark a fence")
@@ -670,6 +687,21 @@ doc_programs_pair()
     assert_eq(found.programs[1].line, 18)
     assert_eq(found.programs[1].program, "main() = ()\n")
     assert_eq(found.programs[1].output, "")
+    assert(!found.programs[0].literate)
+    assert(!found.programs[1].literate)
+
+@test("a `run` fence whose language is `lavin` holds a literate document, and no other word makes one")
+doc_programs_literate()
+    val page = "```lavin run\nProse.\n\n    main() = ()\n```\n```text output\n```\n\n~~~ lavin run\n    main() = ()\n~~~\n```text output\n```\n\n```text run lavin\nmain() = ()\n```\n```lavin output\n```\n\n```lavin\nshown only\n```\n"
+    val found = doc_programs("p.md", page)
+    assert_eq(found.problems, "")
+    assert_eq(found.programs.len(), 3)
+    assert(found.programs[0].literate)
+    assert_eq(found.programs[0].program, "Prose.\n\n    main() = ()\n")
+    assert(found.programs[1].literate)
+    assert_eq(found.programs[1].line, 8)
+    assert(!found.programs[2].literate)
+    assert_eq(found.programs[2].line, 14)
 
 @test("a marked fence inside a longer fence is only shown, and closes at nothing shorter than its opener")
 doc_programs_nested()
@@ -711,6 +743,26 @@ docs_program_failures()
     val unpaired = run_doc_page(tc, "unpaired.md", "```text run\nmain() = ()\n```\n", scratch)
     assert_eq(unpaired.failed, 1)
     assert_eq(unpaired.passed, 0)
+
+@test("a page's `lavin run` fence is built as a literate document: its prose is not compiled, its indented lines are, and a failure names the page and line")
+docs_literate_programs()
+    val tc = repository_toolchain()
+    val scratch = make_temp_dir("avin-docs-lavin").unwrap()
+    defer _ = remove_dir_all(scratch)
+    val document = "# Twice\n\nThe prose is *Markdown*, and never compiled.\n\n    twice(n: int) -> int = 2 * n\n\n    main()\n      val n = twice(21)\n\nA paragraph inside a body ends nothing.\n\n      println(n)\n"
+    val good = run_doc_page(tc, "good.md", "```lavin run\n" + document + "```\n```text output\n42\n```\n", scratch)
+    assert_eq(good.failures, "")
+    assert_eq(good.passed, 1)
+    val as_avin = run_doc_page(tc, "plain.md", "```text run\n" + document + "```\n```text output\n42\n```\n", scratch)
+    assert_eq(as_avin.failed, 1)
+    assert(as_avin.failures.contains("did not compile"))
+    val wrong = run_doc_page(tc, "wrong.md", "Shown:\n\n```lavin run\n" + document + "```\n```text output\n43\n```\n", scratch)
+    assert_eq(wrong.failed, 1)
+    assert(wrong.failures.starts_with("wrong.md:3: the program shown fails:\n"))
+    assert(wrong.failures.contains("standard output was:\n42\n"))
+    val broken = run_doc_page(tc, "broken.md", "```lavin run\nProse.\n\n    main()\n      println(undefinedName)\n```\n```text output\n```\n", scratch)
+    assert_eq(broken.failed, 1)
+    assert(broken.failures.contains("did not compile"))
 
 @test("every example directory under examples with no output beside it builds and links at -O0 and -O2, and is not run, since each opens a window")
 example_packages_build()
