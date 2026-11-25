@@ -11531,6 +11531,29 @@ Settled on the user's delegation 2026-11-11 (built on branch `json-derive`): **J
     expiry are milliseconds, a part of one counting as one. Scans are iterators of `Result`s, a
     failure their last element.
 
+- Settled on the user's delegation 2026-11-24 (branch `uuid-v7`): **`Uuid.v7()` follows RFC 9562
+  section 6.2 method 1: a 12-bit counter in `rand_a`, 62 random bits in `rand_b`.** Each new
+  millisecond starts the counter at a random value below 2048, so 2048 identifiers fit before it
+  carries. The last stamp (48-bit milliseconds above the 12-bit counter, one number) lives in an
+  `Atomic[long]` advanced by compare-and-set: no lock, and a thread that loses a race retries on the
+  new stamp. Identifiers made by one process are strictly increasing and never repeat, from any thread.
+  Alternatives: method 3 (a replaced counter in `rand_a` plus extra counter bits in `rand_b`: more
+  headroom, but the random bits shrink to 50 and the layout is no longer the plain one tools show),
+  method 2 (a fixed-length random counter: the same headroom as 1 with more bookkeeping), and a
+  mutex around the generator (simple, but every identifier in the process queues on it).
+  - **Counter overflow and a clock that stands still or steps back share one rule**: when the clock's
+    millisecond is not above the last stamp, the stamp is incremented, so the counter counts up and an
+    overflowing counter carries into the milliseconds, as the RFC allows. The timestamp bits then run
+    at most a few milliseconds ahead of the clock in a burst, or stay at their last value while the clock
+    is behind, and the sequence stays strictly increasing. Alternatives: waiting for the clock to move
+    (blocks a caller, and for ever across a large step back), refusing (an identifier is wanted, not an
+    error), and drawing a fresh random one on a step back (breaks the order the type promises).
+  - **`UuidGenerator.next(instant)` is the sequence made visible**, so a test can drive a clock it
+    controls; `Uuid.v7()` is a shared generator fed `now()`. **`v7At(instant)` is separate**: it keeps no
+    counter (random bits fill `rand_a`), does not touch the shared sequence, and so is for
+    backfills and tests. An instant outside the 48-bit range is clamped, not trapped.
+    `Nil` and `Max` keep their capitalized names, which the type already had.
+
 ## Proposed
 
 - Settled on the user's delegation 2026-11-24 (branch `fs-content-type`): **`avin.fs` has
