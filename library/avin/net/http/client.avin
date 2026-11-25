@@ -122,6 +122,14 @@ data ClientStats(opened: long, reused: long, idle: int, active: int)
 // `keepAlive = false` keeps no connection: each request writes `Connection: close` and closes its own.
 // A `maxPerHost` or `maxHeaderBytes` less than one, a negative `maxRedirects` or
 // `maxResponseBytes`, or a negative timeout traps.
+//
+// A client with `cookies = Some(jar)` stores every response's `Set-Cookie` headers in `jar`, each
+// redirect's too, and sends each request, each redirect's included, the cookies `jar` holds for its
+// URL, in one `Cookie` header after any the request gives; without a jar no cookie is stored or sent
+// but those the request gives. A client with a `proxy` sends each request by the proxy it names for
+// the URL (see `Proxy`), and keeps the connections it makes through a proxy apart, by proxy and
+// credentials as well as by origin. A `407` from the proxy for an `http` URL is the answer, and for
+// an `https` one, whose `CONNECT` the proxy refuses, it fails the request with `ProxyRefused`.
 class Client(
     val maxPerHost: int = 16,
     val idleTimeout: Duration = seconds(30),
@@ -129,7 +137,9 @@ class Client(
     val maxRedirects: int = 10,
     val maxHeaderBytes: int = 65536,
     val maxResponseBytes: long = 67108864,
-    val keepAlive: bool = true
+    val keepAlive: bool = true,
+    val cookies: Option[CookieJar] = None,
+    val proxy: Proxy = Proxy()
 )
   if maxPerHost < 1 then fail(s"a client of $maxPerHost connections to a host: it is at least one")
   if idleTimeout.isNegative then fail(s"an idle timeout of $idleTimeout: it is at least zero")
@@ -232,11 +242,15 @@ class Client(
     var current = request
     var at = Url.parse(request.url).mapErr(e -> BadUrl(e))?
     var followed = 0
+    val jar = cookies
     while true
       val sent = current
       val from = at
       val more = followed < maxRedirects
-      exchange(sent, from, r -> stepOf(r, sent, from, more, f))? match
+      val asked = jar match
+        Some(j) -> withCookies(sent, from, j)
+        None -> sent
+      exchange(asked, from, r -> stepOf(r, sent, from, more, f, jar))? match
         Answered(v) -> return Ok(v)
         Redirected(next, to) ->
           current = next
@@ -248,7 +262,7 @@ class Client(
   // One request on a connection to its URL's origin, and what `f` makes of its response; sent a
   // second time, on a new connection, where a kept connection turns out to have been closed.
   private exchange[R](request: Request, url: Url, f: (StreamedResponse) -> R) -> Result[R, HttpError]
-    val origin = originOf(url, request.tls)?
+    val origin = originOf(url, request.tls, proxy)?
     attempt(origin, request, url, f, true) match
       Finished(r) -> r
       Again -> attempt(origin, request, url, f, false) match
@@ -261,7 +275,7 @@ class Client(
       Err(e) -> return Finished(Err(e))
     var keep = false
     defer giveBack(c, keep)
-    val head = begin(c, request, url, origin.host, !keepAlive, maxHeaderBytes) match
+    val head = begin(c, request, url, origin, !keepAlive, maxHeaderBytes) match
       Ok(h) -> h
       Err(e) ->
         val repeat = c.uses > 1 && c.received == 0 && !isTimeout(e) && isRepeatable(request.method)
@@ -302,7 +316,7 @@ class Client(
               drop(c)
               return Err(Io(e))
         Room ->
-          return connect(origin, request, start) match
+          return connect(origin, request, start, maxHeaderBytes) match
             Ok(c) ->
               hosts.with(h -> h.made())
               Ok(c)
@@ -488,7 +502,17 @@ private data Attempt[R]
 
 // The response `r` to `request`, sent to `url`, as a redirect to follow where it is one and `more`
 // may be, else what `f` makes of it.
-private stepOf[R](r: StreamedResponse, request: Request, url: Url, more: bool, f: (StreamedResponse) -> R) -> Step[R]
+private stepOf[R](
+    r: StreamedResponse,
+    request: Request,
+    url: Url,
+    more: bool,
+    f: (StreamedResponse) -> R,
+    jar: Option[CookieJar]
+) -> Step[R]
+  jar match
+    Some(j) -> j.receive(url, r.headers)
+    None -> ()
   if more && isRedirect(r.status)
     r.header("Location") match
       Some(location) -> return url.resolve(location.trim) match
@@ -532,6 +556,27 @@ private redirectOf(request: Request, status: int, from: Url, to: Url) -> Request
     request.totalTimeout
   )
 
+// `request` to `url` with the cookies `jar` holds for `url` in its `Cookie` header, after the cookies
+// of any `Cookie` header it has, all in one.
+private withCookies(request: Request, url: Url, jar: CookieJar) -> Request
+  val held = jar.header(url) match
+    Some(h) -> h
+    None -> return request
+  val given = Buffer[string]()
+  for (name, value) in request.headers
+    if name.equalsIgnoreCase("Cookie") && !value.trim.isEmpty then given.addOne(value.trim)
+  given.addOne(held)
+  Request(
+    request.method,
+    request.url,
+    withoutHeader(request.headers, "Cookie") :+ ("Cookie", given.mkString("; ")),
+    request.body,
+    request.timeout,
+    request.tls,
+    request.connectTimeout,
+    request.totalTimeout
+  )
+
 // Whether `a` and `b` have one origin: their scheme, host and port.
 private sameOrigin(a: Url, b: Url) -> bool =
   a.scheme.equalsIgnoreCase(b.scheme)
@@ -550,10 +595,20 @@ private isRepeatable(method: string) -> bool =
 
 // Where a request goes: whether over TLS, the host as the URL names it and as a connection does, the
 // port, the origin as text, and the key its connections are kept under, which for `https` holds the
-// TLS settings too, so a connection is used again only with the settings it was made with.
-private data Origin(secure: bool, host: string, address: string, port: int, text: string, key: string, tls: TlsClient)
+// TLS settings too, so a connection is used again only with the settings it was made with; and the
+// proxy the request goes by, where it goes by one, whose URL and credentials the key holds as well.
+private data Origin(
+    secure: bool,
+    host: string,
+    address: string,
+    port: int,
+    text: string,
+    key: string,
+    tls: TlsClient,
+    via: Option[ProxyRoute]
+)
 
-private originOf(url: Url, tls: TlsClient) -> Result[Origin, HttpError]
+private originOf(url: Url, tls: TlsClient, proxy: Proxy) -> Result[Origin, HttpError]
   val scheme = url.scheme.toLower
   val secure = scheme == "https"
   if !secure && scheme != "http" then return Err(Unsupported(s"the scheme `${url.scheme}`"))
@@ -561,16 +616,26 @@ private originOf(url: Url, tls: TlsClient) -> Result[Origin, HttpError]
   if host.isEmpty then return Err(Unsupported(s"a URL without a host: $url"))
   val port = url.portOrDefault.getOrElse(if secure then 443 else 80)
   val text = s"$scheme://${host.toLower}:$port"
-  val key = if secure then text + "\n" + tls.trusted.mkString("\n") else text
-  Ok(Origin(secure, host, addressOf(host), port, text, key, tls))
+  val direct = if secure then text + "\n" + tls.trusted.mkString("\n") else text
+  val via = proxy.forUrl(url) match
+    Some(p) -> Some(routeOf(p)?)
+    None -> None
+  val key = via match
+    Some(p) -> s"${p.text} ${p.authorization.getOrElse("")}\n$direct"
+    None -> direct
+  Ok(Origin(secure, host, addressOf(host), port, text, key, tls, via))
 
-// A new connection to `origin` for `request`, begun at `start`: the lookup, the connecting and, for
-// `https`, the TLS handshake, together within what is left of the request's `connectTimeout`.
-private connect(origin: Origin, request: Request, start: Duration) -> Result[Conn, HttpError]
+// A new connection to `origin` for `request`, begun at `start`: the lookup, the connecting, for a
+// proxied `https` URL the tunnel, its answer's head at most `headLimit` bytes, and for `https` the TLS
+// handshake, together within what is left of the request's `connectTimeout`.
+private connect(origin: Origin, request: Request, start: Duration, headLimit: int) -> Result[Conn, HttpError]
   val limit = request.connectTimeout
   val left = if limit.isZero then Duration.Zero else limit - (monotonic() - start)
   if !limit.isZero && left <= Duration.Zero then return Err(Io(IoError(TimedOut, "connect to", origin.text)))
-  val tcp = TcpStream.connect(origin.address, origin.port, left).mapErr(e -> Io(e))?
+  val (address, port) = origin.via match
+    Some(p) -> (p.address, p.port)
+    None -> (origin.address, origin.port)
+  val tcp = TcpStream.connect(address, port, left).mapErr(e -> Io(e))?
   request.timeout match
     Some(d) ->
       tcp.setTimeout(d) match
@@ -580,6 +645,14 @@ private connect(origin: Origin, request: Request, start: Duration) -> Result[Con
           return Err(Io(e))
     None -> ()
   if !origin.secure then return Ok(Conn(tcp, origin.key, monotonic()))
+  origin.via match
+    Some(p) ->
+      tunnel(tcp, origin, p, request, start, headLimit) match
+        Ok(_) -> ()
+        Err(e) ->
+          _ = tcp.close()
+          return Err(e)
+    None -> ()
   handshaken(tcp, origin.address, request.tls, start, limit) match
     Ok(s) -> Ok(Conn(s, origin.key, monotonic()))
     Err(e) ->
@@ -591,6 +664,37 @@ private connect(origin: Origin, request: Request, start: Duration) -> Result[Con
 // The host as a connection names it: an IPv6 address without its brackets, its zone's `%25` as `%`.
 private addressOf(host: string) -> string =
   if host.startsWith("[") then host.slice(1, host.byteLength - 1).replace("%25", "%") else host
+
+// A tunnel to `origin` through the proxy `p`, which `tcp` is connected to, for `request`, begun at
+// `start`: `CONNECT` sent with the proxy's credentials, and its answer read, its head at most
+// `headLimit` bytes, within what is left of the request's `connectTimeout` and each read within its
+// `timeout`. A `2xx` opens the tunnel; any other status is `ProxyRefused`, and a byte after a `2xx`
+// head, before the client has spoken, is `Malformed`.
+private tunnel(
+    tcp: TcpStream,
+    origin: Origin,
+    p: ProxyRoute,
+    request: Request,
+    start: Duration,
+    headLimit: int
+) -> Result[unit, HttpError]
+  val each = request.timeout.getOrElse(Duration.Zero)
+  val limit = request.connectTimeout
+  if !limit.isZero
+    val left = limit - (monotonic() - start)
+    if left <= Duration.Zero then return Err(Io(IoError(TimedOut, "connect through the proxy to", origin.text)))
+    tcp.setTimeout(if each.isZero || left < each then left else each).mapErr(e -> Io(e))?
+  val target = s"${origin.host}:${origin.port}"
+  val credentials = p.authorization.map(a -> s"Proxy-Authorization: $a\r\n").getOrElse("")
+  tcp.write(utf8(s"CONNECT $target HTTP/1.1\r\nHost: $target\r\n$credentials\r\n")).mapErr(e -> Io(e))?
+  val c = Conn(tcp, origin.key, monotonic())
+  var head = readHead(c, headLimit)?
+  while 100 <= head.status < 200
+    head = readHead(c, headLimit)?
+  if !(200 <= head.status < 300) then return Err(ProxyRefused(head.status, head.reason))
+  if c.pending then return Err(Malformed("bytes from the proxy after it opened the tunnel"))
+  tcp.setTimeout(each).mapErr(e -> Io(e))?
+  Ok(())
 
 // TLS as the client over `tcp`, a connection to `host` begun at `start` on the monotonic clock, its
 // handshake done within what is left of `limit`; zero is no limit. A `limit` already spent is a
@@ -607,18 +711,20 @@ private handshaken(
   if left <= Duration.Zero then return Err(Transport(IoError(TimedOut, "handshake with", host)))
   TlsStream.client(tcp, host, settings, left)
 
-// The request written on `c`, to `url` on `host`, and the head of its response read, an interim one,
+// The request written on `c`, to `url` at `origin`, and the head of its response read, an interim one,
 // such as `100 Continue`, passed over for the one after it. `closing` asks the server to close the
-// connection after the response.
+// connection after the response. An `http` URL by a proxy is asked of the proxy, with the whole URL as
+// the request's target and the proxy's credentials.
 private begin(
     c: Conn,
     request: Request,
     url: Url,
-    host: string,
+    origin: Origin,
     closing: bool,
     limit: int
 ) -> Result[ResponseHead, HttpError]
-  val head = utf8(requestHead(request, url, host, closing))
+  val toProxy = if origin.secure then None else origin.via
+  val head = utf8(requestHead(request, url, origin.host, closing, toProxy))
   if request.body.length > 0 && request.body.length <= 16384
     val all = Array.fill(head.length + request.body.length, byte(0))
     head.copyTo(all, 0)
@@ -632,13 +738,25 @@ private begin(
     if response.status < 100 || response.status >= 200 || response.status == 101 then return Ok(response)
   fail("unreachable")
 
-// The request line and headers, ending in the empty line.
-private requestHead(request: Request, url: Url, host: string, closing: bool) -> string
+// The request line and headers, ending in the empty line; for a request asked of the proxy `toProxy`,
+// the target is the whole URL and the proxy's credentials, where it has them and the request gives
+// none of its own, are sent.
+private requestHead(request: Request, url: Url, host: string, closing: bool, toProxy: Option[ProxyRoute]) -> string
   val out = StringWriter()
-  val target = (if url.path.isEmpty then "/" else url.path) + url.query.map(q -> "?" + q).getOrElse("")
+  val authority = s"$host${url.port.map(p -> s":$p").getOrElse("")}"
+  val path = (if url.path.isEmpty then "/" else url.path) + url.query.map(q -> "?" + q).getOrElse("")
+  val target = if toProxy.isDefined then s"${url.scheme}://$authority$path" else path
   out.write(s"${request.method} $target HTTP/1.1\r\n")
-  if headerIn(request.headers, "Host").isEmpty
-    out.write(s"Host: $host${url.port.map(p -> s":$p").getOrElse("")}\r\n")
+  if headerIn(request.headers, "Host").isEmpty then out.write(s"Host: $authority\r\n")
+  toProxy match
+    Some(p) ->
+      p.authorization match
+        Some(a) -> if headerIn(
+          request.headers,
+          "Proxy-Authorization"
+        ).isEmpty then out.write(s"Proxy-Authorization: $a\r\n")
+        None -> ()
+    None -> ()
   val sendsLength = request.body.length > 0
     || request.method == "POST"
     || request.method == "PUT"
