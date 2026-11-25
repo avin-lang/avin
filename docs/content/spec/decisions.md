@@ -11041,6 +11041,33 @@ Settled on the user's delegation 2026-11-11 (built on branch `json-derive`): **J
   - **`matcher(pattern)` is a function value** reading the pattern once. Alternative: a `Glob`
     class; a function value is all a walk filter needs.
 
+- Settled on the user's delegation 2026-11-24 (branch `ops-health`): **health routes, a graceful
+  drain and a log reopen on a signal.**
+  - **Checks run at once, each on a thread of its own with its own timeout counted from its start**;
+    a check still running at its time is reported `timed out after Nms` and left to end by itself,
+    since a thread cannot be cancelled from outside. Alternatives: run them one after another (a
+    slow check delays every other and the route's answer by their sum); one timeout for the route
+    (a quick check can be starved by a slow one's allowance).
+  - **The body is plain text, `ok` or `failed`, with the per-check lines only under `?verbose`.** A
+    probe's reason can name hosts and addresses, so the default answer to any caller leaks nothing. Alternatives: JSON (a parser for a supervisor that only reads the status code);
+    always verbose.
+  - **Readiness is an `Atomic[bool]` the program flips, and not ready answers `503` without running
+    the checks**: a draining server should not probe its dependencies for a supervisor that has
+    already been told to go away. Liveness has no checks by default, since a failing dependency must
+    not get a process killed. Alternative: one list of checks for both (restarts a healthy process
+    when a database is down).
+  - **`http.serve` handles no signal; draining is opt-in** (`drain`, `drainOnSignal`). A library
+    that takes `Terminate` by default would change what every existing program does on it. The
+    drain order is not ready, grace (still accepting), stop accepting, in flight finish within a
+    deadline; it answers whether it was clean and does not end the program or close the
+    stragglers' connections, which the caller decides. Alternative: closing the stragglers at the
+    deadline (needs a way to cancel a handler mid-request that the server does not have).
+  - **Log reopen is `Sink.reopen()` plus `reopenOnSignal(sink, sig = Hangup)`**, which runs a
+    watching thread the program stops with the `Reopener`. The file sink's `reopen` forces the open
+    that its periodic look-again makes, so the rotation check is not duplicated. Alternative: the
+    runtime reopening every sink on `Hangup` itself (a hidden global that takes the signal from
+    programs that want it for settings).
+
 ## Proposed
 
 - Settled on the user's delegation 2026-11-23 (branch `fs-handle`): **`File` has positioned

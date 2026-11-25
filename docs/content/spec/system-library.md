@@ -1962,7 +1962,10 @@ stops the program it reports on.
 | `atLevel(level) -> Logger` | The same logger with another threshold, its fields kept. |
 | `level`, `format` | What the logger was made with. |
 | `DefaultLogger` | `Logger()`: `Info` and above, as text, to standard error. |
-| `Sink(write, colours = false)` | A sink calling `write: @sendable (string) -> unit` once a line, the line ending in `\n`; `colours` says it takes colour. |
+| `Sink(write, colours = false, again = () -> ())` | A sink calling `write: @sendable (string) -> unit` once a line, the line ending in `\n`; `colours` says it takes colour; `again` is what `reopen` runs. |
+| `sink.reopen()` | Makes the sink look at where it writes afresh: a file sink opens its file again at once, whatever its `recheck`, making the file where a rotator moved it away; any other sink does nothing. |
+| `reopenOnSignal(sink, sig = signal.Hangup) -> Result[Reopener, IoError]` | Watches `sig` on a thread of its own and `reopen`s `sink` each time it arrives, which is what a log rotator asks for after moving the log. An `Err` for a signal that cannot be watched. While it runs the signal no longer ends the program. |
+| `reopener.stop()` | Stops watching and waits for the thread to end; stopping again does nothing. |
 | `stderrSink()`, `stdoutSink()` | The standard streams, each line in one write, taking colour on a colour terminal. |
 | `fileSink(path, recheck = seconds(1)) -> Result[Sink, IoError]` | Appends to `path`, creating it; an `Err` where it cannot be opened. The file stays open behind a lock, and each line is one write, handed to the platform before the record's call returns. At most once every `recheck` (before every line where it is zero or less) the sink looks at what `path` names, and opens it again where a rotator moved the file away or put another in its place. |
 | `writerSink(target: Mutex[W])` | Any `Writer`, each line written whole under its mutex. |
@@ -2616,6 +2619,51 @@ echoed back) it carries `Access-Control-Allow-Methods`, `-Allow-Headers`, `-Max-
 seconds) and the origin and credentials headers; asking for more, or from an origin not allowed, it
 carries none. `*` together with `credentials`, and a negative `maxAge`, trap where the policy is
 made.
+
+**Health and graceful drain.** `http.health(checks = [], live = [], ready = true, livePath =
+"/livez", readyPath = "/readyz")` answers what a supervisor asks. `http.check(name, probe, timeout =
+seconds(2))` is a named check: `probe` answers `Ok(())` or `Err(reason)` and runs on a thread of its
+own; every check of a route is started at once, each is given its `timeout` counted from its start,
+and one still running by then is reported as timed out and left to end by itself. A probe answers its
+failures as `Err`: a trap in it stops the program, as any thread's does. A `name` that is empty or
+holds a control character, a `timeout` of zero or less, and a path not beginning with `/` trap.
+`health.live(request)` and `health.ready(request)` are handlers, and `health.routes()` the two `GET`
+routes for a `Router`. Liveness runs the `live` checks (none by default: a process that answers is
+alive), readiness the `checks`; each answers `200` where every check passes and `503` otherwise, with
+`Cache-Control: no-store`. The body is plain text: `ok` or `failed`, and with `?verbose` one line a
+check before it, `[+] db ok`, `[-] cache failed: connection refused` or `[-] slow timed out after
+50ms`, a reason cut to one line of at most 200 characters. `health.setReady(false)` makes readiness
+answer `503` at once without running its checks (`[-] ready failed: not ready` in the verbose form),
+and `setReady(true)` undoes it; `ready = false` starts a program not ready; `isReady()` asks.
+
+`http.drain(server, health = None, deadline = seconds(30), grace = Duration.Zero)` stops a server in
+the order a load balancer needs: `health` stops being ready, the server waits `grace` still
+accepting, so the balancer sees it, then stops accepting, and the requests in flight have `deadline`
+to finish. It answers whether every connection had ended by then; where not, the stragglers go on
+running and the caller decides whether to end the program. `http.serve` itself handles no signal.
+`http.drainOnSignal(server, health = None, deadline, grace, signals = [Terminate, Interrupt])`
+watches the signals, waits for one (or for the server to be stopped by other code), then drains,
+answering `Result[bool, IoError]`. While it waits the signals no longer end the program.
+
+```avin
+import avin.net.http
+import avin.net.http.{Response, Route, Router}
+import avin.time.seconds
+
+main()
+  val db = http.check("db", () -> Ok(()))
+  val health = http.health([db])
+  val hello = Route.get("/", _ -> Response.text(200, "hello\n"))
+  val router = Router(hello +: health.routes())
+  http.serve("127.0.0.1", 8080, router.handle) match
+    Ok(server) -> println(http.drainOnSignal(server, Some(health), grace = seconds(5)))
+    Err(e) -> println(e.message)
+```
+
+**Reopening the log.** A file sink opened by `fileSink` follows a log rotator by itself, looking
+again every `recheck`. A rotator that signals the program wants the file reopened at once:
+`log.reopenOnSignal(sink)` does so on every `Hangup`, through `sink.reopen()`, until the `Reopener`
+it answers is stopped.
 
 **Streamed responses.** `Response.stream(status, contentType, write)` answers a response whose body
 `write` writes as it goes, through the `BodyWriter` it is given, each write sent to the client at

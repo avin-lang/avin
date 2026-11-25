@@ -9,6 +9,8 @@ import avin.log
 import avin.log.{Format, Json, Level, Logger, Sink, Text, fileSink, parseLevel, writerSink}
 import avin.net.http
 import avin.net.http.{Response, ServerRequest}
+import avin.process
+import avin.signal
 import avin.threads.{Atomic, Mutex, scope, sleep}
 import avin.time.{Duration, Instant, epochMicros, epochSeconds, millis, seconds}
 
@@ -372,6 +374,86 @@ fileSinkKeepsTheFile()
   logger.info("two")
   assertEq(fs.readText(dir + "/old.log"), Ok(s"$Stamp INFO  one\n$Stamp INFO  two\n"))
   assert(!fs.exists(file))
+  _ = fs.removeDirAll(dir)
+
+@test("reopen makes the sink open its file again at once, whatever its recheck, making a file moved away")
+fileSinkReopen()
+  val dir = fs.createTempDir("avin-log-test").ok.get
+  val file = dir + "/app.log"
+  val sink = fileSink(file, seconds(3600)).ok.get
+  val logger = Logger(sink = sink, clock = fixed)
+  logger.info("one")
+  assert(fs.rename(file, dir + "/old.log").isOk)
+  sink.reopen()
+  assert(fs.exists(file))
+  assertEq(fs.readText(file), Ok(""))
+  logger.info("two")
+  assertEq(fs.readText(dir + "/old.log"), Ok(s"$Stamp INFO  one\n"))
+  assertEq(fs.readText(file), Ok(s"$Stamp INFO  two\n"))
+  // Reopening with the file in place keeps what it holds, and twice does no harm.
+  sink.reopen()
+  sink.reopen()
+  logger.info("three")
+  assertEq(fs.readText(file), Ok(s"$Stamp INFO  two\n$Stamp INFO  three\n"))
+  _ = fs.removeDirAll(dir)
+
+@test("reopen on a sink with no file to open does nothing")
+reopenOtherSinks()
+  val kept = Mutex(Vector.empty[string]())
+  val sink = Sink(line -> kept.update(v -> v :+ line))
+  sink.reopen()
+  Logger(sink = sink, clock = fixed).info("x")
+  sink.reopen()
+  assertEq(kept.get().length, 1)
+  log.stderrSink().reopen()
+  log.stdoutSink().reopen()
+
+@test("a hangup reopens the sink: the log moved away by a rotator is made again, each time one arrives")
+reopenOnHangup()
+  val dir = fs.createTempDir("avin-log-test").ok.get
+  val file = dir + "/app.log"
+  val sink = fileSink(file, seconds(3600)).ok.get
+  val logger = Logger(sink = sink, clock = fixed)
+  val watcher = log.reopenOnSignal(sink).ok.get
+  logger.info("one")
+  for round in 0 ..< 2
+    assert(fs.rename(file, dir + s"/old$round.log").isOk)
+    logger.info(s"into the old file $round")
+    assert(process.signal(process.pid(), signal.Hangup).isOk)
+    var waited = 0
+    while !fs.exists(file) && waited < 100
+      sleep(millis(50))
+      waited += 1
+    assert(fs.exists(file))
+    logger.info(s"into the new file $round")
+  watcher.stop()
+  watcher.stop()
+  assertEq(
+    fs.readText(dir + "/old0.log"),
+    Ok(s"$Stamp INFO  one\n$Stamp INFO  into the old file 0\n")
+  )
+  assertEq(
+    fs.readText(dir + "/old1.log"),
+    Ok(s"$Stamp INFO  into the new file 0\n$Stamp INFO  into the old file 1\n")
+  )
+  assertEq(fs.readText(file), Ok(s"$Stamp INFO  into the new file 1\n"))
+  _ = fs.removeDirAll(dir)
+
+@test("reopenOnSignal watches the signal it is given, and refuses one that cannot be watched")
+reopenOnOtherSignal()
+  val dir = fs.createTempDir("avin-log-test").ok.get
+  val file = dir + "/app.log"
+  val sink = fileSink(file, seconds(3600)).ok.get
+  assert(log.reopenOnSignal(sink, signal.Kill).isErr)
+  val watcher = log.reopenOnSignal(sink, signal.User1).ok.get
+  assert(fs.rename(file, dir + "/old.log").isOk)
+  assert(process.signal(process.pid(), signal.User1).isOk)
+  var waited = 0
+  while !fs.exists(file) && waited < 100
+    sleep(millis(50))
+    waited += 1
+  assert(fs.exists(file))
+  watcher.stop()
   _ = fs.removeDirAll(dir)
 
 @test("the file sink looks again once its recheck has passed, and not before")
