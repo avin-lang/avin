@@ -13387,3 +13387,32 @@ Settled on the user's delegation 2026-11-11 (built on branch `json-derive`): **J
   `=` as an empty-named cookie (6265bis; no server needs it). A cookie jar (domain/path matching,
   expiry, public suffixes) is a later item. Review with the user: strict value octets on `Cookie`
   (a client sending `a=b,c` loses that cookie).
+- Settled on the user's delegation 2026-11-24 (branch `cbor-msgpack`): **`avin.cbor` and
+  `avin.msgpack`** are standard-library modules (not packages, unlike JSON), in pure Avin, with derived
+  encoders and decoders by the same `derive` templates JSON's package uses, so no compiler change was
+  needed. Choices: (1) a tree keeps what was on the wire that a program can tell apart: a float's
+  width (`Half`/`Single`/`Double`), an integer beyond a `long` (`BigUnsigned`/`BigNegative`, holding the
+  64-bit argument, since Avin has no unsigned integers), every map entry in order (a `Dict` of pairs,
+  keys of any type), unknown tags and extensions; an indefinite length is not kept, as it has no
+  meaning beyond framing. (2) Derived encoders write definite lengths by counting the fields to write
+  first (a second walk), so streaming needs no buffering; deterministic output is made by writing and
+  re-reading the bytes as a tree and writing that tree sorted, rather than a second encoder.
+  (3) `real` is written at the shortest float width that holds it exactly, in both modes (the
+  preferred serialization of RFC 8949 section 4.1); a tree's `Double` keeps its width unless
+  `deterministic`. (4) Limits default to depth 128, 1,048,576 items per collection, 16 MiB per string
+  and 64 MiB per document; a declared length is checked against the limit and, where the input is in
+  hand, against what remains, and a streamed reader grows its buffer only by bytes that arrived.
+  (5) `strict` reading is the deterministic encoding as a refusal: shortest forms, no indefinite
+  lengths, shortest floats, one NaN, sorted keys (for a tree and for the text keys of a derived
+  decoder; the keys of a generic map decode are not checked); the default reading accepts every
+  well-formed form, as the RFC requires of a general decoder. (6) A MessagePack timestamp stays an
+  `Ext(-1, bytes)` in the tree, with `Msgpack.timestamp` and `asTimestamp` converting, so an
+  extension of type -1 of a wrong length survives a round trip. (7) `Option[Option[A]]` as `Some(None)`
+  reads back `None`, as in JSON's package; a `null` or `undefined` is `None`. (8) A field's key is
+  written as a text string; a map decoded into a derived type with another key type is an error.
+  Alternatives weighed: one shared `avin.binary` core for both formats (the formats differ in every
+  head; the shared part is a few lines of buffering); a tree of `Vector[byte]` instead of `Array[byte]`
+  (a copy of every string); a separate canonical encoder (a second code path to keep equal to the
+  first); a reader that re-checks sortedness with the encoded bytes of the input (needs the input kept).
+  Review with the user: the `Dict` of pairs (a lookup by key is a scan) against a hash map keyed by
+  the tree, which CBOR's keys of any type make awkward.

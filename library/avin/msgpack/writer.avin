@@ -1,0 +1,231 @@
+module avin.msgpack
+
+import avin.io.ByteWriter
+import avin.io.IoError
+
+// How many bytes the writer holds before it hands them to its sink.
+private val flushAt: int = 65536
+
+// Whether `x` is held exactly by a single-precision float; a NaN is, and writes as the one quiet NaN.
+fitsSingle(x: real) -> bool = x != x || real.fromBits32(x.toBits32) == x
+
+// The bytes `a` and `b` compared as unsigned numbers, the first differing byte deciding and the
+// shorter, if one is a prefix of the other, first.
+compareBytes(a: Array[byte], b: Array[byte]) -> int
+  val n = if a.length < b.length then a.length else b.length
+  var i = 0
+  while i < n
+    val x = int(a(i))
+    val y = int(b(i))
+    if x != y then return if x < y then -1 else 1
+    i += 1
+  if a.length == b.length then 0 elif a.length < b.length then -1 else 1
+
+// Writes MessagePack to a sink a token at a time. Nothing checks that the calls make a document: an
+// array or map is given its length when it begins, and the code calling the writer writes that many
+// elements, or entries of a key and a value each. Integers and lengths always take their shortest
+// form. A writer made with `deterministic` writes a `real` and a tree's floats at their shortest exact
+// width (as every writer does for `real`) and sorts the entries of a map `value` writes by their
+// encoded keys.
+//
+// Bytes are held and handed to the sink 64 KiB at a time; a failure of the sink is kept, ends further
+// writing to it and is the `Err` of `finish`. A writer made by `MsgpackWriter.toBytes` holds
+// everything for `toArray`.
+class MsgpackWriter(private val sink: Option[ByteWriter], val deterministic: bool = false)
+  private val held = Buffer[byte]()
+  private var failure: Option[IoError] = None
+
+  // Everything written so far, by a writer made by `toBytes`.
+  toArray() -> Array[byte] = held.toArray()
+
+  // Hands what is held to the sink and answers the first failure of any write.
+  finish() -> Result[unit, IoError]
+    flush()
+    failure match
+      Some(e) -> Err(e)
+      None -> Ok(())
+
+  private flush()
+    if sink is Some(out) && failure.isEmpty && held.length > 0
+      out.write(held.toArray()) match
+        Err(e) -> failure = Some(e)
+        Ok(_) -> ()
+      held.clear()
+
+  private put(b: int)
+    held.addOne(byte(b & 255))
+
+  private maybeFlush()
+    if sink.isDefined && held.length >= flushAt then flush()
+
+  // `width` bytes of `n`, most significant first.
+  private number(n: long, width: int)
+    for i in 0 ..< width
+      put(int((n >> long((width - 1 - i) * 8)) & 255))
+
+  // An integer in the shortest form that holds it.
+  integer(n: long)
+    if 0 <= n < 128
+      put(int(n))
+    elif 0 <= n < 256
+      put(0xCC)
+      number(n, 1)
+    elif 0 <= n < 65536
+      put(0xCD)
+      number(n, 2)
+    elif 0 <= n < 4294967296
+      put(0xCE)
+      number(n, 4)
+    elif n >= 0
+      put(0xCF)
+      number(n, 8)
+    elif n >= -32
+      put(int(n))
+    elif n >= -128
+      put(0xD0)
+      number(n, 1)
+    elif n >= -32768
+      put(0xD1)
+      number(n, 2)
+    elif n >= -2147483648
+      put(0xD2)
+      number(n, 4)
+    else
+      put(0xD3)
+      number(n, 8)
+    maybeFlush()
+
+  // The integer from 2^63 to 2^64 - 1 whose 64 bits are `bits`.
+  unsigned(bits: long)
+    if bits >= 0
+      integer(bits)
+    else
+      put(0xCF)
+      number(bits, 8)
+      maybeFlush()
+
+  nil() = put(0xC0)
+
+  bool(b: bool) = put(if b then 0xC3 else 0xC2)
+
+  single(x: real)
+    put(0xCA)
+    number(long(x.toBits32), 4)
+    maybeFlush()
+
+  double(x: real)
+    put(0xCB)
+    number(x.toBits, 8)
+    maybeFlush()
+
+  // A float at the shortest width that holds it exactly: a single or a double.
+  float(x: real) = if fitsSingle(x) then single(if x != x then real.fromBits32(0x7FC00000) else x) else double(x)
+
+  textString(value: string)
+    val n = value.byteLength
+    if n < 32
+      put(0xA0 | n)
+    elif n < 256
+      put(0xD9)
+      number(long(n), 1)
+    elif n < 65536
+      put(0xDA)
+      number(long(n), 2)
+    else
+      put(0xDB)
+      number(long(n), 4)
+    for b in value.utf8
+      held.addOne(b)
+    maybeFlush()
+
+  binary(value: Array[byte])
+    val n = value.length
+    if n < 256
+      put(0xC4)
+      number(long(n), 1)
+    elif n < 65536
+      put(0xC5)
+      number(long(n), 2)
+    else
+      put(0xC6)
+      number(long(n), 4)
+    for b in value
+      held.addOne(b)
+    maybeFlush()
+
+  // The head of an array of `length` elements.
+  beginArray(length: int)
+    if length < 16
+      put(0x90 | length)
+    elif length < 65536
+      put(0xDC)
+      number(long(length), 2)
+    else
+      put(0xDD)
+      number(long(length), 4)
+
+  // The head of a map of `length` entries.
+  beginMap(length: int)
+    if length < 16
+      put(0x80 | length)
+    elif length < 65536
+      put(0xDE)
+      number(long(length), 2)
+    else
+      put(0xDF)
+      number(long(length), 4)
+
+  // An extension of type `kind`, -128..127, holding `data`.
+  ext(kind: int, data: Array[byte])
+    if !(-128 <= kind <= 127) then fail(s"$kind is not an extension type")
+    val n = data.length
+    if n == 1 || n == 2 || n == 4 || n == 8 || n == 16
+      put(if n == 1 then 0xD4 elif n == 2 then 0xD5 elif n == 4 then 0xD6 elif n == 8 then 0xD7 else 0xD8)
+    elif n < 256
+      put(0xC7)
+      number(long(n), 1)
+    elif n < 65536
+      put(0xC8)
+      number(long(n), 2)
+    else
+      put(0xC9)
+      number(long(n), 4)
+    put(kind)
+    for b in data
+      held.addOne(b)
+    maybeFlush()
+
+  // A whole tree. The widths of its floats are kept unless the writer is deterministic, which also
+  // sorts every map's entries by their encoded keys.
+  value(v: Msgpack)
+    v match
+      Nil -> nil()
+      Bool(b) -> bool(b)
+      Num(n) -> integer(n)
+      BigUint(bits) -> unsigned(bits)
+      Single(x) -> if deterministic then float(x) else single(x)
+      Double(x) -> if deterministic then float(x) else double(x)
+      Str(s) -> textString(s)
+      Bin(b) -> binary(b)
+      Arr(items) ->
+        beginArray(items.length)
+        for item in items
+          value(item)
+      Dict(entries) ->
+        beginMap(entries.length)
+        for (k, x) in (if deterministic then sorted(entries) else entries)
+          value(k)
+          value(x)
+      Ext(kind, data) -> ext(kind, data)
+    maybeFlush()
+
+  private sorted(entries: Vector[(Msgpack, Msgpack)]) -> Vector[(Msgpack, Msgpack)]
+    val keyed = entries.map(e -> (encodeTree(e.0, true), e))
+    keyed.sortWith((a, b) -> compareBytes(a.0, b.0)).map(p -> p.1)
+
+object MsgpackWriter
+  // A writer that keeps everything for `toArray`.
+  toBytes(deterministic: bool = false) -> MsgpackWriter = MsgpackWriter(None, deterministic)
+
+  // A writer to `out`.
+  to(out: ByteWriter, deterministic: bool = false) -> MsgpackWriter = MsgpackWriter(Some(out), deterministic)

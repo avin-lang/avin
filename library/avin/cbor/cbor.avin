@@ -1,0 +1,215 @@
+module avin.cbor
+
+// CBOR (RFC 8949): a binary data format of integers, byte and text strings, arrays, maps, tags, floats
+// and simple values. A value is a `Cbor` tree; bytes are read into one with `parse` and written from
+// one with `encode`; a program's own types go to and from bytes through `derives CborEncoder,
+// CborDecoder`, as in `encode(person)` and `decode[Person](bytes)`. `CborReader` and `CborWriter` do
+// the same a piece at a time over an `avin.io.Reader` and an `avin.io.ByteWriter`.
+//
+// Everything that arrives from outside is checked against `CborOptions`: how deep arrays, maps and
+// tags nest, how many elements a collection holds, how long a string is and how many bytes a document
+// may take altogether. A length that promises more than the input holds is an error before anything
+// is allocated for it.
+
+import avin.encoding.fromHex
+import avin.encoding.toHex
+import avin.io.Reader
+
+// A CBOR value. An integer that fits a `long` is a `Num`; one beyond it, up to 2^64 - 1 above or
+// -2^64 below, is `BigUnsigned` or `BigNegative`, holding the 64-bit argument the encoding carries (the
+// value itself is `bits` as an unsigned number, or -1 minus it). A float keeps the width it was
+// read at: `Half`, `Single` or `Double`. A tag number of 2^63 or more is held as the `long` with the
+// same 64 bits. Simple values other than false, true, null and undefined are `Simple(n)` for `n` in
+// 0..19 or 32..255.
+data Cbor
+  Num(value: long)
+  BigUnsigned(bits: long)
+  BigNegative(bits: long)
+  Bytes(value: Array[byte])
+  Text(value: string)
+  Arr(items: Vector[Cbor])
+  Dict(entries: Vector[(Cbor, Cbor)])
+  Tagged(tag: long, value: Cbor)
+  Simple(value: int)
+  Bool(value: bool)
+  Null
+  Undefined
+  Half(value: real)
+  Single(value: real)
+  Double(value: real)
+
+// One step of the path to a value at fault: a map's text key, or an array's index.
+data PathStep
+  Key(name: string)
+  Index(at: int)
+
+// What is wrong with the bytes, and the offset of the first byte it concerns; a derived decoder adds
+// the path of the value at fault, outermost step first.
+data CborError(message: string, offset: long, path: List[PathStep] = [])
+
+impl CborError
+  // The error with `name`'s key in front of its path.
+  inField(name: string) -> CborError = CborError(message, offset, Key(name) :: path)
+
+  // The error with the element `i` in front of its path.
+  atIndex(i: int) -> CborError = CborError(message, offset, Index(i) :: path)
+
+  // The path written out: keys joined by `.`, an index in brackets, so `items[2].name`.
+  pathText() -> string
+    val out = StringWriter()
+    var first = true
+    for step in path
+      step match
+        Key(name) ->
+          if !first then out.writeChar('.')
+          out.write(name)
+        Index(i) -> out.write(s"[$i]")
+      first = false
+    out.text
+
+impl Error for CborError
+
+impl Display for CborError
+  display(out: Writer, spec: FormatSpec)
+    val place = if path.isEmpty then "" else s"${pathText()}: "
+    out.writeField(s"$place$message at byte $offset", spec)
+
+// The limits on what is read. The defaults suit a server reading a request: a document of up to 64 MiB
+// nested 128 deep, no collection of more than a million elements, no string of more than 16 MiB. With
+// `strict`, the reader accepts only the deterministic encoding of RFC 8949 section 4.2: shortest
+// integer and length forms, shortest floats, definite lengths only, and map keys sorted without
+// repeats (for a tree, and for the text keys a derived decoder reads).
+data CborOptions(
+    maxDepth: int = 128,
+    maxItems: int = 1048576,
+    maxBytes: int = 16777216,
+    maxSize: long = 67108864,
+    strict: bool = false
+)
+
+// The bytes of a document read as a tree, or the first thing wrong with them, with nothing after it.
+parse(bytes: Array[byte], options: CborOptions = CborOptions()) -> Result[Cbor, CborError]
+  val r = CborReader.fromBytes(bytes, options)
+  val value = r.readValue()?
+  r.finish()?
+  Ok(value)
+
+// As `parse(bytes)`, read a piece at a time from `source`.
+parse(source: Reader, options: CborOptions = CborOptions()) -> Result[Cbor, CborError]
+  val r = CborReader.fromReader(source, options)
+  val value = r.readValue()?
+  r.finish()?
+  Ok(value)
+
+// The tree as bytes, as `encode` writes it. Every integer and length takes its shortest form and every array and map is of
+// definite length. With `deterministic`, a float takes the shortest width that holds it exactly and a
+// map's entries are sorted by their encoded keys (RFC 8949 section 4.2.1), so equal trees give equal
+// bytes.
+encodeTree(value: Cbor, deterministic: bool = false) -> Array[byte]
+  val w = CborWriter.toBytes(deterministic)
+  w.value(value)
+  w.toArray()
+
+object Cbor
+  // A tag 0 value: a date and time as RFC 3339 text.
+  dateTime(text: string) -> Cbor = Tagged(0, Text(text))
+
+  // A tag 1 value: seconds since the Unix epoch.
+  epoch(seconds: long) -> Cbor = Tagged(1, Num(seconds))
+
+  // A tag 1 value: seconds and a fraction since the Unix epoch.
+  epochFraction(seconds: real) -> Cbor = Tagged(1, Double(seconds))
+
+  // The integer as a number, or as a tag 2 or 3 bignum where it does not fit a `long`.
+  integer(n: BigInt) -> Cbor
+    if BigInt(-9223372036854775807) - BigInt(1) <= n && n <= BigInt(9223372036854775807)
+      return Num(n.toLong)
+    val negative = n < BigInt(0)
+    val magnitude = if negative then BigInt(-1) - n else n
+    var hex = magnitude.toRadix(16)
+    if hex.byteLength % 2 == 1 then hex = "0" + hex
+    val raw = fromHex(hex).getOrElse(Vector.empty[byte]()).toArray()
+    Tagged(if negative then 3 else 2, Bytes(raw))
+
+impl Cbor
+  asBool -> Option[bool] = self match
+    Bool(b) -> Some(b)
+    _ -> None
+
+  isNull -> bool = self match
+    Null -> true
+    _ -> false
+
+  // The integer, where it fits a `long`.
+  asLong -> Option[long] = self match
+    Num(n) -> Some(n)
+    _ -> None
+
+  // The integer as a `BigInt`: any integer, and a tag 2 or 3 bignum.
+  asInteger -> Option[BigInt] = self match
+    Num(n) -> Some(BigInt(n))
+    BigUnsigned(bits) -> Some(unsignedBig(bits))
+    BigNegative(bits) -> Some(BigInt(-1) - unsignedBig(bits))
+    Tagged(2, Bytes(raw)) -> Some(bigOfBytes(raw))
+    Tagged(3, Bytes(raw)) -> Some(BigInt(-1) - bigOfBytes(raw))
+    _ -> None
+
+  // The number as a `real`: a float, or an integer rounded to the nearest.
+  asReal -> Option[real] = self match
+    Half(x) -> Some(x)
+    Single(x) -> Some(x)
+    Double(x) -> Some(x)
+    Num(n) -> Some(real(n))
+    _ -> None
+
+  asText -> Option[string] = self match
+    Text(s) -> Some(s)
+    _ -> None
+
+  asBytes -> Option[Array[byte]] = self match
+    Bytes(b) -> Some(b)
+    _ -> None
+
+  asVector -> Option[Vector[Cbor]] = self match
+    Arr(items) -> Some(items)
+    _ -> None
+
+  asEntries -> Option[Vector[(Cbor, Cbor)]] = self match
+    Dict(entries) -> Some(entries)
+    _ -> None
+
+  // The value of a map's entry whose key is the text `key`, the last where there are several.
+  get(key: string) -> Option[Cbor] = self match
+    Dict(entries) ->
+      var k = entries.length - 1
+      while k >= 0
+        if entries(k).0 == Text(key) then return Some(entries(k).1)
+        k -= 1
+      None
+    _ -> None
+
+  // An array's element at `index`.
+  get(index: int) -> Option[Cbor] = self match
+    Arr(items) -> if 0 <= index < items.length then Some(items(index)) else None
+    _ -> None
+
+  // The seconds since the Unix epoch of a tag 1 value.
+  asEpoch -> Option[real] = self match
+    Tagged(1, Num(n)) -> Some(real(n))
+    Tagged(1, Half(x)) -> Some(x)
+    Tagged(1, Single(x)) -> Some(x)
+    Tagged(1, Double(x)) -> Some(x)
+    _ -> None
+
+  // The RFC 3339 text of a tag 0 value.
+  asDateTime -> Option[string] = self match
+    Tagged(0, Text(s)) -> Some(s)
+    _ -> None
+
+private unsignedBig(bits: long) -> BigInt
+  if bits >= 0 then return BigInt(bits)
+  BigInt(bits) + BigInt("18446744073709551616")
+
+private bigOfBytes(raw: Array[byte]) -> BigInt
+  if raw.length == 0 then return BigInt(0)
+  BigInt(toHex(raw.toVector), 16)
