@@ -1489,6 +1489,97 @@ skips the rest of that sequence, so the text never starts with a stray byte; byt
 elsewhere become U+FFFD, since a log's last lines are read to be looked at and not to be refused.
 Lines are decoded the same way, a `\r` before the `\n` going with it.
 
+### Memory-mapped files
+
+A mapped file's bytes are read and written where they lie, a page at a time as they are touched,
+rather than read into an array first: mapping a file of any size costs the same few calls, and a byte
+never touched is never read from the device. It suits an index or a table read at scattered offsets,
+a file larger than the memory a program wants to hold, and a record updated in place.
+
+```avin run
+import avin.fs
+import avin.io.IoError
+
+main() -> Result[unit, IoError]
+  val dir = fs.createTempDir("mapped")?
+  val table = dir + "/table"
+  fs.writeText(table, "id=0042 state=new")?
+  val m = fs.mapFileMutable(table)?
+  println(s"${m.length} bytes, state ${string.fromUtf8Lossy(m.slice(14, 17))}")
+  m.writeAt(14, Array(byte(int('o')), byte(int('l')), byte(int('d'))))
+  m(6) = byte(int('3'))
+  m.flush()?
+  m.close()?
+  println(fs.readText(table)?)
+  val ro = fs.mapFile(table)?
+  println(ro(3) == byte(int('0')))
+  ro.close()?
+  fs.removeDirAll(dir)
+```
+
+```text output
+17 bytes, state new
+id=0043 state=old
+true
+```
+
+| Function | Meaning |
+| --- | --- |
+| `mapFile(file) -> Result[MappedBytes, IoError]` | The file mapped read-only. The file is closed before this answers: the mapping does not need it, and keeps the bytes it reads when the file is renamed over or removed. `IsADirectory` for a directory, `NotFound` for a missing file; an empty file is an empty mapping. |
+| `mapFileMutable(file) -> Result[MutableMappedBytes, IoError]` | The file mapped shared and writable over its whole length: a write through the mapping is a write to the file. The file must exist and be readable and writable. |
+| `File.map()`, `File.mapMutable()` | The same for a file already open, what was written through it handed over first. `mapMutable` needs a file open for reading and writing (`openUpdate`, `createUpdate`); any other, and a closed file, is an `Err`. The mapping outlives the file: closing the file takes nothing from it. |
+
+| Method | Meaning |
+| --- | --- |
+| `length -> long`, `isEmpty` | How many bytes are mapped: the file's length when it was mapped. The mapping does not follow the file as it grows; `setLength` it first and map it again. |
+| `m(i) -> byte` | The byte at offset `i`, a `long` or an `int`. An offset outside `0 ..< length` traps. |
+| `m(i) = b` | Writes the byte at offset `i` (writable only), with the same check. |
+| `slice(from, until) -> Array[byte]`, `toArray()` | A **new** array of the bytes from `from` up to `until`, or of them all. Offsets out of order or outside the mapping trap, and so does a range longer than an array holds. |
+| `writeAt(offset, bytes)` | Writes every byte of `bytes` from `offset` on (writable only); a range running past the end traps before any byte is written. |
+| `flush() -> Result[unit, IoError]` | Writes what was written through the mapping to the file and returns once it is there (writable only). `File.syncData` after it asks the device to keep it. |
+| `close()` | Unmaps the bytes; a second `close` does nothing. A mapping is an [`io.Close`](#close). |
+
+**No array shares a mapping's memory.** Bytes leave a mapping only by copy, through `m(i)`, `slice`
+and `toArray`, and enter only by copy, so an array a program keeps never reads memory that has since
+been unmapped. **Every offset is checked** against the length before the mapping is touched.
+
+**A mapping is unmapped by `close` or, if the program forgot, when the collector frees it**, so a
+program that maps a file in a loop and drops each mapping does not run out of address space. A call
+on a closed mapping, other than `close`, traps:
+
+```text
+avin: trap: `MappedBytes` is closed at main.avin:9:11
+```
+
+**A mapping belongs to one thread at a time**, as every handle on a Sysl value does. It is `Sendable`
+and moves to a thread whose body it is given to; the thread that gave it away traps if it uses it
+again before it is handed back. Threads that each read a file map it for themselves.
+
+**What a write promises.** A write through a writable mapping is in the file as far as every other
+reader is concerned at once on the same machine; closing the mapping or ending the program loses
+none of it. Only `flush` says it has reached the file, and `File.syncData` or `fullSync` after it
+that the device keeps it through a power cut. A read-only mapping made before a write through
+another mapping of the same file may or may not show it, as the platform decides; read the file
+again, or map it again, to be sure.
+
+**A file cut shorter while it is mapped** leaves pages of the mapping with nothing behind them. The
+platform answers a touch of such a page of a writable mapping with a bus error rather than an error
+value, so the program stops with a trap that says why, and never writes into memory nothing reads:
+
+```text
+avin: trap: bus error: touched a page with nothing behind it (a mapped file cut short under its mapping)
+```
+
+A read-only mapping is private to the program, and what touching such a page does is the platform's
+choice: Linux answers the same bus error, while macOS may go on answering the bytes the file had.
+Either way no memory of the program's is read or overwritten. A program that maps a file another
+program may truncate, and must see the truncation, reads it with `readAt` instead.
+
+**A mapping counts towards the next collection.** Each holds little of the heap but much address
+space, and one of the system's map entries, until it is unmapped, so every thousand mappings made,
+or every tebibyte mapped, since the last collection brings one on, and the mappings the program
+dropped are unmapped by it.
+
 ## `avin.time`
 
 Clocks, lengths of time, the calendar and time zones, in eight types: `Instant` (a point on the

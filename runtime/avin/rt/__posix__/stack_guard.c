@@ -67,8 +67,8 @@ static void avin_fault(int sig, siginfo_t *info, void *context) {
         /* Avin code raises a bus error in one way only: touching a page of a mapped file that the
          * file no longer reaches, because something cut the file short underneath the mapping. The
          * access cannot be completed or skipped, so it ends the program, but with a reason. */
-        avin_say("avin: trap: bus error: memory with nothing behind it was read or written, as a page"
-                 " of a mapped file past where the file now ends is\n");
+        avin_say("avin: trap: bus error: touched a page with nothing behind it (a mapped file cut short"
+                 " under its mapping)\n");
         alarm(AVIN_FLUSH_SECONDS);
         fflush(NULL);
         __builtin_trap();
