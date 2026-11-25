@@ -11453,6 +11453,17 @@ Settled on the user's delegation 2026-11-11 (built on branch `json-derive`): **J
   needs a way to tell a frame object from any other pointer outside the heap; a deep copy that
   follows by-name fields, which needs the descriptor to say which fields are delayed expressions.
   Review with the user: the nested capture still allocates, and the deep copy would remove that.
+- Settled on the user's delegation 2026-11-24 (branch `fs-ownership`): **`fs.setOwner(file, owner,
+  group)` takes numeric ids as `long` and sets both; `fs.ownerName(file)` names the owner.** Ids
+  outside `0`..`0xffffffff` are an `Err` of kind `Other` before the path is looked at (the
+  platform's "leave unchanged" id of -1 is not offered: a caller passes the id `metadata` reported).
+  A symbolic link is followed, as `setPermissions` does; `setLinkOwner` (lchown) waits on a Sysl
+  binding. Non-superusers get the platform's `PermissionDenied` for another user. `ownerName` is
+  `metadata` then `process.userName`, so it shares its `NotFound` for an id with no entry. Group
+  names are left out: Sysl has no `group_name`, `user_id` or `group_id` lookup yet. Alternatives
+  weighed: `Option[long]` ids for "unchanged" (a second shape for a rare need; `metadata` already
+  gives the current id); a private `user_name` binding in `avin.fs` (a duplicate of
+  `process.userName`).
 
 ## Proposed
 
@@ -13868,7 +13879,6 @@ Settled on the user's delegation 2026-11-11 (built on branch `json-derive`): **J
   though `dir` is not sendable (it was refused), and `Counter().bump`, a receiver that is not
   sendable built on the spot, is refused (it was accepted, since the expression used nothing from
   around it). The error names it as "it carries its receiver, a `Counter`, ...".
-- Settled on the user's delegation 2026-11-24 (branch `fs-ownership`): **`fs.setOwner(file, owner, group)` takes numeric ids as `long` and sets both; `fs.ownerName(file)` names the owner.** Ids outside `0`..`0xffffffff` are an `Err` of kind `Other` before the path is looked at (the platform's "leave unchanged" id of -1 is not offered: a caller passes the id `metadata` reported). A symbolic link is followed, as `setPermissions` does; `setLinkOwner` (lchown) waits on a Sysl binding. Non-superusers get the platform's `PermissionDenied` for another user. `ownerName` is `metadata` then `process.userName`, so it shares its `NotFound` for an id with no entry. Group names are left out: Sysl has no `group_name`, `user_id` or `group_id` lookup yet. Alternatives weighed: `Option[long]` ids for "unchanged" (a second shape for a rare need; `metadata` already gives the current id); a private `user_name` binding in `avin.fs` (a duplicate of `process.userName`).
 - Settled on the user's delegation 2026-11-24 (branch `fs-listing-dirs`): **directory listing with
   paths and kinds, and the well-known directories.** (1) `fs.list(dir, pattern = None, skipInvalid =
   false)` answers `Vector[DirEntry(name, path, kind)]`, sorted as `listDir`; `kind` is the entry's own
