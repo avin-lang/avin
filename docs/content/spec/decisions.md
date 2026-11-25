@@ -13429,3 +13429,26 @@ Settled on the user's delegation 2026-11-11 (built on branch `json-derive`): **J
   sendable built on the spot, is refused (it was accepted, since the expression used nothing from
   around it). The error names it as "it carries its receiver, a `Counter`, ...".
 - Settled on the user's delegation 2026-11-24 (branch `fs-ownership`): **`fs.setOwner(file, owner, group)` takes numeric ids as `long` and sets both; `fs.ownerName(file)` names the owner.** Ids outside `0`..`0xffffffff` are an `Err` of kind `Other` before the path is looked at (the platform's "leave unchanged" id of -1 is not offered: a caller passes the id `metadata` reported). A symbolic link is followed, as `setPermissions` does; `setLinkOwner` (lchown) waits on a Sysl binding. Non-superusers get the platform's `PermissionDenied` for another user. `ownerName` is `metadata` then `process.userName`, so it shares its `NotFound` for an id with no entry. Group names are left out: Sysl has no `group_name`, `user_id` or `group_id` lookup yet. Alternatives weighed: `Option[long]` ids for "unchanged" (a second shape for a rare need; `metadata` already gives the current id); a private `user_name` binding in `avin.fs` (a duplicate of `process.userName`).
+- Settled on the user's delegation 2026-11-24 (branch `fs-listing-dirs`): **directory listing with
+  paths and kinds, and the well-known directories.** (1) `fs.list(dir, pattern = None, skipInvalid =
+  false)` answers `Vector[DirEntry(name, path, kind)]`, sorted as `listDir`; `kind` is the entry's own
+  (an `lstat`, so a link is `Symlink`), which lists a dangling link and never hides a loop; it costs one
+  `lstat` per entry, which is what the directory's own `d_type` would save but sysl does not expose.
+  (2) Laziness is where it is cheap: `fs.entries` reads the names in one `readdir` pass (a directory
+  stream held open across fiber switches would pin a descriptor, and sysl offers no streaming
+  listing) and stats each entry as the iterator reaches it; an entry vanished meanwhile is skipped.
+  (3) A non-UTF-8 name fails the listing by default, as `listDir` and sysl do (a silently missing entry
+  is a wrong answer that looks right: a copy that leaves a file behind); `skipInvalid = true` is the
+  explicit way through a hostile directory. Alternatives weighed: lossy names (a path that no longer
+  names the file), always skip, a byte-string name type (a second path type for the whole library).
+  (4) A vanished entry is skipped by `list`, any other `lstat` error fails it. (5) The pattern is the
+  existing `matches` grammar applied to the name, so hidden names need a literal `.`. (6) The
+  well-known directories live in `avin.process` beside `homeDir` and `currentDir` (they are facts about
+  where the program runs, and `avin.fs` stays about paths): `tempRoot`, `cacheDir`, `configDir`,
+  `dataDir`, `setCurrentDir`. macOS follows its conventions (`~/Library/Caches`, `~/Library/Application
+  Support` for both configuration and data) and ignores XDG; elsewhere an XDG variable counts only when
+  absolute (the freedesktop rule), else the home leaf. They only name a path and make nothing.
+  `tempRoot` is `TMPDIR` if absolute else `/tmp`, taken as written (no trailing-slash trimming). The
+  Windows spellings are not offered since paths are POSIX. (7) `fs.hardLink` and
+  `process.setCurrentDir` are thin bindings; `setCurrentDir` is process-wide, documented as a
+  program's call, never a library's.

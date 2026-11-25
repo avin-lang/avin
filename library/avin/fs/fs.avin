@@ -990,3 +990,110 @@ private syncParent(file: string) -> Result[unit, IoError]
 // UTF-8 makes the whole listing `InvalidUtf8`.
 listDir(dir: string) -> Result[Vector[string], IoError] =
   syslEntries(dir).map(names -> names.sorted).mapErr(failed("list", dir))
+
+@sysl("avin.rt.fs_entry_names", blocking)
+private syslEntryNames(dir: string, skip: bool) -> Result[Vector[string], SyslError]
+
+@sysl("sysl.fs.hard_link")
+private syslHardLink(existing: string, fresh: string) -> Result[unit, SyslError]
+
+// Makes `fresh` a second name for the file `existing`: afterwards both lead to one file, a change
+// through either shows through the other, and `isSameFile` is true of them. `Metadata.links` counts
+// the names. `AlreadyExists` when something is at `fresh`; `PermissionDenied`, or an error of kind
+// `Other`, for a directory and for a `fresh` on another file system.
+hardLink(existing: string, fresh: string) -> Result[unit, IoError] =
+  syslHardLink(existing, fresh).mapErr(failed("link", fresh))
+
+// One entry of a directory listing: its `name` in the directory, its `path` (the directory joined
+// with the name, so it reads wherever the program is), and its `kind`. The kind is the entry's own,
+// as `linkMetadata` reads it: a symbolic link is `Symlink` whatever it points at, so a dangling link
+// is listed, and `isDir` is false for a link to a directory.
+data DirEntry(name: string, path: string, kind: FileKind)
+
+impl DirEntry
+  // Whether it is a directory itself, not a link to one.
+  isDir -> bool = kind match
+    Directory -> true
+    _ -> false
+  // Whether it is a regular file itself, not a link to one.
+  isFile -> bool = kind match
+    Regular -> true
+    _ -> false
+  // Whether it is a symbolic link, dangling or not.
+  isLink -> bool = kind match
+    Symlink -> true
+    _ -> false
+
+// The entry `name` of `dir`, `None` when it was removed after the directory was read.
+private entryOf(dir: string, name: string) -> Result[Option[DirEntry], IoError]
+  val full = syslJoin(dir, name)
+  syslLinkStat(full) match
+    Ok(s) -> Ok(Some(DirEntry(name, full, fileKindOf(s.kindBits()))))
+    Err(NotFound) -> Ok(None)
+    Err(e) -> Err(failed("read metadata of", full)(e))
+
+// The names of `dir` that a listing keeps, sorted by code point: the ones `pattern` fits, when given.
+private listedNames(dir: string, pattern: Option[string], skipInvalid: bool) -> Result[Vector[string], IoError]
+  val names = syslEntryNames(dir, skipInvalid).map(ns -> ns.sorted).mapErr(failed("list", dir))?
+  pattern match
+    Some(p) ->
+      val fits = matcher(p)
+      Ok(names.filter(n -> fits(n)))
+    None -> Ok(names)
+
+// The entries of the directory `dir` with each one's full path and kind, sorted by name by code point
+// (as `listDir` sorts), without `.` and `..` and without what is inside a subdirectory. `pattern`,
+// when given, keeps the entries whose name fits it, as `matches` reads a pattern (`*.avin`,
+// `*.{c,h}`; a name starting with `.` fits only a pattern component starting with a literal `.`).
+// A name that is not UTF-8 is `InvalidUtf8` for the whole listing, as in `listDir`, unless
+// `skipInvalid` is true, which leaves such names out. An entry removed while the listing was being
+// made is left out; any other error reading an entry ends the listing with it.
+list(dir: string, pattern: Option[string] = None, skipInvalid: bool = false) -> Result[Vector[DirEntry], IoError]
+  val names = listedNames(dir, pattern, skipInvalid)?
+  val out = Vector.newBuilder[DirEntry]()
+  for name in names
+    val found = entryOf(dir, name)?
+    found match
+      Some(e) -> out.addOne(e)
+      None -> ()
+  Ok(out.result())
+
+// `list` read as the iterator advances: the names are read from the directory at once, in one pass,
+// and each entry's kind is asked for when the iterator reaches it, so taking the first few entries of
+// a huge directory asks the file system about those few. The same order, `pattern` and `skipInvalid`
+// as `list`. An entry removed before the iterator reaches it is skipped; an error reading one is an
+// `Err` element and the iterator goes on to the next.
+entries(
+    dir: string,
+    pattern: Option[string] = None,
+    skipInvalid: bool = false
+) -> Result[Iterator[Result[DirEntry, IoError]], IoError] =
+  listedNames(dir, pattern, skipInvalid).map(names -> EntryIterator(dir, names))
+
+private class EntryIterator(
+    private val dir: string,
+    private val names: Vector[string]
+): Iterator[Result[DirEntry, IoError]]
+  private var index = 0
+  private var pending: Option[Result[DirEntry, IoError]] = None
+
+  override hasNext() -> bool
+    fill()
+    pending is Some(_)
+
+  override next() -> Result[DirEntry, IoError]
+    fill()
+    pending match
+      Some(r) ->
+        pending = None
+        r
+      None -> fail("next on an exhausted iterator")
+
+  private fill()
+    while pending is None && index < names.length
+      val name = names(index)
+      index += 1
+      entryOf(dir, name) match
+        Ok(Some(e)) -> pending = Some(Ok(e))
+        Ok(None) -> ()
+        Err(e) -> pending = Some(Err(e))

@@ -124,6 +124,26 @@ knows is asked for by name, and a program's own settings are its own values.
 | `environment() -> Map[string, string]` | Every environment variable and its value, read when called. A variable set to nothing is there with `""`. |
 | `currentDir() -> Result[string, IoError]` | The directory relative paths are read from. |
 | `homeDir() -> Option[string]` | The user's home directory, `None` where the platform names none. |
+| `setCurrentDir(dir) -> Result[unit, IoError]` | Makes `dir` the directory relative paths are read from, for the whole program; `NotFound`, `NotADirectory` or `PermissionDenied` leave it as it was. |
+| `tempRoot() -> string` | The directory for temporary files: `TMPDIR` when it is an absolute path, else `/tmp`. |
+| `cacheDir()`, `configDir()`, `dataDir()` `-> Option[string]` | Where the machine keeps a program's cache, settings and data; see below. A path only: nothing is made. |
+
+**Well-known directories follow the platform's convention.** On macOS `cacheDir()` is
+`~/Library/Caches`, and `configDir()` and `dataDir()` are both `~/Library/Application Support`: the
+platform draws no line between settings and data, and the XDG variables are not read. Elsewhere each
+is its freedesktop variable (`XDG_CACHE_HOME`, `XDG_CONFIG_HOME`, `XDG_DATA_HOME`) when that is set
+to an **absolute** path, and otherwise a leaf under the home directory: `~/.cache`, `~/.config`,
+`~/.local/share`. A variable that is empty or relative is ignored, as the specification requires. All
+three are `None` when no home is known and the variable does not answer (`HOME` unset or empty).
+`homeDir` joins its leaf with exactly one `/`. A program adds its own name:
+
+```text
+import avin.fs
+import avin.process
+
+settingsFile() -> Option[string] =
+  process.configDir().map(d -> fs.join([d, "myprogram", "settings.conf"]))
+```
 | `executable() -> Option[string]` | The absolute path of the running program's file, where the platform can tell. |
 | `processors() -> int` | How many processors the program may run on: the number the futures' pool grows to. |
 | `pid() -> long` | The process's identifier. |
@@ -1318,6 +1338,30 @@ listing `InvalidUtf8` rather than leaving that name out.
 ```text
 for name in fs.listDir(dir)?
   if name.endsWith(".txt") then println(name)
+```
+
+**A listing with paths and kinds.** `list(dir, pattern = None, skipInvalid = false)` answers a
+`Vector[DirEntry]`, `DirEntry(name, path, kind)`, sorted by name as `listDir` sorts. `path` is the
+directory joined with the name, and `kind` is the entry's own `FileKind` as `linkMetadata` reads it, so
+a symbolic link is `Symlink` (a dangling one too) and `isDir` is false for a link to a directory;
+`DirEntry` also has `isDir`, `isFile` and `isLink`. `pattern` keeps the entries whose name fits it, as
+`matches` reads a pattern (`*.{c,h}`; a name starting with `.` needs a pattern starting with a literal
+`.`). A name that is not UTF-8 is `InvalidUtf8` for the whole listing, as in `listDir`, unless
+`skipInvalid` is true, which leaves such names out. An entry removed while the listing is made is left
+out; another error reading an entry (a directory that can be read but not entered) is the listing's
+`Err`. `hardLink(existing, fresh)` makes a second name for a file.
+
+`entries(dir, pattern, skipInvalid) -> Result[Iterator[Result[DirEntry, IoError]], IoError]` is the
+lazy form: the names are read at once, in one pass over the directory, and each entry's kind is asked
+for when the iterator reaches it, so taking the first few entries of a huge directory asks the file
+system about those few. An entry removed before the iterator reaches it is skipped, and an error
+reading one is an `Err` element.
+
+```text
+import avin.fs
+
+for entry in fs.list(dir, Some("*.log"))?
+  if entry.isFile then println(entry.path)
 ```
 
 ### Paths
