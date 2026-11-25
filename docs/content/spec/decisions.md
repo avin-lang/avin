@@ -10990,6 +10990,23 @@ Settled on the user's delegation 2026-11-11 (built on branch `json-derive`): **J
     `{src,lib}/**`). Review with the user: overlaps the path-helpers item, which also lists `{a,b}`.
   - **`matcher(pattern)` is a function value** reading the pattern once. Alternative: a `Glob`
     class; a function value is all a walk filter needs.
+- Settled on the user's delegation 2026-11-24 (branch `actor-segv`): **a trap drops the frames of
+  the code that trapped before anything that may wait**, and the context keeps the trap's reason as
+  a root in their place. A trap is no collection point, so a frame there may hold a slot not yet
+  stored to; a collection another thread made while the trap was reported read it, and an actor
+  restarting under load crashed (`actor_router_restart` at `-O2`, killed by a segmentation fault).
+  The thread goes on from the turn's recorded frame where the trap is contained and from none where
+  it stops the program, so the exit hooks run on an empty shadow stack. Alternatives: count every
+  trap, and every call of a function that may trap, as a point where the frame must be consistent,
+  which sets more slots to null on entry in almost every function (overflow checks trap) and costs
+  every call to keep a guarantee only a dead frame needs; and clearing whole frames on entry, which
+  costs more still.
+- Settled on the user's delegation 2026-11-24 (branch `actor-segv`): **whether the program is
+  stopping is a flag only the first thread to stop it sets**, separate from the lock the others
+  wait on. Asking took and gave back that lock, so a thread asking at the moment `main` returned made
+  `main` believe another thread was stopping the program, and the program hung at its end.
+  Alternative: a second lock for asking; a flag read and a compare-and-set are simpler and never
+  wait.
 
 ## Proposed
 
