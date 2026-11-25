@@ -358,7 +358,8 @@ private bound(pattern: Vector[string], segments: Vector[string]) -> Option[Vecto
 // handler; so does one that traps while it streams a response, whose head is already sent. The
 // answers the server makes itself for an error status are rendered by `errors`. Each response
 // carries a `Date` header, the time it is sent as an HTTP-date, unless the handler gave one or `date`
-// is false; the `101` answer of an upgrade carries none.
+// is false; the `101` answer of an upgrade carries none. With `metrics`, the server counts every
+// request it reads, answers or refuses there, a handler's trap among them.
 serve(
     host: string,
     port: int,
@@ -372,7 +373,8 @@ serve(
     tls: Option[TlsServer] = None,
     errors: ErrorPage = plainError,
     date: bool = true,
-    requestTimeout: Duration = seconds(60)
+    requestTimeout: Duration = seconds(60),
+    metrics: Option[ServerMetrics] = None
 ) -> Result[TcpServer, IoError]
   if maxHeaderBytes < 1 then fail(s"a header limit of $maxHeaderBytes bytes: it is at least one")
   if maxBodyBytes < 0 then fail(s"a body limit of $maxBodyBytes bytes: it is at least zero")
@@ -386,22 +388,28 @@ serve(
     maxBodyBytes,
     errors,
     Streaming(),
-    if date then Some(DateHeader()) else None
+    if date then Some(DateHeader()) else None,
+    metrics,
+    Flights()
   )
   tls match
     None -> TcpServer.start(
       host,
       port,
-      (stream, server) -> converse(stream, server, handler, s),
+      (stream, server) -> converse(stream, server, handler, s, stream.hash()),
       maxConnections,
-      failed = stream -> if !s.streaming.release(stream) then refuse(stream, 500, s)
+      failed = stream ->
+        s.flights.abandon(stream.hash())
+        if !s.streaming.release(stream) then refuse(stream, 500, s)
     )
     Some(identity) -> TcpServer.start(
       host,
       port,
       (stream, server) -> secured(stream, server, handler, s, identity),
       maxConnections,
-      failed = stream -> _ = stream.close()
+      failed = stream ->
+        s.flights.abandon(stream.hash())
+        _ = stream.close()
     )
 
 // A connection served over TLS: the handshake, then its requests as `converse` serves them.
@@ -409,13 +417,14 @@ private secured(tcp: TcpStream, server: TcpServer, handler: Handler, s: Settings
   if tcp.setTimeout(s.readTimeout).isErr then return
   TlsStream.server(tcp, identity) match
     Ok(stream) ->
-      converse(stream, server, handler, s, false)
+      converse(stream, server, handler, s, tcp.hash(), false)
       // The conversation is over; a close notice the client never reads changes nothing.
       _ = stream.close()
     Err(_) -> ()
 
 // The limits a server was started with, the error page it renders its own answers by, the
-// connections streaming a response, and the source of its `Date` header where it sends one.
+// connections streaming a response, the source of its `Date` header where it sends one, and the
+// metrics it keeps where it keeps them, with the requests they count as in flight.
 private data Settings(
     readTimeout: Duration,
     writeTimeout: Duration,
@@ -425,8 +434,39 @@ private data Settings(
     maxBodyBytes: int,
     errors: ErrorPage,
     streaming: Streaming,
-    date: Option[DateHeader]
+    date: Option[DateHeader],
+    metrics: Option[ServerMetrics],
+    flights: Flights
 )
+
+// The requests a server's metrics count as in flight, by the hash of their connection, so a handler
+// that traps has its request counted as answering `500` when its connection fails. Two connections
+// sharing a hash only share a list: the one that fails finishes the other's request too, early.
+private class Flights(): Sendable
+  private val held = Mutex(HeldFlights())
+
+  // Holds `f` while the connection `key` answers it.
+  hold(key: long, f: InFlight) = held.with(h -> h.flights = h.flights.updated(key, h.flights.getOrElse(key, Vector.empty[InFlight]()) :+ f))
+
+  // Lets `f` go, answered.
+  release(key: long, f: InFlight) = held.with(h ->
+    h.flights.get(key) match
+      Some(v) ->
+        val rest = v.filter(g -> !(g === f))
+        h.flights = if rest.isEmpty then h.flights.removed(key) else h.flights.updated(key, rest)
+      None -> ())
+
+  // The connection `key` failed: each request it held is counted as answering `500`.
+  abandon(key: long)
+    val left = held.with(h ->
+      val v = h.flights.getOrElse(key, Vector.empty[InFlight]())
+      h.flights = h.flights.removed(key)
+      v)
+    for f in left
+      _ = f.finish(500)
+
+private class HeldFlights()
+  var flights = HashMap.empty[long, Vector[InFlight]]()
 
 // The date a server's responses carry, as the text of a `Date` header: the HTTP-date of the clock's
 // now, formatted once for each second and handed to every connection that asks within it. The latest
@@ -481,8 +521,9 @@ private data Refusal
 
 // One connection's requests, read and answered in turn until it is not kept alive, its peer ends it,
 // or it waits for a request longer than its limit. Where `marks`, a connection streaming a response
-// is held in `s.streaming` while it does.
-private converse(stream: ByteStream, server: TcpServer, handler: Handler, s: Settings, marks: bool = true)
+// is held in `s.streaming` while it does. Where the server keeps metrics, each request read is in
+// flight, held under `key`, until its response is written.
+private converse(stream: ByteStream, server: TcpServer, handler: Handler, s: Settings, key: long, marks: bool = true)
   val input = Incoming(stream)
   var limit = s.readTimeout
   while input.awaits(limit, server)
@@ -492,13 +533,18 @@ private converse(stream: ByteStream, server: TcpServer, handler: Handler, s: Set
       Ok(r) -> r
       Err(Quietly) -> return
       Err(Answer(status)) ->
+        if s.metrics is Some(m) then m.rejected(status)
         refuse(stream, status, s)
         return
+    val flight = s.metrics.map(m -> m.started(request.method))
+    if flight is Some(f) then s.flights.hold(key, f)
     if server.isStopping()
+      landed(flight, key, 503, s)
       refuse(stream, 503, s)
       return
     val response = handler(request)
     if response.upgraded is Some(upgrade)
+      landed(flight, key, 101, s)
       upgradedOut(stream, server, response, upgrade, input.rest(), s, marks)
       return
     val keep = keepsAlive(request) && !server.isStopping() && !asksToClose(response.headers)
@@ -520,7 +566,14 @@ private converse(stream: ByteStream, server: TcpServer, handler: Handler, s: Set
         )
         if marks then _ = s.streaming.release(stream)
         going
+    landed(flight, key, response.status, s)
     if !kept then return
+
+// Counts the request `flight` is, where the server keeps metrics, as answered `status`.
+private landed(flight: Option[InFlight], key: long, status: int, s: Settings)
+  if flight is Some(f)
+    s.flights.release(key, f)
+    _ = f.finish(status)
 
 // Sends the `101` of `response` and hands the connection to `upgrade`, with the bytes the client sent
 // after its request, which were read ahead; the connection is no longer HTTP's, so the server reads

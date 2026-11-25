@@ -1,0 +1,127 @@
+// expect: exit 0
+// stderr: actor numbers vary
+// A server's own metrics, over real connections: requests answered by method and status class,
+// pipelined ones on one connection each counted; a made-up method as `_other`; a streamed response and
+// an upgrade's `101`; the requests refused before any handler (`400`, `408`, `413`, `414`, `431`) by
+// status; a request held by its handler in flight until it is answered; a handler that traps counted
+// as answering `500`, over TCP and over TLS, the gauge back to zero; `started` and `finish` called
+// directly, a second `finish` counting nothing; and the registry served beside the routes it counts,
+// shared with a program's own counter.
+import avin.fs
+import avin.io.IoError
+import avin.metrics.Registry
+import avin.net.{TcpServer, TcpStream}
+import avin.net.http
+import avin.net.http.{Request, Response, Route, Router, ServerMetrics}
+import avin.net.tls.{TlsClient, TlsServer}
+import avin.threads.{Channel, spawn}
+import avin.time
+
+ok[T](r: Result[T, IoError]) -> T = r match
+  Ok(v) -> v
+  Err(e) -> fail(e.message)
+
+// Everything the server sends for `text` until it closes the connection, its status lines only.
+exchange(server: TcpServer, text: string) -> string
+  val c = ok(TcpStream.connect("127.0.0.1", server.port()))
+  ok(c.setTimeout(time.seconds(10)))
+  ok(c.writeText(text))
+  val got = string.fromUtf8Lossy(ok(c.readAll()))
+  _ = c.close()
+  got.split("\r\n").filter(l -> l.startsWith("HTTP/")).mkString(" | ")
+
+// A test certificate or key, from the repository root or from `compiler/`.
+fixture(name: string) -> string
+  val here = "tests/fixtures/tls/" + name
+  ok(fs.readText(if fs.exists(here) then here else "../" + here))
+
+// The lines of `text` whose values do not depend on how long anything took.
+counts(text: string) -> Vector[string] = text.split("\n").filter(l ->
+  !l.startsWith("#") && !l.isEmpty && (!l.contains("_bucket{") || l.contains("+Inf")) && !l.contains("_sum"))
+
+// Says it has the request, then holds it until let go.
+holding(entered: Channel[unit], hold: Channel[unit]) -> Response
+  entered.send(())
+  _ = hold.receive()
+  Response.empty(204)
+
+main()
+  val registry = Registry()
+  val own = registry.counter("app_jobs_total", "Jobs.")
+  own.inc()
+  val sm = ServerMetrics(registry = registry)
+  val hold = Channel[unit](0)
+  val entered = Channel[unit](1)
+  val router = Router(
+    [
+      Route.get("/", _ -> Response.text(200, "home\r\n")),
+      Route.post("/made", _ -> Response.empty(201)),
+      Route.get("/trap", r -> Response.text(200, s"${1 / r.body.length}")),
+      Route.get("/stream", _ -> Response.stream(200, "text/plain", w -> _ = w.write("ab"))),
+      Route.get("/upgrade", _ -> Response.upgrade("h2c", _ -> ())),
+      Route.get("/hold", _ -> holding(entered, hold)),
+      sm.route()
+    ]
+  )
+  val server = ok(
+    http.serve(
+      "127.0.0.1",
+      0,
+      router.handle,
+      maxHeaderBytes = 256,
+      maxBodyBytes = 4,
+      requestTimeout = time.millis(300),
+      metrics = Some(sm)
+    )
+  )
+  println(exchange(server, "GET / HTTP/1.1\r\nHost: t\r\n\r\nGET /missing HTTP/1.1\r\nHost: t\r\nConnection: close\r\n\r\n"))
+  println(exchange(server, "POST /made HTTP/1.1\r\nHost: t\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok"))
+  println(exchange(server, "BREW / HTTP/1.1\r\nHost: t\r\nConnection: close\r\n\r\n"))
+  println(exchange(server, "GET /stream HTTP/1.1\r\nHost: t\r\nConnection: close\r\n\r\n"))
+  println(exchange(server, "GET /upgrade HTTP/1.1\r\nHost: t\r\nUpgrade: h2c\r\nConnection: Upgrade\r\n\r\n"))
+
+  // Refused before any handler: malformed, too slow, a body, a request line and headers too long.
+  println(exchange(server, "NOT HTTP\r\n\r\n"))
+  println(exchange(server, "GET / HTTP/1.1\r\nHost: t\r\n"))
+  println(exchange(server, "POST /made HTTP/1.1\r\nHost: t\r\nContent-Length: 10\r\n\r\n0123456789"))
+  println(exchange(server, s"GET /${"a".repeat(300)} HTTP/1.1\r\nHost: t\r\n\r\n"))
+  println(exchange(server, s"GET / HTTP/1.1\r\nHost: t\r\nX-Long: ${"b".repeat(200)}\r\nX-More: ${"c".repeat(200)}\r\n\r\n"))
+
+  // In flight while the handler holds it.
+  println(sm.inFlight)
+  val held = spawn(() -> exchange(server, "GET /hold HTTP/1.1\r\nHost: t\r\nConnection: close\r\n\r\n"))
+  _ = entered.receive()
+  println(sm.inFlight)
+  hold.send(())
+  println(held.join())
+
+  // A handler that traps: answered 500, counted so, no longer in flight.
+  println(exchange(server, "GET /trap HTTP/1.1\r\nHost: t\r\n\r\n"))
+  println(sm.inFlight)
+
+  // Called directly.
+  val f = sm.started("PROPFIND")
+  println(s"${f.method} ${sm.inFlight} ${f.finish(207)} ${f.finish(500)} ${sm.inFlight}")
+  sm.rejected(400)
+
+  val shown = exchange(server, "GET /metrics HTTP/1.1\r\nHost: t\r\nConnection: close\r\n\r\n")
+  println(shown)
+  server.shutdown()
+  for line in counts(sm.render)
+    println(line)
+
+  // Over TLS, a handler that traps closes its connection, and is counted as answering 500.
+  val identity = TlsServer.of(fixture("localhost.pem"), fixture("localhost.key")) match
+    Ok(s) -> s
+    Err(e) -> fail(e.message)
+  val tlsMetrics = ServerMetrics()
+  val secure = ok(http.serve("127.0.0.1", 0, router.handle, tls = Some(identity), metrics = Some(tlsMetrics)))
+  val client = TlsClient().trust(fixture("ca.pem"))
+  val fine = http.send(Request("GET", s"https://localhost:${secure.port()}/").withTls(client))
+  println(fine.map(r -> r.status).isOk)
+  val trapped = http.send(Request("GET", s"https://localhost:${secure.port()}/trap").withTls(client))
+  println(trapped.isErr)
+  secure.shutdown()
+  println(tlsMetrics.inFlight)
+  for line in counts(tlsMetrics.render)
+    if line.startsWith("http_server_requests_total") then println(line)

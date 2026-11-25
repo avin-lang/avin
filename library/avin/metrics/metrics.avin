@@ -1,0 +1,417 @@
+module avin.metrics
+
+// Metrics a program keeps about itself, for a scraper to read: counters, gauges and histograms, each
+// a family of series told apart by the values of its labels, held by one `Registry` and rendered in
+// the Prometheus text exposition format. A series is found once by its label values and then counted
+// lock-free, so a program that keeps the series it counts often pays one atomic update for each
+// count. Every type here is `Sendable`: one registry serves every thread.
+
+import avin.threads.{Atomic, Mutex}
+import avin.time.Duration
+
+// The type of the Prometheus text exposition format, version 0.0.4, which `Registry.render` writes.
+val TextContentType: string = "text/plain; version=0.0.4; charset=utf-8"
+
+// The most series a family holds unless given another limit; a label set past it is counted in the
+// family's overflow series.
+val defaultMaxSeries: int = 10000
+
+// The value every label of a family's overflow series has.
+val OverflowValue: string = "_overflow"
+
+// The buckets a histogram counts into unless given others, in seconds: from 5 milliseconds to 10.
+val defaultBuckets: Vector[real] = Vector(0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0)
+
+// `count` buckets of the upper bounds `start`, `start + width` and so on. A `count` below one, or a
+// `width` not above zero, traps.
+linearBuckets(start: real, width: real, count: int) -> Vector[real]
+  if count < 1 then fail(s"$count linear buckets: there is at least one")
+  if !(width > 0.0) then fail(s"linear buckets $width wide: each is wider than zero")
+  Vector.tabulate(count, i -> start + width * real(i))
+
+// `count` buckets of the upper bounds `start`, `start * factor` and so on. A `count` below one, a
+// `start` not above zero or a `factor` not above one traps.
+exponentialBuckets(start: real, factor: real, count: int) -> Vector[real]
+  if count < 1 then fail(s"$count exponential buckets: there is at least one")
+  if !(start > 0.0) then fail(s"exponential buckets from $start: the first is above zero")
+  if !(factor > 1.0) then fail(s"exponential buckets growing by $factor: the factor is above one")
+  var bounds = Vector(start)
+  while bounds.length < count
+    bounds = bounds :+ bounds(bounds.length - 1) * factor
+  bounds
+
+// The metrics of a program, or of a part of it: every family made by its `counter`, `gauge`,
+// `gaugeOf` and `histogram`, rendered together by `render` in the order they were made. A name is
+// made at most once in a registry; making it again traps.
+class Registry(): Sendable
+  private val entries = Mutex(Entries())
+
+  // A counter of `name`, described by `help`, its series told apart by `labels`. A name or a label
+  // name that is not one the format allows, a label name given twice, or a `maxSeries` below one,
+  // traps.
+  counter(name: string, help: string, labels: Vector[string] = [], maxSeries: int = defaultMaxSeries) -> Counter
+    val made = Counter(name, help, labels, maxSeries)
+    add(name, () -> made.render)
+    made
+
+  // A gauge of `name`, described by `help`, its series told apart by `labels`, checked as `counter`
+  // checks them.
+  gauge(name: string, help: string, labels: Vector[string] = [], maxSeries: int = defaultMaxSeries) -> Gauge
+    val made = Gauge(name, help, labels, maxSeries)
+    add(name, () -> made.render)
+    made
+
+  // A gauge of `name` with one series, without labels, whose value is `read` when the registry is
+  // rendered: what the program knows at any moment, such as the connections it holds.
+  gaugeOf(name: string, help: string, read: @sendable () -> real)
+    checkName(name)
+    add(name, () -> s"${header(name, help, "gauge")}$name ${number(read())}\n")
+
+  // A histogram of `name`, described by `help`, counting observations into `buckets`, upper bounds in
+  // increasing order, each a finite number, with one past them all for every observation above the
+  // last. Its series are told apart by `labels`, checked as `counter` checks them; `le` is the
+  // format's own and is not one of them. Buckets out of order or not finite trap.
+  histogram(
+      name: string,
+      help: string,
+      labels: Vector[string] = [],
+      buckets: Vector[real] = defaultBuckets,
+      maxSeries: int = defaultMaxSeries
+  ) -> Histogram
+    val made = Histogram(name, help, labels, buckets, maxSeries)
+    add(name, () -> made.render)
+    made
+
+  // The names of the families, in the order they were made.
+  names -> Vector[string] = entries.with(e -> e.made.map(m -> m.0))
+
+  // Every family in the Prometheus text exposition format, in the order they were made: each one's
+  // `# HELP` and `# TYPE` lines and then its series, ordered by their label values.
+  render -> string
+    val each = entries.with(e -> e.made.map(m -> m.1))
+    val out = StringWriter()
+    for r in each
+      out.write(r())
+    out.text
+
+  private add(name: string, render: @sendable () -> string)
+    entries.with(e ->
+      if e.made.exists(m -> m.0 == name) then fail(s"a metric named `$name` is already in the registry")
+      e.made = e.made :+ (name, render))
+
+private class Entries()
+  var made = Vector.empty[(string, @sendable () -> string)]()
+
+// A counter: a family of series, each a number that only goes up, such as requests answered or bytes
+// sent. Its own `inc`, `add` and `value` are those of its one series where it has no labels.
+class Counter(
+    val name: string,
+    val help: string,
+    val labelNames: Vector[string] = [],
+    maxSeries: int = defaultMaxSeries
+): Sendable
+  private val series = Children(name, labelNames, maxSeries, false, () -> CounterSeries())
+
+  // The series of the label values `values`, one for each of `labelNames` in order, made the first
+  // time they are asked for; a program counting often keeps it. Past the family's `maxSeries` a new
+  // label set is the overflow series, each label `OverflowValue`. A count of values other than the
+  // labels' traps.
+  labels(values: string*) -> CounterSeries = series.at(values)
+
+  // Adds one to the series of a counter without labels; a counter with labels traps.
+  inc() = series.only.inc()
+
+  // Adds `amount` to the series of a counter without labels, as `CounterSeries.add` does.
+  add(amount: real) = series.only.add(amount)
+
+  // The value of the series of a counter without labels.
+  value -> real = series.only.value
+
+  // How many series the family holds, its overflow series among them.
+  size -> int = series.size
+
+  // The family in the Prometheus text exposition format, as its registry renders it.
+  render -> string =
+    header(name, help, "counter") + series.render((out, at, s) -> out.write(s"$name$at ${number(s.value)}\n"))
+
+// One series of a counter.
+class CounterSeries(): Sendable
+  private val count = Atomic(0.0)
+
+  // Adds one.
+  inc() = add(1.0)
+
+  // Adds `amount`, which is finite and at least zero; any other traps, since a counter only goes up.
+  add(amount: real)
+    if !(0.0 <= amount <= real.MaxValue) then fail(s"a counter added $amount: it only goes up, by a finite amount")
+    loop
+      val seen = count.load()
+      if count.compareAndSet(seen, seen + amount) then return
+
+  // The total added.
+  value -> real = count.load()
+
+// A gauge: a family of series, each a number that goes up and down, such as requests being answered
+// or bytes held. Its own methods are those of its one series where it has no labels.
+class Gauge(
+    val name: string,
+    val help: string,
+    val labelNames: Vector[string] = [],
+    maxSeries: int = defaultMaxSeries
+): Sendable
+  private val series = Children(name, labelNames, maxSeries, false, () -> GaugeSeries())
+
+  // The series of the label values `values`, as `Counter.labels` finds one.
+  labels(values: string*) -> GaugeSeries = series.at(values)
+
+  // Sets the series of a gauge without labels; a gauge with labels traps, and so do the rest.
+  set(v: real) = series.only.set(v)
+
+  // Adds one.
+  inc() = series.only.add(1.0)
+
+  // Takes one away.
+  dec() = series.only.add(-1.0)
+
+  // Adds `amount`, which may be below zero.
+  add(amount: real) = series.only.add(amount)
+
+  // Takes `amount` away.
+  sub(amount: real) = series.only.add(-amount)
+
+  // The value.
+  value -> real = series.only.value
+
+  // How many series the family holds, its overflow series among them.
+  size -> int = series.size
+
+  // The family in the Prometheus text exposition format, as its registry renders it.
+  render -> string =
+    header(name, help, "gauge") + series.render((out, at, s) -> out.write(s"$name$at ${number(s.value)}\n"))
+
+// One series of a gauge.
+class GaugeSeries(): Sendable
+  private val current = Atomic(0.0)
+
+  // Sets the value to `v`.
+  set(v: real) = current.store(v)
+
+  // Adds one.
+  inc() = add(1.0)
+
+  // Takes one away.
+  dec() = add(-1.0)
+
+  // Adds `amount`, which may be below zero.
+  add(amount: real)
+    loop
+      val seen = current.load()
+      if current.compareAndSet(seen, seen + amount) then return
+
+  // Takes `amount` away.
+  sub(amount: real) = add(-amount)
+
+  // The value.
+  value -> real = current.load()
+
+// A histogram: a family of series, each counting observations, such as the time requests took, into
+// buckets of upper bounds, with their count and sum. Its own methods are those of its one series where
+// it has no labels.
+class Histogram(
+    val name: string,
+    val help: string,
+    val labelNames: Vector[string] = [],
+    val buckets: Vector[real] = defaultBuckets,
+    maxSeries: int = defaultMaxSeries
+): Sendable
+  for i in 0 ..< buckets.length
+    if !buckets(i).isFinite then fail(s"a histogram bucket of ${buckets(i)}: each is finite")
+    if i > 0 && !(buckets(i - 1) < buckets(i)) then
+      fail(s"the histogram buckets ${buckets(i - 1)} and ${buckets(i)}: each is above the one before")
+
+  private val series = Children(name, labelNames, maxSeries, true, seriesOf(buckets))
+
+  // The series of the label values `values`, as `Counter.labels` finds one.
+  labels(values: string*) -> HistogramSeries = series.at(values)
+
+  // Observes `v` in the series of a histogram without labels; a histogram with labels traps.
+  observe(v: real) = series.only.observe(v)
+
+  // Observes `took` in seconds.
+  observe(took: Duration) = series.only.observe(took)
+
+  // How many observations the series of a histogram without labels has counted.
+  count -> long = series.only.count
+
+  // The sum of those observations.
+  sum -> real = series.only.sum
+
+  // How many series the family holds, its overflow series among them.
+  size -> int = series.size
+
+  // The family in the Prometheus text exposition format, as its registry renders it.
+  render -> string
+    val bounds = buckets.map(b -> number(b))
+    header(name, help, "histogram") + series.render((out, at, s) -> histogramLines(out, name, at, bounds, s))
+
+// What makes a histogram's series, each of `bounds`.
+private seriesOf(bounds: Vector[real]) -> @sendable () -> HistogramSeries = () -> HistogramSeries(bounds)
+
+// A histogram series' lines: each bucket's count, cumulative, then `+Inf`, the sum and the count.
+private histogramLines(out: StringWriter, name: string, at: string, bounds: Vector[string], s: HistogramSeries)
+  val counts = s.cumulative
+  val inner = if at.isEmpty then "" else at.slice(1, at.byteLength - 1) + ","
+  for i in 0 ..< bounds.length
+    out.write(s"${name}_bucket{${inner}le=\"${bounds(i)}\"} ${counts(i)}\n")
+  out.write(s"${name}_bucket{${inner}le=\"+Inf\"} ${counts(bounds.length)}\n")
+  out.write(s"${name}_sum$at ${number(s.sum)}\n")
+  out.write(s"${name}_count$at ${counts(bounds.length)}\n")
+
+// One series of a histogram: the observations in each bucket alone, the last past every bound, and
+// their sum. The count is the buckets' total, so a render's `+Inf` bucket and its count always agree.
+class HistogramSeries(private val bounds: Vector[real]): Sendable
+  private val inBucket: Vector[Atomic[long]] = Vector.tabulate(bounds.length + 1, _ -> Atomic(long(0)))
+  private val total = Atomic(0.0)
+
+  // Counts `v` in the first bucket whose bound is at least `v`, past them all where none is, and adds
+  // it to the sum. A `NaN` is counted past them all, and makes the sum `NaN`.
+  observe(v: real)
+    var lo = 0
+    var hi = bounds.length
+    while lo < hi
+      val mid = (lo + hi) / 2
+      if v <= bounds(mid) then hi = mid else lo = mid + 1
+    _ = inBucket(lo).add(1)
+    loop
+      val seen = total.load()
+      if total.compareAndSet(seen, seen + v) then return
+
+  // Observes `took` in seconds; a time below zero counts as it is.
+  observe(took: Duration) = observe(took.toSecondsReal)
+
+  // How many observations have been counted.
+  count -> long
+    var n: long = 0
+    for b in inBucket
+      n += b.load()
+    n
+
+  // The sum of the observations.
+  sum -> real = total.load()
+
+  // How many observations each bucket holds, counting those below it too, one for each bound and then
+  // the count.
+  cumulative -> Vector[long]
+    var below: long = 0
+    inBucket.map(b ->
+      below += b.load()
+      below)
+
+// The series of one family, by their label values: read without a lock, the map being replaced whole
+// under the family's lock when a series is made. Past `maxSeries`, every new label set shares the
+// overflow series, made the first time one is refused.
+private class Children[S: Sendable](
+    private val name: string,
+    private val labelNames: Vector[string],
+    private val maxSeries: int,
+    histogram: bool,
+    private val make: @sendable () -> S
+): Sendable
+  if maxSeries < 1 then fail(s"the metric `$name` holding at most $maxSeries series: it holds at least one")
+  checkName(name)
+  for i in 0 ..< labelNames.length
+    val label = labelNames(i)
+    checkLabel(name, label)
+    if histogram && label == "le" then fail(s"the histogram `$name` labelled `le`: that label is the format's own")
+    if labelNames.slice(0, i).contains(label) then fail(s"the metric `$name` labelled `$label` twice")
+
+  private val solo: Option[S] = if labelNames.isEmpty then Some(make()) else None
+  private val known: Atomic[HashMap[Vector[string], S]] = Atomic(solo match
+    Some(s) -> HashMap.empty[Vector[string], S]().updated([], s)
+    None -> HashMap.empty[Vector[string], S]())
+  private val lock = Mutex(Overflow[S]())
+
+  // The series of `values`, made where it is new and there is room.
+  at(values: Vector[string]) -> S
+    known.load().get(values) match
+      Some(s) -> s
+      None ->
+        if values.length != labelNames.length then
+          fail(s"the metric `$name` given ${values.length} label values for its ${labelNames.length} labels")
+        lock.with(o ->
+          val now = known.load()
+          now.get(values) match
+            Some(s) -> s
+            None ->
+              if now.size < maxSeries
+                val made = make()
+                known.store(now.updated(values, made))
+                made
+              else
+                o.series match
+                  Some(s) -> s
+                  None ->
+                    val made = make()
+                    o.series = Some(made)
+                    made)
+
+  // The one series of a family without labels; one with labels traps.
+  only -> S = solo match
+    Some(s) -> s
+    None -> fail(s"the metric `$name` has labels: its series are found by `labels`")
+
+  // How many series it holds, the overflow series among them.
+  size -> int = known.load().size + lock.with(o -> if o.series.isDefined then 1 else 0)
+
+  // Each series written by `line`, given its labels as written (`{a="x"}`, or nothing for none),
+  // ordered by its label values, the overflow series last.
+  render(line: (StringWriter, string, S) -> unit) -> string
+    val out = StringWriter()
+    val held = known.load().toVector.sortBy(e -> e.0.mkString("\u{0}"))
+    for (values, s) in held
+      line(out, labelled(labelNames, values), s)
+    lock.with(o -> o.series) match
+      Some(s) -> line(out, labelled(labelNames, Vector.fill(labelNames.length, OverflowValue)), s)
+      None -> ()
+    out.text
+
+private class Overflow[S]()
+  var series: Option[S] = None
+
+// The label pairs of a series as the format writes them, `{a="x",b="y"}`, nothing for no labels.
+private labelled(names: Vector[string], values: Vector[string]) -> string
+  if names.isEmpty then return ""
+  val pairs = Vector.tabulate(names.length, i -> s"${names(i)}=\"${escapedValue(values(i))}\"")
+  s"{${pairs.mkString(",")}}"
+
+// A family's `# HELP` and `# TYPE` lines.
+private header(name: string, help: string, kind: string) -> string =
+  s"# HELP $name ${help.replace("\\", "\\\\").replace("\n", "\\n")}\n# TYPE $name $kind\n"
+
+// A label's value with a backslash, a quote and a line end escaped as the format asks.
+private escapedValue(value: string) -> string = value.replace("\\", "\\\\").replace("\"", "\\\"").replace("\n", "\\n")
+
+// A number as the format writes it: `+Inf`, `-Inf` and `NaN` by name, any other in its shortest
+// decimal form, a whole number without a fraction.
+number(v: real) -> string
+  if v.isNaN then return "NaN"
+  if v == real.PositiveInfinity then return "+Inf"
+  if v == real.NegativeInfinity then return "-Inf"
+  v.toString()
+
+// Traps where `name` is not a metric name: a letter, `_` or `:` first, then letters, digits, `_` and
+// `:`.
+private checkName(name: string)
+  if !named(name, true) then fail(s"`$name` is not a metric name: a letter, `_` or `:`, then letters, digits, `_` or `:`")
+
+// Traps where `label` is not a label name: a letter or `_` first, then letters, digits and `_`, and
+// not beginning with `__`, which the format keeps for itself.
+private checkLabel(metric: string, label: string)
+  if !named(label, false) then
+    fail(s"the metric `$metric` labelled `$label`: a label name is a letter or `_`, then letters, digits or `_`")
+  if label.startsWith("__") then fail(s"the metric `$metric` labelled `$label`: names beginning `__` are the format's own")
+
+private named(text: string, colons: bool) -> bool
+  if text.isEmpty then return false
+  val first = text.chars(0)
+  !('0' <= first <= '9') && text.forall(c -> 'a' <= c <= 'z' || 'A' <= c <= 'Z' || '0' <= c <= '9' || c == '_' || colons && c == ':')
