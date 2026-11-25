@@ -1188,10 +1188,10 @@ copyNotes(from: string, to: string) -> Result[unit, IoError]
 | `writeBytes(file, bytes) -> Result[unit, IoError]` | As `writeText`, with bytes. |
 | `appendBytes(file, bytes) -> Result[unit, IoError]` | As `appendText`, with bytes. |
 | `writeText(file, text, createParents = false)`, `writeBytes(file, bytes, createParents = false)` | With `createParents`, the directories above the file that are missing are made first (`createDirAll` of its parent). |
-| `writeTextAtomic(file, text, createParents = false) -> Result[unit, IoError]`, `writeBytesAtomic(file, bytes, createParents = false)` | Writes to a new file beside `file`, syncs it to the device and renames it over `file`: a reader sees the whole old contents or the whole new, and a failure leaves `file` as it was and removes the new file. The new file's name is unique per call and per process. The replacement takes default permissions, not the old file's. |
+| `writeTextAtomic(file, text, createParents = false, mode = 0o666) -> Result[unit, IoError]`, `writeBytesAtomic(file, bytes, createParents = false, mode = 0o666)` | Writes to a new file beside `file`, syncs it to the device, renames it over `file` and syncs the directory, so the new name survives a crash: a reader sees the whole old contents or the whole new, and a failure before the rename leaves `file` as it was and removes the new file (a failed directory sync is an `Err` with the new contents in place). The new file's name is unique per call and per process. The result keeps the exact permission bits of the file it replaces, setuid and bits the umask would take included; where there was none it has `mode`, less the umask. Either way the new file never has more bits than it ends with. |
 | `readLines(file) -> Result[Vector[string], IoError]` | Every line without its terminator. `\n` and `\r\n` both end a line; a last line with no terminator is kept; a final terminator does not start an empty line, so an empty file has no lines and `"\n"` has one empty line. Invalid UTF-8 becomes U+FFFD. |
 | `lines(file) -> Result[Lines, IoError]` | The same lines, lazily: `Lines` is an `Iterator[Result[string, IoError]]` holding one line at a time. The file closes when the iterator gives its last item (a line, or the `Err` that ended it). To stop early, `close()` it (`defer reader.close()`); one forgotten is closed by the collector. |
-| `writeLines(file, lines, createParents = false) -> Result[unit, IoError]` | Writes each line followed by `\n` to a made or emptied file, so the file ends in a newline; an empty collection leaves an empty file. |
+| `writeLines(file, lines, createParents = false, mode = 0o666) -> Result[unit, IoError]` | Writes each line followed by `\n` to a made or emptied file, so the file ends in a newline; an empty collection leaves an empty file. A file it makes has `mode`, as `create` makes one. |
 | `exists(file, followLinks = true) -> bool` | Whether anything, file or directory, is at the path. A dangling link answers `false`; with `followLinks = false` the link itself is asked about, so it answers `true`. |
 | `isDir(file) -> bool` | Whether the path names a directory, one the program may not read included. |
 | `isFile(file) -> bool` | Whether the path names a regular file: not a directory, and not a FIFO, a socket or a device either. |
@@ -1269,7 +1269,17 @@ remembers each directory's `(inode, device)` so a link back up is seen.
 **Permissions** are written as octal literals, `fs.setPermissions(file, 0o600)`, and read back the
 same way: `fs.permissions(file)` is `Ok(0o600)`, and `f"${p}%o"` prints it as `600`. A file the
 library creates asks for `0o666`, which the process umask narrows; rewriting a file with
-`writeText` or `writeBytes` keeps the mode it has, so a file set to `0o600` stays so. Where the
+`writeText` or `writeBytes` keeps the mode it has, so a file set to `0o600` stays so.
+
+**A file can be made with its mode from the start.** `create`, `createUpdate`, `writeLines`,
+`writeTextAtomic` and `writeBytesAtomic` take `mode = 0o666`: a new file has those bits, less the
+umask, from the moment it exists, so a secret written as `fs.writeTextAtomic(token, secret, mode =
+0o600)` is never readable by others, not even between being made and being set. A file already
+there keeps its mode, whatever `mode` asks (an atomic write keeps the replaced file's exact bits). A
+mode outside `0o0` to `0o7777` is an `Err` of kind `Other` before anything is touched: no file is
+made or emptied and no directory is made. `appendText`, `appendBytes`, `append`, `writeText` and
+`writeBytes` take no mode yet. An open file's bits are set with `f.setPermissions(mode)`, which
+changes the file the handle holds even after it is renamed. Where the
 platforms differ the platform decides and the answer says so: macOS refuses the sticky bit on a
 plain file to anyone but the superuser (an `Err`, the mode unchanged), and Linux keeps it.
 
@@ -1448,10 +1458,10 @@ follow(log: string) -> Result[unit, IoError]
 | Function | Meaning |
 | --- | --- |
 | `open(file) -> Result[File, IoError]` | The existing file, for reading, at its start; `IsADirectory` for a directory. |
-| `create(file)` | For writing, made if it is not there and emptied if it is. |
+| `create(file, mode = 0o666)` | For writing, made if it is not there and emptied if it is. A file it makes has the bits `mode`, less the umask, from the moment it exists; one already there keeps its mode. A mode outside `0o0` to `0o7777` is an `Err` that touches nothing. |
 | `append(file)` | For writing, made if it is not there; every write goes to the end, whatever other handles append to the same file. |
 | `openUpdate(file)` | The existing file, for reading and writing, keeping what it holds. |
-| `createUpdate(file)` | For reading and writing, made if it is not there and emptied if it is. |
+| `createUpdate(file, mode = 0o666)` | For reading and writing, made if it is not there and emptied if it is; `mode` as for `create`. |
 | `readBytesFrom(file, offset) -> Result[Array[byte], IoError]` | Every byte from `offset` on, empty at or past the end: what was appended since a program last read to `offset`. A negative offset traps. |
 | `readTail(file, maxBytes) -> Result[string, IoError]` | The last `maxBytes` bytes as text, reading only those. |
 | `readTailLines(file, count) -> Result[Vector[string], IoError]` | The last `count` lines, without terminators, fewer where there are fewer. |
@@ -1470,6 +1480,7 @@ follow(log: string) -> Result[unit, IoError]
 | `setLength(length)`, `truncate(length)` | Cuts the file to `length` bytes or extends it with zeros; the position does not move and may end up past the end. A negative length, or a file not open for writing, is an `Err`. |
 | `sync()`, `syncData()`, `fullSync()` | Hands over what is written and asks the device to keep it. `syncData` skips details a reader of the contents does not need where the platform can; on macOS it is `sync`, which reaches the drive but not its write cache. `fullSync` also empties the drive's cache (`F_FULLFSYNC` on macOS) and is the slowest. A closed file is an `Err`; a file opened only to read may be synced. |
 | `deleteOnClose()` | Marks the file so `close` removes its name after releasing it; a failed removal is the `Err` of `close`. A file the collector frees without a `close` is not removed. |
+| `setPermissions(mode)` | Sets the permission bits of the file the handle holds to exactly `mode`, as `fs.setPermissions` does for a path, whatever name the file has now. A file open only to read may be changed by its owner; the handle keeps writing after its bits lose write permission. A mode outside `0o0` to `0o7777` or a closed file is an `Err` that changes nothing. |
 
 Positioned calls on one file from several lightweight threads belong to separate handles, one per
 thread, opened on the same path: each call is the platform's own positioned read or write, so

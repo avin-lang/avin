@@ -373,9 +373,15 @@ permissions(file: string) -> Result[int, IoError] = metadata(file).map(m -> m.pe
 // where the platform allows them, and anything outside that range is an `Err` that leaves the file
 // as it was. A symbolic link is followed. A path that is not there is `NotFound`.
 setPermissions(file: string, mode: int) -> Result[unit, IoError]
-  if !(0 <= mode <= 0o7777)
-    return Err(IoError(io.Other(s"a mode outside 0o0 to 0o7777: ${octal(mode)}"), "set permissions of", file))
+  checkMode(mode, "set permissions of", file)?
   syslSetPermissions(file, mode).mapErr(failed("set permissions of", file))
+
+// `Ok` for a mode of `0o0` to `0o7777`; any other is the `Err` of kind `Other` naming it in octal,
+// `operation` on `subject` being what it would have done.
+private checkMode(mode: int, operation: string, subject: string) -> Result[unit, IoError] =
+  if 0 <= mode <= 0o7777 then Ok(()) else Err(
+    IoError(io.Other(s"a mode outside 0o0 to 0o7777: ${octal(mode)}"), operation, subject)
+  )
 
 // `mode` as an octal literal reads, its sign before the prefix.
 private octal(mode: int) -> string
@@ -427,8 +433,8 @@ private class SyslFile
 @sysl("sysl.fs.open", blocking)
 private syslOpen(file: string) -> Result[SyslFile, SyslError]
 
-@sysl("sysl.fs.create", blocking)
-private syslCreate(file: string) -> Result[SyslFile, SyslError]
+@sysl("avin.rt.fs_create", blocking)
+private syslCreate(file: string, mode: int) -> Result[SyslFile, SyslError]
 
 @sysl("sysl.fs.append", blocking)
 private syslAppend(file: string) -> Result[SyslFile, SyslError]
@@ -436,8 +442,11 @@ private syslAppend(file: string) -> Result[SyslFile, SyslError]
 @sysl("sysl.fs.open_update", blocking)
 private syslOpenUpdate(file: string) -> Result[SyslFile, SyslError]
 
-@sysl("sysl.fs.create_update", blocking)
-private syslCreateUpdate(file: string) -> Result[SyslFile, SyslError]
+@sysl("avin.rt.fs_create_update", blocking)
+private syslCreateUpdate(file: string, mode: int) -> Result[SyslFile, SyslError]
+
+@sysl("avin.rt.fs_file_set_permissions")
+private syslFileSetPermissions(f: SyslFile, mode: int) -> Result[unit, SyslError]
 
 // How much a line or a read-everything call takes from the file at once.
 private val ChunkSize = 8192
@@ -627,6 +636,15 @@ class File(
     removeOnClose = true
     Ok(())
 
+  // Sets the permission bits of the file this handle holds to exactly `mode`, as `fs.setPermissions`
+  // sets them on a path, whatever name the file has now; a file opened only to read may be changed
+  // too, as its owner may change any file. A mode outside `0o0` to `0o7777` is an `Err` that changes
+  // nothing, and a closed file is an `Err`.
+  setPermissions(mode: int) -> Result[unit, IoError]
+    if closed then return Err(closedError("set permissions of"))
+    checkMode(mode, "set permissions of", name)?
+    syslFileSetPermissions(handle, mode).mapErr(failed("set permissions of", name))
+
   // Flushes and releases the file; closing a closed file is not an error. Every later call
   // answers an `Err`. A file marked by `deleteOnClose` is removed once released, and a failure to
   // remove it is the `Err` where releasing succeeded.
@@ -705,9 +723,15 @@ open(file: string) -> Result[File, IoError]
   if isDir(file) then return Err(IoError(io.IsADirectory, "open", file))
   syslOpen(file).mapErr(failed("open", file)).map(h -> File(file, h, true, false, Array.empty[byte](), 0, false))
 
-// Opens `file` for writing, making it if it is not there and emptying it if it is.
-create(file: string) -> Result[File, IoError]
-  syslCreate(file).mapErr(failed("create", file)).map(h -> File(file, h, false, true, Array.empty[byte](), 0, false))
+// Opens `file` for writing, making it if it is not there and emptying it if it is. A file it makes
+// has the permission bits `mode` from the moment it exists, narrowed by the process umask as every
+// new file is; a file already there keeps the mode it has. A mode outside `0o0` to `0o7777` is an
+// `Err` of kind `Other`, before the path is touched.
+create(file: string, mode: int = 0o666) -> Result[File, IoError]
+  checkMode(mode, "create", file)?
+  syslCreate(file, mode).mapErr(failed("create", file)).map(
+    h -> File(file, h, false, true, Array.empty[byte](), 0, false)
+  )
 
 // Opens `file` for writing at its end, making it if it is not there. Every write goes to the end,
 // however many handles append to the file at once.
@@ -719,9 +743,11 @@ openUpdate(file: string) -> Result[File, IoError]
   if isDir(file) then return Err(IoError(io.IsADirectory, "open", file))
   syslOpenUpdate(file).mapErr(failed("open", file)).map(h -> File(file, h, true, true, Array.empty[byte](), 0, false))
 
-// Opens `file` for reading and writing, making it if it is not there and emptying it if it is.
-createUpdate(file: string) -> Result[File, IoError]
-  syslCreateUpdate(file).mapErr(failed("create", file)).map(
+// Opens `file` for reading and writing, making it if it is not there and emptying it if it is. A file
+// it makes has the permission bits `mode`, as `create` makes one.
+createUpdate(file: string, mode: int = 0o666) -> Result[File, IoError]
+  checkMode(mode, "create", file)?
+  syslCreateUpdate(file, mode).mapErr(failed("create", file)).map(
     h -> File(file, h, true, true, Array.empty[byte](), 0, false)
   )
 
@@ -838,10 +864,18 @@ class Lines(
 
 // Writes each of `lines` to `file` followed by `\n`, so a file of three lines ends in a newline and
 // no list of lines is written with `\r\n`. The file is made or emptied first, and what was written
-// before a failure stays. With `createParents`, missing directories above `file` are made first.
-writeLines(file: string, lines: Iterable[string], createParents: bool = false) -> Result[unit, IoError]
+// before a failure stays. With `createParents`, missing directories above `file` are made first. A
+// file it makes has the permission bits `mode`, as `create` makes one; a file already there keeps
+// its mode.
+writeLines(
+    file: string,
+    lines: Iterable[string],
+    createParents: bool = false,
+    mode: int = 0o666
+) -> Result[unit, IoError]
+  checkMode(mode, "create", file)?
   if createParents then makeParents(file)?
-  val out = create(file)?
+  val out = create(file, mode)?
   val it = lines.iterator()
   while it.hasNext()
     val wrote = out.writeText(it.next() + "\n")
@@ -854,28 +888,77 @@ writeLines(file: string, lines: Iterable[string], createParents: bool = false) -
 // and a failure leaves `file` as it was. The text is written to a new file beside `file` (so on its
 // file system), synced to the device, and renamed over `file`; the new file has a name no other
 // call or program gets, and is removed on every failure. `file`'s directory must exist unless
-// `createParents`. A new file takes the default permissions, not those of the file it replaces.
-writeTextAtomic(file: string, text: string, createParents: bool = false) -> Result[unit, IoError] =
-  writeBytesAtomic(file, Array.tabulate(text.byteLength, i -> text.byteAt(i)), createParents)
+// `createParents`. The result keeps the permission bits of the file it replaces; where there was none
+// it has the bits `mode`, which the umask narrows as it does for `create`. The new file has its final
+// bits from the moment it exists, so a file kept at `0o600` is never readable by others on the way.
+// After the rename the directory is synced too, so the new name survives a crash; a failure there
+// is an `Err` with the new contents already in place. A mode outside `0o0` to `0o7777` is an `Err` of
+// kind `Other`, before anything is touched.
+writeTextAtomic(
+    file: string,
+    text: string,
+    createParents: bool = false,
+    mode: int = 0o666
+) -> Result[unit, IoError] =
+  writeBytesAtomic(file, Array.tabulate(text.byteLength, i -> text.byteAt(i)), createParents, mode)
 
 // As `writeTextAtomic`, with bytes.
-writeBytesAtomic(file: string, bytes: Array[byte], createParents: bool = false) -> Result[unit, IoError]
+writeBytesAtomic(
+    file: string,
+    bytes: Array[byte],
+    createParents: bool = false,
+    mode: int = 0o666
+) -> Result[unit, IoError]
+  checkMode(mode, "write", file)?
   if createParents then makeParents(file)?
+  val kept = permissionsIfThere(file)?
   val pending = syslPendingName(file)
-  val h = syslCreate(pending).mapErr(failed("write", file))?
-  h.write(bytes)
-  val outcome = if h.failed() then Err(
-    IoError(io.Other("the write failed"), "write", file)
-  ) else h.sync().mapErr(failed("write", file))
+  val h = syslCreate(pending, kept.getOrElse(mode)).mapErr(failed("write", file))?
+  val outcome = fillPending(h, bytes, kept, file)
   val closed = h.release().mapErr(failed("write", file))
   val result = outcome match
     Ok(_) -> closed
     Err(e) -> Err(e)
   result match
-    Ok(_) -> syslPublishFile(pending, file).mapErr(failed("write", file))
+    Ok(_) ->
+      syslPublishFile(pending, file).mapErr(failed("write", file))?
+      syncParent(file)
     Err(e) ->
       _ = syslRemoveFile(pending)
       Err(e)
+
+// The permission bits of `file`, or `None` where nothing is there; any other failure to look is the
+// `Err` of writing it.
+private permissionsIfThere(file: string) -> Result[Option[int], IoError] = metadata(file) match
+  Ok(m) -> Ok(Some(m.permissions))
+  Err(e) -> e.kind match
+    io.NotFound -> Ok(None)
+    _ -> Err(IoError(e.kind, "write", file))
+
+// Writes `bytes` to the pending file `h`, gives it exactly the bits `kept` of the file it replaces,
+// and syncs it to the device. The bits are set after the write and its flush, since a write clears
+// setuid and setgid, and the umask may have narrowed the others when the file was made; until then
+// the file has fewer bits than it ends with, never more.
+private fillPending(h: SyslFile, bytes: Array[byte], kept: Option[int], file: string) -> Result[unit, IoError]
+  h.write(bytes)
+  if h.failed() then return Err(IoError(io.Other("the write failed"), "write", file))
+  h.flush().mapErr(failed("write", file))?
+  val fixed = kept match
+    Some(bits) -> syslFileSetPermissions(h, bits).mapErr(failed("write", file))
+    None -> Ok(())
+  if fixed.isErr then return fixed
+  h.sync().mapErr(failed("write", file))
+
+// Syncs the directory that holds `file` to the device, so a rename that put `file` there survives a
+// crash: the directory is opened to read and synced like a file.
+private syncParent(file: string) -> Result[unit, IoError]
+  val dir = parent(file) match
+    Some(d) -> if d == "" then "." else d
+    None -> "."
+  val h = syslOpen(dir).mapErr(failed("sync the directory of", file))?
+  val synced = h.sync().mapErr(failed("sync the directory of", file))
+  val released = h.release().mapErr(failed("sync the directory of", file))
+  if synced.isErr then synced else released
 
 // The names of the entries of the directory `dir`, without `dir` before them and without `.` and
 // `..`, sorted by code point, so two listings of an unchanged directory agree. A name that is not
