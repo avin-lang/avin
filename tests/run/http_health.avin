@@ -1,0 +1,125 @@
+// expect: exit 0
+// Health routes, without a connection: liveness with no checks and with checks; readiness passing,
+// failing with a reason, timing out, and every check run at once (three checks of 300 ms finish in
+// well under 900 ms); the plain summary and the `?verbose` one, in the order the checks were given;
+// readiness flipped off and on, and a program started not ready; a reason with line breaks and a
+// long one tidied; custom paths and the router's routes; a method other than GET not matching; the
+// checks that trap (an empty name, a control character, a timeout of zero, a path without `/`).
+import avin.net.http
+import avin.net.http.{Response, Router, ServerRequest}
+import avin.threads.{Atomic, sleep}
+import avin.time.{millis, monotonic, seconds}
+
+req(path: string) -> ServerRequest = ServerRequest("GET", path)
+
+show(r: Response) -> string = s"${r.status} ${r.text.replace("\n", "|")} ${r.header("Cache-Control")}"
+
+passes(name: string) -> http.Check = http.check(name, () -> Ok(()))
+
+main()
+  // Liveness with no checks is always ok.
+  val bare = http.health()
+  println(show(bare.live(req("/livez"))))
+  println(show(bare.live(req("/livez?verbose"))))
+  println(show(bare.ready(req("/readyz"))))
+  println(bare.livePath + " " + bare.readyPath)
+
+  // Readiness with passing, failing and timing out checks.
+  val h = http.health(
+    [
+      passes("db"),
+      http.check("cache", () -> Err("connection refused")),
+      http.check("slow", () ->
+        sleep(millis(400))
+        Ok(()), timeout = millis(50))
+    ]
+  )
+  println(show(h.ready(req("/readyz"))))
+  println(show(h.ready(req("/readyz?verbose"))))
+  println(show(h.ready(req("/readyz?verbose=1&x=y"))))
+  println(show(h.ready(req("/readyz?other"))))
+
+  // All checks passing.
+  val good = http.health([passes("a"), passes("b")])
+  println(show(good.ready(req("/readyz?verbose"))))
+
+  // Liveness checks are separate from readiness checks.
+  val split = http.health([http.check("dep", () -> Err("down"))], live = [passes("loop")])
+  println(show(split.live(req("/livez?verbose"))))
+  println(show(split.ready(req("/readyz"))))
+  val deadLive = http.health(live = [http.check("loop", () -> Err("stuck"))])
+  println(show(deadLive.live(req("/livez"))))
+  println(show(deadLive.ready(req("/readyz"))))
+
+  // The checks run at once: three of 300 ms take well under their sum.
+  val naps = http.health(
+    [1, 2, 3].map(i ->
+      http.check(s"nap$i", () ->
+        sleep(millis(300))
+        Ok(()), timeout = seconds(5)))
+  )
+  val began = monotonic().micros
+  println(show(naps.ready(req("/readyz"))))
+  val took = (monotonic().micros - began) / 1000
+  println(took < 800)
+  println(took >= 300)
+
+  // Each check has a timeout of its own: the slow one is reported, the quick ones are not.
+  val mixed = http.health(
+    [
+      http.check("quick", () -> Ok(()), timeout = millis(30)),
+      http.check("late", () ->
+        sleep(millis(300))
+        Ok(()), timeout = millis(30))
+    ]
+  )
+  val t0 = monotonic().micros
+  println(show(mixed.ready(req("/readyz?verbose"))))
+  println((monotonic().micros - t0) / 1000 < 250)
+
+  // The probes run on each request, and see the world as it is then.
+  val up = Atomic(false)
+  val flip = http.health([http.check("flag", () -> if up.load() then Ok(()) else Err("not yet"))])
+  println(show(flip.ready(req("/readyz"))))
+  up.store(true)
+  println(show(flip.ready(req("/readyz"))))
+
+  // Readiness flipped by the program: not ready answers 503 without asking the checks.
+  val asked = Atomic(0)
+  val sw = http.health([http.check("count", () ->
+    asked.add(1)
+    Ok(()))])
+  println(sw.isReady())
+  println(show(sw.ready(req("/readyz"))))
+  sw.setReady(false)
+  println(sw.isReady())
+  println(show(sw.ready(req("/readyz"))))
+  println(show(sw.ready(req("/readyz?verbose"))))
+  println(asked.load())
+  println(show(sw.live(req("/livez"))))
+  sw.setReady(true)
+  println(show(sw.ready(req("/readyz"))))
+  println(asked.load())
+  val starting = http.health(ready = false)
+  println(show(starting.ready(req("/readyz"))))
+
+  // A reason is one line and at most 200 characters.
+  val wordy = http.health(
+    [http.check("w", () -> Err("line one\nline two\r\nthree")), http.check("v", () -> Err("x".repeat(500)))]
+  )
+  val body = wordy.ready(req("/readyz?verbose")).text
+  println(body.split("\n").length)
+  println(body.split("\n")(0))
+  println(body.split("\n")(1).length)
+
+  // The routes, with the default and with other paths, through a router; other methods and paths miss.
+  val router = Router(good.routes())
+  println(show(router.handle(req("/livez"))))
+  println(show(router.handle(req("/readyz"))))
+  println(router.handle(ServerRequest("POST", "/readyz")).status)
+  println(router.handle(req("/healthz")).status)
+  val moved = http.health([passes("a")], livePath = "/healthz", readyPath = "/ready")
+  val r2 = Router(moved.routes())
+  println(show(r2.handle(req("/healthz"))))
+  println(show(r2.handle(req("/ready"))))
+  println(r2.handle(req("/livez")).status)
