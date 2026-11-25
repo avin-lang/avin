@@ -1,0 +1,1197 @@
+// `avin.crypto`'s signatures and keys, against answers nobody here chose: RFC 8032's Ed25519 keys and
+// signatures, RFC 7515's RS256 and ES256 examples, and Wycheproof's verification vectors for Ed25519,
+// ECDSA over P-256 and P-384 (DER and fixed-width), RSA PKCS#1 v1.5 and RSA-PSS, each with its
+// malformed, malleated and forged signatures. Then every scheme round trips with a generated key,
+// keys move through PEM and DER both ways, every kind a key can wrongly be is refused, and a key's
+// text shows nothing of it.
+import avin.crypto.{KeyKind, Ed25519Key, EcP256Key, EcP384Key, RsaKey}
+import avin.crypto.{SignatureScheme, Ed25519, EcdsaP256Sha256, EcdsaP384Sha384}
+import avin.crypto.{RsaPkcs1Sha256, RsaPkcs1Sha384, RsaPkcs1Sha512, RsaPssSha256, RsaPssSha384, RsaPssSha512}
+import avin.crypto.{PrivateKey, PublicKey, CryptoError, InvalidKey, KeyMismatch}
+import avin.crypto.{privateKeyFromPem, privateKeyFromDer, publicKeyFromPem, publicKeyFromDer, generatePrivateKey}
+import avin.crypto.{ed25519PrivateKey, ed25519PublicKey, ecdsaFixedSignature, ecdsaDerSignature}
+import avin.encoding.{fromHex, toHex, fromBase64Url}
+import avin.threads.spawn
+
+// The bytes `text` writes in hexadecimal.
+hex(text: string) -> Vector[byte] = fromHex(text).getOrElse(fail(s"not hexadecimal: $text"))
+
+// The key in `pem`, which the test knows to be one.
+privateOf(pem: string) -> PrivateKey = privateKeyFromPem(pem).getOrElse(fail("a fixture that is not a private key"))
+
+publicOf(pem: string) -> PublicKey = publicKeyFromPem(pem).getOrElse(fail("a fixture that is not a public key"))
+
+publicOfDer(der: string) -> PublicKey = publicKeyFromDer(hex(der)).getOrElse(fail("a fixture that is not a public key"))
+
+// The signature `key` makes, which the test knows it makes.
+signed(key: PrivateKey, scheme: SignatureScheme, message: Vector[byte]) -> Vector[byte] =
+  key.sign(scheme, message).getOrElse(fail(s"$key did not sign with $scheme"))
+
+// Whether `key` takes `signature` over `message`, which the test knows to be a question it can ask.
+checks(key: PublicKey, scheme: SignatureScheme, message: Vector[byte], signature: Vector[byte]) -> bool =
+  key.verify(scheme, message, signature) match
+    Ok(verdict) -> verdict
+    Err(e) -> fail(s"$key could not check $scheme: ${e.message}")
+
+// The reason an `InvalidKey` gives, or a failure.
+invalidReason(r: Result[PrivateKey, CryptoError]) -> string = r match
+  Err(InvalidKey(reason)) -> reason
+  Err(e) -> fail(s"not an InvalidKey: ${e.message}")
+  Ok(k) -> fail(s"read $k")
+
+invalidPublicReason(r: Result[PublicKey, CryptoError]) -> string = r match
+  Err(InvalidKey(reason)) -> reason
+  Err(e) -> fail(s"not an InvalidKey: ${e.message}")
+  Ok(k) -> fail(s"read $k")
+
+// `bytes` with the byte at `at` changed.
+flipped(bytes: Vector[byte], at: int) -> Vector[byte] =
+  Vector.tabulate(bytes.length, i -> if i == at then bytes(i) ^ byte(1) else bytes(i))
+
+// -- fixtures -------------------------------------------------------------------------------------------
+
+// RFC 7515 Appendix A.2's RSA key, built from the `n`, `e`, `d`, `p`, `q`, `dp`, `dq` and `qi` it prints.
+val RfcRsaPrivate = """
+  -----BEGIN PRIVATE KEY-----
+  MIIEvQIBADANBgkqhkiG9w0BAQEFAASCBKcwggSjAgEAAoIBAQCh+BYK4uPJtGXO
+  jS1lYmM2K5J9vinh8CR3/BYlzJChNuOL2TSXxbbqY913EeZ8dCn5VrD7io8ImtxL
+  aYk8wTM/U+3QGbh3hCUv7JFP5IV3aVlL6kKA0ywPVb9ilE8TA5a8bpvfbr3SvaNn
+  juygxmj3AbONv/s4yDQs4v5tJ/reSlpIdJed1LnPmt7Ex1sFhSwsD174pcF1A5L5
+  ROjtZMEQxrZHYJqkeDrrnGya11UxMFBji4NmXG9veoKjlnAqH2QbgtPr8jkiGUkf
+  toaHLFcW9Qr4NY2ai50Xw0Byj3+H2JoY2PyrZ62EWQwuz3WTOTY8BwNNb2BvniHg
+  VFbK5emhAgMBAAECggEAEq5xpGnNCivDflJsRQBXHx1hdR1k6Ulwe2JZD50LpXyW
+  PEAeP88vLNO97IjlA7/GQ5sLKMgvfTeXZx9SE+7YwVol2NXOoAJe46sui395IW/G
+  O+pWJ1O0BkTGoVEn2bKVRUCgu+GjBVaYLU6f3l9kJfFNS3E0QbVdxzubSu3Mkqzj
+  kn439X0M/V51gfpRLI9JYanrC4D4qAdGcopV/0ZHHzQlBjudU2QvXt4ehNYTCBr6
+  XCLQUShb1juUO1ZdiYoFaFQT5Tw8bGUl/x/jTj3ccPDVZFD9pIuhLhBOneufuBiB
+  4cS98l2SR/RQyGWSeWjnczT0QU91p1DhOVRuOopznQKBgQDgHMQQ60imZV1URk0K
+  pLttoLhyt3SmqdEf/kgHePDdtzEafpAu+cS191R2JiuoF2yzWXnwFDcqGigp5BNr
+  0AHQfD8/Lk8l1Mk09jxxCfui5nYooNyac8YFjm3vItzVCVDnEd3BbVWG8qf6deqE
+  lMGAg+C2V0L4oNXnP7LZcPAZRwKBgQC5A8R+CZW2MvRTLLHzwZkUXV866cff7tx6
+  kqa0finGG0KgeqlaZPxgCZnFp7AeAcCMtiynVlJ7vMVgePsLq6XtON4tB5kP9jAP
+  rq3rbAOal78eUH5OcED6eNuCV8ixEu1eWcPNCS/l1OW1EnXUEoEHKl54Xrrz2uNw
+  kgMTP1FZ1wKBgAcCn1dwJKufzBWQxWQp1vsM5fggqPN1qGb5y0MAk3g7/Ls5bkUp
+  5u9SN0Ai3Ya6hNnvWJMb7sXQX6U/zyO2M/hTip7tUeh7CXgwo59dkpN75gJLVds2
+  9+DAncu3KXU4f2Fa+7bLNrur53k8KwPOq2bbuTG69QtV7Jr5MR0AHWKNAoGBAIf/
+  evpitUf+4JYbLpvNXWcY052Mpz22aR84mY3nh3F2LF2mjMJDpTg7FmuyPcVw6EcG
+  yoAe9fa65iNqCq+jdw6PVNGo2hxfjSiZ8IIzHdsPXI89//pMjZcQK9r+CCoRjaZj
+  OYiIDktVWZzmevJuv6WywUqd57LE3Zar3dLSIkx1AoGAIYd7DHOhrWvxkwPQsRM2
+  tOgrjbcrfvtQJipd+DlcxyVuuM9sQLdgjVk2oy26F0EmpScGLq2MowX7fhd/QJQ3
+  ydy5cY7YIBi87w93IKLEdfnbJtoOPLUW0ITrJReOgo1cq9SbsxYawBgfp/gh6A56
+  03k2+ZQwVK0JKSHuLFkuQ3U=
+  -----END PRIVATE KEY-----
+  """
+
+val RfcRsaPublic = """
+  -----BEGIN PUBLIC KEY-----
+  MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEAofgWCuLjybRlzo0tZWJj
+  NiuSfb4p4fAkd/wWJcyQoTbji9k0l8W26mPddxHmfHQp+Vaw+4qPCJrcS2mJPMEz
+  P1Pt0Bm4d4QlL+yRT+SFd2lZS+pCgNMsD1W/YpRPEwOWvG6b32690r2jZ47soMZo
+  9wGzjb/7OMg0LOL+bSf63kpaSHSXndS5z5rexMdbBYUsLA9e+KXBdQOS+UTo7WTB
+  EMa2R2CapHg665xsmtdVMTBQY4uDZlxvb3qCo5ZwKh9kG4LT6/I5IhlJH7aGhyxX
+  FvUK+DWNmoudF8NAco9/h9iaGNj8q2ethFkMLs91kzk2PAcDTW9gb54h4FRWyuXp
+  oQIDAQAB
+  -----END PUBLIC KEY-----
+  """
+
+// The same key in the traditional PKCS#1 form, `BEGIN RSA PRIVATE KEY`.
+val RfcRsaTraditional = """
+  -----BEGIN RSA PRIVATE KEY-----
+  MIIEowIBAAKCAQEAofgWCuLjybRlzo0tZWJjNiuSfb4p4fAkd/wWJcyQoTbji9k0
+  l8W26mPddxHmfHQp+Vaw+4qPCJrcS2mJPMEzP1Pt0Bm4d4QlL+yRT+SFd2lZS+pC
+  gNMsD1W/YpRPEwOWvG6b32690r2jZ47soMZo9wGzjb/7OMg0LOL+bSf63kpaSHSX
+  ndS5z5rexMdbBYUsLA9e+KXBdQOS+UTo7WTBEMa2R2CapHg665xsmtdVMTBQY4uD
+  Zlxvb3qCo5ZwKh9kG4LT6/I5IhlJH7aGhyxXFvUK+DWNmoudF8NAco9/h9iaGNj8
+  q2ethFkMLs91kzk2PAcDTW9gb54h4FRWyuXpoQIDAQABAoIBABKucaRpzQorw35S
+  bEUAVx8dYXUdZOlJcHtiWQ+dC6V8ljxAHj/PLyzTveyI5QO/xkObCyjIL303l2cf
+  UhPu2MFaJdjVzqACXuOrLot/eSFvxjvqVidTtAZExqFRJ9mylUVAoLvhowVWmC1O
+  n95fZCXxTUtxNEG1Xcc7m0rtzJKs45J+N/V9DP1edYH6USyPSWGp6wuA+KgHRnKK
+  Vf9GRx80JQY7nVNkL17eHoTWEwga+lwi0FEoW9Y7lDtWXYmKBWhUE+U8PGxlJf8f
+  40493HDw1WRQ/aSLoS4QTp3rn7gYgeHEvfJdkkf0UMhlknlo53M09EFPdadQ4TlU
+  bjqKc50CgYEA4BzEEOtIpmVdVEZNCqS7baC4crd0pqnRH/5IB3jw3bcxGn6QLvnE
+  tfdUdiYrqBdss1l58BQ3KhooKeQTa9AB0Hw/Py5PJdTJNPY8cQn7ouZ2KKDcmnPG
+  BY5t7yLc1QlQ5xHdwW1VhvKn+nXqhJTBgIPgtldC+KDV5z+y2XDwGUcCgYEAuQPE
+  fgmVtjL0Uyyx88GZFF1fOunH3+7cepKmtH4pxhtCoHqpWmT8YAmZxaewHgHAjLYs
+  p1ZSe7zFYHj7C6ul7TjeLQeZD/YwD66t62wDmpe/HlB+TnBA+njbglfIsRLtXlnD
+  zQkv5dTltRJ11BKBBypeeF6689rjcJIDEz9RWdcCgYAHAp9XcCSrn8wVkMVkKdb7
+  DOX4IKjzdahm+ctDAJN4O/y7OW5FKebvUjdAIt2GuoTZ71iTG+7F0F+lP88jtjP4
+  U4qe7VHoewl4MKOfXZKTe+YCS1XbNvfgwJ3Ltyl1OH9hWvu2yza7q+d5PCsDzqtm
+  27kxuvULVeya+TEdAB1ijQKBgQCH/3r6YrVH/uCWGy6bzV1nGNOdjKc9tmkfOJmN
+  54dxdixdpozCQ6U4OxZrsj3FcOhHBsqAHvX2uuYjagqvo3cOj1TRqNocX40omfCC
+  Mx3bD1yPPf/6TI2XECva/ggqEY2mYzmIiA5LVVmc5nrybr+lssFKneeyxN2Wq93S
+  0iJMdQKBgCGHewxzoa1r8ZMD0LETNrToK423K377UCYqXfg5XMclbrjPbEC3YI1Z
+  NqMtuhdBJqUnBi6tjKMF+34Xf0CUN8ncuXGO2CAYvO8PdyCixHX52ybaDjy1FtCE
+  6yUXjoKNXKvUm7MWGsAYH6f4IegOetN5NvmUMFStCSkh7ixZLkN1
+  -----END RSA PRIVATE KEY-----
+  """
+
+// RFC 7515 Appendix A.3's P-256 key, from its `x`, `y` and `d`.
+val RfcEcPublic = """
+  -----BEGIN PUBLIC KEY-----
+  MFkwEwYHKoZIzj0CAQYIKoZIzj0DAQcDQgAEf83OJ3D2xF1Bg8vub9tLe1gHMzV7
+  6e8Tus9uPHvRVEXH8UTNG72bfocs3+257rn0s2ldbqkLJK2KRiMohYjlrQ==
+  -----END PUBLIC KEY-----
+  """
+
+val RfcEcPrivate = """
+  -----BEGIN PRIVATE KEY-----
+  MIGHAgEAMBMGByqGSM49AgEGCCqGSM49AwEHBG0wawIBAQQgjpsQnnGQmL+YBIff
+  H1136cspYG6+0iY7X1fCE9+E9LKhRANCAAR/zc4ncPbEXUGDy+5v20t7WAczNXvp
+  7xO6z248e9FURcfxRM0bvZt+hyzf7bnuufSzaV1uqQskrYpGIyiFiOWt
+  -----END PRIVATE KEY-----
+  """
+
+// The JWS signing inputs of A.2 and A.3, and their signatures, base64url.
+val RfcInputRs = "eyJhbGciOiJSUzI1NiJ9.eyJpc3MiOiJqb2UiLA0KICJleHAiOjEzMDA4MTkzODAsDQogImh0dHA6Ly9leGFtcGxlLmNvbS9pc19yb290Ijp0cnVlfQ"
+val RfcInputEs = "eyJhbGciOiJFUzI1NiJ9.eyJpc3MiOiJqb2UiLA0KICJleHAiOjEzMDA4MTkzODAsDQogImh0dHA6Ly9leGFtcGxlLmNvbS9pc19yb290Ijp0cnVlfQ"
+val RfcRs256 = "cC4hiUPoj9Eetdgtv3hF80EGrhuB__dzERat0XF9g2VtQgr9PJbu3XOiZj5RZmh7AAuHIm4Bh-0Qc_lF5YKt_O8W2Fp5jujGbds9uJdbF9CUAr7t1dnZcAcQjbKBYNX4BAynRFdiuB--f_nZLgrnbyTyWzO75vRK5h6xBArLIARNPvkSjtQBMHlb1L07Qe7K0GarZRmB_eSN9383LcOLn6_dO--xi12jzDwusC-eOkHWEsqtFZESc6BfI7noOPqvhJ1phCnvWh6IeYI2w9QOYEUipUTI8np6LbgGY9Fs98rqVt5AXLIhWkWywlVmtVrBp0igcN_IoypGlUPQGe77Rw"
+val RfcEs256 = "DtEhU3ljbEg8L38VWAfUAqOyKAM6-Xx-F4GawxaepmXFCgfTjDxw5djxLa8ISlSApmWQxfKTUJqPP3-Kg6NU1Q"
+
+// A P-384 key pair.
+val P384Private = """
+  -----BEGIN PRIVATE KEY-----
+  MIG2AgEAMBAGByqGSM49AgEGBSuBBAAiBIGeMIGbAgEBBDA7Tnfxxgmz6SGW1CBM
+  EFdzASi8peS0r/28mlZufWZB8rG250bXmHjLvLeG1cDQ5N2hZANiAAQN0Ql5ceeH
+  Ww/xYlVHtHWYBn9AI5/0axn0HYGxZmjI00yzRpTh+Bbva0SRuBkdJoKowG/RcKx6
+  YxNMBTZIHn0REyPr/PLLx5iPCBXwbhqaNZiYCWouzu9ohV9H8FpAWRg=
+  -----END PRIVATE KEY-----
+  """
+
+val P384Public = """
+  -----BEGIN PUBLIC KEY-----
+  MHYwEAYHKoZIzj0CAQYFK4EEACIDYgAEDdEJeXHnh1sP8WJVR7R1mAZ/QCOf9GsZ
+  9B2BsWZoyNNMs0aU4fgW72tEkbgZHSaCqMBv0XCsemMTTAU2SB59ERMj6/zyy8eY
+  jwgV8G4amjWYmAlqLs7vaIVfR/BaQFkY
+  -----END PUBLIC KEY-----
+  """
+
+// A P-256 key in the traditional form RFC 5915 gives, after the `EC PARAMETERS` block
+// `openssl ecparam -genkey` writes before it.
+val EcTraditional = """
+  -----BEGIN EC PARAMETERS-----
+  BggqhkjOPQMBBw==
+  -----END EC PARAMETERS-----
+  -----BEGIN EC PRIVATE KEY-----
+  MHcCAQEEIAmd7osEhvBSgbQJalcX1bNzP52vmcK7pA+J2qjrXHuFoAoGCCqGSM49
+  AwEHoUQDQgAElyrOiiORfrfutn8zY5jQLTrjyxEK29Ezp/w/KWROWnfoVA5YnHqu
+  f3cvk5y7gIMRQTEp7wmgbAGGrV+gj6B79A==
+  -----END EC PRIVATE KEY-----
+  """
+
+// Keys of kinds that are refused: P-521, secp256k1, Ed448, X25519, a 1024-bit RSA key, and an
+// encrypted Ed25519 key.
+val P521Private = """
+  -----BEGIN PRIVATE KEY-----
+  MIHuAgEAMBAGByqGSM49AgEGBSuBBAAjBIHWMIHTAgEBBEIAkhA1/rEEWaVgwr+y
+  FT/fcVViCX1ujGkzxBTuepmjq/YekTxLwBCCx/jJ3ojSjItPNjufPMpQn5S7eEgG
+  KVMQJI2hgYkDgYYABAHOFvZ6viCJJEGLtS4saaqPDzL5KawWXzS+yaj+aozaSaD2
+  tpfvUtUR53TLvLELw+LwqpJ6Kf+nmG0CFoVor3AewwAyAl6KP85+rvcfUCbMnqS5
+  2IFLdEIImK9F+jgcaOoJgEHLsqk/pYOYc+tepQk05EaKwTP7EJhf9G1gT9NCFHRD
+  Cw==
+  -----END PRIVATE KEY-----
+  """
+
+val P521Public = """
+  -----BEGIN PUBLIC KEY-----
+  MIGbMBAGByqGSM49AgEGBSuBBAAjA4GGAAQBzhb2er4giSRBi7UuLGmqjw8y+Sms
+  Fl80vsmo/mqM2kmg9raX71LVEed0y7yxC8Pi8KqSein/p5htAhaFaK9wHsMAMgJe
+  ij/Ofq73H1AmzJ6kudiBS3RCCJivRfo4HGjqCYBBy7KpP6WDmHPrXqUJNORGisEz
+  +xCYX/RtYE/TQhR0Qws=
+  -----END PUBLIC KEY-----
+  """
+
+val Secp256k1Private = """
+  -----BEGIN EC PRIVATE KEY-----
+  MHQCAQEEIE3SWSYWm+Z2zsDLzxkZ1UZZ/R29k2HaS1SAEErs+E+roAcGBSuBBAAK
+  oUQDQgAEDZe921yijYTLkvLmtDCMGZdCisEDPN8XYlxj767WEO1FgfZ9EJYvLcfu
+  TO54qxqHTWTduSrDBx1cMqqjg6VgLw==
+  -----END EC PRIVATE KEY-----
+  """
+
+val Ed448Private = """
+  -----BEGIN PRIVATE KEY-----
+  MEcCAQAwBQYDK2VxBDsEOS5ttGN9vDEmtVuh5O5Zct0YYCCNiI/9B9jnPxP6+35A
+  +UpWrJovbF8IRzDQt0mX/NVWgZnma3pbHQ==
+  -----END PRIVATE KEY-----
+  """
+
+val X25519Private = """
+  -----BEGIN PRIVATE KEY-----
+  MC4CAQAwBQYDK2VuBCIEIIh0gZk/tadKPn5umpHbMCVYAehqN4bziAzV7ctN0Kx4
+  -----END PRIVATE KEY-----
+  """
+
+val Rsa1024Private = """
+  -----BEGIN PRIVATE KEY-----
+  MIICdwIBADANBgkqhkiG9w0BAQEFAASCAmEwggJdAgEAAoGBAK5gAV6xka4urdEZ
+  zWJ4kVq+8iTSc69vU0ABlD2fBFooYZUxq4IklOyXZmL53ZssPsZNhsqgs5Bxr7+4
+  tFyt+ef1oKj5DUo8fsY+nnDY4/6Md9ypp9tYFXptn9fWJEhLx/CmS8w6jAFiyX7/
+  2Bd/vd0ELd8h9vSW8Azj9NXTL273AgMBAAECgYAEKqsdtiSDAv6IRpOPzM28W1+x
+  3Y2CHajhmKgQKOKTvO9H/13XyEP+u0dpCgtvj8kYN/YGlXx08SJ/9EvrAwU7qZFm
+  yyFtdHwh26vrgrzIcoJAzHSFNX5dQSTqNUqi6/iQFnVUhDu68J6CiYONcEJ4BCBY
+  Rnwadw6BmbKzTB1O0QJBAOdJhms+B0VBNGOKrZ/csgyUBlGIJuj8ft+rg2ljsGGf
+  ORwvTDzJbNl5/IbSQWdy0iui46ZJXPBk1haptJKI620CQQDBAb4YEoRen5kUqADo
+  jSdX40vt+ikm6XPzm4GChQ3X7yohlU+sowBfOWpGVM1MSv9OL18RCABpPu2IQiO8
+  I0FzAkEAvgdE79v48UfPmXGZkd0sVPVR868f+RFr1K4AvJhxlOPTcnrR8qe0TULS
+  3prlre9DCyM8U6W3PLQ8ykYI3NSuSQJBAL5VLpZkpF7/+qFRMFwk3xif0QAlA7IY
+  5LzmrKf++HDqrNyjdwfjUvmVEEW9WRuUlgMPWivcfTNM2EfYGY9uIRsCQD2R1WGq
+  yI4XRlqDek0M4t1kldJ7NK/zlOinKQC+3O3QIWajwpj/wec2jzKMnYNMr92eVfkl
+  ybWEj5D9+6BpFdY=
+  -----END PRIVATE KEY-----
+  """
+
+val EncryptedEd25519 = """
+  -----BEGIN ENCRYPTED PRIVATE KEY-----
+  MIGjMF8GCSqGSIb3DQEFDTBSMDEGCSqGSIb3DQEFDDAkBBAIV7tAcj2fnlhrlq3O
+  44rzAgIIADAMBggqhkiG9w0CCQUAMB0GCWCGSAFlAwQBAgQQwLXCAVAC0f7CYgL0
+  XRdjPwRAbDlAzXlqetvDuF7ItuauuLZFM2G9iVpOYCKRMITa71OlfwsKYyIv5XTc
+  FM/q7X/US+LJZfv9HOfCDx1XC81SYA==
+  -----END ENCRYPTED PRIVATE KEY-----
+  """
+
+// -- Ed25519 -----------------------------------------------------------------------------------------------
+
+@test("Ed25519 makes RFC 8032's public keys and signatures from its secret keys")
+ed25519Rfc8032()
+  val one = ed25519PrivateKey(
+    hex("9d61b19deffd5a60ba844af492ec2cc44449c5697b326919703bac031cae7f60")
+  ).getOrElse(fail("RFC 8032 key 1"))
+  assertEq(
+    toHex(one.publicKey.ed25519Bytes().getOrElse(Vector())),
+    "d75a980182b10ab7d54bfed3c964073a0ee172f3daa62325af021a68f707511a"
+  )
+  val sig1 = signed(one, Ed25519, Vector())
+  assertEq(
+    toHex(sig1),
+    "e5564300c360ac729086e2cc806e828a84877f1eb8e5d974d873e065224901555fb8821590a33bacc61e39701cf9b46bd25bf5f0595bbe24655141438e7a100b"
+  )
+  assert(checks(one.publicKey, Ed25519, Vector(), sig1))
+  val two = ed25519PrivateKey(
+    hex("4ccd089b28ff96da9db6c346ec114e0f5b8a319f35aba624da8cf6ed4fb8a6fb")
+  ).getOrElse(fail("RFC 8032 key 2"))
+  assertEq(
+    toHex(two.publicKey.ed25519Bytes().getOrElse(Vector())),
+    "3d4017c3e843895a92b70aa74d1b7ebc9c982ccf2ec4968cc0cd55f12af4660c"
+  )
+  assertEq(
+    toHex(signed(two, Ed25519, hex("72"))),
+    "92a009a9f0d4cab8720e820b5f642540a2b27b5416503f8fb3762223ebdb69da085ac1e43e15996e458f3613d0f11d8c387b2eaeb4302aeeb00d291612bb0c00"
+  )
+
+@test("an Ed25519 public key made from its 32 bytes is the one its SubjectPublicKeyInfo encodes")
+ed25519RawAndDerAgree()
+  val raw = hex("7d4d0e7f6153a69b6242b522abbee685fda4420f8834b108c3bdae369ef549fa")
+  val fromRaw = ed25519PublicKey(raw).getOrElse(fail("a raw Ed25519 key"))
+  val fromDer = publicOfDer("302a300506032b65700321007d4d0e7f6153a69b6242b522abbee685fda4420f8834b108c3bdae369ef549fa")
+  assert(fromRaw == fromDer)
+  assertEq(
+    toHex(fromRaw.toDer()),
+    "302a300506032b65700321007d4d0e7f6153a69b6242b522abbee685fda4420f8834b108c3bdae369ef549fa"
+  )
+  assertEq(toHex(fromDer.ed25519Bytes().getOrElse(Vector())), toHex(raw))
+  assert(fromDer.kind == Ed25519Key)
+
+// Wycheproof's Ed25519 vectors over its first key: (tcId, message, signature, valid).
+val Ed25519Vectors = [
+  (
+    1,
+    "",
+    "d4fbdb52bfa726b44d1786a8c0d171c3e62ca83c9e5bbe63de0bb2483f8fd6cc1429ab72cafc41ab56af02ff8fcc43b99bfe4c7ae940f60f38ebaa9d311c4007",
+    true
+  ),
+  (
+    2,
+    "78",
+    "d80737358ede548acb173ef7e0399f83392fe8125b2ce877de7975d8b726ef5b1e76632280ee38afad12125ea44b961bf92f1178c9fa819d020869975bcbe109",
+    true
+  ),
+  (
+    3,
+    "54657374",
+    "7c38e026f29e14aabd059a0f2db8b0cd783040609a8be684db12f82a27774ab07a9155711ecfaf7f99f277bad0c6ae7e39d4eef676573336a5c51eb6f946b30d",
+    true
+  ),
+  (
+    4,
+    "48656c6c6f",
+    "1c1ad976cbaae3b31dee07971cf92c928ce2091a85f5899f5e11ecec90fc9f8e93df18c5037ec9b29c07195ad284e63d548cd0a6fe358cc775bd6c1608d2c905",
+    true
+  ),
+  (
+    5,
+    "313233343030",
+    "657c1492402ab5ce03e2c3a7f0384d051b9cf3570f1207fc78c1bcc98c281c2bf0cf5b3a289976458a1be6277a5055545253b45b07dcc1abd96c8b989c00f301",
+    true
+  ),
+  (
+    6,
+    "000000000000000000000000",
+    "d46543bfb892f84ec124dcdfc847034c19363bf3fc2fa89b1267833a14856e52e60736918783f950b6f1dd8d40dc343247cd43ce054c2d68ef974f7ed0f3c60f",
+    true
+  ),
+  (
+    9,
+    "ffffffffffffffffffffffffffffffff",
+    "5dbd7360e55aa38e855d6ad48c34bd35b7871628508906861a7c4776765ed7d1e13d910faabd689ec8618b78295c8ab8f0e19c8b4b43eb8685778499e943ae04",
+    true
+  ),
+  (
+    10,
+    "3f",
+    "00000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000",
+    false
+  ),
+  (
+    14,
+    "3f",
+    "0000000000000000000000000000000000000000000000000000000000000000edffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff7f",
+    false
+  ),
+  (
+    20,
+    "3f",
+    "edd3f55c1a631258d69cf7a2def9de14000000000000000000000000000000100000000000000000000000000000000000000000000000000000000000000000",
+    false
+  ),
+  (
+    29,
+    "3f",
+    "edffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff7fedffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff7f",
+    false
+  ),
+  (30, "54657374", "", false),
+  (31, "54657374", "7c38e026f29e14aabd059a0f2db8b0cd783040609a8be684db12f82a27774ab0", false),
+  (
+    32,
+    "54657374",
+    "7c38e026f29e14aabd059a0f2db8b0cd783040609a8be684db12f82a27774ab07a9155711ecfaf7f99f277bad0c6ae7e39d4eef676573336a5c51eb6f946",
+    false
+  ),
+  (
+    33,
+    "54657374",
+    "7c38e026f29e14aabd059a0f2db8b0cd783040609a8be684db12f82a27774ab07a9155711ecfaf7f99f277bad0c6ae7e39d4eef676573336a5c51eb6f946b30d2020",
+    false
+  ),
+  (
+    34,
+    "54657374",
+    "7c38e026f29e14aabd059a0f2db8b0cd783040609a8be684db12f82a27774ab07a9155711ecfaf7f99f277bad0c6ae7e39d4eef676573336a5c51eb6f946b30d7d4d0e7f6153a69b6242b522abbee685fda4420f8834b108c3bdae369ef549fa",
+    false
+  ),
+  (
+    35,
+    "54657374",
+    "007c38e026f29e14aabd059a0f2db8b0cd783040609a8be684db12f82a27774ab07a9155711ecfaf7f99f277bad0c6ae7e39d4eef676573336a5c51eb6f946b30d",
+    false
+  ),
+  (
+    36,
+    "54657374",
+    "7c38e026f29e14aabd059a0f2db8b0cd783040609a8be684db12f82a27774ab0007a9155711ecfaf7f99f277bad0c6ae7e39d4eef676573336a5c51eb6f946b30d",
+    false
+  ),
+  (
+    37,
+    "54657374",
+    "7c38e026f29e14aabd059a0f2db8b0cd783040609a8be684db12f82a27774ab07a9155711ecfaf7f99f277bad0c6ae7e39d4eef676573336a5c51eb6f946b30d00",
+    false
+  ),
+  (
+    38,
+    "546573743137",
+    "93de3ca252426c95f735cb9edd92e83321ac62372d5aa5b379786bae111ab6b17251330e8f9a7c30d6993137c596007d7b001409287535ac4804e662bc58a3",
+    false
+  ),
+  (
+    41,
+    "54657374333437",
+    "b0928b46e99fbbad3f5cb502d2cd309d94a7e86cfd4d84b1fcf4cea18075a9c36993c0582dba1e9e519fae5a8654f454201ae0c3cb397c37b8f4f8eef18400",
+    false
+  ),
+  (
+    42,
+    "313233343030",
+    "647c1492402ab5ce03e2c3a7f0384d051b9cf3570f1207fc78c1bcc98c281c2b1d125e5538f38afbcc1c84e489521083041d24bc6240767029da063271a1ff0c",
+    false
+  ),
+  (
+    45,
+    "313233343030",
+    "e57c1492402ab5ce03e2c3a7f0384d051b9cf3570f1207fc78c1bcc98c281c2bbb3eb51cd98dddb235a5f46f2bded6af184a58d09cce928bda43f41d69118a03",
+    false
+  ),
+  (
+    59,
+    "313233343030",
+    "657c1492402ab5ce03e2c3a7f0384d051b9cf3570f1207fc78c1bcc98c281cab227aedf259f910f0f3a759a335062665217925d019173b88917eae294f75d40f",
+    false
+  ),
+  (
+    60,
+    "313233343030",
+    "0000000000000000000000000000000000000000000000000000000000000000e0b8e7770d51c7a36375d006c5bffd6af43ff54aaf47e4330dc118c71d61ec02",
+    false
+  ),
+  (
+    61,
+    "313233343030",
+    "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff463a1908382e7eb7693acef9884f7cf931a215e0791876be22c631a59881fd0e",
+    false
+  ),
+  (
+    62,
+    "313233343030",
+    "9a83eb6dbfd54a31fc1d3c580fc7b2fae4630ca8f0edf803873e433673d7e3d40e94254586cb6188c5386c3febed477cb9a6cb29e3979adc4cb27cf5278fb70a",
+    false
+  ),
+  (
+    63,
+    "54657374",
+    "7c38e026f29e14aabd059a0f2db8b0cd783040609a8be684db12f82a27774ab067654bce3832c2d76f8f6f5dafc08d9339d4eef676573336a5c51eb6f946b31d",
+    false
+  ),
+  (
+    66,
+    "54657374",
+    "7c38e026f29e14aabd059a0f2db8b0cd783040609a8be684db12f82a27774ab0e2300459f1e742404cd934d2c595a6253ad4eef676573336a5c51eb6f946b38d",
+    false
+  ),
+  (
+    67,
+    "54657374",
+    "7c38e026f29e14aabd059a0f2db8b0cd783040609a8be684db12f82a27774ab07a9155711ecfaf7f99f277bad0c6ae7e39d4eef676573336a5c51eb6f946b32d",
+    false
+  ),
+  (
+    70,
+    "54657374",
+    "7c38e026f29e14aabd059a0f2db8b0cd783040609a8be684db12f82a27774ab0679155711ecfaf7f99f277bad0c6ae7e39d4eef676573336a5c51eb6f946b38d",
+    false
+  )
+]
+
+@test("Ed25519 takes Wycheproof's valid signatures and refuses its truncated, padded, malleated and forged ones")
+ed25519Wycheproof()
+  val key = ed25519PublicKey(
+    hex("7d4d0e7f6153a69b6242b522abbee685fda4420f8834b108c3bdae369ef549fa")
+  ).getOrElse(fail("the key"))
+  for (tc, msg, sig, valid) in Ed25519Vectors
+    assertEq(s"$tc ${checks(key, Ed25519, hex(msg), hex(sig))}", s"$tc $valid")
+
+// -- ECDSA ---------------------------------------------------------------------------------------------------
+
+// Wycheproof's ECDSA P-256 SHA-256 vectors in DER over one key: the valid, the BER-encoded, the
+// overlong and truncated, the integers out of range or of the wrong type.
+val P256Key = "3059301306072a8648ce3d020106082a8648ce3d030107034200042927b10512bae3eddcfe467828128bad2903269919f7086069c8c4df6c732838c7787964eaac00e5921fb1498a60f4606766b3d9685001558d1a974e7341513e"
+
+val P256Vectors = [
+  (
+    5,
+    "313233343030",
+    "304402202ba3a8be6b94d5ec80a6d9d1190a436effe50d85a1eee859b8cc6af9bd5c2e1802204cd60b855d442f5b3c7b11eb6c4e0ae7525fe710fab9aa7c77a67f79e6fadd76",
+    true
+  ),
+  (
+    6,
+    "313233343030",
+    "304402202ba3a8be6b94d5ec80a6d9d1190a436effe50d85a1eee859b8cc6af9bd5c2e180220b329f479a2bbd0a5c384ee1493b1f5186a87139cac5df4087c134b49156847db",
+    false
+  ),
+  (
+    7,
+    "313233343030",
+    "304502202ba3a8be6b94d5ec80a6d9d1190a436effe50d85a1eee859b8cc6af9bd5c2e18022100b329f479a2bbd0a5c384ee1493b1f5186a87139cac5df4087c134b49156847db",
+    true
+  ),
+  (
+    8,
+    "313233343030",
+    "30814502202ba3a8be6b94d5ec80a6d9d1190a436effe50d85a1eee859b8cc6af9bd5c2e18022100b329f479a2bbd0a5c384ee1493b1f5186a87139cac5df4087c134b49156847db",
+    false
+  ),
+  (
+    9,
+    "313233343030",
+    "3082004502202ba3a8be6b94d5ec80a6d9d1190a436effe50d85a1eee859b8cc6af9bd5c2e18022100b329f479a2bbd0a5c384ee1493b1f5186a87139cac5df4087c134b49156847db",
+    false
+  ),
+  (
+    10,
+    "313233343030",
+    "304602202ba3a8be6b94d5ec80a6d9d1190a436effe50d85a1eee859b8cc6af9bd5c2e18022100b329f479a2bbd0a5c384ee1493b1f5186a87139cac5df4087c134b49156847db",
+    false
+  ),
+  (
+    12,
+    "313233343030",
+    "3085010000004502202ba3a8be6b94d5ec80a6d9d1190a436effe50d85a1eee859b8cc6af9bd5c2e18022100b329f479a2bbd0a5c384ee1493b1f5186a87139cac5df4087c134b49156847db",
+    false
+  ),
+  (22, "313233343030", "30", false),
+  (
+    40,
+    "313233343030",
+    "314502202ba3a8be6b94d5ec80a6d9d1190a436effe50d85a1eee859b8cc6af9bd5c2e18022100b329f479a2bbd0a5c384ee1493b1f5186a87139cac5df4087c134b49156847db",
+    false
+  ),
+  (
+    49,
+    "313233343030",
+    "308002202ba3a8be6b94d5ec80a6d9d1190a436effe50d85a1eee859b8cc6af9bd5c2e18022100b329f479a2bbd0a5c384ee1493b1f5186a87139cac5df4087c134b49156847db00",
+    false
+  ),
+  (
+    58,
+    "313233343030",
+    "304902202ba3a8be6b94d5ec80a6d9d1190a436effe50d85a1eee859b8cc6af9bd5c2e18022100b329f479a2bbd0a5c384ee1493b1f5186a87139cac5df4087c134b49156847dba0020500",
+    false
+  ),
+  (
+    67,
+    "313233343030",
+    "30460281202ba3a8be6b94d5ec80a6d9d1190a436effe50d85a1eee859b8cc6af9bd5c2e18022100b329f479a2bbd0a5c384ee1493b1f5186a87139cac5df4087c134b49156847db",
+    false
+  ),
+  (
+    85,
+    "313233343030",
+    "304702202ba3a8be6b94d5ec80a6d9d1190a436effe50d85a1eee859b8cc6af9bd5c2e180000022100b329f479a2bbd0a5c384ee1493b1f5186a87139cac5df4087c134b49156847db",
+    false
+  ),
+  (94, "313233343030", "30250500022100b329f479a2bbd0a5c384ee1493b1f5186a87139cac5df4087c134b49156847db", false),
+  (
+    103,
+    "313233343030",
+    "304502202ba3a8be6b94d5ec80a6d9d1190a436effe50d85a1eee859b8cc6af9bd5c2e98022100b329f479a2bbd0a5c384ee1493b1f5186a87139cac5df4087c134b49156847db",
+    false
+  ),
+  (
+    112,
+    "313233343030",
+    "304302202ba3a8be6b94d5ec80a6d9d1190a436effe50d85a1eee859b8cc6af9bd5c2e1800b329f479a2bbd0a5c384ee1493b1f5186a87139cac5df4087c124b49156847db",
+    false
+  ),
+  (
+    157,
+    "313233343030",
+    "30460221fed45c5742946b2a127f59262ee6f5bc914333f7ccb6f979215379ca434640ac97022100b329f479a2bbd0a5c384ee1493b1f5186a87139cac5df4087c134b49156847db",
+    false
+  ),
+  (
+    166,
+    "313233343030",
+    "30450220b329f479a2bbd0a5c384ee1493b1f5186a87139cac5df4087c134b49156847db022100b329f479a2bbd0a5c384ee1493b1f5186a87139cac5df4087c134b49156847db",
+    false
+  ),
+  (175, "313233343030", "3026020100022100ffffffff00000001000000000000000000000001000000000000000000000000", false),
+  (184, "313233343030", "30060201ff020100", false),
+  (193, "313233343030", "3026022100ffffffff00000000ffffffffffffffffbce6faada7179e84f3b9cac2fc632551020101", false),
+  (
+    211,
+    "313233343030",
+    "3046022100ffffffff00000000ffffffffffffffffbce6faada7179e84f3b9cac2fc632552022100ffffffff00000000ffffffffffffffffbce6faada7179e84f3b9cac2fc632551",
+    false
+  ),
+  (238, "313233343030", "30060201000c0130", false),
+  (
+    301,
+    "33373036323131373132",
+    "3046022100ed66dc34f551ac82f63d4aa4f81fe2cb0031a91d1314f835027bca0f1ceeaa0302210099ca123aa09b13cd194a422e18d5fda167623c3f6e5d4d6abb8953d67c0c48c7",
+    true
+  ),
+  (
+    310,
+    "39383137333230323837",
+    "3044022044a3e23bf314f2b344fc25c7f2de8b6af3e17d27f5ee844b225985ab6e2775cf02202d48e223205e98041ddc87be532abed584f0411f5729500493c9cc3f4dd15e86",
+    true
+  ),
+  (
+    337,
+    "333232313434313632",
+    "304602210081f2359c4faba6b53d3e8c8c3fcc16a948350f7ab3a588b28c17603a431e39a8022100cd6f6a5cc3b55ead0ff695d06c6860b509e46d99fccefb9f7f9e101857f74300",
+    true
+  )
+]
+
+@test("ECDSA P-256 takes Wycheproof's valid DER signatures and refuses its malformed and forged ones")
+ecdsaP256Wycheproof()
+  val key = publicOfDer(P256Key)
+  assert(key.kind == EcP256Key)
+  for (tc, msg, sig, valid) in P256Vectors
+    assertEq(s"$tc ${checks(key, EcdsaP256Sha256, hex(msg), hex(sig))}", s"$tc $valid")
+
+// Wycheproof's fixed-width (IEEE P1363) vectors over the same key.
+val P256FixedVectors = [
+  (
+    1,
+    "313233343030",
+    "2ba3a8be6b94d5ec80a6d9d1190a436effe50d85a1eee859b8cc6af9bd5c2e184cd60b855d442f5b3c7b11eb6c4e0ae7525fe710fab9aa7c77a67f79e6fadd76",
+    true
+  ),
+  (
+    2,
+    "313233343030",
+    "012ba3a8bd6b94d5ed80a6d9d1190a436ebccc0833490686deac8635bcb9bf536900b329f479a2bbd0a5c384ee1493b1f5186a87139cac5df4087c134b49156847db",
+    false
+  ),
+  (
+    4,
+    "313233343030",
+    "d45c5740946b2a147f59262ee6f5bc90bd01ed280528b62b3aed5fc93f06f739b329f479a2bbd0a5c384ee1493b1f5186a87139cac5df4087c134b49156847db",
+    false
+  ),
+  (
+    6,
+    "313233343030",
+    "0100000000000000002ba3a8be6b94d5ec80a6d9d1190a436effe50d85a1eee859b8cc6af9bd5c2e18000000000000000000b329f479a2bbd0a5c384ee1493b1f5186a87139cac5df4087c134b49156847db",
+    false
+  )
+]
+
+@test("a fixed-width ECDSA signature checks once made DER, and one of the wrong width makes none")
+ecdsaP256FixedWycheproof()
+  val key = publicOfDer(P256Key)
+  for (tc, msg, sig, valid) in P256FixedVectors
+    val verdict = ecdsaDerSignature(hex(sig), EcdsaP256Sha256) match
+      Some(der) -> checks(key, EcdsaP256Sha256, hex(msg), der)
+      None -> false
+    assertEq(s"$tc $verdict", s"$tc $valid")
+  assert(ecdsaDerSignature(hex(P256FixedVectors(1).2), EcdsaP256Sha256) is None)
+
+val P384Key = "3076301006072a8648ce3d020106052b81040022036200042da57dda1089276a543f9ffdac0bff0d976cad71eb7280e7d9bfd9fee4bdb2f20f47ff888274389772d98cc5752138aa4b6d054d69dcf3e25ec49df870715e34883b1836197d76f8ad962e78f6571bbc7407b0d6091f9e4d88f014274406174f"
+
+val P384Vectors = [
+  (
+    5,
+    "313233343030",
+    "3064023012b30abef6b5476fe6b612ae557c0425661e26b44b1bfe19daf2ca28e3113083ba8e4ae4cc45a0320abd3394f1c548d702301840da9fc1d2f8f8900cf485d5413b8c2574ee3a8d4ca03995ca30240e09513805bf6209b58ac7aa9cff54eecd82b9f1",
+    true
+  ),
+  (
+    6,
+    "313233343030",
+    "3064023012b30abef6b5476fe6b612ae557c0425661e26b44b1bfe19daf2ca28e3113083ba8e4ae4cc45a0320abd3394f1c548d70230e7bf25603e2d07076ff30b7a2abec473da8b11c572b35fc631991d5de62ddca7525aaba89325dfd04fecc47bff426f82",
+    false
+  ),
+  (
+    7,
+    "313233343030",
+    "3065023012b30abef6b5476fe6b612ae557c0425661e26b44b1bfe19daf2ca28e3113083ba8e4ae4cc45a0320abd3394f1c548d7023100e7bf25603e2d07076ff30b7a2abec473da8b11c572b35fc631991d5de62ddca7525aaba89325dfd04fecc47bff426f82",
+    true
+  ),
+  (
+    8,
+    "313233343030",
+    "308165023012b30abef6b5476fe6b612ae557c0425661e26b44b1bfe19daf2ca28e3113083ba8e4ae4cc45a0320abd3394f1c548d7023100e7bf25603e2d07076ff30b7a2abec473da8b11c572b35fc631991d5de62ddca7525aaba89325dfd04fecc47bff426f82",
+    false
+  ),
+  (22, "313233343030", "30", false),
+  (
+    103,
+    "313233343030",
+    "3065023012b30abef6b5476fe6b612ae557c0425661e26b44b1bfe19daf2ca28e3113083ba8e4ae4cc45a0320abd3394f1c54857023100e7bf25603e2d07076ff30b7a2abec473da8b11c572b35fc631991d5de62ddca7525aaba89325dfd04fecc47bff426f82",
+    false
+  ),
+  (
+    157,
+    "313233343030",
+    "30660231feed4cf541094ab8901949ed51aa83fbda99e1d94bb4e401e65da9e85528b7a19ced57a768eb09b8530856b30041758db6023100e7bf25603e2d07076ff30b7a2abec473da8b11c572b35fc631991d5de62ddca7525aaba89325dfd04fecc47bff426f82",
+    false
+  ),
+  (
+    175,
+    "313233343030",
+    "3036020100023100fffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffeffffffff000000000000000100000000",
+    false
+  ),
+  (
+    295,
+    "3133323237",
+    "3066023100ac042e13ab83394692019170707bc21dd3d7b8d233d11b651757085bdd5767eabbb85322984f14437335de0cdf565684023100bd770d3ee4beadbabe7ca46e8c4702783435228d46e2dd360e322fe61c86926fa49c8116ec940f72ac8c30d9beb3e12f",
+    true
+  ),
+  (
+    296,
+    "31373530353531383135",
+    "3066023100d3298a0193c4316b34e3833ff764a82cff4ef57b5dd79ed6237b51ff76ceab13bf92131f41030515b7e012d2ba857830023100bfc7518d2ad20ed5f58f3be79720f1866f7a23b3bd1bf913d3916819d008497a071046311d3c2fd05fc284c964a39617",
+    true
+  )
+]
+
+@test("ECDSA P-384 takes Wycheproof's valid signatures and refuses its malformed and forged ones")
+ecdsaP384Wycheproof()
+  val key = publicOfDer(P384Key)
+  assert(key.kind == EcP384Key)
+  for (tc, msg, sig, valid) in P384Vectors
+    assertEq(s"$tc ${checks(key, EcdsaP384Sha384, hex(msg), hex(sig))}", s"$tc $valid")
+
+@test("RFC 7515's ES256 signature, carried fixed-width, checks against its P-256 key")
+es256Rfc7515()
+  val key = publicOf(RfcEcPublic)
+  val fixed = fromBase64Url(RfcEs256).getOrElse(fail("the signature"))
+  assertEq(fixed.length, 64)
+  val der = ecdsaDerSignature(fixed, EcdsaP256Sha256).getOrElse(fail("DER of the signature"))
+  assert(checks(key, EcdsaP256Sha256, RfcInputEs.bytes, der))
+  assertEq(toHex(ecdsaFixedSignature(der, EcdsaP256Sha256).getOrElse(Vector())), toHex(fixed))
+  assert(!checks(key, EcdsaP256Sha256, RfcInputRs.bytes, der))
+  assert(privateOf(RfcEcPrivate).publicKey == key)
+
+@test(
+  "the two forms of an ECDSA signature round trip, and anything that is not one signature in canonical DER has no fixed form"
+)
+ecdsaForms()
+  val key = generatePrivateKey(EcP256Key)
+  for i in 0 ..< 40
+    val der = signed(key, EcdsaP256Sha256, s"message $i".bytes)
+    val fixed = ecdsaFixedSignature(der, EcdsaP256Sha256).getOrElse(fail("the fixed form"))
+    assertEq(fixed.length, 64)
+    assertEq(toHex(ecdsaDerSignature(fixed, EcdsaP256Sha256).getOrElse(Vector())), toHex(der))
+  val p384 = generatePrivateKey(EcP384Key)
+  val der384 = signed(p384, EcdsaP384Sha384, "x".bytes)
+  assertEq(ecdsaFixedSignature(der384, EcdsaP384Sha384).getOrElse(Vector()).length, 96)
+  // A P-256 signature's integers fit P-384's 48-byte width too.
+  val der256 = signed(key, EcdsaP256Sha256, "x".bytes)
+  assertEq(ecdsaFixedSignature(der256, EcdsaP384Sha384).getOrElse(Vector()).length, 96)
+  // BER, trailing bytes, an empty input, a lone tag, a negative integer, and schemes that are not ECDSA.
+  for (_, _, sig, valid) in P256Vectors
+    if !valid then
+      val bytes = hex(sig)
+      ecdsaFixedSignature(bytes, EcdsaP256Sha256) match
+        Some(fixed) -> assertEq(fixed.length, 64)
+        None -> ()
+  assert(ecdsaFixedSignature(hex(P256Vectors(3).2), EcdsaP256Sha256) is None)
+  assert(ecdsaFixedSignature(hex(P256Vectors(4).2), EcdsaP256Sha256) is None)
+  assert(ecdsaFixedSignature(hex(P256Vectors(9).2), EcdsaP256Sha256) is None)
+  assert(ecdsaFixedSignature(hex(P256Vectors(19).2), EcdsaP256Sha256) is None)
+  assert(ecdsaFixedSignature(Vector(), EcdsaP256Sha256) is None)
+  assert(ecdsaFixedSignature(hex("30"), EcdsaP256Sha256) is None)
+  assert(ecdsaFixedSignature(der256 ++ hex("00"), EcdsaP256Sha256) is None)
+  assert(ecdsaFixedSignature(der256, Ed25519) is None)
+  assert(ecdsaFixedSignature(der256, RsaPssSha256) is None)
+  assert(ecdsaDerSignature(Vector.fill(63, byte(1)), EcdsaP256Sha256) is None)
+  assert(ecdsaDerSignature(Vector.fill(65, byte(1)), EcdsaP256Sha256) is None)
+  assert(ecdsaDerSignature(Vector.fill(64, byte(1)), EcdsaP384Sha384) is None)
+  assert(ecdsaDerSignature(Vector.fill(64, byte(1)), Ed25519) is None)
+  assert(ecdsaDerSignature(Vector(), EcdsaP256Sha256) is None)
+  // Integers whose top bit is set gain a leading zero in DER, and leading zeros come off.
+  val high = Vector.fill(64, byte(0xff))
+  assertEq(toHex(ecdsaDerSignature(high, EcdsaP256Sha256).getOrElse(Vector())).slice(0, 12), "3046022100ff")
+  val low = Vector.tabulate(64, i -> if i == 31 || i == 63 then byte(7) else byte(0))
+  assertEq(toHex(ecdsaDerSignature(low, EcdsaP256Sha256).getOrElse(Vector())), "3006020107020107")
+  assertEq(toHex(ecdsaFixedSignature(hex("3006020107020107"), EcdsaP256Sha256).getOrElse(Vector())), toHex(low))
+
+// -- RSA -----------------------------------------------------------------------------------------------------
+
+val Rsa2048Key = "30820122300d06092a864886f70d01010105000382010f003082010a0282010100a2b451a07d0aa5f96e455671513550514a8a5b462ebef717094fa1fee82224e637f9746d3f7cafd31878d80325b6ef5a1700f65903b469429e89d6eac8845097b5ab393189db92512ed8a7711a1253facd20f79c15e8247f3d3e42e46e48c98e254a2fe9765313a03eff8f17e1a029397a1fa26a8dce26f490ed81299615d9814c22da610428e09c7d9658594266f5c021d0fceca08d945a12be82de4d1ece6b4c03145b5d3495d4ed5411eb878daf05fd7afc3e09ada0f1126422f590975a1969816f48698bcbba1b4d9cae79d460d8f9f85e7975005d9bc22c4e5ac0f7c1a45d12569a62807d3b9a02e5a530e773066f453d1f5b4c2e9cf7820283f742b9d50203010001"
+
+// Wycheproof's RSA PKCS#1 v1.5 SHA-256 vectors: valid, and padding that is BER, truncated or altered.
+val Pkcs1Vectors = [
+  (
+    1,
+    "",
+    "840f5dac53106dd1f9c57219224cf51289290c42f20466875ba8e830ac5690e541536fcc8ab03b731f82bf66d83f194e7e180b3963ec7a2f3f7904a7ce49aed47da4d4b79421eaf937d301b3e696169297b797c32c076a12be4de0b58e003c5123051a84a10c62f8dac2f42a8640008eb3c7cccd6760ff5b51b689763922582845f048fb8150e5a7a6ca2eccc7bdc85349ad5b26c52137a79fa3fe5c29ab5cd7615013219c1941b6708e9c3c23feff5febaf0c8ebca5750b54e3e6e99a3e876b396f27860b7f3ec4e9191703c6332d944f6f69751167680c79c4f6b57f1cc8755d24b6ec158ccdbacdb23107a33cb6b332516c13274d1f9dccc21dced869e486",
+    true
+  ),
+  (
+    3,
+    "54657374",
+    "264491e844c119f14e425c03282139a558dcdaeb82a4628173cd407fd319f9076eaebc0dd87a1c22e4d17839096886d58a9d5b7f7aeb63efec56c45ac7bead4203b6886e1faa90e028ec0ae094d46bf3f97efdd19045cfbc25a1abda2432639f9876405c0d68f8edbf047c12a454f7681d5d5a2b54bd3723d193dbad4338baad753264006e2d08931c4b8bb79aa1c9cad10eb6605f87c5831f6e2b08e002f9c6f21141f5841d92727dd3e1d99c36bc560da3c9067df99fcaf818941f72588be33032bad22caf6704223bb114d575b6d02d9d222b580005d930e8f40cce9f672eebb634a20177d84351627964b83f2053d736a84ab1a005f63bd5ba943de6205c",
+    true
+  ),
+  (
+    7,
+    "e0e1e2e3e4e5e6e7e8e9eaebecedeeeff0f1f2f3f4f5f6f7f8f9fafbfcfdfeff",
+    "2ae8d95b19cbd64d0e343ff413fffb85d8e6713c06ac8a1ceba7f3924fa740f8d2b3e120fd71f22711e795cd6468c5e263b1a5ba6ac6b8fa9e23d2d6e7243f510592a61d134e68b8ead00612dbf38c5b7302abc3bf33f23e6d4816a6e3ddcea6482566e84f57464f7d56de4cef0b2256ef21874dda4c131a47292ff8ef853f93804483c8e6373d39ca3a22552e75427b812b861de6a310ff4c366f6f6604116efd9770170aa423554c4ebbd2b5c0698950e66bb5b7c5c346285d9f5c35146255736b6e818e8e77983c93b21e7f60b04a7a525598e7fd8049b181000bffc7f3753a504370f6bb70617ac8e914deb05a198a5758a459c9fcd2fce1aede48e8a852",
+    true
+  ),
+  (
+    9,
+    "313233343030",
+    "8a0e82d4f334aca72a718b6f8f643f69c6048d619d5eba71263a5d2d3ac7a7af133b780c7595ca2c982c006e861948f543cd0210c758691f9626842c25de2843ea314ca8eff285d47e0cffa54180af416004017034962a80a5959c3d3f1bfc154a4824462a93c014f6dfe920824f414a6e30e0e5944d480b99949ec7bf64c4a7461575933b17d7d6b0178b5192392ace3ed8469e8ac1dacae51ad5d3ad73dcb213e056d04596e64d8c0703def3110c7cecc93ba8ac8059f0f3d66b89d8712c62b41d407e4b4a104f4569558b0290c213cad6d0653898b9df8f4a453ab07d13bfb7598d505abbd0c4987e4f1ac66e1a523e113e370ab7cf990f0cc63f50f4f0a4",
+    false
+  ),
+  (
+    21,
+    "313233343030",
+    "498209f59a0679a1f926eccf3056da2cba553d7ab3064e7c41ad1d739f038249f02f5ad12ee246073d101bc3cdb563e8b6be61562056422b7e6c16ad53deb12af5de744197753a35859833f41bb59c6597f3980132b7478fd0b95fd27dfad64a20fd5c25312bbd41a85286cd2a83c8df5efa0779158d01b0747ff165b055eb2880ea27095700a295593196d8c5922cf6aa9d7e29b5056db5ded5eb20aeb31b8942e26b15a5188a4934cd7e39cfe379a197f49a204343a493452deebca436ee614f4daf989e355544489f7e69ffa8ccc6a1e81cf0ab33c3e6d7591091485a6a31bda3b33946490057b9a3003d3fd9daf7c4778b43fd46144d945d815f12628ff4",
+    false
+  ),
+  (
+    48,
+    "313233343030",
+    "0f7e36a02137a094719570754763ccf4cbfe21a05b95634fffe0cf0cb46210d379b5e7dda7ad815081d12dc43452e35a89b1fb715e4a507b364da2b73b3fdf91ecf1b04a6aa3ab9b90718660291478e6ac0cbd29c18d4beda2b0bfeb53979facf2e5d8ef1bed5a36686cb034082feff665686c41572441a673e7426a89866f65529de9fecfa32a2cd1c7098e7e7bcf2a720d46cebf23988c259dc880a3acf8e1b17f1ba8de6e8e9cfb8af2b6398f7541d45162438c3f14c308dc6d778bc91106c7d48332d8968fb083bdadf1edcba30638853e5bf1398d61bb8eb6b61363cdd859ce4f6160f7e819758afa067c612be054b4c0e2567fe39a81550001cfa081d3",
+    false
+  ),
+  (
+    62,
+    "313233343030",
+    "49cd3a96260855d9a0ba3005b8ab18f077e18dc88923a4acbffa7ce91a948601db5317c6e6d7e55a7686f735d378ea12bd17ecb26638dc1ef5f613c527c52dd91ec1fab9d3823ccd51d7ad1af5383f4920478116e20fe43996a8ee7b61116cba0f69f42d5661c97c71e62a0ca792d592e6e0ef28e67e27b1ff7260ac427f35f7788ac81dcc69ed4f4ac4eea07a69303cfe083a7cde808e75abf62283424a8727cf0a85df2e26060de2dc04dd12fa6a0471a00f003b30eb4d14b65438d7090c2bdc953588207c0951f39d0aee482dabb782cf593d631900eebb3dca524f9d1607440ada91e20bdb7117486ae90d77fc44cf5e4aacf4c850093ca883ddb7b3a040",
+    false
+  )
+]
+
+@test("RSA PKCS#1 v1.5 takes Wycheproof's valid signatures and refuses its malformed padding")
+rsaPkcs1Wycheproof()
+  val key = publicOfDer(Rsa2048Key)
+  assert(key.kind == RsaKey(2048))
+  for (tc, msg, sig, valid) in Pkcs1Vectors
+    assertEq(s"$tc ${checks(key, RsaPkcs1Sha256, hex(msg), hex(sig))}", s"$tc $valid")
+  // A signature one byte short, one byte long, empty, and a valid one under the wrong digest.
+  val good = hex(Pkcs1Vectors(1).2)
+  assert(!checks(key, RsaPkcs1Sha256, hex("54657374"), good.slice(1, good.length)))
+  assert(!checks(key, RsaPkcs1Sha256, hex("54657374"), good ++ hex("00")))
+  assert(!checks(key, RsaPkcs1Sha256, hex("54657374"), Vector()))
+  assert(!checks(key, RsaPkcs1Sha384, hex("54657374"), good))
+  assert(!checks(key, RsaPssSha256, hex("54657374"), good))
+
+// Wycheproof's RSA-PSS SHA-256 vectors (MGF1 over SHA-256, a 32-byte salt), over the same key.
+val PssVectors = [
+  (
+    1,
+    "",
+    "4f01e0c12b08625ecac89a69231906edf826380f37c959a96690d046316d68ffce9d5c471694fcebfc6b45534864689256e4fc81c78e583f675d0c94b449647451e81beff01a11a516d5e5ce3f1a910437cb8a3a5096b19fb15f4524a35b23d89cdba12cf5b71aac1047b28c562df7c5542c34ce23a182cf7e0e231934b17294799d44877a1d68ef1b8f073619b7618e6b7c22db20030d98cf591ffc3d4da5f58613ecd5ecfc3b40a1d02f40891ca43695cd4c088b05a8054c89c595a47e274816f35384226f74459ee63e25a1bfc03c360490552ec38343f8ace502f065303b00bc0ec320711b211fde92e57feb9013c3609342495ec0d7cabdec21e54acc38",
+    true
+  ),
+  (
+    4,
+    "313233343030",
+    "68caf07e71ee654ffabf07d342fc4059deb4f7e5970746c423b1e8f668d5332275cc35eb61270aebd27855b1e80d59def47fe8882867fd33c2308c91976baa0b1df952caa78db4828ab81e79949bf145cbdfd1c4987ed036f81e8442081016f20fa4b587574884ca6f6045959ce3501ae7c02b1902ec1d241ef28dee356c0d30d28a950f1fbc683ee7d9aad26b048c13426fe3975d5638afeb5b9c1a99d162d3a5810e8b074d7a2eae2be52b577151f76e1f734b0a956ef4f22be64dc20a81ad1316e4f79dff5fc41fc08a20bc612283a88415d41595bfea66d59de7ac12e230f72244ad9905aef0ead3fa41ed70bf4218863d5f041292f2d14ce0a7271c6d36",
+    true
+  ),
+  (
+    62,
+    "313233343030",
+    "67d1d1c0a398148625317c3f5e44b738bdf461c27a59594b39ebb2aebef233c7809379e54411411b82d2e7ac88f989b58373d532c758baea121878ce9759441738d121881c1fa2d04421f02dd565b12770d844611ed1873a0b64d822709a6b78d6d3892b294404bce6711001d6c3a54546c76a1d17819674b0be904497a233b466fe4becc832dee740f9ab79e5b9f5db0b0f9aac0084ba05cebf42303b5ca2ad95e3d61b29ed6475545c02e93e7b0e118af92f5cddb1faeb2cbc23c9e69c120e29df7fe31991e887b3b29e77688c60e80be65cccf3d7861a7a14c39e6a6e5645568e2cc5e4a17b75db1dd415aadb45e112a9b582b2ff6e82a43d7a7347b7b56d",
+    false
+  ),
+  (
+    70,
+    "313233343030",
+    "5d8c3644e0e18da9d81ba3fd33436e4379d3c3fa8127b41f2eb901836b31a78f0954d3287d452887ee3a285701a920b0f6fb8da0e017c7bcbe59cb9bf5d5aacb1032cdc4ddd85492c0638519a4694f686e77305d138b9d3491460f408abb8abfd7e3622aff5a4a96b383ff87560e9be962aa4696be3668645e6a43b460b18c93af0578a8de3b4d2fc657376c7ec9a23c473a81ac57da1262b47204c13f5befc0ce2b4339b83999cbedafa334ddc73624eae8b7002c082d8ca7064b6963b443ae32b2a16fcdb4ad5e8c9b8073305ac4c14fe0c29514320d09b6e48ddea9f3e02cf3273f5cb5871a0bb81a935606b7fe56bebe410c5afea5a8af3c426b72cd291a",
+    false
+  ),
+  (
+    71,
+    "313233343030",
+    "563e94111eade9526d1f2e93da16ee171273291abfb90aeb94ae7b95f16395949ef3d3f0994852de035cebf8cd002b76579d0758325c6750ffc917be419174d255a2b798ce287f6240a97d4fcae47e88308658898ce37407e9684caca197c46ec9f66a0ba4e8aecf6a7ae749304fddf1ec4155a17de5d01117a3cbf2a34fa77d0556a39451b697c869e6fab3283541816bd6c7520b5eb0ee6b592a19331ffcccdcaa403f4f25e732a847ff260ec40ecfb52abc6f65f95d21715acd2c0dadb23d7e1c0fa8cac3e60c6f19b430f9c252ce1f392cd2f7bc87a4be0a4dc0b7f909afa7c25ed1b5be611bf86a648592786385f02c345eaedd03c4b0bb5bb758254d9d",
+    false
+  ),
+  (
+    94,
+    "313233343030",
+    "9c13d877ac2bd8c02c11e29ffcc0c1046dbc9870177e843c30b499c2bf7fd09daa43469caf2b8c3e955ded95e4d62209f7571bb45593f4cd8b0c7bc9470a8a693837248b5a7854dc8e37e752d949479272642994182061d7af80b0ac6f6e984874c8cdc6a5d7d17dc9e9de5ad12120cdb9f6c0d09c0e11b87b3423e37ba9437a4f76cc1e6124579e5f79832b89710de1968ce46e3e69fa185c0a924e8cb5f996ee5963f6826dd37714de264d75545e8509caf8735330cde7ed4228e5779471827b83757c466022117c45d598f5a4a7fed7be4e1b4d320f894879061a75d1a41efd8dcaf3c61733ed8ca2cc2f83714f8fdbc7a97cd6d6b97ea3d36ebd69890633",
+    false
+  ),
+  (
+    102,
+    "313233343030",
+    "a2b451a07d0aa5f96e455671513550514a8a5b462ebef717094fa1fee82224e637f9746d3f7cafd31878d80325b6ef5a1700f65903b469429e89d6eac8845097b5ab393189db92512ed8a7711a1253facd20f79c15e8247f3d3e42e46e48c98e254a2fe9765313a03eff8f17e1a029397a1fa26a8dce26f490ed81299615d9814c22da610428e09c7d9658594266f5c021d0fceca08d945a12be82de4d1ece6b4c03145b5d3495d4ed5411eb878daf05fd7afc3e09ada0f1126422f590975a1969816f48698bcbba1b4d9cae79d460d8f9f85e7975005d9bc22c4e5ac0f7c1a45d12569a62807d3b9a02e5a530e773066f453d1f5b4c2e9cf7820283f742b9d5",
+    false
+  )
+]
+
+@test(
+  "RSA-PSS takes Wycheproof's valid signatures and refuses a changed hash, a salt of another length and a signature equal to n"
+)
+rsaPssWycheproof()
+  val key = publicOfDer(Rsa2048Key)
+  for (tc, msg, sig, valid) in PssVectors
+    assertEq(s"$tc ${checks(key, RsaPssSha256, hex(msg), hex(sig))}", s"$tc $valid")
+  assert(!checks(key, RsaPkcs1Sha256, Vector(), hex(PssVectors(0).2)))
+  assert(!checks(key, RsaPssSha512, Vector(), hex(PssVectors(0).2)))
+
+@test("RS256 over RFC 7515's input with its key gives exactly A.2's signature, and the public key checks it")
+rs256Rfc7515()
+  val key = privateOf(RfcRsaPrivate)
+  assert(key.kind == RsaKey(2048))
+  val expected = fromBase64Url(RfcRs256).getOrElse(fail("the signature"))
+  val made = signed(key, RsaPkcs1Sha256, RfcInputRs.bytes)
+  assertEq(toHex(made), toHex(expected))
+  assert(checks(publicOf(RfcRsaPublic), RsaPkcs1Sha256, RfcInputRs.bytes, made))
+  assert(key.publicKey == publicOf(RfcRsaPublic))
+  // The traditional form of the same key is the same key, and signs the same.
+  val traditional = privateOf(RfcRsaTraditional)
+  assertEq(toHex(traditional.toDer()), toHex(key.toDer()))
+  assertEq(toHex(signed(traditional, RsaPkcs1Sha256, RfcInputRs.bytes)), toHex(expected))
+
+// -- every scheme --------------------------------------------------------------------------------------------
+
+// Each scheme with a key it signs with: generated for Ed25519 and the curves, RFC 7515's for RSA.
+schemesAndKeys() -> Vector[(SignatureScheme, PrivateKey)]
+  val ed = generatePrivateKey(Ed25519Key)
+  val p256 = generatePrivateKey(EcP256Key)
+  val p384 = generatePrivateKey(EcP384Key)
+  val rsa = privateOf(RfcRsaPrivate)
+  [
+    (Ed25519, ed),
+    (EcdsaP256Sha256, p256),
+    (EcdsaP384Sha384, p384),
+    (RsaPkcs1Sha256, rsa),
+    (RsaPkcs1Sha384, rsa),
+    (RsaPkcs1Sha512, rsa),
+    (RsaPssSha256, rsa),
+    (RsaPssSha384, rsa),
+    (RsaPssSha512, rsa)
+  ]
+
+@test("every scheme signs and checks: an empty message, one byte, every byte value, a mebibyte, and Unicode text")
+everySchemeRoundTrips()
+  val big = Vector.tabulate(1048576 + 3, i -> byte(i * 7 % 256))
+  val every = Vector.tabulate(256, i -> byte(i))
+  for (scheme, key) in schemesAndKeys()
+    val public = key.publicKey
+    for message in [Vector(), hex("00"), every, big]
+      val signature = signed(key, scheme, message)
+      assert(checks(public, scheme, message, signature))
+    val text = "héllo wörld ✓ 日本語 😀"
+    val fromText = key.sign(scheme, text).getOrElse(fail("text"))
+    assert(public.verify(scheme, text, fromText).getOrElse(false))
+    assert(checks(public, scheme, text.bytes, fromText))
+
+@test("a signature does not check over another message, after any one of its bytes changes, or under another key")
+alteredSignaturesFail()
+  for (scheme, key) in schemesAndKeys()
+    val public = key.publicKey
+    val message = "the message".bytes
+    val signature = signed(key, scheme, message)
+    assert(!checks(public, scheme, "the messagE".bytes, signature))
+    assert(!checks(public, scheme, message ++ hex("00"), signature))
+    assert(!checks(public, scheme, Vector(), signature))
+    for at in [0, 1, signature.length / 2, signature.length - 1]
+      assert(!checks(public, scheme, message, flipped(signature, at)))
+    assert(!checks(public, scheme, message, signature.slice(0, signature.length - 1)))
+    assert(!checks(public, scheme, message, signature ++ hex("00")))
+    assert(!checks(public, scheme, message, Vector()))
+  val other = generatePrivateKey(Ed25519Key)
+  val signature = signed(other, Ed25519, "m".bytes)
+  assert(!checks(generatePrivateKey(Ed25519Key).publicKey, Ed25519, "m".bytes, signature))
+
+@test("Ed25519 and PKCS#1 v1.5 sign the same message the same way twice; ECDSA and PSS differ each time and both check")
+determinism()
+  for (scheme, key) in schemesAndKeys()
+    val a = signed(key, scheme, "same".bytes)
+    val b = signed(key, scheme, "same".bytes)
+    val deterministic = scheme match
+      Ed25519 -> true
+      RsaPkcs1Sha256 -> true
+      RsaPkcs1Sha384 -> true
+      RsaPkcs1Sha512 -> true
+      _ -> false
+    assertEq(s"$scheme ${a == b}", s"$scheme $deterministic")
+    assert(checks(key.publicKey, scheme, "same".bytes, a))
+    assert(checks(key.publicKey, scheme, "same".bytes, b))
+
+@test("signature lengths: 64 for Ed25519, the modulus for RSA, DER no longer than 72 and 104 for P-256 and P-384")
+signatureLengths()
+  for (scheme, key) in schemesAndKeys()
+    val length = signed(key, scheme, "x".bytes).length
+    val fits = scheme match
+      Ed25519 -> length == 64
+      EcdsaP256Sha256 -> 8 <= length <= 72
+      EcdsaP384Sha384 -> 8 <= length <= 104
+      _ -> length == 256
+    assert(fits, s"$scheme gave $length bytes")
+
+@test("a scheme for another kind of key is a KeyMismatch, in both directions, never a false verdict")
+keyMismatch()
+  val keys = [
+    generatePrivateKey(Ed25519Key),
+    generatePrivateKey(EcP256Key),
+    generatePrivateKey(EcP384Key),
+    privateOf(RfcRsaPrivate)
+  ]
+  val schemes = [
+    Ed25519, EcdsaP256Sha256, EcdsaP384Sha384, RsaPkcs1Sha256, RsaPkcs1Sha384, RsaPkcs1Sha512, RsaPssSha256,
+    RsaPssSha384, RsaPssSha512
+  ]
+  var mismatches = 0
+  for key in keys
+    for scheme in schemes
+      if !scheme.fits(key.kind) then
+        mismatches += 1
+        key.sign(scheme, "m".bytes) match
+          Err(KeyMismatch(kind, s)) ->
+            assert(kind == key.kind)
+            assert(s == scheme)
+          _ -> fail(s"$key signed with $scheme")
+        key.publicKey.verify(scheme, "m".bytes, Vector.fill(64, byte(0))) match
+          Err(KeyMismatch(_, _)) -> ()
+          _ -> fail(s"$key checked $scheme")
+  assertEq(mismatches, 4 * 9 - 9)
+  val e = generatePrivateKey(Ed25519Key).sign(RsaPssSha256, "m".bytes).err.getOrElse(fail("no error"))
+  assertEq(e.message, "a Ed25519 key does not sign with RSA-PSS SHA-256")
+
+@test("which kinds of key each scheme signs with")
+schemeFits()
+  assert(Ed25519.fits(Ed25519Key))
+  assert(!Ed25519.fits(EcP256Key))
+  assert(EcdsaP256Sha256.fits(EcP256Key))
+  assert(!EcdsaP256Sha256.fits(EcP384Key))
+  assert(EcdsaP384Sha384.fits(EcP384Key))
+  assert(!EcdsaP384Sha384.fits(EcP256Key))
+  assert(!EcdsaP384Sha384.fits(RsaKey(2048)))
+  for scheme in [RsaPkcs1Sha256, RsaPkcs1Sha384, RsaPkcs1Sha512, RsaPssSha256, RsaPssSha384, RsaPssSha512]
+    assert(scheme.fits(RsaKey(2048)))
+    assert(scheme.fits(RsaKey(4096)))
+    assert(!scheme.fits(Ed25519Key))
+    assert(!scheme.fits(EcP256Key))
+
+// -- keys ------------------------------------------------------------------------------------------------------
+
+@test("a generated key is of the kind asked for, and two are different keys")
+generatedKeys()
+  assert(generatePrivateKey(Ed25519Key).kind == Ed25519Key)
+  assert(generatePrivateKey(EcP256Key).kind == EcP256Key)
+  assert(generatePrivateKey(EcP384Key).kind == EcP384Key)
+  val rsa = generatePrivateKey(RsaKey(2048))
+  assert(rsa.kind == RsaKey(2048))
+  assert(checks(rsa.publicKey, RsaPssSha256, "m".bytes, signed(rsa, RsaPssSha256, "m".bytes)))
+  assert(generatePrivateKey(RsaKey(3072)).kind == RsaKey(3072))
+  assert(generatePrivateKey(Ed25519Key).publicKey != generatePrivateKey(Ed25519Key).publicKey)
+  assert(generatePrivateKey(EcP256Key).publicKey != generatePrivateKey(EcP256Key).publicKey)
+
+@test("a key written as PEM or DER reads back as the same key, private and public, of every kind")
+pemAndDerRoundTrip()
+  for (_, key) in schemesAndKeys()
+    val pem = key.toPem()
+    assert(pem.startsWith("-----BEGIN PRIVATE KEY-----\n"))
+    assert(pem.endsWith("-----END PRIVATE KEY-----\n"))
+    for line in pem.lines
+      assert(line.byteLength <= 64)
+    val again = privateOf(pem)
+    assertEq(toHex(again.toDer()), toHex(key.toDer()))
+    assert(again.kind == key.kind)
+    assertEq(toHex(privateKeyFromDer(key.toDer()).getOrElse(fail("DER")).toDer()), toHex(key.toDer()))
+    val public = key.publicKey
+    assert(public.toPem().startsWith("-----BEGIN PUBLIC KEY-----\n"))
+    assert(publicOf(public.toPem()) == public)
+    assert(publicKeyFromDer(public.toDer()).getOrElse(fail("DER")) == public)
+    assert(publicOf(public.toPem()).kind == key.kind)
+  assertEq(publicOf(RfcRsaPublic).toPem(), RfcRsaPublic)
+  assertEq(privateOf(RfcRsaPrivate).toPem(), RfcRsaPrivate)
+
+@test(
+  "PEM is found among other text, after other blocks, with CRLF line ends and indentation, and traditional forms read as PKCS#8"
+)
+pemLeniency()
+  val key = privateOf(RfcEcPrivate)
+  assert(privateOf("a note\n" + RfcEcPrivate + "trailing text").publicKey == key.publicKey)
+  assert(privateOf(RfcEcPrivate.replace("\n", "\r\n")).publicKey == key.publicKey)
+  assert(privateOf(RfcEcPrivate.replace("\n", "\n    ")).publicKey == key.publicKey)
+  assert(privateOf(RfcEcPublic + RfcEcPrivate).publicKey == key.publicKey)
+  assert(publicOf(RfcEcPrivate + RfcEcPublic) == key.publicKey)
+  val traditional = privateOf(EcTraditional)
+  assert(traditional.kind == EcP256Key)
+  assert(traditional.toPem().startsWith("-----BEGIN PRIVATE KEY-----"))
+  assert(checks(traditional.publicKey, EcdsaP256Sha256, "m".bytes, signed(traditional, EcdsaP256Sha256, "m".bytes)))
+
+@test("text with no key, a block cut short, a body that is not base64, and an encrypted key are each refused, with why")
+pemRefusals()
+  assert(invalidReason(privateKeyFromPem("")).contains("no PEM block"))
+  assert(invalidReason(privateKeyFromPem("just words")).contains("no PEM block"))
+  assert(invalidReason(privateKeyFromPem(RfcEcPublic)).contains("no PEM block"))
+  assert(invalidPublicReason(publicKeyFromPem(RfcEcPrivate)).contains("no PEM block"))
+  assert(invalidReason(privateKeyFromPem("-----BEGIN PRIVATE KEY")).contains("not closed"))
+  assert(invalidReason(privateKeyFromPem("-----BEGIN PRIVATE KEY-----\nMIGH\n")).contains("no END line"))
+  assert(
+    invalidReason(
+      privateKeyFromPem("-----BEGIN PRIVATE KEY-----\nM!GH\n-----END PRIVATE KEY-----\n")
+    ).contains("not base64")
+  )
+  assert(
+    invalidReason(privateKeyFromPem("-----BEGIN PRIVATE KEY-----\n-----END PRIVATE KEY-----\n")).contains("no bytes")
+  )
+  assert(invalidReason(privateKeyFromPem(EncryptedEd25519)).contains("encrypted"))
+  val procType = "-----BEGIN EC PRIVATE KEY-----\nProc-Type: 4,ENCRYPTED\nDEK-Info: AES-128-CBC,00\n\nAAAA\n-----END EC PRIVATE KEY-----\n"
+  assert(invalidReason(privateKeyFromPem(procType)).contains("encrypted"))
+  // Base64 of bytes that are not a key.
+  assert(
+    invalidReason(
+      privateKeyFromPem("-----BEGIN PRIVATE KEY-----\nAAAA\n-----END PRIVATE KEY-----\n")
+    ).contains("not an unencrypted private key")
+  )
+
+@test("DER that is empty, cut short, followed by more bytes, or of the other half of a key is refused")
+derRefusals()
+  val key = privateOf(RfcEcPrivate)
+  val der = key.toDer()
+  assert(invalidReason(privateKeyFromDer(Vector())).contains("no bytes"))
+  assert(invalidReason(privateKeyFromDer(der.slice(0, der.length - 1))).contains("not an unencrypted private key"))
+  assert(invalidReason(privateKeyFromDer(der.slice(0, 10))).contains("not an unencrypted private key"))
+  assert(invalidReason(privateKeyFromDer(der ++ hex("00"))).contains("bytes follow"))
+  assert(invalidReason(privateKeyFromDer(key.publicKey.toDer())).contains("not an unencrypted private key"))
+  val spki = key.publicKey.toDer()
+  assert(invalidPublicReason(publicKeyFromDer(Vector())).contains("no bytes"))
+  assert(invalidPublicReason(publicKeyFromDer(spki.slice(0, spki.length - 1))).contains("not a public key"))
+  assert(invalidPublicReason(publicKeyFromDer(spki ++ hex("0000"))).contains("bytes follow"))
+  assert(invalidPublicReason(publicKeyFromDer(der)).contains("not a public key"))
+  // A P-256 point that is not on the curve: the last byte of y changed.
+  assert(publicKeyFromDer(flipped(hex(P256Key), hex(P256Key).length - 1)) is Err(InvalidKey(_)))
+  // An Ed25519 key of the wrong length, either half.
+  assert(ed25519PrivateKey(Vector.fill(31, byte(1))) is Err(InvalidKey(_)))
+  assert(ed25519PrivateKey(Vector.fill(33, byte(1))) is Err(InvalidKey(_)))
+  assert(ed25519PublicKey(Vector()) is Err(InvalidKey(_)))
+  assert(ed25519PublicKey(Vector.fill(64, byte(1))) is Err(InvalidKey(_)))
+
+@test("keys of kinds not signed with are refused: P-521, secp256k1, Ed448, X25519 and RSA under 2048 bits")
+refusedKinds()
+  assert(invalidReason(privateKeyFromPem(P521Private)).contains("P-256 and P-384"))
+  assert(invalidPublicReason(publicKeyFromPem(P521Public)).contains("P-256 and P-384"))
+  assert(invalidReason(privateKeyFromPem(Secp256k1Private)).contains("secp256k1"))
+  assert(invalidReason(privateKeyFromPem(Ed448Private)).contains("kind not read"))
+  assert(invalidReason(privateKeyFromPem(X25519Private)).contains("kind not read"))
+  assert(invalidReason(privateKeyFromPem(Rsa1024Private)).contains("1024 bits, under the 2048"))
+
+@test("only an Ed25519 public key has its 32 bytes to give")
+ed25519Bytes()
+  val ed = generatePrivateKey(Ed25519Key).publicKey
+  assertEq(ed.ed25519Bytes().getOrElse(Vector()).length, 32)
+  assert(ed25519PublicKey(ed.ed25519Bytes().getOrElse(Vector())).getOrElse(fail("raw")) == ed)
+  assert(generatePrivateKey(EcP256Key).publicKey.ed25519Bytes() is None)
+  assert(publicOf(RfcRsaPublic).ed25519Bytes() is None)
+
+@test("a key's text names its kind and shows nothing of the key")
+keysDisplayNoMaterial()
+  val seed = hex("9d61b19deffd5a60ba844af492ec2cc44449c5697b326919703bac031cae7f60")
+  val ed = ed25519PrivateKey(seed).getOrElse(fail("key"))
+  assertEq(s"$ed", "PrivateKey(Ed25519)")
+  assertEq(s"${ed.publicKey}", "PublicKey(Ed25519)")
+  assertEq(s"${privateOf(RfcRsaPrivate)}", "PrivateKey(RSA 2048)")
+  assertEq(s"${publicOf(P384Public)}", "PublicKey(ECDSA P-384)")
+  assertEq(s"${privateOf(RfcEcPrivate)}", "PrivateKey(ECDSA P-256)")
+  assertEq(s"${[ed]}", "[PrivateKey(Ed25519)]")
+  assertEq(s"${Some(ed)}", "Some(PrivateKey(Ed25519))")
+  assert(!s"$ed".contains("9d61"))
+
+@test("a key kind and a scheme say what they are, and compare by what they are")
+kindsAndSchemes()
+  assertEq(s"${RsaKey(4096)}", "RSA 4096")
+  assertEq(s"$EcP256Key", "ECDSA P-256")
+  assert(RsaKey(2048) == RsaKey(2048))
+  assert(RsaKey(2048) != RsaKey(3072))
+  assert(Ed25519Key != EcP256Key)
+  assertEq(s"$RsaPssSha384", "RSA-PSS SHA-384")
+  assertEq(s"$RsaPkcs1Sha512", "RSA PKCS#1 v1.5 SHA-512")
+  assert(EcdsaP256Sha256 == EcdsaP256Sha256)
+  assert(EcdsaP256Sha256 != EcdsaP384Sha384)
+
+@test("a key read once signs and checks from other threads at the same time")
+keysAcrossThreads()
+  val key = privateOf(RfcEcPrivate)
+  val public = key.publicKey
+  val threads = Vector.tabulate(4, i -> spawn(() -> countGood(key, public, i)))
+  for t in threads
+    assertEq(t.join(), 25)
+
+// How many of 25 messages `key` signs that `public` then takes.
+countGood(key: PrivateKey, public: PublicKey, thread: int) -> int
+  var good = 0
+  for j in 0 ..< 25
+    val message = s"thread $thread message $j".bytes
+    if public.verify(
+      EcdsaP256Sha256,
+      message,
+      key.sign(EcdsaP256Sha256, message).getOrElse(Vector())
+    ).getOrElse(false) then good += 1
+  good

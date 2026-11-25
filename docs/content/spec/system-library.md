@@ -1978,9 +1978,10 @@ since nothing could stand in for them.
 
 ## `avin.crypto`
 
-Content digests and keyed digests: SHA-256, SHA-512, SHA-1 and MD5, HMAC over the first two,
-PBKDF2, comparison of secrets in constant time, SASLprep for passwords, and hexadecimal text for any
-digest.
+Content digests and keyed digests: SHA-224, SHA-256, SHA-384, SHA-512, SHA-1 and MD5, HMAC over
+SHA-1 and the SHA-2 family, PBKDF2 and HKDF, comparison of secrets in constant time, SASLprep for
+passwords, and hexadecimal text for any digest; then [signatures and their keys](#signatures-and-keys)
+and [authenticated encryption](#authenticated-encryption).
 
 ```text
 import avin.crypto.{sha256, hmacSha256, toHex, Sha256}
@@ -2000,14 +2001,18 @@ or a cache, and is written as text only on request. Text is hashed as its UTF-8 
 | Function | Meaning |
 | --- | --- |
 | `sha256(x)`, `sha512(x)` | The 32-byte and 64-byte digest of `x`, a `Vector[byte]` or a `string`. |
+| `sha224(x)`, `sha384(x)` | The 28-byte and 48-byte digest of `x` (FIPS 180-4), the truncated members of the family. |
 | `sha1(x)`, `md5(x)` | The 20-byte and 16-byte digest of `x`. **Broken for security** (below). |
 | `hmacSha256(key, message)`, `hmacSha512(key, message)` | The 32-byte and 64-byte HMAC (RFC 2104) of `message` under `key`, both `Vector[byte]` or both `string`. Any key length is allowed, the empty key included; one longer than the algorithm's block is hashed first, as the RFC says. |
+| `hmacSha224`, `hmacSha384`, `hmacSha1` | HMAC over SHA-224 (28 bytes), SHA-384 (48 bytes) and SHA-1 (20 bytes), taking what `hmacSha256` takes. HMAC-SHA-1 is what HOTP and TOTP (RFC 4226, RFC 6238) name. |
+| `hkdfSha256(secret, salt, info, length)`, `hkdfSha384(...)`, `hkdfSha512(...)` | `length` bytes of key (RFC 5869 HKDF) from `secret`, with `salt` (empty is the standard's default) and `info`, all `Vector[byte]`. `length` below 1 or over 255 digests (8160, 12240, 16320 bytes) traps. |
+| `hkdfExtractSha256(salt, secret)`, `hkdfExpandSha256(prk, info, length)` and the SHA-384 and SHA-512 pairs | HKDF's two halves (§ 2.2 and § 2.3), for a protocol that keeps the pseudorandom key, as TLS 1.3's key schedule does. Extract is the HMAC of `secret` under `salt`; Expand traps on a `prk` shorter than a digest, and on the lengths `hkdfSha256` traps on. |
 | `pbkdf2HmacSha256(password, salt, iterations, length)`, `pbkdf2HmacSha512(...)` | `length` bytes of key (RFC 8018 PBKDF2 over HMAC-SHA-256 or -SHA-512) as a `Vector[byte]`; `password` and `salt` both `Vector[byte]` or both `string` (UTF-8), either empty. `iterations` below 1, `length` below 1, or `length` over 8160 (SHA-256) or 16320 (SHA-512) trap. |
 | `constantTimeEquals(a, b) -> bool` | Whether `a` and `b`, both `Vector[byte]` or both `string` (compared as UTF-8 bytes), are the same, taking as long wherever they first differ. Different lengths answer `false` at once. |
 | `toHex(bytes) -> string` | Lower-case hexadecimal, two digits for each byte: [`avin.encoding`](#avinencoding)'s, which this module offers too. |
 
 **A hasher takes its input in pieces**, for data too large to hold whole, such as a file read in
-chunks. `Sha256()`, `Sha512()`, `Sha1()` and `Md5()` each have `update(bytes)` and `update(text)`,
+chunks. `Sha224()`, `Sha256()`, `Sha384()`, `Sha512()`, `Sha1()` and `Md5()` each have `update(bytes)` and `update(text)`,
 any number of times, and `finish()`, the digest of everything added. `finish()` answers the same
 digest each time it is called, and `update` after `finish` traps. Hashing in any pieces gives the
 one-shot digest. A hasher belongs to the thread that made it, as a handle does.
@@ -2015,7 +2020,17 @@ one-shot digest. A hasher belongs to the thread that made it, as a handle does.
 **`sha1` and `md5` are for formats that already use them**: a checksum in a listing, a cache key
 nobody attacks. Two different inputs with the same digest can be made for both, so neither signs,
 authenticates or names untrusted content; use `sha256` or `sha512` for those. HMAC does not rest on
-collision resistance, but only the SHA-2 variants are offered.
+collision resistance, so `hmacSha1` remains sound for the protocols that name it (TOTP above all);
+a new design takes `hmacSha256`.
+
+**HKDF turns a secret that is already unguessable into keys**: a Diffie-Hellman result, a random
+master key. It adds no cost to guessing, so a password goes to `pbkdf2HmacSha256` instead. `info`
+keeps the keys one secret gives apart, so each purpose names its own:
+
+```text
+val encryption = hkdfSha256(master, salt, "app v1 encryption".bytes, 32)
+val signing = hkdfSha256(master, salt, "app v1 signing".bytes, 32)
+```
 
 **A secret someone sent is compared with `constantTimeEquals`, never with `==`.** `==` stops at the
 first byte that differs, so how long a rejection takes tells a patient attacker how much of a guessed
@@ -2076,6 +2091,134 @@ may a client written with this: `saslPrep(password).getOrElse(password)`.
 
 The digests, the key derivation and the comparison are bound to Sysl's `sysl.crypto`, so they are the
 same code Sysl programs use.
+
+### Signatures and keys
+
+A `PrivateKey` signs and a `PublicKey` checks, in one of nine `SignatureScheme`s: `Ed25519` (RFC
+8032), `EcdsaP256Sha256` and `EcdsaP384Sha384` (FIPS 186-5), and RSA (RFC 8017) with PKCS#1 v1.5
+padding, `RsaPkcs1Sha256`, `RsaPkcs1Sha384` and `RsaPkcs1Sha512`, or PSS, `RsaPssSha256`,
+`RsaPssSha384` and `RsaPssSha512`. They are the schemes TLS 1.3 and JOSE name (EdDSA, ES256, ES384,
+RS256, PS256 and the rest). The signing is OpenSSL's libcrypto, which the program links only where
+it signs, checks, reads a key or seals.
+
+```text run
+import avin.crypto.{generatePrivateKey, publicKeyFromPem, Ed25519Key, Ed25519}
+
+main()
+  val key = generatePrivateKey(Ed25519Key)
+  val signature = key.sign(Ed25519, "the release notes").getOrElse(Vector())
+  val public = publicKeyFromPem(key.publicKey.toPem()).getOrElse(key.publicKey)
+  println(public.verify(Ed25519, "the release notes", signature))
+  println(public.verify(Ed25519, "the release notes, changed", signature))
+  println(signature.length)
+  println(key)
+```
+
+```text output
+Ok(true)
+Ok(false)
+64
+PrivateKey(Ed25519)
+```
+
+| Function or method | Meaning |
+| --- | --- |
+| `privateKeyFromPem(text)`, `publicKeyFromPem(text)` | The key in the first `PRIVATE KEY` (PKCS#8), `RSA PRIVATE KEY` or `EC PRIVATE KEY` block, or `PUBLIC KEY` (SubjectPublicKeyInfo) block, among any other text; `Result[PrivateKey, CryptoError]` and `Result[PublicKey, CryptoError]`. |
+| `privateKeyFromDer(bytes)`, `publicKeyFromDer(bytes)` | The same from DER, which must be the whole of `bytes`. |
+| `generatePrivateKey(kind)` | A new key of `kind`, from the operating system's randomness. |
+| `ed25519PrivateKey(seed)`, `ed25519PublicKey(raw)` | An Ed25519 key from its 32 bytes (RFC 8032's encoding, a JWK's `d` and `x`). |
+| `key.sign(scheme, message) -> Result[Vector[byte], CryptoError]` | The signature over `message`, a `Vector[byte]` or a `string` (UTF-8). |
+| `public.verify(scheme, message, signature) -> Result[bool, CryptoError]` | Whether `signature` is the key's over `message`. |
+| `key.publicKey`, `key.kind`, `public.kind` | The public half, and what each key is: `Ed25519Key`, `EcP256Key`, `EcP384Key` or `RsaKey(bits)`. |
+| `toPem()`, `toDer()` | The key written out: PKCS#8 for a private key, SubjectPublicKeyInfo for a public one, PEM in lines of 64 (RFC 7468). |
+| `public.ed25519Bytes() -> Option[Vector[byte]]` | The 32 bytes of an Ed25519 key, `None` for another kind. |
+| `scheme.fits(kind) -> bool` | Whether a key of `kind` signs with `scheme`. |
+| `ecdsaFixedSignature(der, scheme)`, `ecdsaDerSignature(fixed, scheme)` | An ECDSA signature between DER and the fixed-width form, `Option[Vector[byte]]`. |
+
+**The caller names the scheme, always.** Nothing reads it from the data being checked, so a token or
+a message cannot choose how it is verified; that is how `alg: none` and the RSA-key-as-HMAC-secret
+confusions work elsewhere. A scheme the key does not sign with is `Err(KeyMismatch(kind, scheme))`
+from both `sign` and `verify`: a mistake in the program, told apart from a signature that does not
+check.
+
+**`verify` answers `Ok(false)` for every signature that does not check**: forged, made by another key
+or over other bytes, of the wrong length, or not even well-formed, since the signature is bytes
+somebody sent. An ECDSA signature is checked in strict DER, so BER and trailing bytes do not check;
+Ed25519 refuses a non-canonical `S`, so a signature cannot be altered into a second valid one.
+
+**An ECDSA signature is DER**, the form X.509, TLS and WebAuthn carry. JOSE (ES256), COSE and
+WebCrypto carry the two integers side by side, each in the curve's width (64 bytes for P-256, 96 for
+P-384): `ecdsaFixedSignature` turns `sign`'s answer into that, and `ecdsaDerSignature` turns one back
+for `verify`. Either is `None` unless its input is exactly one signature of the scheme's width, in
+canonical DER for the first. ECDSA and RSA-PSS signatures are randomised, so two signatures over one
+message differ and both check; Ed25519 and PKCS#1 v1.5 give the same signature every time.
+
+**PSS** uses MGF1 over the scheme's digest and a salt as long as the digest, in signing and in
+checking (RFC 8017's recommendation, and what TLS 1.3 and JOSE fix); a PSS signature with another
+salt length does not check.
+
+**What is read is limited**: Ed25519 keys, elliptic-curve keys on P-256 and P-384, and RSA keys of
+2048 to 16384 bits. Anything else is `Err(InvalidKey(reason))`: another curve (P-521, secp256k1),
+Ed448, X25519, an RSA key under 2048 bits or restricted to PSS, bytes left after the key, and an
+encrypted key, which is refused rather than asked a passphrase (`openssl pkey` decrypts one). A
+traditional `RSA PRIVATE KEY` or `EC PRIVATE KEY` reads as the key it holds and writes as PKCS#8.
+`generatePrivateKey(RsaKey(bits))` traps outside 2048 to 16384 bits; an RSA key takes a moment to
+make, seconds from 4096 bits, and the collector carries on for the program's other threads meanwhile.
+
+**A key is a value.** It holds its DER encoding and parses it again for each `sign` and `verify`, so a
+key read once at startup is used from any thread at once, belongs to none, and costs nothing to
+keep; the parse is small beside the signature. Two public keys are `==` when they are the same key.
+A key's text is its kind, `PrivateKey(RSA 2048)`, and nothing of the key: `toPem` and `toDer` are
+the only ways the key itself comes out. The DER the key holds is ordinary memory, which the runtime
+does not wipe when the key is collected.
+
+### Authenticated encryption
+
+An `AeadKey` seals a message, encrypting it and authenticating it together with associated data that
+travels in the clear (a header, a record's id), and opens it only if neither was changed. The
+ciphers (`Aead`) are `Aes128Gcm` and `Aes256Gcm` (NIST SP 800-38D) and `ChaCha20Poly1305` (RFC
+8439), each with a 12-byte nonce and a 16-byte tag; ChaCha20-Poly1305 is the fast one where the
+processor has no AES instructions.
+
+```text run
+import avin.crypto.{Aes256Gcm, Unauthentic}
+
+main()
+  val key = Aes256Gcm.generateKey()
+  val sealed = key.seal("attack at dawn", "msg-1".bytes)
+  println(sealed.length)
+  println(key.open(sealed, "msg-1".bytes).map(b -> string.fromUtf8Lossy(b.toArray())))
+  println(key.open(sealed, "msg-2".bytes) is Err(Unauthentic))
+  println(key)
+```
+
+```text output
+42
+Ok(attack at dawn)
+true
+AeadKey(AES-256-GCM)
+```
+
+| Function or method | Meaning |
+| --- | --- |
+| `aead.generateKey() -> AeadKey` | A new key from the operating system's randomness. |
+| `aead.key(bytes) -> Result[AeadKey, CryptoError]` | The key whose bytes are `bytes`, `keyLength` long (16 for `Aes128Gcm`, 32 for the others), `InvalidKey` otherwise. |
+| `key.seal(plaintext, aad = Vector())` | `plaintext` (a `Vector[byte]` or a `string`) sealed under a fresh random nonce: the nonce, the ciphertext and the tag, 28 bytes more than the message. |
+| `key.open(sealed, aad = Vector()) -> Result[Vector[byte], CryptoError]` | What `seal` made, opened, or `Err(Unauthentic)`. |
+| `key.sealWithNonce(nonce, plaintext, aad = Vector())`, `key.openWithNonce(nonce, sealed, aad = Vector())` | The same under a nonce the caller gives, which must be 12 bytes (anything else traps): the ciphertext and the tag, without the nonce. |
+| `key.aead`, `key.toBytes()` | The cipher, and the key's bytes, the secret itself. |
+| `aead.keyLength`, `aead.nonceLength`, `aead.tagLength` | 16 or 32, 12, and 16. |
+
+**A message that does not open gives nothing back**: `Unauthentic` is the whole answer for a changed
+ciphertext, tag, nonce or associated data, a message cut short or lengthened, and one sealed under
+another key or cipher. Decryption writes into a buffer the program never sees until the tag has
+checked, and wipes it when the tag does not; no part of an unauthenticated message is ever returned.
+
+**A nonce is never used twice with one key**; one reuse gives away both messages and lets anyone
+forge new ones. `seal` draws each nonce from `SecureRandom` and puts it in front, which is safe for
+2^32 messages under one key; past that, change the key. `sealWithNonce` is for a protocol that fixes
+its nonces (a record counter), which then answers for never repeating one. A key's text is its
+cipher, `AeadKey(AES-256-GCM)`, and nothing of the key.
 
 ## `avin.uuid`
 
