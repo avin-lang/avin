@@ -1747,6 +1747,10 @@ main()
   val id = Uuid.random()
   println(id)
   assertEq(Uuid.parse(id.toString()), Some(id))
+  val first = Uuid.v7()
+  val second = Uuid.v7()
+  assert(first < second)
+  assert(first.timestamp().isDefined)
 ```
 
 `Uuid` is a value: it compares and hashes by its bits, orders by them as sixteen unsigned bytes
@@ -1755,6 +1759,10 @@ main()
 | Member | Meaning |
 | --- | --- |
 | `Uuid.random()` | A version 4 identifier from `SecureRandom`, with the version and variant bits set. |
+| `Uuid.v7() -> Uuid` | A version 7 identifier: the wall clock's Unix milliseconds in the first 48 bits, a 12-bit counter, 62 random bits from `SecureRandom`. Identifiers made in one process sort strictly in the order they were made, from any thread, even when the clock stands still or steps back. No lock is taken. |
+| `Uuid.v7At(instant) -> Uuid` | A version 7 identifier stamped `instant`, for tests and backfills. It has random bits where `v7()` has its counter, so it does not order against others of the same millisecond. An instant outside 1970 to the year 10889 reads as the nearest one inside. |
+| `UuidGenerator()`, `next(instant) -> Uuid` | The sequence `v7()` draws from, made on its own: `next` gives an identifier above every earlier one of that generator whatever `instant` is. A test feeds it a clock it controls. |
+| `timestamp() -> Option[Instant]` | The millisecond a version 7 identifier was stamped; `None` for any other version. |
 | `Uuid.parse(text) -> Option[Uuid]` | The canonical 8-4-4-4-12 form in either case; `None` for anything else (braces, a `urn:uuid:` prefix, missing hyphens and white space are not accepted). |
 | `Uuid.fromBytes(bytes) -> Option[Uuid]` | Sixteen bytes, the first most significant; `None` for any other length. |
 | `Uuid.Nil`, `Uuid.Max` | All zero bits and all one bits. |
