@@ -1,0 +1,179 @@
+module avin.fs
+
+// Files mapped into memory: a file's bytes read and written in place, a page at a time as they are
+// touched, rather than read into an array first.
+
+import avin.io
+import avin.io.IoError
+
+// A read-only mapping Sysl holds. It is unmapped when it is closed or, for one the program forgot,
+// when the collector frees it. Its traps name the `MappedBytes`.
+@sysl("sysl.fs.Mapped", named: "MappedBytes")
+private class SyslMapped
+  @sysl("len")
+  size() -> long
+
+// A shared, writable mapping, unmapped as a read-only one is. Its traps name the `MutableMappedBytes`.
+@sysl("sysl.fs.MappedMut", named: "MutableMappedBytes")
+private class SyslMappedMut
+  @sysl("len")
+  size() -> long
+
+@sysl("sysl.fs.map_file", blocking)
+private syslMapFile(file: string) -> Result[SyslMapped, SyslError]
+
+@sysl("avin.rt.fs_map_mutable", blocking)
+private syslMapFileMutable(file: string) -> Result[SyslMappedMut, SyslError]
+
+@sysl("avin.rt.fs_mapped_byte")
+private syslMappedByte(m: SyslMapped, at: long) -> byte
+
+@sysl("avin.rt.fs_mapped_read")
+private syslMappedRead(m: SyslMapped, from: long, into: Array[byte])
+
+@sysl("avin.rt.fs_mapped_mut_byte")
+private syslMappedMutByte(m: SyslMappedMut, at: long) -> byte
+
+@sysl("avin.rt.fs_mapped_mut_set")
+private syslMappedMutSet(m: SyslMappedMut, at: long, value: byte)
+
+@sysl("avin.rt.fs_mapped_mut_read")
+private syslMappedMutRead(m: SyslMappedMut, from: long, into: Array[byte])
+
+@sysl("avin.rt.fs_mapped_mut_write")
+private syslMappedMutWrite(m: SyslMappedMut, at: long, bytes: Array[byte])
+
+@sysl("avin.rt.fs_mapped_mut_flush", blocking)
+private syslMappedMutFlush(m: SyslMappedMut) -> Result[unit, SyslError]
+
+// The longest range one slice copies out: the most elements an array holds.
+private val MaxSlice: long = 2147483647
+
+// Stops the program unless `index` is a byte of a mapping `size` bytes long.
+private checkIndex(index: long, size: long)
+  if !(0 <= index < size) then fail(s"index $index out of range for a mapping of $size bytes")
+
+// Stops the program unless `from` up to `until` is a range of a mapping `size` bytes long that one
+// array can hold.
+private checkRange(from: long, until: long, size: long)
+  if !(0 <= from <= until <= size) then fail(s"range $from until $until out of range for a mapping of $size bytes")
+  if until - from > MaxSlice then fail(s"a slice of ${until - from} bytes is longer than an array can be")
+
+// The file `file`, mapped read-only into memory: its bytes are read where they lie, a page at a time
+// as they are touched, so mapping a file of any size costs the same few calls and a byte never read
+// is never read from the device. The file is closed before this answers; the mapping does not need
+// it, and stays readable after the file is renamed over or removed. A directory is `IsADirectory`, a
+// missing file `NotFound`, and an empty file an empty mapping.
+mapFile(file: string) -> Result[MappedBytes, IoError] =
+  syslMapFile(file).map(h -> mappedBytes(h, file)).mapErr(failed("map", file))
+
+// The file `file`, mapped shared and writable over its whole length: a write through the mapping is a
+// write to the file, which `flush` makes sure has reached it. The file must exist and be readable and
+// writable. Its length is fixed when it is mapped; `setLength` the file first for a longer mapping.
+mapFileMutable(file: string) -> Result[MutableMappedBytes, IoError] =
+  syslMapFileMutable(file).map(h -> mutableMappedBytes(h, file)).mapErr(failed("map", file))
+
+private mappedBytes(h: SyslMapped, file: string) -> MappedBytes = MappedBytes(h, h.size(), file)
+
+private mutableMappedBytes(h: SyslMappedMut, file: string) -> MutableMappedBytes =
+  MutableMappedBytes(h, h.size(), file)
+
+// A file's bytes as they were when it was mapped, read in place, from `mapFile` or `File.map`. `m(i)`
+// reads the byte at offset `i`, and `slice` copies a range into a new array; an offset outside
+// `0 ..< length` traps. No array ever shares the mapping's memory, so nothing the program holds reads
+// it once it is unmapped. It is unmapped by `close` or, if the program forgot, when the collector
+// frees it; every call but `close` on a closed mapping traps. A mapping belongs to one thread at a
+// time and is handed to another as a Sysl handle is, by giving it to the thread's body.
+//
+// A file cut shorter while it is mapped leaves pages of the mapping with nothing behind them; reading
+// one stops the program with a bus error trap, never with bytes that are not the file's.
+class MappedBytes(private val handle: SyslMapped, private val size: long, private val name: string): io.Close
+  // How many bytes are mapped: the file's length when it was mapped.
+  length -> long = handle.size()
+
+  // Whether the mapping holds no bytes, as an empty file's does.
+  isEmpty -> bool = length == 0
+
+  // The byte at offset `index`.
+  apply(index: long) -> byte
+    checkIndex(index, size)
+    syslMappedByte(handle, index)
+
+  apply(index: int) -> byte = apply(long(index))
+
+  // A new array of the bytes from `from` up to `until`, which traps when the offsets are not in order
+  // within the mapping, or the range is longer than an array can be.
+  slice(from: long, until: long) -> Array[byte]
+    checkRange(from, until, size)
+    val out = Array.fill(int(until - from), byte(0))
+    syslMappedRead(handle, from, out)
+    out
+
+  slice(from: int, until: int) -> Array[byte] = slice(long(from), long(until))
+
+  // A new array of every mapped byte.
+  toArray() -> Array[byte] = slice(0, size)
+
+  // Unmaps the bytes. Closing again does nothing.
+  override close() -> Result[unit, IoError]
+    handle.close()
+    Ok(())
+
+// A file's bytes mapped shared and writable, from `mapFileMutable` or `File.mapMutable`: `m(i) = b`
+// writes the byte at offset `i` of the file itself, and other handles and programs reading the file
+// see it. Reading, slicing, offsets and closing are as for a `MappedBytes`. A write is promised to be
+// in the file only after `flush`; one the program has made is not lost when the mapping is closed
+// or the program ends, since the platform has it, but only `flush`, and `File.syncData` after it for
+// a power cut, says it is out.
+class MutableMappedBytes(
+    private val handle: SyslMappedMut,
+    private val size: long,
+    private val name: string
+): io.Close
+  // How many bytes are mapped: the file's length when it was mapped.
+  length -> long = handle.size()
+
+  // Whether the mapping holds no bytes, as an empty file's does.
+  isEmpty -> bool = length == 0
+
+  // The byte at offset `index`.
+  apply(index: long) -> byte
+    checkIndex(index, size)
+    syslMappedMutByte(handle, index)
+
+  apply(index: int) -> byte = apply(long(index))
+
+  // Writes `value` at offset `index`.
+  update(index: long, value: byte)
+    checkIndex(index, size)
+    syslMappedMutSet(handle, index, value)
+
+  update(index: int, value: byte) = update(long(index), value)
+
+  // A new array of the bytes from `from` up to `until`, as `MappedBytes.slice`.
+  slice(from: long, until: long) -> Array[byte]
+    checkRange(from, until, size)
+    val out = Array.fill(int(until - from), byte(0))
+    syslMappedMutRead(handle, from, out)
+    out
+
+  slice(from: int, until: int) -> Array[byte] = slice(long(from), long(until))
+
+  // A new array of every mapped byte.
+  toArray() -> Array[byte] = slice(0, size)
+
+  // Writes every byte of `bytes` from offset `offset` on, which traps unless they all fall inside the
+  // mapping.
+  writeAt(offset: long, bytes: Array[byte])
+    checkRange(offset, offset + long(bytes.length), size)
+    syslMappedMutWrite(handle, offset, bytes)
+
+  writeAt(offset: int, bytes: Array[byte]) = writeAt(long(offset), bytes)
+
+  // Writes what has been written through the mapping to the file and returns once it is there.
+  flush() -> Result[unit, IoError] = syslMappedMutFlush(handle).mapErr(failed("flush the mapping of", name))
+
+  // Unmaps the bytes, which keeps every write already made. Closing again does nothing.
+  override close() -> Result[unit, IoError]
+    handle.close()
+    Ok(())

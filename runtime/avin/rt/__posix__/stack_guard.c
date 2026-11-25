@@ -11,9 +11,11 @@
  * first records where the thread's stack is and gives it an alternate signal stack, which is what
  * lets the handler run when the ordinary stack is the thing that is full.
  *
- * The handler reports only a fault inside the guard region of the faulting thread's own stack. Any
- * other fault is a real crash and is left to crash: the handler puts the default action back and
- * returns, so the instruction that faulted runs again and ends the process as it would have.
+ * The handler reports a fault inside the guard region of the faulting thread's own stack as a stack
+ * overflow, and any other bus error as a trap of its own: a page of a mapped file the file no longer
+ * reaches (`avin.fs.mapFile` and its writable twin). Any other fault is a real crash and is left to
+ * crash: the handler puts the default action back and returns, so the instruction that faulted runs
+ * again and ends the process as it would have.
  *
  * Standard output is flushed from the handler with `fflush`, which is not async-signal-safe: a
  * fault inside the C library's own output routines would find the stream half updated. The report
@@ -60,6 +62,17 @@ static void avin_fault(int sig, siginfo_t *info, void *context) {
                      at < avin_stack_low + AVIN_GUARD_ABOVE;
 
     (void)context;
+
+    if (!overflowed && sig == SIGBUS) {
+        /* Avin code raises a bus error in one way only: touching a page of a mapped file that the
+         * file no longer reaches, because something cut the file short underneath the mapping. The
+         * access cannot be completed or skipped, so it ends the program, but with a reason. */
+        avin_say("avin: trap: bus error: memory with nothing behind it was read or written, as a page"
+                 " of a mapped file past where the file now ends is\n");
+        alarm(AVIN_FLUSH_SECONDS);
+        fflush(NULL);
+        __builtin_trap();
+    }
 
     if (!overflowed) {
         signal(sig, SIG_DFL);
