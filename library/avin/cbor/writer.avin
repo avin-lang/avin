@@ -1,0 +1,238 @@
+module avin.cbor
+
+import avin.io.ByteWriter
+import avin.io.IoError
+
+// How many bytes the writer holds before it hands them to its sink.
+private val flushAt: int = 65536
+
+// The `real` a half-precision float of the 16 bits `bits` holds.
+halfToReal(bits: int) -> real
+  val sign = if (bits & 0x8000) != 0 then -1.0 else 1.0
+  val exponent = (bits >> 10) & 31
+  val fraction = bits & 1023
+  if exponent == 0 then return sign * real(fraction) * 5.9604644775390625e-8
+  if exponent == 31 then return if fraction == 0 then sign * (1.0 / 0.0) else 0.0 / 0.0
+  val pattern = (long(if sign < 0.0 then 1 else 0) << 63) | (long(exponent - 15 + 1023) << 52) | (long(fraction) << 42)
+  real.fromBits(pattern)
+
+// The 16 bits of the half-precision float nearest `x`, ties to even; a NaN is the quiet NaN
+// `0x7E00`, and a magnitude beyond the largest half is an infinity.
+realToHalf(x: real) -> int
+  if x != x then return 0x7E00
+  val bits = x.toBits
+  val sign = if bits < 0 then 0x8000 else 0
+  val magnitude = bits & 0x7FFFFFFFFFFFFFFF
+  if magnitude >= 0x7FF0000000000000 then return sign | 0x7C00
+  if magnitude < 0x3F10000000000000
+    // below the smallest normal half, 2^-14: a multiple of 2^-24
+    val scaled = real.fromBits(magnitude) * 16777216.0
+    val whole = long(scaled)
+    val fraction = scaled - real(whole)
+    val rounded = if fraction > 0.5 || (fraction == 0.5 && (whole & 1) == 1) then whole + 1 else whole
+    return sign | int(rounded)
+  val high = magnitude >> 42
+  val low = magnitude & 0x3FFFFFFFFFF
+  val halfway = long(1) << 41
+  val up = if low > halfway || (low == halfway && (high & 1) == 1) then high + 1 else high
+  val result = up - (long(1008) << 10)
+  if result > 0x7BFF then sign | 0x7C00 else sign | int(result)
+
+// The width in bytes, 2, 4 or 8, of the shortest float that holds `x` exactly; a NaN is a half.
+floatWidth(x: real) -> int
+  if x != x then return 2
+  if halfToReal(realToHalf(x)) == x then return 2
+  if real.fromBits32(x.toBits32) == x then return 4
+  8
+
+// The bytes `a` and `b` compared as unsigned numbers, the first differing byte deciding and the
+// shorter, if one is a prefix of the other, first.
+compareBytes(a: Array[byte], b: Array[byte]) -> int
+  val n = if a.length < b.length then a.length else b.length
+  var i = 0
+  while i < n
+    val x = int(a(i))
+    val y = int(b(i))
+    if x != y then return if x < y then -1 else 1
+    i += 1
+  if a.length == b.length then 0 elif a.length < b.length then -1 else 1
+
+// Writes CBOR to a sink a token at a time. Nothing checks that the calls make a document: an array or
+// map is given its length when it begins, and the code calling the writer writes that many elements,
+// or entries of a key and a value each. Integers and lengths always take their shortest form. A
+// writer made with `deterministic` writes a `real` and a tree's floats at their shortest exact width
+// (as every writer does for `real`) and sorts the entries of a map `value` writes by their encoded
+// keys.
+//
+// Bytes are held and handed to the sink 64 KiB at a time; a failure of the sink is kept, ends
+// further writing to it and is the `Err` of `finish`. A writer made by `CborWriter.toBytes` holds
+// everything for `bytes`.
+class CborWriter(private val sink: Option[ByteWriter], val deterministic: bool = false)
+  private val held = Buffer[byte]()
+  private var failure: Option[IoError] = None
+
+  // Everything written so far, by a writer made by `toBytes`.
+  toArray() -> Array[byte] = held.toArray()
+
+  // Hands what is held to the sink and answers the first failure of any write.
+  finish() -> Result[unit, IoError]
+    flush()
+    failure match
+      Some(e) -> Err(e)
+      None -> Ok(())
+
+  private flush()
+    if sink is Some(out) && failure.isEmpty && held.length > 0
+      out.write(held.toArray()) match
+        Err(e) -> failure = Some(e)
+        Ok(_) -> ()
+      held.clear()
+
+  private put(b: int)
+    held.addOne(byte(b & 255))
+
+  private maybeFlush()
+    if sink.isDefined && held.length >= flushAt then flush()
+
+  private head(major: int, arg: long)
+    val m = major << 5
+    if 0 <= arg < 24
+      put(m | int(arg))
+    elif 0 <= arg < 256
+      put(m | 24)
+      put(int(arg))
+    elif 0 <= arg < 65536
+      put(m | 25)
+      put(int(arg >> 8))
+      put(int(arg))
+    elif 0 <= arg < 4294967296
+      put(m | 26)
+      number(arg, 4)
+    else
+      put(m | 27)
+      number(arg, 8)
+
+  // `width` bytes of `n`, most significant first.
+  private number(n: long, width: int)
+    for i in 0 ..< width
+      put(int((n >> long((width - 1 - i) * 8)) & 255))
+
+  // An integer, as major type 0 or 1.
+  integer(n: long)
+    if n >= 0 then head(0, n) else head(1, -1 - n)
+    maybeFlush()
+
+  // The integer whose 64-bit argument is `bits`, as an unsigned number: `bits` itself, or -1 minus it.
+  unsigned(bits: long)
+    head(0, bits)
+    maybeFlush()
+
+  negative(bits: long)
+    head(1, bits)
+    maybeFlush()
+
+  byteString(value: Array[byte])
+    head(2, long(value.length))
+    for b in value
+      held.addOne(b)
+    maybeFlush()
+
+  textString(value: string)
+    head(3, long(value.byteLength))
+    for b in value.utf8
+      held.addOne(b)
+    maybeFlush()
+
+  // The head of an array of `length` elements.
+  beginArray(length: int) = head(4, long(length))
+
+  // The head of a map of `length` entries.
+  beginMap(length: int) = head(5, long(length))
+
+  // A tag, on the value written next.
+  tag(number: long) = head(6, number)
+
+  bool(b: bool)
+    put(if b then 0xF5 else 0xF4)
+
+  writeNull() = put(0xF6)
+
+  undefined() = put(0xF7)
+
+  // A simple value: 0..19 or 32..255. Any other number is not one, and traps.
+  simple(n: int)
+    if 0 <= n < 20
+      put(0xE0 | n)
+    elif 32 <= n < 256
+      put(0xF8)
+      put(n)
+    elif 20 <= n < 24
+      put(0xE0 | n)
+    else
+      fail(s"$n is not a CBOR simple value")
+
+  // A half-precision float, the nearest to `x`.
+  half(x: real)
+    val bits = realToHalf(x)
+    put(0xF9)
+    put(bits >> 8)
+    put(bits)
+
+  single(x: real)
+    val bits = x.toBits32
+    put(0xFA)
+    number(long(bits), 4)
+
+  double(x: real)
+    val bits = x.toBits
+    put(0xFB)
+    number(bits, 8)
+
+  // A float at the shortest width that holds it exactly: a half, a single or a double.
+  float(x: real)
+    floatWidth(x) match
+      2 -> half(x)
+      4 -> single(x)
+      _ -> double(x)
+    maybeFlush()
+
+  // A whole tree. The widths of its floats are kept unless the writer is deterministic, which also
+  // sorts every map's entries by their encoded keys.
+  value(v: Cbor)
+    v match
+      Num(n) -> integer(n)
+      BigUnsigned(bits) -> unsigned(bits)
+      BigNegative(bits) -> negative(bits)
+      Bytes(b) -> byteString(b)
+      Text(s) -> textString(s)
+      Arr(items) ->
+        beginArray(items.length)
+        for item in items
+          value(item)
+      Dict(entries) ->
+        beginMap(entries.length)
+        for (k, x) in (if deterministic then sorted(entries) else entries)
+          value(k)
+          value(x)
+      Tagged(n, inner) ->
+        tag(n)
+        value(inner)
+      Simple(n) -> simple(n)
+      Bool(b) -> bool(b)
+      Null -> writeNull()
+      Undefined -> undefined()
+      Half(x) -> if deterministic then float(x) else half(x)
+      Single(x) -> if deterministic then float(x) else single(x)
+      Double(x) -> if deterministic then float(x) else double(x)
+    maybeFlush()
+
+  private sorted(entries: Vector[(Cbor, Cbor)]) -> Vector[(Cbor, Cbor)]
+    val keyed = entries.map(e -> (encodeTree(e.0, true), e))
+    keyed.sortWith((a, b) -> compareBytes(a.0, b.0)).map(p -> p.1)
+
+object CborWriter
+  // A writer that keeps everything for `toArray`.
+  toBytes(deterministic: bool = false) -> CborWriter = CborWriter(None, deterministic)
+
+  // A writer to `out`.
+  to(out: ByteWriter, deterministic: bool = false) -> CborWriter = CborWriter(Some(out), deterministic)

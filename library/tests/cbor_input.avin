@@ -1,0 +1,346 @@
+// `avin.cbor` on input from outside and on its two modes: truncation at every byte, lengths beyond the
+// input, nesting, bad text, the limits, strict reading of the deterministic encoding, deterministic
+// writing, and reading from a `Reader` and writing to a `ByteWriter`.
+import avin.cbor
+
+import avin.cbor.{
+  Arr, BigUnsigned, Bool, Bytes, Cbor, CborError, CborOptions, CborReader, CborWriter, Dict, Double, Half, Null, Num,
+  Simple, Single, Tagged, Text, Undefined
+}
+
+import avin.encoding.{fromHex, toHex}
+import avin.io.{ByteWriter, IoError, Other, Reader}
+
+hex(text: string) -> Array[byte] = fromHex(text).getOrElse(Vector.empty[byte]()).toArray()
+
+hexOf(bytes: Array[byte]) -> string = toHex(bytes.toVector)
+
+// The message of the error reading `text` gives, or "ok".
+failure(text: string, options: CborOptions = CborOptions()) -> string = cbor.parse(hex(text), options) match
+  Ok(_) -> "ok"
+  Err(e) -> e.message
+
+// A document of `n` of the byte `unit` followed by `tail`.
+repeated(piece: string, n: int, tail: string) -> Array[byte]
+  val u = hex(piece)
+  val t = hex(tail)
+  Array.tabulate(u.length * n + t.length, i -> if i < u.length * n then u(i % u.length) else t(i - u.length * n))
+
+val minLong: long = -9223372036854775807 - 1
+val maxLong: long = 9223372036854775807
+
+// Integers at every boundary of the encoding's sizes.
+val integerSizes: Vector[long] = [
+  minLong, -4294967297, -4294967296, -65537, -65536, -257, -256, -255, -25, -24, -1, 0, 23, 24, 255, 256, 65535, 65536,
+  4294967295, 4294967296, maxLong
+]
+
+// Every well-formed document of RFC 8949 appendix A, definite and indefinite.
+val corpus: Vector[string] = [
+  "00", "17", "1818", "1903e8", "1a000f4240", "1b000000e8d4a51000", "1bffffffffffffffff", "20", "3863",
+  "3bffffffffffffffff", "c249010000000000000000", "f90000", "f93c00", "fb3ff199999999999a", "fa47c35000",
+  "fb7e37e43c8800759c", "f97e00", "fa7fc00000", "fb7ff8000000000000", "f4", "f5", "f6", "f7", "f0", "f8ff",
+  "c11a514b67b0", "d74401020304", "40", "4401020304", "60", "6449455446", "62c3bc", "64f0908591", "80", "83010203",
+  "8301820203820405", "a0", "a201020304", "a26161016162820203", "826161a161626163", "5f42010243030405ff",
+  "7f657374726561646d696e67ff", "9fff", "9f018202039f0405ffff", "83019f0203ff820405", "bf61610161629f0203ffff",
+  "bf6346756ef563416d7421ff", "c0c1c200"
+]
+
+@test("every proper prefix of every well-formed document is an error, never a trap or a value")
+truncationAtEveryByte()
+  for text in corpus
+    val whole = hex(text)
+    assertEq(failure(text), "ok")
+    for n in 0 ..< whole.length
+      val cut = cbor.parse(whole.slice(0, n))
+      assertEq(cut.isErr, true)
+
+@test("a document followed by anything is an error, and so is an empty one")
+trailingAndEmpty()
+  for text in corpus
+    assertEq(cbor.parse(hex(text + "00")).isErr, true)
+  assertEq(failure(""), "the input ends inside an item")
+  assertEq(failure("0000"), "there is data after the item")
+
+@test("a length beyond the input is an error before anything is allocated for it")
+lengthsBeyondTheInput()
+  assertEq(failure("5bffffffffffffffff"), "a byte string of 18446744073709551615 is longer than the limit of 16777216")
+  assertEq(failure("7bffffffffffffffff").startsWith("a text string of"), true)
+  assertEq(failure("9bffffffffffffffff").startsWith("a collection of 18446744073709551615"), true)
+  assertEq(failure("bbffffffffffffffff").startsWith("a collection of"), true)
+  assertEq(failure("5b0000000100000000"), "a byte string of 4294967296 is longer than the limit of 16777216")
+  assertEq(failure("5a00ffffff"), "the input ends inside an item")
+  assertEq(failure("7a00ffffff"), "the input ends inside an item")
+  assertEq(failure("9a000fffff"), "a collection is longer than the input that remains")
+  assertEq(failure("ba000fffff"), "a collection is longer than the input that remains")
+  assertEq(failure("9a7fffffff").startsWith("a collection of 2147483647"), true)
+  assertEq(failure("8201"), "a collection is longer than the input that remains")
+  assertEq(failure("a101"), "a collection is longer than the input that remains")
+  assertEq(failure("5a0000010000"), "the input ends inside an item")
+
+@test("nesting is limited: exactly maxDepth deep reads, one more is an error, however many follow")
+nestingLimit()
+  val options = CborOptions(maxDepth = 8)
+  assertEq(cbor.parse(repeated("81", 7, "00"), options).isOk, true)
+  assertEq(cbor.parse(repeated("81", 8, "00"), options).isOk, true)
+  assertEq(failure("", options), "the input ends inside an item")
+  assertEq(cbor.parse(repeated("81", 9, "00"), options).isErr, true)
+  assertEq(cbor.parse(repeated("9f", 9, "00"), options).isErr, true)
+  assertEq(cbor.parse(repeated("a10100", 9, "00"), options).isErr, true)
+  assertEq(cbor.parse(repeated("a101", 9, "00"), options).isErr, true)
+  assertEq(cbor.parse(repeated("c0", 9, "00"), options).isErr, true)
+  assertEq(cbor.parse(repeated("c0", 8, "00"), options).isOk, true)
+  assertEq(cbor.parse(repeated("81", 200000, "00")).isErr, true)
+  assertEq(cbor.parse(repeated("9f", 200000, "00")).isErr, true)
+  assertEq(cbor.parse(repeated("c0", 200000, "00")).isErr, true)
+  assertEq(cbor.parse(repeated("a101", 200000, "00")).isErr, true)
+  assertEq(cbor.parse(repeated("81", 128, "00")).isOk, true)
+  assertEq(cbor.parse(repeated("81", 129, "00")).isErr, true)
+
+@test("a collection, a string and a whole document are limited too")
+sizeLimits()
+  val items = CborOptions(maxItems = 3)
+  assertEq(failure("83010203", items), "ok")
+  assertEq(failure("8401020304", items), "a collection of 4 items is longer than the limit of 3")
+  assertEq(failure("a40102030405060708", items), "a collection of 4 items is longer than the limit of 3")
+  assertEq(failure("9f01020304ff", items), "ok")
+  val bytes = CborOptions(maxBytes = 4)
+  assertEq(failure("4401020304", bytes), "ok")
+  assertEq(failure("450102030405", bytes), "a byte string of 5 is longer than the limit of 4")
+  assertEq(failure("6568656c6c6f", bytes), "a text string of 5 is longer than the limit of 4")
+  assertEq(failure("5f42010243030405ff", bytes), "a byte string of 3 is longer than the limit of 2")
+  assertEq(failure("7f626162626162ff", CborOptions(maxBytes = 3)), "a text string of 2 is longer than the limit of 1")
+  val size = CborOptions(maxSize = 5)
+  assertEq(failure("4401020304", size), "ok")
+  assertEq(failure("83010203", size), "ok")
+  assertEq(failure("8401020304", size), "ok")
+  assertEq(failure("850102030405", size), "the document is longer than the limit of 5 bytes")
+  assertEq(failure("1b0000000000000001", size), "the document is longer than the limit of 5 bytes")
+
+@test("text that is not UTF-8 is an error: a stray byte, an overlong form, a surrogate, a cut character")
+badUtf8()
+  for text in ["62c328", "61ff", "62c080", "63eda080", "63e6b0", "62e6b0", "64f4908080", "63f09085", "61c3", "6180"]
+    assertEq(failure(text).endsWith("is not UTF-8") || failure(text).startsWith("the input ends"), true)
+  assertEq(failure("61ff"), "a text string is not UTF-8")
+  assertEq(failure("62c328"), "a text string is not UTF-8")
+  assertEq(failure("63eda080"), "a text string is not UTF-8")
+  assertEq(failure("7f61e661b0ff"), "a text string is not UTF-8")
+  assertEq(cbor.parse(hex("62c328")).mapErr(e -> e.offset), Err(1))
+  assertEq(cbor.parse(hex("826161" + "62c328")).mapErr(e -> e.offset), Err(4))
+
+@test("malformed items: reserved additional information, a stray break, a wrong chunk, a short simple value")
+malformed()
+  for text in ["1c", "3d", "5e", "7c", "9d", "be", "dc", "fc", "fd", "fe"]
+    assertEq(failure(text).endsWith("is reserved"), true)
+  assertEq(failure("ff"), "expected a value, found a break")
+  assertEq(failure("81ff"), "expected a value, found a break")
+  assertEq(failure("9f"), "the input ends inside an item")
+  assertEq(failure("9f01"), "the input ends inside an item")
+  assertEq(failure("5f6161ff"), "expected a definite byte string chunk, found a text string")
+  assertEq(failure("7f4161ff"), "expected a definite text string chunk, found a byte string")
+  assertEq(failure("5f5fffff"), "expected a definite byte string chunk, found a byte string")
+  assertEq(failure("5f01ff"), "expected a definite byte string chunk, found an integer")
+  assertEq(failure("5f"), "the input ends inside an item")
+  assertEq(failure("f800"), "the simple value 0 is written in two bytes")
+  assertEq(failure("f81f"), "the simple value 31 is written in two bytes")
+  assertEq(failure("f820"), "ok")
+  assertEq(failure("a1ff00"), "expected a value, found a break")
+  assertEq(failure("bf01ff"), "expected a value, found a break")
+  assertEq(failure("c0"), "the input ends inside an item")
+  assertEq(failure("1b00"), "the input ends inside an item")
+  assertEq(failure("fb00"), "the input ends inside an item")
+
+@test("an integer beyond a long reads as the integer it is, and decoding it as a long is an error")
+integersBeyondLong()
+  assertEq(cbor.parse(hex("1bffffffffffffffff")), Ok(BigUnsigned(-1)))
+  assertEq(
+    cbor.decode[long](hex("1bffffffffffffffff")).mapErr(e -> e.message),
+    Err("the integer 18446744073709551615 is beyond a long")
+  )
+  assertEq(
+    cbor.decode[long](hex("3bffffffffffffffff")).mapErr(e -> e.message),
+    Err("the integer -1 - 18446744073709551615 is beyond a long")
+  )
+  assertEq(
+    cbor.decode[int](hex("1b0000000100000000")).mapErr(e -> e.message),
+    Err("the integer 4294967296 is beyond an int")
+  )
+  assertEq(cbor.decode[int](hex("1a7fffffff")), Ok(2147483647))
+  assertEq(cbor.decode[int](hex("3a7fffffff")), Ok(-2147483648))
+  assertEq(cbor.decode[int](hex("3a80000000")).isErr, true)
+  assertEq(cbor.decode[long](hex("3b7fffffffffffffff")), Ok(minLong))
+  assertEq(cbor.decode[long](hex("1b7fffffffffffffff")), Ok(maxLong))
+
+@test("deterministic writing: shortest floats, sorted keys, and the same bytes for equal trees")
+deterministicWriting()
+  assertEq(hexOf(cbor.encodeTree(Double(1.0), true)), "f93c00")
+  assertEq(hexOf(cbor.encodeTree(Double(1.0))), "fb3ff0000000000000")
+  assertEq(hexOf(cbor.encodeTree(Single(1.5), true)), "f93e00")
+  assertEq(hexOf(cbor.encodeTree(Double(65504.0), true)), "f97bff")
+  assertEq(hexOf(cbor.encodeTree(Double(65505.0), true)), "fa477fe100")
+  assertEq(hexOf(cbor.encodeTree(Double(100000.0), true)), "fa47c35000")
+  assertEq(hexOf(cbor.encodeTree(Double(1.1), true)), "fb3ff199999999999a")
+  assertEq(hexOf(cbor.encodeTree(Double(3.4028234663852886e38), true)), "fa7f7fffff")
+  assertEq(hexOf(cbor.encodeTree(Double(5.960464477539063e-8), true)), "f90001")
+  assertEq(hexOf(cbor.encodeTree(Double(0.00006103515625), true)), "f90400")
+  assertEq(hexOf(cbor.encodeTree(Double(6.0e-8), true)).take(2), "fb")
+  assertEq(hexOf(cbor.encodeTree(Double(0.0), true)), "f90000")
+  assertEq(hexOf(cbor.encodeTree(Double(-0.0), true)), "f98000")
+  assertEq(hexOf(cbor.encodeTree(Double(1.0e300), true)), "fb7e37e43c8800759c")
+  assertEq(hexOf(cbor.encodeTree(Double(1.0 / 0.0), true)), "f97c00")
+  assertEq(hexOf(cbor.encodeTree(Single(-1.0 / 0.0), true)), "f9fc00")
+  assertEq(hexOf(cbor.encodeTree(Double(0.0 / 0.0), true)), "f97e00")
+  assertEq(hexOf(cbor.encodeTree(Single(0.0 / 0.0), true)), "f97e00")
+  assertEq(hexOf(cbor.encodeTree(Half(1.0), true)), "f93c00")
+  // a half rounds to the nearest where it must: 1.0009765625 is the next half above 1.0
+  assertEq(hexOf(cbor.encodeTree(Half(1.0009765625))), "f93c01")
+  assertEq(hexOf(cbor.encodeTree(Half(1.00048828125))), "f93c00")
+  assertEq(hexOf(cbor.encodeTree(Half(1.00146484375))), "f93c02")
+  assertEq(hexOf(cbor.encodeTree(Half(70000.0))), "f97c00")
+  assertEq(hexOf(cbor.encodeTree(Half(65519.0))), "f97bff")
+  assertEq(hexOf(cbor.encodeTree(Half(65520.0))), "f97c00")
+  assertEq(hexOf(cbor.encodeTree(Half(2.9802322387695312e-8))), "f90000")
+  assertEq(hexOf(cbor.encodeTree(Half(2.98023223876953125e-8 * 1.5))), "f90001")
+  assertEq(hexOf(cbor.encodeTree(Half(-0.0))), "f98000")
+
+@test("deterministic writing sorts map entries by their encoded keys, as RFC 8949 section 4.2.1 lists them")
+deterministicKeys()
+  val keys = [Num(10), Num(100), Num(-1), Text("z"), Text("aa"), Arr([Num(100)]), Arr([Num(-1)]), Bool(false)]
+  val shuffled = [Text("aa"), Bool(false), Num(100), Arr([Num(-1)]), Num(-1), Text("z"), Num(10), Arr([Num(100)])]
+  val expected = "a8" + "0a00" + "186400" + "2000" + "617a00" + "62616100" + "81186400" + "812000" + "f400"
+  assertEq(hexOf(cbor.encodeTree(Dict(keys.map(k -> (k, Num(0)))), true)), expected)
+  assertEq(hexOf(cbor.encodeTree(Dict(shuffled.map(k -> (k, Num(0)))), true)), expected)
+  assertEq(
+    hexOf(cbor.encodeTree(Dict(shuffled.map(k -> (k, Num(0)))))),
+    "a8" + "626161" + "00" + "f400" + "186400" + "812000" + "2000" + "617a00" + "0a00" + "81186400"
+  )
+  assertEq(hexOf(cbor.encodeTree(Dict([(Text("b"), Num(1)), (Text("a"), Num(2))]), true)), "a2616102616201")
+  assertEq(hexOf(cbor.encodeTree(Dict([(Text("bb"), Num(1)), (Text("a"), Num(2))]), true)), "a2616102626262" + "01")
+  assertEq(hexOf(cbor.encodeTree(Arr([Dict([(Num(2), Num(0)), (Num(1), Num(0))])]), true)), "81a2010002" + "00")
+  assertEq(
+    hexOf(cbor.encodeTree(Dict([(Num(2), Dict([(Num(4), Num(0)), (Num(3), Num(0))])), (Num(1), Num(0))]), true)),
+    "a2" + "0100" + "02a2030004" + "00"
+  )
+
+@test("strict reading takes the deterministic encoding and refuses every other form")
+strictReading()
+  val strict = CborOptions(strict = true)
+  for text in [
+    "00",
+    "17",
+    "1818",
+    "18ff",
+    "190100",
+    "1a00010000",
+    "1b0000000100000000",
+    "20",
+    "3818",
+    "40",
+    "60",
+    "80",
+    "a0",
+    "f4",
+    "f6",
+    "f7",
+    "f93c00",
+    "fa47c35000",
+    "fb3ff199999999999a",
+    "f97e00",
+    "f97c00",
+    "f98000",
+    "f90001"
+  ]
+    assertEq(failure(text, strict), "ok")
+  for text in [
+    "1800",
+    "1817",
+    "190001",
+    "1900ff",
+    "1a0000ffff",
+    "1b00000000ffffffff",
+    "3800",
+    "3817",
+    "5800",
+    "7800",
+    "9800",
+    "b800",
+    "d800" + "00",
+    "9f01ff",
+    "bf0100ff",
+    "5f4100ff",
+    "7f6161ff"
+  ]
+    assertEq(failure(text, strict).isEmpty, false)
+    assertEq(failure(text, strict) == "ok", false)
+  assertEq(failure("1800", strict), "an argument is not in its shortest form")
+  assertEq(failure("9f01ff", strict), "an indefinite length is not deterministic")
+  assertEq(failure("5f4100ff", strict), "an indefinite length is not deterministic")
+  assertEq(failure("7f6161ff", strict), "an indefinite length is not deterministic")
+  assertEq(failure("bf0100ff", strict), "an indefinite length is not deterministic")
+  assertEq(failure("fb3ff0000000000000", strict), "a float is not in its shortest form")
+  assertEq(failure("fa3fc00000", strict), "a float is not in its shortest form")
+  assertEq(failure("fa7fc00000", strict), "a float is not in its shortest form")
+  assertEq(failure("fb7ff8000000000000", strict), "a float is not in its shortest form")
+  assertEq(failure("f97e01", strict), "a NaN is not the one deterministic NaN")
+  assertEq(failure("f9fe00", strict), "a NaN is not the one deterministic NaN")
+  assertEq(failure("a2616101616202", strict), "ok")
+  assertEq(failure("a2616201616102", strict), "map keys are not in sorted order, without repeats")
+  assertEq(failure("a2616101616102", strict), "map keys are not in sorted order, without repeats")
+  assertEq(failure("a2" + "0a00" + "0900", strict), "map keys are not in sorted order, without repeats")
+  assertEq(failure("a2" + "0a00" + "186400", strict), "ok")
+  assertEq(failure("a2" + "186400" + "0a00", strict), "map keys are not in sorted order, without repeats")
+  assertEq(failure("a2" + "6161" + "00" + "626161" + "00", strict), "ok")
+  assertEq(failure("a2" + "626161" + "00" + "6162" + "00", strict), "map keys are not in sorted order, without repeats")
+  assertEq(failure("1800"), "ok")
+
+@test("whatever the deterministic writer writes, the strict reader reads back to the same tree")
+strictReadsDeterministic()
+  val strict = CborOptions(strict = true)
+  val trees = [
+    Num(0),
+    Num(23),
+    Num(24),
+    Num(255),
+    Num(256),
+    Num(65535),
+    Num(65536),
+    Num(4294967295),
+    Num(4294967296),
+    Num(-1),
+    Num(-24),
+    Num(-25),
+    Num(-256),
+    Num(-257),
+    Num(-9223372036854775807 - 1),
+    BigUnsigned(-1),
+    Double(1.0),
+    Double(0.1),
+    Double(-4.1),
+    Single(100000.0),
+    Half(65504.0),
+    Text("é"),
+    Bytes(hex("0102")),
+    Tagged(2, Bytes(hex("01"))),
+    Dict([(Text("bb"), Num(1)), (Text("a"), Num(2)), (Num(7), Null)]),
+    Arr([Simple(16), Undefined, Bool(true)])
+  ]
+  for tree in trees
+    val bytes = cbor.encodeTree(tree, true)
+    val back = cbor.parse(bytes, strict)
+    assertEq(back.isOk, true)
+    assertEq(cbor.encodeTree(back.getOrElse(Null), true), bytes)
+
+@test("the bytes of a tree read back to it at every size of integer, string and collection")
+roundTripSizes()
+  for n in [0, 1, 23, 24, 255, 256, 65535, 65536, 300000]
+    val bytes = Array.fill(n, byte(7))
+    assertEq(cbor.parse(cbor.encodeTree(Bytes(bytes))), Ok(Bytes(bytes)))
+  for n in [0, 1, 23, 24, 255, 256, 70000]
+    val text = "x".repeat(n)
+    assertEq(cbor.parse(cbor.encodeTree(Text(text))), Ok(Text(text)))
+    val items = Vector.tabulate(n, i -> Num(long(i)))
+    assertEq(cbor.parse(cbor.encodeTree(Arr(items))), Ok(Arr(items)))
+    val entries = Vector.tabulate(n, i -> (Num(long(i)), Num(long(-i))))
+    assertEq(cbor.parse(cbor.encodeTree(Dict(entries))), Ok(Dict(entries)))
+  for n in integerSizes
+    assertEq(cbor.parse(cbor.encodeTree(Num(n))), Ok(Num(n)))

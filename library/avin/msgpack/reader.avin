@@ -1,0 +1,400 @@
+module avin.msgpack
+
+import avin.io.IoError
+import avin.io.Reader
+
+// How many bytes one read from a source asks for.
+val readChunkSize: int = 65536
+
+private object NoInput: Reader
+  override read(max: int) -> Result[Array[byte], IoError] = Ok(Array.empty[byte]())
+
+// The kinds of item a format byte begins.
+private val KUint = 0
+private val KInt = 1
+private val KStr = 2
+private val KBin = 3
+private val KArr = 4
+private val KMap = 5
+private val KExt = 6
+private val KNil = 7
+private val KFalse = 8
+private val KTrue = 9
+private val KSingle = 10
+private val KDouble = 11
+
+// An item's kind and argument: an integer's value (the 64 bits of an unsigned one), a string's, binary's,
+// array's, map's or extension's length, a float's bits; for an extension also its type; and the offset
+// the item began at.
+private data Head(kind: int, arg: long, ext: int, start: long)
+
+// An array or map the reader is inside: the elements or entries still to come, and for a map read by
+// `nextKey` under `strict` the last key's encoding.
+private class Frame(var remaining: long)
+  var lastKey: Array[byte] = Array.empty[byte]()
+  var hasKey = false
+
+// Reads MessagePack from a source an item at a time, as a decoder written for a type does. Each `read`
+// takes a whole scalar; `beginArray` and `beginMap` open a collection, and `nextElement`, `nextEntry` or
+// `nextKey` say whether it has another and close it where it has not. `readValue` takes a whole item
+// as a `Msgpack` tree and `skipValue` drops one.
+//
+// The source is read 64 KiB at a time as items need it, and held only as far as the item being read
+// needs. A reader belongs to the thread that reads it. After a call answers `Err`, the reader's
+// position is not meaningful and the document is not read further.
+class MsgpackReader(
+    private val source: Reader,
+    val options: MsgpackOptions,
+    private var chunk: Array[byte],
+    private var end: int,
+    private var ended: bool
+)
+  // The next byte to read in `chunk`, and how many bytes of the document came before `chunk`.
+  private var pos = 0
+  private var base: long = 0
+  private val frames = Buffer[Frame]()
+
+  // How many bytes have been read, the offset of the next one.
+  offset() -> long = base + long(pos)
+
+  // How many arrays and maps are open.
+  depth() -> int = frames.length
+
+  // An error at the reader's position.
+  error(message: string) -> MsgpackError = MsgpackError(message, offset())
+
+  private errorAt(at: long, message: string) -> MsgpackError = MsgpackError(message, at)
+
+  // Makes `n` bytes available at `pos`, reading the source as far as needed; an error where the
+  // document would pass `maxSize` or the source ends first.
+  private need(n: int) -> Result[unit, MsgpackError]
+    if base + long(pos) + long(n) > options.maxSize
+      return Err(error(s"the document is longer than the limit of ${options.maxSize} bytes"))
+    while end - pos < n && !ended
+      pull()?
+    if end - pos < n then return Err(error("the input ends inside an item"))
+    Ok(())
+
+  private pull() -> Result[unit, MsgpackError]
+    if chunk.length - end < readChunkSize
+      val live = end - pos
+      val grown = Array.fill(if live * 2 > live + readChunkSize then live * 2 else live + readChunkSize, byte(0))
+      chunk.copyTo(grown, 0, pos, live)
+      chunk = grown
+      base += long(pos)
+      pos = 0
+      end = live
+    val got = source.read(readChunkSize)
+    got match
+      Err(e) -> Err(error(s"the document could not be read: ${e.message}"))
+      Ok(piece) ->
+        if piece.length == 0
+          ended = true
+        else
+          piece.copyTo(chunk, end, 0, piece.length)
+          end += piece.length
+        Ok(())
+
+  // The next byte, not moved past.
+  private peekByte() -> Result[int, MsgpackError]
+    need(1)?
+    Ok(int(chunk(pos)))
+
+  // `width` bytes as an unsigned number.
+  private unsignedOf(width: int) -> Result[long, MsgpackError]
+    need(width)?
+    var v: long = 0
+    for i in 0 ..< width
+      v = (v << 8) | long(int(chunk(pos + i)))
+    pos += width
+    Ok(v)
+
+  // `width` bytes as a signed number.
+  private signedOf(width: int) -> Result[long, MsgpackError]
+    val v = unsignedOf(width)?
+    if width == 8 then return Ok(v)
+    val bits = width * 8
+    Ok(if v >= (long(1) << long(bits - 1)) then v - (long(1) << long(bits)) else v)
+
+  // Whether the length `n` is the shortest form of a length the format byte `f` carries: a string's,
+  // binary's, array's, map's or extension's.
+  private shortestLength(kind: int, f: int, n: long) -> bool = kind match
+    2 -> if f == 0xD9 then n >= 32 elif f == 0xDA then n >= 256 else n >= 65536
+    3 -> if f == 0xC4 then true elif f == 0xC5 then n >= 256 else n >= 65536
+    4 | 5 -> if f == 0xDC || f == 0xDE then n >= 16 else n >= 65536
+    _ -> if f == 0xC7 then !(
+      n == 1 || n == 2 || n == 4 || n == 8 || n == 16
+    ) elif f == 0xC8 then n >= 256 else n >= 65536
+
+  private head() -> Result[Head, MsgpackError]
+    need(1)?
+    val start = offset()
+    val f = int(chunk(pos))
+    pos += 1
+    if f < 0x80 then return Ok(Head(KUint, long(f), 0, start))
+    if f >= 0xE0 then return Ok(Head(KInt, long(f - 256), 0, start))
+    if f < 0x90 then return Ok(Head(KMap, long(f & 15), 0, start))
+    if f < 0xA0 then return Ok(Head(KArr, long(f & 15), 0, start))
+    if f < 0xC0 then return Ok(Head(KStr, long(f & 31), 0, start))
+    f match
+      0xC0 -> Ok(Head(KNil, 0, 0, start))
+      0xC1 -> Err(errorAt(start, "the format byte 0xC1 is never used"))
+      0xC2 -> Ok(Head(KFalse, 0, 0, start))
+      0xC3 -> Ok(Head(KTrue, 0, 0, start))
+      0xC4 | 0xC5 | 0xC6 -> sized(KBin, f, f - 0xC4, start)
+      0xC7 | 0xC8 | 0xC9 -> sized(KExt, f, f - 0xC7, start)
+      0xCA -> unsignedOf(4).map(v -> Head(KSingle, v, 0, start))
+      0xCB -> unsignedOf(8).map(v -> Head(KDouble, v, 0, start))
+      0xCC | 0xCD | 0xCE | 0xCF -> integer(f, start)
+      0xD0 | 0xD1 | 0xD2 | 0xD3 -> integer(f, start)
+      0xD4 | 0xD5 | 0xD6 | 0xD7 | 0xD8 -> fixed(f, start)
+      0xD9 | 0xDA | 0xDB -> sized(KStr, f, f - 0xD9, start)
+      0xDC | 0xDD -> sized(KArr, f, f - 0xDC + 1, start)
+      0xDE | 0xDF -> sized(KMap, f, f - 0xDE + 1, start)
+      _ -> Err(errorAt(start, "the format byte is not one"))
+
+  // A length of `1 << lengthWidth` bytes where `lengthWidth` is 0, 1 or 2 (the widths 1, 2 and 4),
+  // and for an extension its type byte after.
+  private sized(kind: int, f: int, lengthWidth: int, start: long) -> Result[Head, MsgpackError]
+    val n = unsignedOf(1 << lengthWidth)?
+    if options.strict && !shortestLength(kind, f, n)
+      return Err(errorAt(start, "a length is not in its shortest form"))
+    if kind == KExt
+      val t = signedOf(1)?
+      return Ok(Head(KExt, n, int(t), start))
+    Ok(Head(kind, n, 0, start))
+
+  // A fixext format: 1, 2, 4, 8 or 16 bytes after the extension type.
+  private fixed(f: int, start: long) -> Result[Head, MsgpackError]
+    val t = signedOf(1)?
+    Ok(Head(KExt, long(1 << (f - 0xD4)), int(t), start))
+
+  // An unsigned or signed integer of 1, 2, 4 or 8 bytes, shortest form checked.
+  private integer(f: int, start: long) -> Result[Head, MsgpackError]
+    val unsigned = f < 0xD0
+    val width = 1 << ((f - (if unsigned then 0xCC else 0xD0)))
+    val v = if unsigned then unsignedOf(width)? else signedOf(width)?
+    if options.strict
+      val shortest = if unsigned
+        // below 128 a fixint, then each width from the one below
+        if width == 1 then v >= 128 elif width == 2 then 256 <= v || v < 0 elif width == 4 then 65536 <= v || v < 0 else 4294967296 <= v || v < 0
+      else
+        // a non-negative value is an unsigned format's
+        if width == 1 then v < -32 elif width == 2 then v < -128 elif width == 4 then v < -32768 else v < -2147483648
+      if !shortest then return Err(errorAt(start, "an integer is not in its shortest form"))
+    Ok(Head(if unsigned then KUint else KInt, v, 0, start))
+
+  private describe(h: Head) -> string = h.kind match
+    0 | 1 -> "an integer"
+    2 -> "a string"
+    3 -> "binary data"
+    4 -> "an array"
+    5 -> "a map"
+    6 -> "an extension"
+    7 -> "nil"
+    8 | 9 -> "a boolean"
+    _ -> "a float"
+
+  private expected(what: string, h: Head) -> MsgpackError = errorAt(h.start, s"expected $what, found ${describe(h)}")
+
+  // A length of at most `limit`, so nothing longer is ever allocated for.
+  private bound(h: Head, limit: int, what: string) -> Result[int, MsgpackError]
+    if h.arg < 0 || h.arg > long(limit)
+      return Err(errorAt(h.start, s"${article(what)} of ${h.arg} is longer than the limit of $limit"))
+    Ok(int(h.arg))
+
+  private piece(n: int) -> Result[Array[byte], MsgpackError]
+    need(n)?
+    val out = chunk.slice(pos, pos + n)
+    pos += n
+    Ok(out)
+
+  private textFrom(h: Head) -> Result[string, MsgpackError]
+    if h.kind != KStr then return Err(expected("a string", h))
+    val n = bound(h, options.maxBytes, "string")?
+    val at = offset()
+    val raw = piece(n)?
+    string.fromUtf8(raw) match
+      Ok(s) -> Ok(s)
+      Err(e) -> Err(errorAt(at + e.offset, "a string is not UTF-8"))
+
+  private binaryFrom(h: Head) -> Result[Array[byte], MsgpackError]
+    if h.kind != KBin then return Err(expected("binary data", h))
+    piece(bound(h, options.maxBytes, "binary")?)
+
+  // Opens the array or map `h` heads.
+  private open(h: Head) -> Result[unit, MsgpackError]
+    if frames.length >= options.maxDepth
+      return Err(errorAt(h.start, s"nesting is deeper than the limit of ${options.maxDepth}"))
+    if h.arg < 0 || h.arg > long(options.maxItems)
+      return Err(errorAt(h.start, s"a collection of ${h.arg} items is longer than the limit of ${options.maxItems}"))
+    // every element is at least a byte, every entry at least two
+    val least = if h.kind == KMap then h.arg * 2 else h.arg
+    if ended && long(end - pos) < least
+      return Err(errorAt(h.start, "a collection is longer than the input that remains"))
+    frames.addOne(Frame(h.arg))
+    Ok(())
+
+  beginArray() -> Result[unit, MsgpackError]
+    val h = head()?
+    if h.kind != KArr then return Err(expected("an array", h))
+    open(h)
+
+  beginMap() -> Result[unit, MsgpackError]
+    val h = head()?
+    if h.kind != KMap then return Err(expected("a map", h))
+    open(h)
+
+  // Whether the open array has another element, closing it where it has not.
+  nextElement() -> Result[bool, MsgpackError]
+    if frames.isEmpty then return Err(error("no array or map is open"))
+    val f = frames(frames.length - 1)
+    if f.remaining == 0
+      frames.remove(frames.length - 1)
+      return Ok(false)
+    f.remaining -= 1
+    Ok(true)
+
+  // Whether the open map has another entry, closing it where it has not. The key and the value
+  // follow, each an item.
+  nextEntry() -> Result[bool, MsgpackError] = nextElement()
+
+  // The string key of the open map's next entry, None where the map has ended. A key of another type
+  // is an error.
+  nextKey() -> Result[Option[string], MsgpackError]
+    if !nextElement()? then return Ok(None)
+    val at = offset()
+    val h = head()?
+    val key = textFrom(h)?
+    if options.strict
+      val f = frames(frames.length - 1)
+      val encoded = encodeTree(Str(key), true)
+      if f.hasKey && compareBytes(f.lastKey, encoded) >= 0
+        return Err(errorAt(at, "map keys are not in sorted order, without repeats"))
+      f.lastKey = encoded
+      f.hasKey = true
+    Ok(Some(key))
+
+  readText() -> Result[string, MsgpackError] = textFrom(head()?)
+
+  readBytes() -> Result[Array[byte], MsgpackError] = binaryFrom(head()?)
+
+  readBool() -> Result[bool, MsgpackError]
+    val h = head()?
+    if h.kind == KFalse then return Ok(false)
+    if h.kind == KTrue then return Ok(true)
+    Err(expected("a boolean", h))
+
+  private longFrom(h: Head) -> Result[long, MsgpackError]
+    if h.kind == KUint
+      if h.arg >= 0 then Ok(h.arg) else Err(errorAt(h.start, s"the integer ${showUnsigned(h.arg)} is beyond a long"))
+    elif h.kind == KInt
+      Ok(h.arg)
+    else
+      Err(expected("an integer", h))
+
+  readLong() -> Result[long, MsgpackError] = longFrom(head()?)
+
+  readInt() -> Result[int, MsgpackError]
+    val h = head()?
+    val n = longFrom(h)?
+    if long(-2147483647) - 1 <= n <= 2147483647 then Ok(int(n)) else Err(
+      errorAt(h.start, s"the integer $n is beyond an int")
+    )
+
+  private floatFrom(h: Head) -> Result[Msgpack, MsgpackError]
+    if h.kind == KSingle
+      val bits = int.wrap(h.arg)
+      val x = real.fromBits32(bits)
+      if options.strict && x != x && bits != 0x7FC00000
+        return Err(errorAt(h.start, "a NaN is not the one deterministic NaN"))
+      return Ok(Single(x))
+    val x = real.fromBits(h.arg)
+    if options.strict && fitsSingle(x)
+      return Err(errorAt(h.start, "a float is not in its shortest form"))
+    Ok(Double(x))
+
+  // A float of either width, or an integer as the `real` nearest it.
+  readReal() -> Result[real, MsgpackError]
+    val h = head()?
+    if h.kind == KSingle || h.kind == KDouble
+      return floatFrom(h)? match
+        Single(x) -> Ok(x)
+        Double(x) -> Ok(x)
+        _ -> Err(expected("a float", h))
+    if h.kind <= KInt then return longFrom(h).map(n -> real(n))
+    Err(expected("a number", h))
+
+  // Whether the next item is a nil, moved past if so.
+  takeNil() -> Result[bool, MsgpackError]
+    if peekByte()? == 0xC0
+      pos += 1
+      return Ok(true)
+    Ok(false)
+
+  // The next item as a tree.
+  readValue() -> Result[Msgpack, MsgpackError] = valueFrom(head()?)
+
+  private valueFrom(h: Head) -> Result[Msgpack, MsgpackError] = h.kind match
+    0 -> Ok(if h.arg >= 0 then Num(h.arg) else BigUint(h.arg))
+    1 -> Ok(Num(h.arg))
+    2 -> textFrom(h).map(s -> Str(s))
+    3 -> binaryFrom(h).map(b -> Bin(b))
+    4 ->
+      open(h)?
+      val items = Buffer[Msgpack]()
+      while nextElement()?
+        items.addOne(readValue()?)
+      Ok(Arr(items.toVector))
+    5 ->
+      open(h)?
+      val entries = Buffer[(Msgpack, Msgpack)]()
+      var last = Array.empty[byte]()
+      while nextEntry()?
+        val at = offset()
+        val k = readValue()?
+        if options.strict
+          val encoded = encodeTree(k, true)
+          if entries.length > 0 && compareBytes(last, encoded) >= 0
+            return Err(errorAt(at, "map keys are not in sorted order, without repeats"))
+          last = encoded
+        entries.addOne((k, readValue()?))
+      Ok(Dict(entries.toVector))
+    6 -> piece(bound(h, options.maxBytes, "extension")?).map(data -> Ext(h.ext, data))
+    7 -> Ok(Nil)
+    8 -> Ok(Bool(false))
+    9 -> Ok(Bool(true))
+    _ -> floatFrom(h)
+
+  // Moves past the next item, checking it as `readValue` would.
+  skipValue() -> Result[unit, MsgpackError]
+    readValue()?
+    Ok(())
+
+  // Whether the document has more bytes.
+  hasMore() -> Result[bool, MsgpackError]
+    while end - pos < 1 && !ended
+      pull()?
+    Ok(end - pos >= 1)
+
+  // Ends the document: no array or map left open and nothing after the item.
+  finish() -> Result[unit, MsgpackError]
+    if !frames.isEmpty then return Err(error("an array or map is not finished"))
+    if hasMore()? then return Err(error("there is data after the item"))
+    Ok(())
+
+object MsgpackReader
+  // A reader of the document `source` gives, read a piece at a time.
+  fromReader(source: Reader, options: MsgpackOptions = MsgpackOptions()) -> MsgpackReader =
+    MsgpackReader(source, options, Array.empty[byte](), 0, false)
+
+  // A reader of a document in hand.
+  fromBytes(bytes: Array[byte], options: MsgpackOptions = MsgpackOptions()) -> MsgpackReader =
+    MsgpackReader(NoInput, options, bytes, bytes.length, true)
+
+private article(what: string) -> string = if what.startsWith("e") then s"an $what" else s"a $what"
+
+// An unsigned 64-bit number written as the decimal digits it holds.
+private showUnsigned(
+    bits: long
+) -> string = if bits >= 0 then s"$bits" else s"${BigInt(bits) + BigInt("18446744073709551616")}"
