@@ -8,6 +8,7 @@ module avin.net.http
 // machine's trusted authorities and those the request's `TlsClient` adds. The server, `serve`, is in
 // `server.avin` beside this file; a `Response` is what its handlers answer.
 
+import avin.compress.{CompressError, Gzip, Zlib, decompress, defaultMaxBytes}
 import avin.io.IoError
 import avin.net.{ByteStream, TcpStream, Url, UrlError}
 import avin.net.tls.{TlsClient, TlsError, TlsStream, Transport}
@@ -28,6 +29,9 @@ data HttpError
   // handshake failed, or a certificate the request trusts cannot be read. A connection that could
   // not be made, broke or timed out is `Io`, for `https` as for `http`.
   Tls(error: TlsError)
+  // The response's body, compressed by the server, could not be decompressed: it is corrupt, ends
+  // early, or decompresses past the request's limit.
+  Decoding(error: CompressError)
 
 impl Error for HttpError
   // A sentence saying what went wrong, for a message to a person.
@@ -37,23 +41,34 @@ impl Error for HttpError
     Malformed(t) -> s"malformed reply: $t"
     Unsupported(t) -> s"unsupported: $t"
     Tls(e) -> e.message
+    Decoding(e) -> s"the response body: ${e.message}"
 
 // A request: its method, its URL as text, the headers sent besides the ones the client writes, its
 // body, how long a read or write on its connection may wait, and the TLS settings an `https` URL is
 // fetched with, by redirect too. A method is a token, such as `GET`, a header's name is a token and
 // its value holds no line break; a request where one does not hold traps as it is made, its headers
 // given to the constructor as much as those added by `withHeader`.
+//
+// Unless `decoding` is `None`, the client asks for a compressed response, sending `Accept-Encoding:
+// gzip`, and decompresses a body the server sent as `gzip`, `x-gzip` or `deflate`, within `decoding`
+// bytes (100 MiB unless given), so the response's `body` is the decompressed bytes and its headers
+// carry no `Content-Encoding` or `Content-Length`; a body that is corrupt, ends early or passes the
+// limit fails the request with `Decoding`. A request that sends its own `Accept-Encoding` gets the
+// body as the server sent it, as one with `decoding` of `None` does. A body of another coding is
+// left as it came.
 class Request(
     val method: string,
     val url: string,
     val headers: Vector[(string, string)] = Vector.empty[(string, string)](),
     val body: Array[byte] = Array.empty[byte](),
     val timeout: Option[Duration] = None,
-    val tls: TlsClient = TlsClient()
+    val tls: TlsClient = TlsClient(),
+    val decoding: Option[long] = Some(defaultMaxBytes)
 )
   if method.isEmpty || method.indexWhere(c -> !isTokenChar(c)) >= 0 then fail(s"`$method` is not an HTTP method")
   for (name, value) in headers
     checkHeader(name, value)
+  if decoding is Some(n) && n < 0 then fail(s"a decompression limit of $n bytes: it is at least zero")
 
   // The request with a header added after the ones it has. `Host`, `Content-Length` and
   // `Connection`, given here, replace the ones the client would write.
@@ -63,25 +78,34 @@ class Request(
     headers :+ (name, value),
     body,
     timeout,
-    tls
+    tls,
+    decoding
   )
 
   // The value of the first header of `name`, compared without regard to case.
   header(name: string) -> Option[string] = headerIn(headers, name)
 
   // The request with the headers of `more` added after the ones it has, in order.
-  withHeaders(more: Vector[(string, string)]) -> Request = Request(method, url, headers ++ more, body, timeout, tls)
+  withHeaders(more: Vector[(string, string)]) -> Request =
+    Request(method, url, headers ++ more, body, timeout, tls, decoding)
 
   // The request with the query parameter `name=value` added after any its URL has, each encoded by
   // `Url.encode`, and before the URL's fragment.
   withQueryParam(name: string, value: string) -> Request =
-    Request(method, withParam(url, name, value), headers, body, timeout, tls)
+    Request(method, withParam(url, name, value), headers, body, timeout, tls, decoding)
 
   // The request with `text`, as UTF-8, for its body.
-  withBody(text: string) -> Request = Request(method, url, headers, utf8(text), timeout, tls)
+  withBody(text: string) -> Request = Request(method, url, headers, utf8(text), timeout, tls, decoding)
 
   // The request with `bytes` for its body.
-  withBody(bytes: Array[byte]) -> Request = Request(method, url, headers, bytes, timeout, tls)
+  withBody(bytes: Array[byte]) -> Request = Request(method, url, headers, bytes, timeout, tls, decoding)
+
+  // The request asking for a compressed response and decompressing it within `maxBytes`; a limit
+  // below zero traps.
+  withDecoding(maxBytes: long) -> Request = Request(method, url, headers, body, timeout, tls, Some(maxBytes))
+
+  // The request asking for no compressed response, and taking any body as the server sent it.
+  withoutDecoding() -> Request = Request(method, url, headers, body, timeout, tls, None)
 
   // The request with `pairs` for its body, written as `application/x-www-form-urlencoded` by
   // `Url.formEncode`, and that for its `Content-Type`, replacing any it has.
@@ -107,16 +131,21 @@ class Request(
     withoutHeader(headers, "Content-Type") :+ ("Content-Type", contentType),
     bytes,
     timeout,
-    tls
+    tls,
+    decoding
   )
 
   // The request with a read or write on its connection, the TLS handshake's included, failing with
   // `TimedOut` after waiting `d`.
-  withTimeout(d: Duration) -> Request = Request(method, url, headers, body, Some(d), tls)
+  withTimeout(d: Duration) -> Request = Request(method, url, headers, body, Some(d), tls, decoding)
 
   // The request fetching an `https` URL with `client`'s settings: the machine's trusted
   // authorities and those `client` adds.
-  withTls(client: TlsClient) -> Request = Request(method, url, headers, body, timeout, client)
+  withTls(client: TlsClient) -> Request = Request(method, url, headers, body, timeout, client, decoding)
+
+// Whether the client asks for a compressed response to `request` and decompresses it: its `decoding`
+// is given and it sends no `Accept-Encoding` of its own.
+private decodes(request: Request) -> bool = request.decoding.isDefined && request.header("Accept-Encoding").isEmpty
 
 // A response: its status and reason, its headers as they came, name and value, and its body. A
 // response a server writes may instead be `streamed`, its body written as the handler makes it,
@@ -387,8 +416,23 @@ private over(stream: ByteStream, request: Request, url: Url, host: string) -> Re
   while true
     val response = readResponse(stream, request.method == "HEAD")?
     // An interim answer, such as `100 Continue`, is followed by the real one.
-    if response.status < 100 || response.status >= 200 || response.status == 101 then return Ok(response)
+    if response.status < 100 || response.status >= 200 || response.status == 101
+      return if decodes(request) then decoded(response, request.decoding.getOrElse(defaultMaxBytes)) else Ok(response)
   fail("unreachable")
+
+// `response` with its body decompressed within `limit`, where its `Content-Encoding` is one the
+// client decompresses, and without that header and its `Content-Length`.
+private decoded(response: Response, limit: long) -> Result[Response, HttpError]
+  val coding = response.header("Content-Encoding").map(c -> c.trim.toLower).getOrElse("")
+  val format = coding match
+    "gzip" | "x-gzip" -> Gzip
+    "deflate" -> Zlib
+    _ -> return Ok(response)
+  val kept = withoutHeader(withoutHeader(response.headers, "Content-Encoding"), "Content-Length")
+  if response.body.length == 0 then return Ok(Response(response.status, response.reason, kept, response.body))
+  decompress(response.body, format, limit) match
+    Ok(bytes) -> Ok(Response(response.status, response.reason, kept, bytes))
+    Err(e) -> Err(Decoding(e))
 
 // The request line and headers, ending in the empty line.
 private requestHead(request: Request, url: Url, host: string) -> string
@@ -404,6 +448,7 @@ private requestHead(request: Request, url: Url, host: string) -> string
   if sendsLength && headerIn(request.headers, "Content-Length").isEmpty
     out.write(s"Content-Length: ${request.body.length}\r\n")
   if headerIn(request.headers, "Connection").isEmpty then out.write("Connection: close\r\n")
+  if decodes(request) then out.write("Accept-Encoding: gzip\r\n")
   for (name, value) in request.headers
     out.write(s"$name: $value\r\n")
   out.write("\r\n")

@@ -861,7 +861,7 @@ source checkout. Its version is the compiler's. It is never a dependency: no man
   error at the import, listing the modules under the deepest prefix that exists:
 
 ```text
-error: the standard library has no module `avin.regx`; the modules under `avin` are `avin.actors`, `avin.c`, `avin.cli`, `avin.collections`, `avin.crypto`, `avin.fs`, `avin.io`, `avin.math`, `avin.net`, `avin.process`, `avin.random`, `avin.regex`, `avin.signal`, `avin.target`, `avin.threads`, `avin.time`
+error: the standard library has no module `avin.regx`; the modules under `avin` are `avin.actors`, `avin.c`, `avin.cli`, `avin.collections`, `avin.compress`, `avin.crypto`, `avin.diff`, `avin.encoding`, `avin.fs`, `avin.io`, `avin.log`, `avin.math`, `avin.net`, `avin.process`, `avin.random`, `avin.regex`, `avin.signal`, `avin.target`, `avin.threads`, `avin.time`, `avin.uuid`
  --> app/main.avin:1:8
 ```
 

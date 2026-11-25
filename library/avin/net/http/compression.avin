@@ -1,0 +1,238 @@
+module avin.net.http
+
+// Content codings: a middleware that compresses responses for the clients that accept it and
+// decompresses the request bodies clients compressed. The codings are `gzip` and `deflate` (the zlib
+// format, as RFC 9110 defines it), by `avin.compress`.
+
+import avin.compress.{Encoder, Format, Gzip, TooLarge, Zlib, compress, decompress, defaultLevel}
+import avin.io.{ByteWriter, IoError}
+
+// The compression of a server's responses and the decompression of its requests' bodies, and the
+// middleware that applies them.
+//
+// **Responses.** A response is compressed with the coding the request's `Accept-Encoding` prefers,
+// read with its q-values: `gzip` (or `x-gzip`) and `deflate`, `*` standing for any coding the header
+// does not name, `gzip` chosen where the two are preferred alike. A coding is used where its q-value
+// is above zero and no lower than identity's, which is 1 unless the header gives it, or gives `*`,
+// another. A request whose header refuses identity (`identity;q=0`, or `*;q=0` without `identity`)
+// and accepts neither coding is answered `406` before the handler is called. A request with no
+// `Accept-Encoding` is answered as the handler answers it.
+//
+// A response is left as it is, without `Vary`, where it answers a `HEAD`, has the status `204`,
+// `206` or `304` (or an upgrade's `101`), carries a `Content-Range`, a `Content-Encoding` of its own
+// or `Cache-Control: no-transform`, is of a type `compressible` says is already compressed (by
+// default images other than SVG, video, audio, fonts other than TrueType and OpenType, archives and
+// other compressed formats, and `application/octet-stream`), or has a body under `minBytes` (a
+// streamed one only where its length is given). A request that refuses identity has its response
+// compressed whatever its type or size. Every other response says `Vary: Accept-Encoding`, merged
+// into any `Vary` it has, and is compressed where the request accepts a coding: its body replaced
+// by the compressed one (kept as it was where compressing does not make it smaller), with
+// `Content-Encoding` saying which coding, any `Content-Length` dropped (the server writes the new
+// one), and a strong `ETag` made weak (`"x"` becomes `W/"x"`), since the bytes are no longer the
+// ones it names. A streamed response's body is compressed as the handler writes it, each write sent
+// at once as the compressed bytes for everything written so far, and is sent chunked.
+//
+// **Requests.** Where `decodesRequests`, a request whose `Content-Encoding` is `gzip`, `x-gzip` or
+// `deflate` is decompressed before the handler sees it, and its `Content-Encoding` dropped;
+// `identity` is dropped and nothing done. A buffered body is decompressed whole within
+// `maxDecodedBytes`, and its `Content-Length` made the decompressed length; a body that is corrupt
+// or ends early is answered `400`, one that decompresses past the limit `413`, and the handler is
+// not called. A streamed body is decompressed as the handler reads it, within the limit the handler
+// gives `bodyReader` (`ServerRequest.withBodyDecoded`). Any other coding, or more than one, is
+// answered `415` with `Accept-Encoding: gzip, deflate`. An empty body is passed on empty.
+//
+// A level outside 0 to 9, a `minBytes` below zero or a `maxDecodedBytes` below zero traps.
+class Compression(
+    val level: int = defaultLevel,
+    val minBytes: int = 1024,
+    val maxDecodedBytes: long = 1048576,
+    val decodesRequests: bool = true,
+    private val compressible: @sendable (string) -> bool = compressibleType
+): Sendable
+  if level < 0 || level > 9 then fail(s"a compression level of $level: it is 0 to 9")
+  if minBytes < 0 then fail(s"a compression threshold of $minBytes bytes: it is at least zero")
+  if maxDecodedBytes < 0 then fail(s"a decompression limit of $maxDecodedBytes bytes: it is at least zero")
+
+  // The middleware that applies the compression around `next`.
+  middleware -> (Handler) -> Handler = next -> request -> handled(next, request)
+
+  private handled(next: Handler, request: ServerRequest) -> Response
+    val choice = chosen(request.header("Accept-Encoding"))
+    if choice is Unacceptable
+      return withVary(plainError(406), "Accept-Encoding")
+    val inner = if decodesRequests then decoded(request) else Ok(request)
+    inner match
+      Ok(r) -> shaped(request, next(r), choice)
+      Err(refused) -> refused
+
+  // `request` with its body decompressed, or the response that refuses it.
+  private decoded(request: ServerRequest) -> Result[ServerRequest, Response]
+    val named = request.headers.filter(h -> h.0.equalsIgnoreCase("Content-Encoding"))
+    if named.isEmpty then return Ok(request)
+    val codings = named.flatMap(h -> h.1.split(",")).map(c -> c.trim.toLower).filter(c -> !c.isEmpty && c != "identity")
+    val plain = request.withoutHeader("Content-Encoding")
+    if codings.isEmpty then return Ok(plain)
+    val format = if codings.length > 1 then None else formatOf(codings(0))
+    format match
+      None -> Err(plainError(415).withHeader("Accept-Encoding", "gzip, deflate"))
+      Some(f) ->
+        if request.bodyStreamed then return Ok(plain.withoutHeader("Content-Length").withBodyDecoded(f))
+        if request.body.length == 0 then return Ok(plain)
+        decompress(request.body, f, maxDecodedBytes) match
+          Ok(bytes) -> Ok(plain.withHeaderReplaced("Content-Length", bytes.length.toString()).withBody(bytes))
+          Err(TooLarge(_)) -> Err(plainError(413))
+          Err(_) -> Err(plainError(400))
+
+  // `response` compressed as `choice` says, where it may be.
+  private shaped(request: ServerRequest, response: Response, choice: Choice) -> Response
+    if request.method == "HEAD" || response.upgraded.isDefined then return response
+    val status = response.status
+    if status < 200 || status == 204 || status == 206 || status == 304 then return response
+    if response.header("Content-Range").isDefined || response.header("Content-Encoding").isDefined then return response
+    if headerWords(response.headers, "Cache-Control").contains("no-transform") then return response
+    val required = choice is Coded(_, true)
+    val small = response.streamed match
+      Some(body) -> body.length.exists(n -> n < long(minBytes))
+      None -> response.body.length < minBytes
+    if (small || !compressible(mediaType(response))) && !required then return response
+    val varied = withVary(response, "Accept-Encoding")
+    choice match
+      Coded(format, _) -> coded(varied, format, required)
+      _ -> varied
+
+  // `response` with its body compressed into `format`.
+  private coded(response: Response, format: Format, required: bool) -> Response
+    val headers = codedHeaders(response.headers, format)
+    response.streamed match
+      Some(body) ->
+        val streamed = StreamedBody(None, out ->
+          val encoder = Encoder(out, format, level)
+          body.write(out.through(Flushing(encoder)))
+          _ = encoder.finish())
+        Response(response.status, response.reason, headers, Array.empty[byte](), Some(streamed))
+      None ->
+        val packed = compress(response.body, format, level)
+        if packed.length >= response.body.length && !required then return response
+        Response(response.status, response.reason, headers, packed)
+
+// Whether a response of the media type `contentType` (lower case, without its parameters) is worth
+// compressing: false for the types whose content is compressed already, true for every other,
+// and for a response with no type. Images other than SVG, BMP and icons, video, audio, fonts other
+// than TrueType and OpenType, archives and compressed files, PDF and `application/octet-stream`
+// are compressed already, or are bytes of no known kind, which usually are.
+compressibleType(contentType: string) -> bool
+  val t = contentType
+  if t.startsWith("image/")
+    return t == "image/svg+xml" || t == "image/bmp" || t == "image/x-icon" || t == "image/vnd.microsoft.icon"
+  if t.startsWith("video/") || t.startsWith("audio/") then return false
+  if t.startsWith("font/") then return t == "font/ttf" || t == "font/otf"
+  !incompressibleTypes.contains(t)
+
+// The application types whose content is compressed already.
+private val incompressibleTypes: Vector[string] = [
+  "application/zip", "application/gzip", "application/x-gzip", "application/zstd", "application/x-bzip2",
+  "application/x-xz", "application/x-7z-compressed", "application/vnd.rar", "application/x-rar-compressed",
+  "application/x-compress", "application/pdf", "application/octet-stream", "application/epub+zip",
+  "application/font-woff"
+]
+
+// What a response is sent as: as the handler answered it, compressed into `format` (`required`
+// where the request refuses identity), or not at all, the request accepting nothing the server can
+// send.
+private data Choice
+  Plain
+  Coded(format: Format, required: bool)
+  Unacceptable
+
+// The choice an `Accept-Encoding` of `header` asks for.
+private chosen(header: Option[string]) -> Choice
+  val value = header match
+    Some(v) -> v
+    None -> return Plain
+  val entries = acceptEntries(value)
+  val star = qIn(entries, "*")
+  val gzipQ = qIn(entries, "gzip").orElse(qIn(entries, "x-gzip")).orElse(star).getOrElse(0)
+  val deflateQ = qIn(entries, "deflate").orElse(star).getOrElse(0)
+  val identityQ = qIn(entries, "identity").orElse(star).getOrElse(1000)
+  val (format, q) = if gzipQ > 0 && gzipQ >= deflateQ then (Gzip, gzipQ) else (Zlib, deflateQ)
+  if q > 0 && q >= identityQ then return Coded(format, identityQ == 0)
+  if q == 0 && identityQ == 0 then Unacceptable else Plain
+
+// The codings an `Accept-Encoding` value names, in lower case, each with its q-value in thousandths.
+// An entry whose q-value is not one (`0` to `1`, with at most three decimals) is left out.
+private acceptEntries(value: string) -> Vector[(string, int)]
+  val out = Buffer[(string, int)]()
+  for item in value.split(",")
+    val parts = item.split(";")
+    val name = parts(0).trim.toLower
+    if name.isEmpty then continue
+    var q: Option[int] = Some(1000)
+    for i in 1 ..< parts.length
+      val param = parts(i).trim
+      val eq = param.indexOf('=')
+      if eq > 0 && param.slice(0, eq).trim.toLower == "q"
+        q = qValue(param.slice(eq + 1, param.byteLength).trim)
+    if q is Some(n) then out.addOne((name, n))
+  out.toVector
+
+// The q-value of the first entry named `name`.
+private qIn(entries: Vector[(string, int)], name: string) -> Option[int]
+  for (n, q) in entries
+    if n == name then return Some(q)
+  None
+
+// A q-value (RFC 9110: `0`, `1`, or either with up to three decimals, `1`'s all zero) in
+// thousandths, or `None` where `text` is not one.
+private qValue(text: string) -> Option[int]
+  if text.isEmpty || text.byteLength > 5 then return None
+  val first = text.byteAt(0)
+  if first != byte(int('0')) && first != byte(int('1')) then return None
+  val whole = if first == byte(int('1')) then 1000 else 0
+  if text.byteLength == 1 then return Some(whole)
+  if text.byteAt(1) != byte(int('.')) then return None
+  var n = 0
+  var scale = 100
+  for i in 2 ..< text.byteLength
+    val c = int(text.byteAt(i)) - int('0')
+    if !(0 <= c <= 9) then return None
+    n += c * scale
+    scale = scale / 10
+  if whole == 1000 && n > 0 then return None
+  Some(whole + n)
+
+// The format a request's content coding `name` is decompressed from, or `None` for one the server
+// does not decompress.
+private formatOf(name: string) -> Option[Format] =
+  if name == "gzip" || name == "x-gzip" then Some(Gzip) else if name == "deflate" then Some(Zlib) else None
+
+// The name of the content coding `format` is.
+private codingName(format: Format) -> string = format match
+  Gzip -> "gzip"
+  Zlib -> "deflate"
+  _ -> "identity"
+
+// The headers of a response compressed into `format`: its `Content-Length` dropped, its `ETag`
+// made weak, and its `Content-Encoding` added.
+private codedHeaders(headers: Vector[(string, string)], format: Format) -> Vector[(string, string)]
+  val out = Buffer[(string, string)]()
+  for (name, value) in headers
+    if name.equalsIgnoreCase("Content-Length") then continue
+    if name.equalsIgnoreCase("ETag") && !value.startsWith("W/")
+      out.addOne((name, s"W/$value"))
+    else
+      out.addOne((name, value))
+  out.addOne(("Content-Encoding", codingName(format)))
+  out.toVector
+
+// The media type of `response`, in lower case and without its parameters; empty where it has none.
+private mediaType(response: Response) -> string =
+  response.header("Content-Type").map(t -> t.split(";")(0).trim.toLower).getOrElse("")
+
+// The comma-separated words of the headers of `name`, in lower case.
+private headerWords(headers: Vector[(string, string)], name: string) -> Vector[string] =
+  headers.filter(h -> h.0.equalsIgnoreCase(name)).flatMap(h -> h.1.split(",")).map(w -> w.trim.toLower)
+
+// A writer that compresses each write and sends at once the compressed bytes for everything written
+// so far, as a streamed body's writes are sent.
+private class Flushing(private val encoder: Encoder): ByteWriter
+  override write(bytes: Array[byte]) -> Result[unit, IoError] = encoder.writeFlushed(bytes)

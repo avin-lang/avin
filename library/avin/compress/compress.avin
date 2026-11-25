@@ -1,0 +1,348 @@
+module avin.compress
+
+// Deflate compression, in its three framings: gzip (RFC 1952), the zlib wrapper (RFC 1950), which
+// HTTP calls `deflate`, and raw deflate (RFC 1951), with no framing at all. A whole array is
+// compressed or decompressed at once, or a stream a piece at a time: an `Encoder` is a `ByteWriter`
+// that compresses what is written into another, and a `Decoder` a `Reader` that decompresses what
+// it reads from another.
+//
+//     val packed = gzip("hello, hello, hello".utf8)
+//     println(string.fromUtf8Lossy(gunzip(packed)?))
+//
+// Decompression is bounded: it answers `TooLarge` once its output would pass `maxBytes`, so a few
+// hundred bytes of hostile input that stand for gigabytes cost no more than the limit, and its
+// memory never more than one piece of output. Input that ends before its stream does is
+// `Truncated`, and input that is not a stream of its format, or whose checksum or length is wrong,
+// is `Corrupt`. A gzip stream of several members, as `cat a.gz b.gz` makes, decompresses to their
+// outputs joined; anything after the end of a zlib or raw stream, or after a gzip member that does
+// not begin another, is `Corrupt`.
+//
+// The codec is the system's zlib.
+
+import avin.io.{ByteWriter, Close, IoError, Other, Reader}
+
+// The framing around deflate data.
+data Format
+  // A gzip header, the data, and a CRC-32 and length of what it decompresses to: what `gzip`
+  // writes and HTTP's `gzip` content coding.
+  Gzip
+  // A two-byte header, the data, and an Adler-32 of what it decompresses to: HTTP's `deflate`
+  // content coding.
+  Zlib
+  // The deflate data alone, with nothing to check it by, for a container that frames and checks
+  // it itself.
+  RawDeflate
+
+// Why compressed bytes could not be decompressed.
+data CompressError
+  // The bytes are not a stream of the format, or its checksum or length does not match what it
+  // decompressed to. `text` is the codec's account.
+  Corrupt(text: string)
+  // The bytes end before the stream does.
+  Truncated
+  // The output would pass `limit` bytes.
+  TooLarge(limit: long)
+
+impl Error for CompressError
+  // A sentence saying what is wrong, for a message to a person.
+  message -> string = self match
+    Corrupt(text) -> s"the compressed data is corrupt: $text"
+    Truncated -> "the compressed data ends before its stream does"
+    TooLarge(limit) -> s"the decompressed data is longer than its limit of $limit bytes"
+
+// The level a compression runs at unless it is given one: zlib's own default, close to the
+// smallest output for a fraction of the time the smallest takes.
+val defaultLevel = 6
+
+// The most a decompression produces unless it is given a limit: 100 MiB.
+val defaultMaxBytes: long = 104857600
+
+// `bytes` compressed into `format` at `level`, from 0 (stored, not compressed) to 9 (the smallest,
+// and the slowest). A level outside them traps.
+compress(bytes: Array[byte], format: Format = Gzip, level: int = defaultLevel) -> Array[byte]
+  val out = ArraySink()
+  val encoder = Encoder(out, format, level)
+  // Writing into an array cannot fail.
+  _ = encoder.write(bytes)
+  _ = encoder.finish()
+  out.bytes()
+
+// `bytes` decompressed from `format`, within `maxBytes` of output; a limit below zero traps.
+decompress(
+    bytes: Array[byte],
+    format: Format = Gzip,
+    maxBytes: long = defaultMaxBytes
+) -> Result[Array[byte], CompressError]
+  val decoder = Decoder(ArraySource(bytes), format, maxBytes)
+  val out = Buffer[byte]()
+  loop
+    decoder.read(65536) match
+      Ok(piece) ->
+        if piece.length == 0 then return Ok(out.toArray())
+        out.addAll(piece)
+      Err(e) -> return Err(decoder.failure.getOrElse(Corrupt(e.message)))
+  Ok(out.toArray())
+
+// `bytes` compressed as gzip at `level`.
+gzip(bytes: Array[byte], level: int = defaultLevel) -> Array[byte] = compress(bytes, Gzip, level)
+
+// `bytes` decompressed from gzip within `maxBytes`.
+gunzip(bytes: Array[byte], maxBytes: long = defaultMaxBytes) -> Result[Array[byte], CompressError] =
+  decompress(bytes, Gzip, maxBytes)
+
+// A writer that compresses what is written to it into `format` at `level` and writes the result to
+// `out`. A write hands on whatever output the codec has ready, which may be nothing: the codec holds
+// input back to compress it better. `flush` hands on everything written so far, so the reader at the
+// other end can decompress all of it now, and the stream goes on; `finish` ends the stream and hands
+// on the rest of it with its trailer, and `close` finishes it. Neither closes `out`. A write or flush
+// after the stream has finished, or after one that failed, answers `Err`; a finish after one that
+// went through does nothing. A level outside 0 to 9 traps.
+class Encoder(private val out: ByteWriter, val format: Format = Gzip, val level: int = defaultLevel): ByteWriter, Close
+  checkLevel(level)
+  // The codec, made at the first write, so the encoder is used on the thread that writes it.
+  private var codec: Option[ZStream] = None
+  private var finished = false
+  private var fault: Option[IoError] = None
+  // How large a piece of output the next step may write, grown while steps fill it.
+  private var room = 256
+
+  // Compresses `bytes`, handing on what output is ready.
+  override write(bytes: Array[byte]) -> Result[unit, IoError]
+    usable()?
+    if bytes.length == 0 then return Ok(())
+    run(bytes, ZFlush.Keep)
+
+  // Hands on everything written so far, ending on a byte boundary.
+  flush() -> Result[unit, IoError]
+    usable()?
+    run(Array.empty[byte](), ZFlush.Sync)
+
+  // Compresses `bytes` and hands on everything written so far, as `write` and then `flush` do, the
+  // output of the two in one write to `out` where it is under 64 KiB.
+  writeFlushed(bytes: Array[byte]) -> Result[unit, IoError]
+    usable()?
+    run(bytes, ZFlush.Sync)
+
+  // Ends the stream, handing on the rest of it and its trailer.
+  finish() -> Result[unit, IoError]
+    if fault is Some(e) then return Err(e)
+    if finished then return Ok(())
+    val done = run(Array.empty[byte](), ZFlush.Finish)
+    finished = true
+    codec match
+      Some(z) -> z.close()
+      None -> ()
+    codec = None
+    done
+
+  // Finishes the stream; `out` stays open.
+  override close() -> Result[unit, IoError] = finish()
+
+  private usable() -> Result[unit, IoError]
+    if fault is Some(e) then return Err(e)
+    if finished then return Err(IoError(Other("the compressed stream is finished"), "write", "a compressed stream"))
+    Ok(())
+
+  private stream() -> ZStream = codec match
+    Some(z) -> z
+    None ->
+      val z = zEncoder(level, wrapperOf(format)) match
+        Ok(made) -> made
+        Err(e) -> fail(zFailure(e))
+      codec = Some(z)
+      z
+
+  // Steps the codec over `src` with `flush` until it has taken all of it and, for a flush, written
+  // everything, handing the output to `out` in one write, or in writes of 64 KiB where it is more.
+  private run(src: Array[byte], flush: ZFlush) -> Result[unit, IoError]
+    val z = stream()
+    val ready = Buffer[byte]()
+    var at = 0
+    loop
+      val piece = if at == 0 then src else src.slice(at, src.length)
+      val dst = Array.fill(room, byte(0))
+      val step = z.step(piece, dst, flush) match
+        Ok(s) -> s
+        Err(e) -> fail(zFailure(e))
+      at += int(step.consumed)
+      val full = step.produced == long(dst.length)
+      if step.produced > 0 then ready.addAll(if full then dst else dst.slice(0, int(step.produced)))
+      if full && room < 65536 then room = room * 2
+      val more = flush match
+        Finish -> !step.ended
+        _ -> at < src.length || full
+      if ready.length >= 65536 || (!more && ready.length > 0)
+        out.write(ready.toArray()) match
+          Ok(_) -> ready.clear()
+          Err(e) ->
+            fault = Some(e)
+            return Err(e)
+      if !more then return Ok(())
+    Ok(())
+
+// A reader that decompresses what it reads from `input`, a stream in `format`, within `maxBytes`
+// of output in all. `read(max)` answers up to `max` bytes of the decompressed data, reading as much
+// of `input` as that takes, and an empty array once the stream has ended with `input`. A stream
+// that is corrupt, that `input` ends before it does, or whose output passes `maxBytes` fails the
+// read, `failure` saying why, and every read after it fails the same way; so does a read of `input`
+// that fails. A limit below zero traps.
+class Decoder(private val input: Reader, val format: Format = Gzip, val maxBytes: long = defaultMaxBytes): Reader
+  if maxBytes < 0 then fail(s"a decompression limit of $maxBytes bytes: it is at least zero")
+  // The codec, made at the first read, so the decoder is used on the thread that reads it.
+  private var codec: Option[ZStream] = None
+  // Input read and not yet taken by the codec, from `at`.
+  private var pending = Array.empty[byte]()
+  private var at = 0
+  // Whether `input` has ended.
+  private var drained = false
+  // Whether the codec has reached the end of a stream, or of a gzip member.
+  private var ended = false
+  private var done = false
+  private var total: long = 0
+  private var fault: Option[IoError] = None
+
+  // Why the stream could not be decompressed, where a read failed for that.
+  var failure: Option[CompressError] = None
+
+  // Up to `max` bytes of the decompressed data, `max` being at least one; an empty array at its end.
+  override read(max: int) -> Result[Array[byte], IoError]
+    if max < 1 then fail(s"a read of $max bytes: it is at least one")
+    if fault is Some(e) then return Err(e)
+    if done then return Ok(Array.empty[byte]())
+    val z = stream()
+    // One byte past the limit is asked for, so output that passes it is seen and never answered.
+    val left = maxBytes - total + 1
+    val most = if max > 65536 then 65536 else max
+    val want = if left < long(most) then int(left) else most
+    loop
+      if at == pending.length && !drained then refill()?
+      if ended
+        if at == pending.length
+          done = true
+          z.close()
+          codec = None
+          return Ok(Array.empty[byte]())
+        if format is Gzip
+          z.reset() match
+            Ok(_) -> ended = false
+            Err(e) -> fail(zFailure(e))
+        else
+          return broken(Corrupt("bytes follow the end of the stream"))
+      else
+        val piece = if at == 0 then pending else pending.slice(at, pending.length)
+        val dst = Array.fill(want, byte(0))
+        val step = z.step(piece, dst, ZFlush.Keep) match
+          Ok(s) -> s
+          Err(Corrupt(text)) -> return broken(CompressError.Corrupt(text))
+          Err(e) -> fail(zFailure(e))
+        at += int(step.consumed)
+        if step.ended then ended = true
+        if step.produced > 0
+          total += step.produced
+          if total > maxBytes then return broken(TooLarge(maxBytes))
+          return Ok(if step.produced == long(dst.length) then dst else dst.slice(0, int(step.produced)))
+        if !step.ended && step.consumed == 0
+          if drained && at == pending.length then return broken(Truncated)
+          if at < pending.length then return broken(Corrupt("the stream makes no progress"))
+    Ok(Array.empty[byte]())
+
+  private stream() -> ZStream = codec match
+    Some(z) -> z
+    None ->
+      val z = zDecoder(wrapperOf(format)) match
+        Ok(made) -> made
+        Err(e) -> fail(zFailure(e))
+      codec = Some(z)
+      z
+
+  // Reads the next piece of `input` into `pending`.
+  private refill() -> Result[unit, IoError]
+    input.read(16384) match
+      Ok(got) ->
+        if got.length == 0 then drained = true
+        pending = got
+        at = 0
+        Ok(())
+      Err(e) ->
+        fault = Some(e)
+        Err(e)
+
+  // Records `e` as the failure of every read from now on, and answers it.
+  private broken(e: CompressError) -> Result[Array[byte], IoError]
+    failure = Some(e)
+    val io = IoError(Other(e.message), "decompress", "")
+    fault = Some(io)
+    codec match
+      Some(z) -> z.close()
+      None -> ()
+    codec = None
+    Err(io)
+
+private checkLevel(level: int)
+  if level < 0 || level > 9 then fail(s"a compression level of $level: it is 0 to 9")
+
+private wrapperOf(format: Format) -> ZWrapper = format match
+  Gzip -> ZWrapper.Gzip
+  Zlib -> ZWrapper.Zlib
+  RawDeflate -> ZWrapper.Raw
+
+// The trap a failure of the codec itself is: memory it could not have, or a setting it refused.
+private zFailure(e: ZError) -> string = e match
+  Corrupt(text) -> s"zlib: $text"
+  NoMemory -> "zlib could not allocate its state"
+  Refused(text) -> s"zlib: $text"
+
+// Bytes written into memory, for a whole array compressed at once.
+private class ArraySink(): ByteWriter
+  private val held = Buffer[byte]()
+  override write(bytes: Array[byte]) -> Result[unit, IoError]
+    held.addAll(bytes)
+    Ok(())
+  bytes() -> Array[byte] = held.toArray()
+
+// An array read a piece at a time, for a whole array decompressed at once.
+private class ArraySource(private val bytes: Array[byte]): Reader
+  private var at = 0
+  override read(max: int) -> Result[Array[byte], IoError]
+    val end = if bytes.length - at > max then at + max else bytes.length
+    val out = if at == 0 && end == bytes.length then bytes else bytes.slice(at, end)
+    at = end
+    Ok(out)
+
+// The framing a codec reads or writes.
+@sysl("avin.zcodec.Wrapper")
+private data ZWrapper
+  Raw
+  Zlib
+  Gzip
+  Detect
+
+// How much a compressing step pushes out.
+@sysl("avin.zcodec.Flush")
+private data ZFlush
+  Keep
+  Sync
+  Finish
+
+// Why a step of the codec failed.
+@sysl("avin.zcodec.Error")
+private data ZError
+  Corrupt(text: string)
+  NoMemory
+  Refused(text: string)
+
+// How far a step of the codec got.
+@sysl("avin.zcodec.Step")
+private data ZStep(consumed: long, produced: long, ended: bool)
+
+// One compression or decompression in zlib.
+@sysl("avin.zcodec.Stream")
+private class ZStream
+  step(src: Array[byte], dst: Array[byte], flush: ZFlush) -> Result[ZStep, ZError]
+  reset() -> Result[unit, ZError]
+
+@sysl("avin.zcodec.encoder")
+private zEncoder(level: int, wrapper: ZWrapper) -> Result[ZStream, ZError]
+
+@sysl("avin.zcodec.decoder")
+private zDecoder(wrapper: ZWrapper) -> Result[ZStream, ZError]

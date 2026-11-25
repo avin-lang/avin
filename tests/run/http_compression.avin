@@ -1,0 +1,271 @@
+// expect: exit 0
+// `Compression` on a real server, with the client at the other end: a buffered response compressed
+// and decompressed by the client that asked for it, taken raw by a client sending its own
+// `Accept-Encoding`, or sent plain to one that asked for none; a streamed response compressed write by
+// write, each write arriving as a chunk that decompresses at once, over keep-alive and HTTP/1.0;
+// server-sent events through it; `HEAD`; request bodies sent compressed, buffered and streamed, in
+// pieces, corrupt, cut short and as a bomb past the handler's limit; and a client's own limit on what
+// it decompresses.
+import avin.compress.{Decoder, Gzip, TooLarge, Zlib, compress, decompress, gunzip, gzip}
+import avin.io.{IoError, Reader}
+import avin.net.{TcpServer, TcpStream}
+import avin.net.http
+import avin.net.http.{Compression, Decoding, Request, Response, Route, Router, ServerRequest}
+import avin.time
+
+ok[T](r: Result[T, IoError]) -> T = r match
+  Ok(v) -> v
+  Err(e) -> fail(e.message)
+
+// The value of a result the program expects to succeed; its error's message stops the program.
+impl[T, E: Error] Result[T, E]
+  unwrap() -> T = self match
+    Ok(v) -> v
+    Err(e) -> fail(e.message)
+
+val big: string = "hello world ".repeat(200)
+
+// The pieces `/stream` writes.
+val pieces: Vector[string] = Vector.tabulate(40, i -> s"piece $i of the stream, ${"padding ".repeat(i)}\n")
+
+// Reads the body a piece of `size` at a time within `limit` and answers its length and a sum of its
+// bytes; a failed read is answered by the server, whatever this answers.
+upload(r: ServerRequest) -> Response
+  val limit = r.queryAs[long]("limit", long(104857600)).getOrElse(long(0))
+  val size = r.queryAs[int]("size", 7).getOrElse(7)
+  val reader = r.bodyReader(limit)
+  var total: long = 0
+  var sum = 0
+  loop
+    reader.read(size) match
+      Ok(got) ->
+        if got.length == 0 then break
+        if got.length > size then return Response.text(500, "a piece over its size")
+        total += long(got.length)
+        for b in got
+          sum = (sum + int(b)) % 65521
+      Err(_) -> return Response.text(200, "ignored")
+  Response.text(200, s"read $total bytes, sum $sum")
+
+val router = Router(
+  [
+    Route.get("/big", _ -> Response.text(200, big)),
+    Route.get("/stream", _ -> Response.stream(200, "text/plain", w ->
+      for p in pieces
+        if w.write(p).isErr then break)),
+    Route.get("/stream-small", _ -> Response.stream(200, "text/plain", 5, w -> _ = w.write("small"))),
+    Route.get("/events", _ -> Response.events(time.seconds(0), e ->
+      for i in 0 ..< 3
+        _ = e.send(s"event $i ${"data ".repeat(100)}"))),
+    Route.post("/echo", r -> Response.text(200, s"${r.header("Content-Encoding")} ${r.text}")),
+    Route.post("/upload", upload).streaming()
+  ]
+)
+
+started() -> TcpServer = ok(
+  http.serve(
+    "127.0.0.1",
+    0,
+    Compression().middleware(router.handle),
+    readTimeout = time.seconds(2),
+    maxBodyBytes = 1048576,
+    date = false,
+    streamsBody = router.streamsBody
+  )
+)
+
+// Everything the server sends until it closes.
+rest(c: TcpStream) -> Array[byte]
+  val out = Buffer[byte]()
+  loop
+    c.read(65536) match
+      Ok(got) ->
+        if got.length == 0 then break
+        out.addAll(got)
+      Err(_) -> break
+  out.toArray()
+
+// Sends `head` and then `body`, and answers all the server sends back before it closes.
+exchange(server: TcpServer, head: string, body: Array[byte] = Array.empty[byte]()) -> Array[byte]
+  val c = ok(TcpStream.connect("127.0.0.1", server.port()))
+  ok(c.setTimeout(time.seconds(5)))
+  ok(c.write(head.utf8))
+  if body.length > 0 then ok(c.write(body))
+  rest(c)
+
+// Where the head of a reply ends: the index just past its empty line.
+headEnd(reply: Array[byte], from: int = 0) -> int
+  for i in from ..< reply.length - 3
+    if reply(i) == byte(13) && reply(i + 1) == byte(10) && reply(i + 2) == byte(13) && reply(i + 3) == byte(10)
+      return i + 4
+  fail("no end of the head")
+
+headOf(reply: Array[byte], from: int = 0) -> string = string.fromUtf8Lossy(
+  reply.slice(from, headEnd(reply, from))
+).replace("\r\n", "|")
+
+// The chunks of a chunked body beginning at `at`, and where the body ends.
+chunksOf(reply: Array[byte], at: int) -> (Vector[Array[byte]], int)
+  val out = Buffer[Array[byte]]()
+  var i = at
+  loop
+    var size = 0
+    while reply(i) != byte(13)
+      val c = int(reply(i))
+      size = size * 16 + (if c >= int('a') then c - int('a') + 10 else c - int('0'))
+      i += 1
+    i += 2
+    if size == 0 then return (out.toVector, i + 2)
+    out.addOne(reply.slice(i, i + size))
+    i += size + 2
+  (out.toVector, i)
+
+joinedAll(parts: Vector[Array[byte]]) -> Array[byte]
+  val out = Buffer[byte]()
+  for p in parts do out.addAll(p)
+  out.toArray()
+
+textOf(b: Array[byte]) -> string = string.fromUtf8Lossy(b)
+
+get(
+    target: string,
+    extra: string = ""
+) -> string = s"GET $target HTTP/1.1\r\nHost: t\r\nConnection: close\r\n$extra\r\n"
+
+post(target: string, body: Array[byte], extra: string) -> string =
+  s"POST $target HTTP/1.1\r\nHost: t\r\nConnection: close\r\nContent-Length: ${body.length}\r\n$extra\r\n"
+
+// `n` in lower-case hexadecimal.
+hex(n: int) -> string
+  val digits = "0123456789abcdef"
+  if n < 16 then digits.slice(n, n + 1) else hex(n / 16) + digits.slice(n % 16, n % 16 + 1)
+
+// `body` as chunks of `size` bytes and the empty one that ends them.
+chunked(body: Array[byte], size: int) -> Array[byte]
+  val out = Buffer[byte]()
+  var at = 0
+  while at < body.length
+    val end = if body.length - at > size then at + size else body.length
+    out.addAll(s"${hex(end - at)}\r\n".utf8)
+    out.addAll(body.slice(at, end))
+    out.addAll("\r\n".utf8)
+    at = end
+  out.addAll("0\r\n\r\n".utf8)
+  out.toArray()
+
+main()
+  val server = started()
+  val base = s"http://127.0.0.1:${server.port()}"
+
+  // The client asks for gzip and decompresses; the body is the handler's, the coding headers gone.
+  val fetched = http.get(s"$base/big").unwrap()
+  println(
+    s"client: ${fetched.status} ${fetched.text == big} ${fetched.header("Content-Encoding")} ${fetched.header("Content-Length")} ${fetched.header("Vary")}"
+  )
+  // A request asking for none gets the body plain; one sending its own Accept-Encoding gets it raw.
+  val plain = http.send(Request("GET", s"$base/big").withoutDecoding()).unwrap()
+  println(s"no decoding: ${plain.text == big} ${plain.header("Content-Encoding")} ${plain.header("Content-Length")}")
+  val raw = http.send(Request("GET", s"$base/big").withHeader("Accept-Encoding", "deflate")).unwrap()
+  println(s"own header: ${raw.header("Content-Encoding")} ${textOf(decompress(raw.body, Zlib).unwrap()) == big}")
+  // The client's own limit on what it decompresses.
+  val limited = http.send(Request("GET", s"$base/big").withDecoding(100))
+  val tooLarge = limited match
+    Err(Decoding(TooLarge(n))) -> s"TooLarge($n)"
+    _ -> "another answer"
+  println(s"client limit: $tooLarge ${limited.mapErr(e -> e.message).map(r -> r.status)}")
+  println(s"client limit met: ${http.send(Request("GET", s"$base/big").withDecoding(2400)).map(r -> r.body.length)}")
+
+  // On the wire: Content-Encoding, Vary and the new length; HEAD is left as it is.
+  val wire = exchange(server, get("/big", "Accept-Encoding: gzip\r\n"))
+  val end = headEnd(wire)
+  println(s"wire: ${headOf(wire)}")
+  println(s"wire body: ${textOf(gunzip(wire.slice(end, wire.length)).unwrap()) == big}")
+  println(
+    s"head: ${headOf(exchange(server, s"HEAD /big HTTP/1.1\r\nHost: t\r\nConnection: close\r\nAccept-Encoding: gzip\r\n\r\n"))}"
+  )
+  println(s"refused: ${headOf(exchange(server, get("/big", "Accept-Encoding: identity;q=0\r\n")))}")
+
+  // A streamed response: chunked, each write a chunk of its own that decompresses at once.
+  val streamed = exchange(server, get("/stream", "Accept-Encoding: gzip\r\n"))
+  val sEnd = headEnd(streamed)
+  println(s"stream: ${headOf(streamed)}")
+  val (chunks, _) = chunksOf(streamed, sEnd)
+  println(s"stream chunks: at least one a write ${chunks.length >= pieces.length}")
+  val first = Decoder(Once(chunks(0)), Gzip).read(65536)
+  println(s"first chunk alone: ${first.map(b -> textOf(b) == pieces(0))}")
+  println(s"stream whole: ${textOf(gunzip(joinedAll(chunks)).unwrap()) == pieces.mkString("")}")
+  val viaClient = http.get(s"$base/stream").unwrap()
+  println(s"stream by the client: ${viaClient.text == pieces.mkString("")} ${viaClient.header("Content-Encoding")}")
+  // A streamed body under minBytes with its length given is sent as it is.
+  println(s"small stream: ${headOf(exchange(server, get("/stream-small", "Accept-Encoding: gzip\r\n")))}")
+  // HTTP/1.0: no chunks, the body ended by the connection's end.
+  val old = exchange(server, "GET /stream HTTP/1.0\r\nAccept-Encoding: deflate\r\n\r\n")
+  val oEnd = headEnd(old)
+  println(s"http/1.0: ${headOf(old)}")
+  println(s"http/1.0 body: ${textOf(decompress(old.slice(oEnd, old.length), Zlib).unwrap()) == pieces.mkString("")}")
+  // Keep-alive: a streamed response and then a buffered one on one connection.
+  val twice = exchange(
+    server,
+    s"GET /stream HTTP/1.1\r\nHost: t\r\nAccept-Encoding: gzip\r\n\r\n${get("/big", "Accept-Encoding: gzip\r\n")}"
+  )
+  val (firstChunks, after) = chunksOf(twice, headEnd(twice))
+  val secondEnd = headEnd(twice, after)
+  println(
+    s"keep-alive: ${textOf(gunzip(joinedAll(firstChunks)).unwrap()) == pieces.mkString("")} ${headOf(twice, after)}"
+  )
+  println(s"keep-alive second: ${textOf(gunzip(twice.slice(secondEnd, twice.length)).unwrap()) == big}")
+  // Server-sent events, compressed and read back by the client.
+  val events = http.get(s"$base/events").unwrap()
+  println(
+    s"events: ${events.header("Content-Type")} ${events.text.split("\n\n").length} ${events.text.startsWith("data: event 0")}"
+  )
+
+  // Request bodies: buffered, decompressed for the handler.
+  val posted = gzip("posted text, ℵ₀".utf8)
+  println(textOf(exchange(server, post("/echo", posted, "Content-Encoding: gzip\r\n"), posted)).split("\r\n\r\n")(1))
+  val viaRequest = http.send(
+    Request("POST", s"$base/echo").withBody(
+      compress("by the client".utf8, Zlib)
+    ).withHeader("Content-Encoding", "deflate")
+  ).unwrap()
+  println(viaRequest.text)
+  println(headOf(exchange(server, post("/echo", posted, "Content-Encoding: br\r\n"), posted)))
+  println(
+    headOf(exchange(server, post("/echo", posted.slice(0, 10), "Content-Encoding: gzip\r\n"), posted.slice(0, 10)))
+  )
+  // Streamed: chunked and by length, in pieces, decompressed as the handler reads, its limit counting
+  // decompressed bytes.
+  val data = "0123456789".repeat(1000).utf8
+  val packed = gzip(data)
+  for size in [1, 7, 512, 65536]
+    val reply = exchange(
+      server,
+      s"POST /upload?size=$size HTTP/1.1\r\nHost: t\r\nConnection: close\r\nContent-Encoding: gzip\r\nTransfer-Encoding: chunked\r\n\r\n",
+      chunked(packed, size)
+    )
+    println(s"upload in pieces of $size: ${textOf(reply.slice(headEnd(reply), reply.length))}")
+  val sized = exchange(server, post("/upload", packed, "Content-Encoding: gzip\r\n"), packed)
+  println(s"upload by length: ${textOf(sized.slice(headEnd(sized), sized.length))}")
+  val atLimit = exchange(server, post("/upload?limit=10000", packed, "Content-Encoding: gzip\r\n"), packed)
+  println(s"upload at its limit: ${textOf(atLimit.slice(headEnd(atLimit), atLimit.length))}")
+  println(
+    s"upload past its limit: ${headOf(exchange(server, post("/upload?limit=9999", packed, "Content-Encoding: gzip\r\n"), packed))}"
+  )
+  val bomb = gzip(Array.fill(5000000, byte(0)), 9)
+  println(
+    s"bomb: ${bomb.length < 10000} ${headOf(exchange(server, post("/upload?limit=1000000&size=65536", bomb, "Content-Encoding: gzip\r\n"), bomb))}"
+  )
+  val cut = packed.slice(0, packed.length - 5)
+  println(s"cut short: ${headOf(exchange(server, post("/upload", cut, "Content-Encoding: gzip\r\n"), cut))}")
+  println(
+    s"corrupt: ${headOf(exchange(server, post("/upload", data.slice(0, 100), "Content-Encoding: gzip\r\n"), data.slice(0, 100)))}"
+  )
+  server.stop()
+
+// A reader of one array, then its end.
+class Once(private val bytes: Array[byte]): Reader
+  private var given = false
+  override read(max: int) -> Result[Array[byte], IoError]
+    if given then return Ok(Array.empty[byte]())
+    given = true
+    Ok(bytes)
