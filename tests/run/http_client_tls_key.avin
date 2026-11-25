@@ -1,0 +1,52 @@
+// expect: exit 0
+// A `Client` keeps an `https` connection under every TLS setting it was made with: the authorities
+// trusted, the protocols offered, in their order, and the versions allowed. A request whose
+// settings differ in any of them never gets a connection another made, and one whose settings are
+// equal, built afresh, does: `stats()` counts the connections made and the requests sent on one an
+// earlier request used. Names joined by a comma are not taken for two names.
+import avin.fs
+import avin.io.IoError
+import avin.net.http
+import avin.net.http.{Client, HttpError, Request, Response, ServerRequest}
+import avin.net.tls.{TlsClient, TlsServer, TlsVersion}
+
+ok[T](r: Result[T, IoError]) -> T = r match
+  Ok(v) -> v
+  Err(e) -> fail(s"unexpected error: ${e.message}")
+
+fetched[T](r: Result[T, HttpError]) -> T = r match
+  Ok(v) -> v
+  Err(e) -> fail(s"unexpected error: ${e.message}")
+
+// A test certificate or key, from the repository root or from `compiler/`.
+fixture(name: string) -> string
+  val here = "tests/fixtures/tls/" + name
+  ok(fs.readText(if fs.exists(here) then here else "../" + here))
+
+trusting() -> TlsClient = TlsClient().trust(fixture("ca.pem"))
+
+main()
+  val identity = TlsServer.of(fixture("localhost.pem"), fixture("localhost.key")) match
+    Ok(s) -> s.offer(["h2", "http/1.1", "a,b", "a", "b"])
+    Err(e) -> fail(e.message)
+  val server = ok(http.serve("127.0.0.1", 0, (r: ServerRequest) -> Response.text(200, r.target), tls = Some(identity)))
+  val base = s"https://localhost:${server.port()}"
+  val client = Client()
+  val opened = (name: string, tls: TlsClient) ->
+    println(s"$name: ${fetched(client.send(Request("GET", s"$base/$name").withTls(tls))).text} ${client.stats()}")
+
+  opened("plain", trusting())
+  opened("plain-again", trusting())
+  opened("http11", trusting().offer(["http/1.1"]))
+  opened("http11-again", trusting().offer(["http/1.1"]))
+  opened("both", trusting().offer(["http/1.1", "h2"]))
+  opened("both-reversed", trusting().offer(["h2", "http/1.1"]))
+  opened("comma-one", trusting().offer(["a,b"]))
+  opened("comma-two", trusting().offer(["a", "b"]))
+  opened("tls13", trusting().versions(TlsVersion.Tls13, TlsVersion.Tls13))
+  opened("tls13-again", trusting().versions(TlsVersion.Tls13, TlsVersion.Tls13))
+  opened("tls12", trusting().versions(TlsVersion.Tls12, TlsVersion.Tls12))
+  opened("twice-trusted", trusting().trust(fixture("ca.pem")))
+  opened("plain-last", trusting())
+  client.close()
+  server.stop()

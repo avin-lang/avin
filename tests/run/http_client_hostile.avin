@@ -1,0 +1,156 @@
+// expect: exit 0
+// A `Client` against a server written here that answers each connection from a script, for replies
+// no real server should send and for the cases where a connection must not be used again: bytes
+// after a body, HTTP/1.0, `Transfer-Encoding` with a `Content-Length`, a body cut short, either end's
+// `Connection: close`; a kept connection closed under a request, a `GET` sent again and a `POST`
+// not, and one closed while it was kept, found before it is used; a head over the limit, a line with no end, a body over the limit by its length and by its
+// chunks, lengths that disagree or are not digits, a folded header, a header name with a space, a
+// chunk size past any limit and trailers over the limit; and the replies that keep a connection:
+// equal lengths, a chunk extension with trailers, `304` and `204`, and an interim `100`.
+import avin.io.IoError
+import avin.net.{TcpListener, TcpStream}
+import avin.net.http.{Client, HttpError, Request, Response}
+import avin.threads.{sleep, spawn}
+import avin.time.millis
+
+ok[T](r: Result[T, IoError]) -> T = r match
+  Ok(v) -> v
+  Err(e) -> fail(e.message)
+
+// Reads one request's head and body; `false` where the connection ended first.
+readRequest(s: TcpStream) -> bool
+  var length = 0
+  var any = false
+  while true
+    val line = s.readLine() match
+      Ok(Some(l)) -> l
+      _ -> return false
+    any = true
+    if line.isEmpty then break
+    if line.toLower.startsWith("content-length:") then length = line.slice(15, line.byteLength).trim.toInt()
+  var got = 0
+  while got < length
+    val part = ok(s.read(length - got))
+    if part.length == 0 then return false
+    got += part.length
+  any
+
+// A script's step closing the connection at once, without reading another request.
+val Cut = "cut"
+
+// Answers connection after connection, each from its script: a reply for each request, an empty
+// one closing the connection once a request has come, unanswered, and `Cut` closing it at once;
+// once the script is done, it waits for the client to close the connection.
+serve(l: TcpListener, scripts: Vector[Vector[string]]) -> int
+  var served = 0
+  for script in scripts
+    val s = ok(l.accept())
+    served += 1
+    var open = true
+    for reply in script
+      if open
+        if reply == Cut then open = false
+        elif !readRequest(s) || reply.isEmpty then open = false
+        else _ = s.writeText(reply)
+    if open then _ = s.readAll()
+    _ = s.close()
+  served
+
+fixed(body: string, extra: string = "") -> string =
+  s"HTTP/1.1 200 OK\r\nContent-Length: ${body.byteLength}\r\n$extra\r\n$body"
+
+describe(r: Result[Response, HttpError]) -> string = r match
+  Ok(res) -> s"${res.status} [${res.text}]"
+  Err(e) -> s"error: ${e.message}"
+
+main()
+  val filler = "x".repeat(2000)
+  val scripts: Vector[Vector[string]] = [
+    // Reused.
+    [fixed("one"), fixed("two")],
+    // Bytes after the body.
+    ["HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nokEXTRA"],
+    [fixed("after extra")],
+    // HTTP/1.0.
+    ["HTTP/1.0 200 OK\r\nContent-Length: 2\r\n\r\nok"],
+    [fixed("after 1.0")],
+    // Both framings.
+    ["HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\nContent-Length: 99\r\n\r\n2\r\nok\r\n0\r\n\r\n"],
+    [fixed("after both")],
+    // A body cut short.
+    ["HTTP/1.1 200 OK\r\nContent-Length: 10\r\n\r\nabc", Cut],
+    [fixed("after short")],
+    // The server's close, in a list of tokens, and the client's.
+    [fixed("closing", "Connection: keep-alive, Close\r\n")],
+    [fixed("after close")],
+    [fixed("asked")],
+    [fixed("after asking")],
+    // A kept connection closed under a `GET`, which is sent again, and a `POST`, which is not.
+    [fixed("first"), ""],
+    [fixed("again")],
+    [fixed("posted"), ""],
+    // A kept connection the server closed while it waited: found closed before it is used.
+    [fixed("kept"), Cut],
+    [fixed("fresh")],
+    // Over the limits.
+    [s"HTTP/1.1 200 OK\r\nX-Long: $filler\r\nContent-Length: 0\r\n\r\n"],
+    ["HTTP/1.1 200 " + "y".repeat(5000)],
+    ["HTTP/1.1 200 OK\r\nContent-Length: 1000\r\n\r\n"],
+    ["HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n3c\r\n" + "a".repeat(60) + "\r\n3c\r\n" + "b".repeat(60) + "\r\n0\r\n\r\n"],
+    // Lengths: equal ones kept, then ones that differ.
+    [fixed("abc").replace("Content-Length: 3", "Content-Length: 3, 3"), "HTTP/1.1 200 OK\r\nContent-Length: 5, 6\r\n\r\nabcde"],
+    ["HTTP/1.1 200 OK\r\nContent-Length: +3\r\n\r\nabc"],
+    // Headers that are not HTTP's.
+    ["HTTP/1.1 200 OK\r\nX-A: 1\r\n folded\r\nContent-Length: 0\r\n\r\n"],
+    ["HTTP/1.1 200 OK\r\nBad Name: 1\r\nContent-Length: 0\r\n\r\n"],
+    // Chunks past the limits.
+    ["HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\nfffffffff\r\n"],
+    [s"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n0\r\nX-T: $filler\r\n\r\n"],
+    // Replies that keep their connection.
+    [
+      "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n2;name=value\r\nok\r\n0\r\nX-Trailer: yes\r\n\r\n",
+      "HTTP/1.1 304 Not Modified\r\nContent-Length: 50\r\n\r\n",
+      "HTTP/1.1 204 No Content\r\n\r\n",
+      "HTTP/1.1 100 Continue\r\n\r\nHTTP/1.1 200 OK\r\nContent-Length: 4\r\n\r\ndone"
+    ]
+  ]
+  val l = ok(TcpListener.bind("127.0.0.1", 0))
+  val base = s"http://127.0.0.1:${l.port()}"
+  val server = spawn(() -> serve(l, scripts))
+
+  // Each case on a client of its own, closed after it, with limits of 1024 head bytes and 100 body
+  // bytes; each line ends with the connections the client made.
+  val check = (label: string, requests: Vector[Request]) ->
+    val c = Client(maxHeaderBytes = 1024, maxResponseBytes = 100)
+    val answers = requests.map(r -> describe(c.send(r)))
+    println(s"$label: ${answers.mkString(" | ")} (${c.stats().opened})")
+    c.close()
+  val get = Request("GET", s"$base/")
+  val twice = [get, get]
+  check("reused", twice)
+  check("bytes after", twice)
+  check("HTTP/1.0", twice)
+  check("both framings", twice)
+  check("cut short", twice)
+  check("server closes", twice)
+  check("client closes", [get.withHeader("Connection", "close"), get])
+  check("closed under a GET", twice)
+  check("closed under a POST", [Request("POST", s"$base/"), Request("POST", s"$base/")])
+  val waiting = Client()
+  val before = describe(waiting.send(get))
+  sleep(millis(100))
+  println(s"closed while kept: $before | ${describe(waiting.send(get))} (${waiting.stats().opened})")
+  waiting.close()
+  check("head too large", [get])
+  check("endless line", [get])
+  check("body too large", [get])
+  check("chunks too large", [get])
+  check("lengths", twice)
+  check("signed length", [get])
+  check("folded", [get])
+  check("bad name", [get])
+  check("chunk size", [get])
+  check("trailers", [get])
+  check("kept", [get, get, get, get])
+  println(s"connections served: ${server.join()}")
+  _ = l.close()

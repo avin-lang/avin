@@ -1,0 +1,968 @@
+module avin.net.http
+
+// The HTTP/1.1 client. A `Client` keeps the connections it makes, by origin, and sends the next
+// request to the same origin on one of them, so a program that talks to a server again and again
+// pays for a connection, and for an `https` URL its TLS handshake, once; its limits say how many it
+// keeps and for how long. `send` reads a response whole and `stream` hands it to a function as it
+// arrives, its body read a piece at a time. A status is an answer rather than a failure, so a `404`
+// is an `Ok`, and redirects are followed, each resolved against the URL that answered it, up to the
+// client's limit. The module's own `get`, `head`, `delete`, `post`, `put`, `patch`, `send` and
+// `stream` make a connection for each request and close it after the response. An `https` URL is
+// fetched over TLS, its certificate checked for the URL's host against the machine's trusted
+// authorities and those the request's `TlsClient` adds.
+
+import avin.collections.mutable.{Map as MutableMap}
+import avin.io
+import avin.io.{IoError, Reader, TimedOut}
+import avin.net.{ByteStream, TcpStream, Url}
+import avin.net.tls.{TlsClient, TlsError, TlsStream, TlsVersion, Transport}
+import avin.threads.{Condition, Mutex, withTimeout}
+import avin.time.{Duration, minutes, monotonic, seconds}
+
+// Fetches `url`, sending `headers` besides the ones the client writes.
+get(url: string, headers: Vector[(string, string)] = Vector.empty[(string, string)]()) -> Result[Response, HttpError] =
+  send(Request("GET", url, headers))
+
+// Asks for `url`'s headers without its body.
+head(url: string, headers: Vector[(string, string)] = Vector.empty[(string, string)]()) -> Result[Response, HttpError] =
+  send(Request("HEAD", url, headers))
+
+// Asks the server to delete `url`.
+delete(
+    url: string,
+    headers: Vector[(string, string)] = Vector.empty[(string, string)]()
+) -> Result[Response, HttpError] =
+  send(Request("DELETE", url, headers))
+
+// Sends `body`, as UTF-8, to `url` with the content type `contentType`, and answers the response.
+post(
+    url: string,
+    body: string,
+    contentType: string,
+    headers: Vector[(string, string)] = Vector.empty[(string, string)]()
+) -> Result[Response, HttpError] =
+  send(withContent("POST", url, body, contentType, headers))
+
+// Stores `body`, as UTF-8, at `url` with the content type `contentType`.
+put(
+    url: string,
+    body: string,
+    contentType: string,
+    headers: Vector[(string, string)] = Vector.empty[(string, string)]()
+) -> Result[Response, HttpError] =
+  send(withContent("PUT", url, body, contentType, headers))
+
+// Changes `url` by `body`, as UTF-8, of the content type `contentType`.
+patch(
+    url: string,
+    body: string,
+    contentType: string,
+    headers: Vector[(string, string)] = Vector.empty[(string, string)]()
+) -> Result[Response, HttpError] =
+  send(withContent("PATCH", url, body, contentType, headers))
+
+// Sends `request` on a connection of its own, closed once the response is read, and answers the
+// response, following up to five redirects as a `Client` does.
+send(request: Request) -> Result[Response, HttpError] = oneShot().send(request)
+
+// Sends `request` on a connection of its own, as `send` does, and answers what `f` makes of the
+// response, given to it as it arrives, as `Client.stream` does.
+stream[R](request: Request, f: (StreamedResponse) -> R) -> Result[R, HttpError] = oneShot().stream(request, f)
+
+// The client the module's own functions use: no connection kept, five redirects followed, and no
+// limit on the body.
+private oneShot() -> Client = Client(maxRedirects = 5, maxResponseBytes = long.MaxValue, keepAlive = false)
+
+// A request with a body: its `Content-Type` first, then `headers`.
+private withContent(
+    method: string,
+    url: string,
+    body: string,
+    contentType: string,
+    headers: Vector[(string, string)]
+) -> Request =
+  Request(method, url, Vector(("Content-Type", contentType)) ++ headers, utf8(body))
+
+// What a client has done and holds: `opened` connections made in all, `reused` requests sent on a
+// connection an earlier request had used, `idle` connections kept for the next request now, and
+// `active` lent to a request now.
+data ClientStats(opened: long, reused: long, idle: int, active: int)
+
+// An HTTP client that keeps its connections open for the requests after the first. One client is
+// meant to be made once and used for every request, by every thread: it may be shared between
+// threads, and each request borrows a connection to its origin, its scheme, host and port (and, for
+// `https`, its TLS settings), for as long as it is sent and its response read:
+//
+//     val client = Client()
+//     val page = client.get("https://example.org/")?
+//
+// Each origin has at most `maxPerHost` connections, lent and kept together; a request that finds
+// them all lent waits for one to come back, within its `connectTimeout`, as a new connection is made
+// within it, and fails with `TimedOut` when it runs out. A connection goes back to be used again
+// only where the exchange ended cleanly: the request was written, the response is HTTP/1.1 without
+// `Connection: close`, its body's end was found by its `Content-Length` or chunks and was read to it,
+// and nothing came after it. Anything else, an error, a timeout, a body left partly read, a
+// cancellation, closes it. A connection kept longer than `idleTimeout` without a request, or older
+// than `maxLifetime`, is closed instead of being used; zero takes either limit away. One the server
+// has closed while it was kept is found before it is used and closed, and where a request on a kept
+// connection fails, other than by a timeout, before any byte of its response arrives, a server's
+// close having crossed it, a
+// request of a method that may be repeated (`GET`, `HEAD`, `OPTIONS`, `TRACE`, `PUT` and `DELETE`)
+// is sent once more on a new connection.
+//
+// A redirect, `301`, `302`, `303`, `307` or `308` with a `Location`, is followed up to
+// `maxRedirects` times, and the one after is the answer; zero follows none. A `303` asks again with
+// `GET` (a `HEAD` stays a `HEAD`), and so do `301` and `302` of a `POST`, dropping the body and the
+// headers that describe it; every other redirect sends the same method and body again. A redirect to
+// another origin drops `Authorization`, `Proxy-Authorization`, `Cookie` and a `Host` the request
+// gave, which were meant for the origin the request was sent to.
+//
+// A response's status line and headers together may be at most `maxHeaderBytes` long, and the body
+// `send` reads whole at most `maxResponseBytes`; a reply over either fails with `TooLarge`.
+// `keepAlive = false` keeps no connection: each request writes `Connection: close` and closes its own.
+// A `maxPerHost` or `maxHeaderBytes` less than one, a negative `maxRedirects` or
+// `maxResponseBytes`, or a negative timeout traps.
+class Client(
+    val maxPerHost: int = 16,
+    val idleTimeout: Duration = seconds(30),
+    val maxLifetime: Duration = minutes(10),
+    val maxRedirects: int = 10,
+    val maxHeaderBytes: int = 65536,
+    val maxResponseBytes: long = 67108864,
+    val keepAlive: bool = true
+)
+  if maxPerHost < 1 then fail(s"a client of $maxPerHost connections to a host: it is at least one")
+  if idleTimeout.isNegative then fail(s"an idle timeout of $idleTimeout: it is at least zero")
+  if maxLifetime.isNegative then fail(s"a connection lifetime of $maxLifetime: it is at least zero")
+  if maxRedirects < 0 then fail(s"a limit of $maxRedirects redirects: it is at least zero")
+  if maxHeaderBytes < 1 then fail(s"a header limit of $maxHeaderBytes bytes: it is at least one")
+  if maxResponseBytes < 0 then fail(s"a body limit of $maxResponseBytes bytes: it is at least zero")
+  private val hosts = Mutex(Hosts())
+  private val freed = hosts.condition()
+
+  // Fetches `url`, sending `headers` besides the ones the client writes.
+  get(
+      url: string,
+      headers: Vector[(string, string)] = Vector.empty[(string, string)]()
+  ) -> Result[Response, HttpError] =
+    send(Request("GET", url, headers))
+
+  // Asks for `url`'s headers without its body.
+  head(
+      url: string,
+      headers: Vector[(string, string)] = Vector.empty[(string, string)]()
+  ) -> Result[Response, HttpError] =
+    send(Request("HEAD", url, headers))
+
+  // Asks the server to delete `url`.
+  delete(
+      url: string,
+      headers: Vector[(string, string)] = Vector.empty[(string, string)]()
+  ) -> Result[Response, HttpError] =
+    send(Request("DELETE", url, headers))
+
+  // Sends `body`, as UTF-8, to `url` with the content type `contentType`, and answers the response.
+  post(
+      url: string,
+      body: string,
+      contentType: string,
+      headers: Vector[(string, string)] = Vector.empty[(string, string)]()
+  ) -> Result[Response, HttpError] =
+    send(withContent("POST", url, body, contentType, headers))
+
+  // Stores `body`, as UTF-8, at `url` with the content type `contentType`.
+  put(
+      url: string,
+      body: string,
+      contentType: string,
+      headers: Vector[(string, string)] = Vector.empty[(string, string)]()
+  ) -> Result[Response, HttpError] =
+    send(withContent("PUT", url, body, contentType, headers))
+
+  // Changes `url` by `body`, as UTF-8, of the content type `contentType`.
+  patch(
+      url: string,
+      body: string,
+      contentType: string,
+      headers: Vector[(string, string)] = Vector.empty[(string, string)]()
+  ) -> Result[Response, HttpError] =
+    send(withContent("PATCH", url, body, contentType, headers))
+
+  // Sends `request` and answers its response, its body read whole.
+  send(request: Request) -> Result[Response, HttpError]
+    val limit = maxResponseBytes
+    run(request, r -> wholeOf(r, limit))?
+
+  // Sends `request` and answers what `f` makes of its response, given to `f` once its head has
+  // arrived, its body read through the response's `body` as it comes. The response belongs to `f`:
+  // its body is read in `f` or not at all, and once `f` returns, the connection goes back to be used
+  // again where the body was read to its end, and is closed where it was not.
+  //
+  //     val saved = client.stream(Request("GET", url), r -> io.copy(r.body, file))?
+  stream[R](request: Request, f: (StreamedResponse) -> R) -> Result[R, HttpError] = run(request, f)
+
+  // What the client has done and holds now.
+  stats() -> ClientStats = hosts.with(h -> h.stats())
+
+  // Closes every connection kept longer than `idleTimeout` or older than `maxLifetime`, as a request
+  // to its origin would before it used one, and answers how many it closed.
+  evictIdle() -> int
+    val idleFor = idleTimeout
+    val lifetime = maxLifetime
+    val doomed = hosts.with(h -> h.expire(monotonic(), idleFor, lifetime))
+    closeAll(doomed)
+    doomed.length
+
+  // Closes every connection the client keeps; a connection lent now is closed when it comes back,
+  // and a request sent afterwards fails, making no connection.
+  close()
+    val doomed = hosts.with(h -> h.shut())
+    freed.notifyAll()
+    closeAll(doomed)
+
+  // `request` sent, its redirects followed, and its final response given to `f`, all within its
+  // `totalTimeout`.
+  private run[R](request: Request, f: (StreamedResponse) -> R) -> Result[R, HttpError]
+    if request.totalTimeout.isZero then return follow(request, f)
+    withTimeout(request.totalTimeout, _ -> follow(request, f)) match
+      Some(r) -> r
+      None -> Err(Io(IoError(TimedOut, "complete the request to", request.url)))
+
+  private follow[R](request: Request, f: (StreamedResponse) -> R) -> Result[R, HttpError]
+    var current = request
+    var at = Url.parse(request.url).mapErr(e -> BadUrl(e))?
+    var followed = 0
+    while true
+      val sent = current
+      val from = at
+      val more = followed < maxRedirects
+      exchange(sent, from, r -> stepOf(r, sent, from, more, f))? match
+        Answered(v) -> return Ok(v)
+        Redirected(next, to) ->
+          current = next
+          at = to
+          followed += 1
+        Unfollowable(e) -> return Err(e)
+    fail("unreachable")
+
+  // One request on a connection to its URL's origin, and what `f` makes of its response; sent a
+  // second time, on a new connection, where a kept connection turns out to have been closed.
+  private exchange[R](request: Request, url: Url, f: (StreamedResponse) -> R) -> Result[R, HttpError]
+    val origin = originOf(url, request.tls)?
+    attempt(origin, request, url, f, true) match
+      Finished(r) -> r
+      Again -> attempt(origin, request, url, f, false) match
+        Finished(r) -> r
+        Again -> fail("unreachable")
+
+  private attempt[R](origin: Origin, request: Request, url: Url, f: (StreamedResponse) -> R, kept: bool) -> Attempt[R]
+    val c = lease(origin, request, kept) match
+      Ok(c) -> c
+      Err(e) -> return Finished(Err(e))
+    var keep = false
+    defer giveBack(c, keep)
+    val head = begin(c, request, url, origin.host, !keepAlive, maxHeaderBytes) match
+      Ok(h) -> h
+      Err(e) ->
+        val repeat = c.uses > 1 && c.received == 0 && !isTimeout(e) && isRepeatable(request.method)
+        return if repeat then Again else Finished(Err(e))
+    val framing = framingOf(head, request.method) match
+      Ok(fr) -> fr
+      Err(e) -> return Finished(Err(e))
+    val body = ResponseBodyReader(c, framing, maxHeaderBytes)
+    val answer = f(StreamedResponse(head.status, head.reason, head.headers, body))
+    keep = keepAlive && body.isComplete && !c.pending && reusable(head, request, framing)
+    Finished(Ok(answer))
+
+  // A connection to `origin` for `request`: a kept one, where `kept` allows it and one is good, or a
+  // new one, waiting for a place among the origin's connections within the request's
+  // `connectTimeout`.
+  private lease(origin: Origin, request: Request, kept: bool) -> Result[Conn, HttpError]
+    val start = monotonic()
+    val limit = request.connectTimeout
+    val until = if limit.isZero then None else Some(start + limit)
+    val key = origin.key
+    val most = maxPerHost
+    val idleFor = idleTimeout
+    val lifetime = maxLifetime
+    val waitFor = freed
+    while true
+      val (taken, doomed) = hosts.with(h -> h.take(key, most, idleFor, lifetime, until, waitFor))
+      closeAll(doomed)
+      taken match
+        Kept(c) ->
+          if !kept || c.isStale()
+            drop(c)
+            continue
+          c.uses += 1
+          c.received = 0
+          c.stream.setTimeout(request.timeout.getOrElse(Duration.Zero)) match
+            Ok(_) -> return Ok(c)
+            Err(e) ->
+              drop(c)
+              return Err(Io(e))
+        Room ->
+          return connect(origin, request, start) match
+            Ok(c) ->
+              hosts.with(h -> h.made())
+              Ok(c)
+            Err(e) ->
+              hosts.with(h -> h.unmade(key))
+              waitFor.notifyAll()
+              Err(e)
+        Full -> return Err(Io(IoError(TimedOut, "wait for a connection to", origin.text)))
+        Shut -> return Err(Io(IoError(io.Other("the client is closed"), "send to", origin.text)))
+    fail("unreachable")
+
+  // `c` back from a request: kept for the next where `keep` says it may be, else closed.
+  private giveBack(c: Conn, keep: bool)
+    val lifetime = maxLifetime
+    if keep
+      c.since = monotonic()
+      handOver(c, ownerNow(), InTransit)
+    val doomed = hosts.with(h -> h.giveBack(c, keep, lifetime))
+    freed.notifyAll()
+    doomed match
+      Some(d) -> _ = d.stream.close()
+      None -> ()
+
+  // `c`, lent and found no good, closed and its place given up.
+  private drop(c: Conn)
+    val doomed = hosts.with(h -> h.giveBack(c, false, Duration.Zero))
+    freed.notifyAll()
+    doomed match
+      Some(d) -> _ = d.stream.close()
+      None -> ()
+
+// A response as it arrives: its status and reason and its headers, read, and its body, read through
+// `body` by the function `Client.stream` gives it to.
+class StreamedResponse(
+    val status: int,
+    val reason: string,
+    val headers: Vector[(string, string)],
+    val body: ResponseBodyReader
+)
+  // The value of the first header of `name`, compared without regard to case.
+  header(name: string) -> Option[string] = headerIn(headers, name)
+
+// The body of a response as it arrives, a `Reader`: each `read` answers what has come of it, up to
+// what is asked for, and an empty array once it has ended, its end found by its `Content-Length`,
+// its last chunk, or the connection's close. A body that breaks off, or whose chunks are not
+// HTTP's, answers an `Err`, and so does every read after it.
+class ResponseBodyReader(private val conn: Conn, private val framing: Framing, private val headLimit: int): Reader
+  // What is left of the body, or of the chunk being read.
+  private var left: long = framing match
+    Sized(n) -> n
+    _ -> 0
+  private var done = left == 0 && framing is Sized(_)
+  private var failure: Option[HttpError] = None
+
+  // Whether the body has been read to its end, without an error.
+  isComplete -> bool = done && failure.isEmpty
+
+  // Up to `max` bytes of the body, `max` being at least one, waiting for at least one where the body
+  // is still coming; an empty array once it has ended.
+  override read(max: int) -> Result[Array[byte], IoError] = piece(max).mapErr(e -> ioErrorOf(e))
+
+  // The rest of the body.
+  readAll() -> Result[Array[byte], IoError] = readAll(long.MaxValue).mapErr(e -> ioErrorOf(e))
+
+  // The rest of the body, `TooLarge` where it is longer than `limit` bytes, which is found before
+  // anything is read where its `Content-Length` says so.
+  readAll(limit: long) -> Result[Array[byte], HttpError]
+    if left > limit then return Err(TooLarge(s"a body of $left bytes, over the limit of $limit"))
+    val out = Buffer[byte]()
+    while true
+      val part = piece(65536)?
+      if part.length == 0 then return Ok(out.toArray())
+      if long(out.length) + long(part.length) > limit then return Err(TooLarge(s"a body over $limit bytes"))
+      out.addAll(part)
+    Ok(out.toArray())
+
+  // Reads the rest of the body and drops it, stopping once more than `limit` bytes have gone, and
+  // answers whether its end was reached; a body left unread keeps its connection from being used
+  // again.
+  discard(limit: long) -> bool
+    var read: long = 0
+    while read <= limit
+      val room = limit - read + 1
+      piece(if room < 65536 then int(room) else 65536) match
+        Ok(part) ->
+          if part.length == 0 then return isComplete
+          read += long(part.length)
+        Err(_) -> return false
+    isComplete
+
+  private piece(max: int) -> Result[Array[byte], HttpError]
+    failure match
+      Some(e) -> return Err(e)
+      None -> ()
+    if done then return Ok(Array.empty[byte]())
+    val got = framing match
+      Sized(_) -> sized(max)
+      Chunked -> chunked(max)
+      Closing -> closing(max)
+    if got is Err(e) then failure = Some(e)
+    got
+
+  private sized(max: int) -> Result[Array[byte], HttpError]
+    val part = conn.read(if long(max) < left then max else int(left))?
+    if part.length == 0
+      val total = framing match
+        Sized(n) -> n
+        _ -> left
+      return Err(Malformed(s"the body ended after ${total - left} of $total bytes"))
+    left -= long(part.length)
+    if left == 0 then done = true
+    Ok(part)
+
+  private chunked(max: int) -> Result[Array[byte], HttpError]
+    if left == 0
+      val line = conn.line(ChunkLineLimit, "a chunk's size line")? match
+        Some(l) -> l
+        None -> return Err(Malformed("the connection closed in a chunked body"))
+      val semicolon = line.indexOf(';')
+      val size = hexValue((if semicolon >= 0 then line.slice(0, semicolon) else line).trim) match
+        Some(n) -> n
+        None -> return Err(Malformed(s"not a chunk size: `$line`"))
+      if size == 0
+        trailers()?
+        done = true
+        return Ok(Array.empty[byte]())
+      left = long(size)
+    val part = conn.read(if long(max) < left then max else int(left))?
+    if part.length == 0 then return Err(Malformed("the connection closed in a chunked body"))
+    left -= long(part.length)
+    if left == 0
+      conn.line(2, "a chunk's end")? match
+        Some(end) -> if !end.isEmpty then return Err(Malformed("a chunk longer than its size"))
+        None -> return Err(Malformed("the connection closed in a chunked body"))
+    Ok(part)
+
+  // The trailer lines after the last chunk, up to the empty one, counted against the head's limit.
+  private trailers() -> Result[unit, HttpError]
+    var budget = headLimit
+    while true
+      val line = conn.line(budget, "the trailers").mapErr(e -> e match
+        TooLarge(_) -> TooLarge(s"trailers over $headLimit bytes")
+        other -> other)? match
+        Some(l) -> l
+        None -> return Err(Malformed("the connection closed in the trailers"))
+      if line.isEmpty then return Ok(())
+      budget -= line.byteLength + 2
+      if budget <= 0 then return Err(TooLarge(s"trailers over $headLimit bytes"))
+    Ok(())
+
+  private closing(max: int) -> Result[Array[byte], HttpError]
+    val part = conn.read(max)?
+    if part.length == 0 then done = true
+    Ok(part)
+
+// The response `r` with its body read whole, at most `limit` bytes of it.
+private wholeOf(r: StreamedResponse, limit: long) -> Result[Response, HttpError]
+  val body = r.body.readAll(limit)?
+  Ok(Response(r.status, r.reason, r.headers, body))
+
+// How long a chunk's size line may be, its extensions included.
+private val ChunkLineLimit = 4096
+
+// How much of a redirect's body is read and dropped, so its connection is used again; a longer one
+// closes it.
+private val DrainLimit: long = 65536
+
+// An `HttpError` as a `Reader`'s error: an `Io` one as it is, and any other in its words.
+private ioErrorOf(e: HttpError) -> IoError = e match
+  Io(error) -> error
+  other -> IoError(io.Other(other.message), "read", "the response body")
+
+// What one exchange came to: an answer, a redirect to follow, or a redirect that cannot be.
+private data Step[R]
+  Answered(value: R)
+  Redirected(request: Request, url: Url)
+  Unfollowable(error: HttpError)
+
+// What one try of an exchange came to: its answer, or a kept connection that was closed under it.
+private data Attempt[R]
+  Finished(result: Result[R, HttpError])
+  Again
+
+// The response `r` to `request`, sent to `url`, as a redirect to follow where it is one and `more`
+// may be, else what `f` makes of it.
+private stepOf[R](r: StreamedResponse, request: Request, url: Url, more: bool, f: (StreamedResponse) -> R) -> Step[R]
+  if more && isRedirect(r.status)
+    r.header("Location") match
+      Some(location) -> return url.resolve(location.trim) match
+        Ok(to) ->
+          _ = r.body.discard(DrainLimit)
+          Redirected(redirectOf(request, r.status, url, to), to)
+        Err(e) -> Unfollowable(BadUrl(e))
+      None -> ()
+  Answered(f(r))
+
+private isRedirect(status: int) -> bool =
+  status == 301 || status == 302 || status == 303 || status == 307 || status == 308
+
+// `request` as it is sent again to `to`, after `from` answered it with the redirect `status`.
+private redirectOf(request: Request, status: int, from: Url, to: Url) -> Request
+  val toGet = (status == 303 && request.method != "HEAD") || (
+    (status == 301 || status == 302) && request.method == "POST"
+  )
+  var headers = request.headers
+  if toGet
+    for name in [
+      "Content-Type",
+      "Content-Length",
+      "Content-Encoding",
+      "Content-Language",
+      "Content-Location",
+      "Transfer-Encoding"
+    ]
+      headers = withoutHeader(headers, name)
+  if !sameOrigin(from, to)
+    for name in ["Authorization", "Proxy-Authorization", "Cookie", "Host"]
+      headers = withoutHeader(headers, name)
+  Request(
+    if toGet then "GET" else request.method,
+    s"$to",
+    headers,
+    if toGet then Array.empty[byte]() else request.body,
+    request.timeout,
+    request.tls,
+    request.connectTimeout,
+    request.totalTimeout
+  )
+
+// Whether `a` and `b` have one origin: their scheme, host and port.
+private sameOrigin(a: Url, b: Url) -> bool =
+  a.scheme.equalsIgnoreCase(b.scheme)
+    && a.host.getOrElse("").equalsIgnoreCase(b.host.getOrElse(""))
+    && a.portOrDefault == b.portOrDefault
+
+// Whether `e` is a wait that ran out of time, which says nothing of a connection closed under it.
+private isTimeout(e: HttpError) -> bool = e match
+  Io(IoError(TimedOut, _, _)) -> true
+  _ -> false
+
+// Whether a request of `method` may be sent again without its meaning changing (RFC 9110 section
+// 9.2.2).
+private isRepeatable(method: string) -> bool =
+  method == "GET" || method == "HEAD" || method == "OPTIONS" || method == "TRACE" || method == "PUT" || method == "DELETE"
+
+// Where a request goes: whether over TLS, the host as the URL names it and as a connection does, the
+// port, the origin as text, and the key its connections are kept under, which for `https` holds the
+// TLS settings too, so a connection is used again only with the settings it was made with.
+private data Origin(secure: bool, host: string, address: string, port: int, text: string, key: string, tls: TlsClient)
+
+private originOf(url: Url, tls: TlsClient) -> Result[Origin, HttpError]
+  val scheme = url.scheme.toLower
+  val secure = scheme == "https"
+  if !secure && scheme != "http" then return Err(Unsupported(s"the scheme `${url.scheme}`"))
+  val host = url.host.getOrElse("")
+  if host.isEmpty then return Err(Unsupported(s"a URL without a host: $url"))
+  val port = url.portOrDefault.getOrElse(if secure then 443 else 80)
+  val text = s"$scheme://${host.toLower}:$port"
+  val key = if secure then text + "\n" + tlsKey(tls) else text
+  Ok(Origin(secure, host, addressOf(host), port, text, key, tls))
+
+// Every setting of `tls` a connection is made with, as text two settings share only where they are
+// equal: the versions it allows, the protocols it offers in their order, each written after its
+// length so no two lists of names read alike, and the authorities it trusts.
+private tlsKey(tls: TlsClient) -> string =
+  val offered = tls.protocols.map(p -> s"${p.byteLength}:$p").mkString(",")
+  s"${versionName(tls.minVersion)}-${versionName(tls.maxVersion)}\n$offered\n${tls.trusted.mkString("\n")}"
+
+private versionName(v: TlsVersion) -> string = v match
+  TlsVersion.Tls12 -> "1.2"
+  TlsVersion.Tls13 -> "1.3"
+
+// A new connection to `origin` for `request`, begun at `start`: the lookup, the connecting and, for
+// `https`, the TLS handshake, together within what is left of the request's `connectTimeout`.
+private connect(origin: Origin, request: Request, start: Duration) -> Result[Conn, HttpError]
+  val limit = request.connectTimeout
+  val left = if limit.isZero then Duration.Zero else limit - (monotonic() - start)
+  if !limit.isZero && left <= Duration.Zero then return Err(Io(IoError(TimedOut, "connect to", origin.text)))
+  val tcp = TcpStream.connect(origin.address, origin.port, left).mapErr(e -> Io(e))?
+  request.timeout match
+    Some(d) ->
+      tcp.setTimeout(d) match
+        Ok(_) -> ()
+        Err(e) ->
+          _ = tcp.close()
+          return Err(Io(e))
+    None -> ()
+  if !origin.secure then return Ok(Conn(tcp, origin.key, monotonic()))
+  handshaken(tcp, origin.address, request.tls, start, limit) match
+    Ok(s) -> Ok(Conn(s, origin.key, monotonic()))
+    Err(e) ->
+      _ = tcp.close()
+      Err(e match
+        Transport(io) -> Io(io)
+        other -> Tls(other))
+
+// The host as a connection names it: an IPv6 address without its brackets, its zone's `%25` as `%`.
+private addressOf(host: string) -> string =
+  if host.startsWith("[") then host.slice(1, host.byteLength - 1).replace("%25", "%") else host
+
+// TLS as the client over `tcp`, a connection to `host` begun at `start` on the monotonic clock, its
+// handshake done within what is left of `limit`; zero is no limit. A `limit` already spent is a
+// `Transport` error of kind `TimedOut`, and `tcp` is left for the caller to close.
+private handshaken(
+    tcp: TcpStream,
+    host: string,
+    settings: TlsClient,
+    start: Duration,
+    limit: Duration
+) -> Result[TlsStream, TlsError]
+  if limit == Duration.Zero then return TlsStream.client(tcp, host, settings)
+  val left = limit - (monotonic() - start)
+  if left <= Duration.Zero then return Err(Transport(IoError(TimedOut, "handshake with", host)))
+  TlsStream.client(tcp, host, settings, left)
+
+// The request written on `c`, to `url` on `host`, and the head of its response read, an interim one,
+// such as `100 Continue`, passed over for the one after it. `closing` asks the server to close the
+// connection after the response.
+private begin(
+    c: Conn,
+    request: Request,
+    url: Url,
+    host: string,
+    closing: bool,
+    limit: int
+) -> Result[ResponseHead, HttpError]
+  val head = utf8(requestHead(request, url, host, closing))
+  if request.body.length > 0 && request.body.length <= 16384
+    val all = Array.fill(head.length + request.body.length, byte(0))
+    head.copyTo(all, 0)
+    request.body.copyTo(all, head.length)
+    c.stream.write(all).mapErr(e -> Io(e))?
+  else
+    c.stream.write(head).mapErr(e -> Io(e))?
+    if request.body.length > 0 then c.stream.write(request.body).mapErr(e -> Io(e))?
+  while true
+    val response = readHead(c, limit)?
+    if response.status < 100 || response.status >= 200 || response.status == 101 then return Ok(response)
+  fail("unreachable")
+
+// The request line and headers, ending in the empty line.
+private requestHead(request: Request, url: Url, host: string, closing: bool) -> string
+  val out = StringWriter()
+  val target = (if url.path.isEmpty then "/" else url.path) + url.query.map(q -> "?" + q).getOrElse("")
+  out.write(s"${request.method} $target HTTP/1.1\r\n")
+  if headerIn(request.headers, "Host").isEmpty
+    out.write(s"Host: $host${url.port.map(p -> s":$p").getOrElse("")}\r\n")
+  val sendsLength = request.body.length > 0
+    || request.method == "POST"
+    || request.method == "PUT"
+    || request.method == "PATCH"
+  if sendsLength && headerIn(request.headers, "Content-Length").isEmpty
+    out.write(s"Content-Length: ${request.body.length}\r\n")
+  if closing && headerIn(request.headers, "Connection").isEmpty then out.write("Connection: close\r\n")
+  for (name, value) in request.headers
+    out.write(s"$name: $value\r\n")
+  out.write("\r\n")
+  out.text
+
+// A response's status line and headers: its version, `HTTP/1.1` or another, its status and reason,
+// and its headers in order.
+private data ResponseHead(version: string, status: int, reason: string, headers: Vector[(string, string)])
+
+// The status line and headers of one response, together at most `limit` bytes long.
+private readHead(c: Conn, limit: int) -> Result[ResponseHead, HttpError] = headOf(c, limit).mapErr(e -> e match
+  TooLarge(_) -> TooLarge(s"a response head over $limit bytes")
+  other -> other)
+
+private headOf(c: Conn, limit: int) -> Result[ResponseHead, HttpError]
+  val statusLine = c.line(limit, "the response's head")? match
+    Some(line) -> line
+    None -> return Err(Malformed("the connection closed before a response"))
+  var budget = limit - statusLine.byteLength - 2
+  val (version, status, reason) = statusLineOf(statusLine)?
+  val headers = Buffer[(string, string)]()
+  while true
+    if budget <= 0 then return Err(TooLarge(s"a response head over $limit bytes"))
+    val line = c.line(budget, "the response's head")? match
+      Some(l) -> l
+      None -> return Err(Malformed("the connection closed in the headers"))
+    if line.isEmpty then break
+    budget -= line.byteLength + 2
+    if line.startsWith(" ") || line.startsWith("\t") then return Err(Malformed(s"a folded header line: `$line`"))
+    val colon = line.indexOf(':')
+    if colon <= 0 then return Err(Malformed(s"not a header: `$line`"))
+    val name = line.slice(0, colon)
+    if name.indexWhere(ch -> !isTokenChar(ch)) >= 0 then return Err(Malformed(s"not a header name: `$name`"))
+    headers.addOne((name, line.slice(colon + 1, line.byteLength).trim))
+  Ok(ResponseHead(version, status, reason, headers.toVector))
+
+// `HTTP/1.1 200 OK` as its status and reason.
+private parseStatus(line: string) -> Result[(int, string), HttpError]
+  val (_, status, reason) = statusLineOf(line)?
+  Ok((status, reason))
+
+// `HTTP/1.1 200 OK` as its version, status and reason.
+private statusLineOf(line: string) -> Result[(string, int, string), HttpError]
+  val bad = Malformed(s"not a status line: `$line`")
+  if !line.startsWith("HTTP/") then return Err(bad)
+  val space = line.indexOf(' ')
+  if space < 0 || line.byteLength < space + 4 then return Err(bad)
+  val code = line.slice(space + 1, space + 4)
+  if code.indexWhere(ch -> !('0' <= ch <= '9')) >= 0 then return Err(bad)
+  if line.byteLength > space + 4 && line.byteAt(space + 4) != byte(32) then return Err(bad)
+  val reason = if line.byteLength > space + 5 then line.slice(space + 5, line.byteLength) else ""
+  Ok((line.slice(0, space), code.toInt(), reason))
+
+// How the body of a response with `head`, to a request of `method`, ends: none for a `HEAD`, a `1xx`,
+// `204` or `304`; chunked where its last transfer coding is `chunked`; by the connection's close for
+// any other coding or where nothing says; else by its `Content-Length`, which, given more than once,
+// must say one length every time.
+private framingOf(head: ResponseHead, method: string) -> Result[Framing, HttpError]
+  val status = head.status
+  if method == "HEAD" || (100 <= status < 200) || status == 204 || status == 304 then return Ok(Sized(0))
+  val codings = tokensOf(head.headers, "Transfer-Encoding")
+  if codings.nonEmpty then return Ok(if codings(codings.length - 1) == "chunked" then Chunked else Closing)
+  var length: Option[long] = None
+  for (name, value) in head.headers
+    if name.equalsIgnoreCase("Content-Length")
+      for part in value.split(",")
+        val n = lengthOf(part.trim) match
+          Some(n) -> n
+          None -> return Err(Malformed(s"a Content-Length of `$value`"))
+        if length.exists(m -> m != n) then return Err(Malformed(s"Content-Lengths that differ: `$value`"))
+        length = Some(n)
+  Ok(length match
+    Some(n) -> Sized(n)
+    None -> Closing)
+
+// Whether the connection a response with `head` came on, to `request`, read with `framing`, may be
+// used again: HTTP/1.1, with neither end asking to close it, its body ended by its length or chunks,
+// and not both of those said, and not switched to another protocol.
+private reusable(head: ResponseHead, request: Request, framing: Framing) -> bool =
+  head.version == "HTTP/1.1"
+    && head.status != 101
+    && !(framing is Closing)
+    && !tokensOf(head.headers, "Connection").contains("close")
+    && !tokensOf(request.headers, "Connection").contains("close")
+    && !(headerIn(head.headers, "Transfer-Encoding").nonEmpty && headerIn(head.headers, "Content-Length").nonEmpty)
+
+// The comma-separated tokens of every header of `name`, in lower case.
+private tokensOf(headers: Vector[(string, string)], name: string) -> Vector[string]
+  val out = Buffer[string]()
+  for (n, v) in headers
+    if n.equalsIgnoreCase(name)
+      for t in v.split(",")
+        val token = t.trim.toLower
+        if !token.isEmpty then out.addOne(token)
+  out.toVector
+
+// The value of hexadecimal digits, `None` for none or for a value above `int.MaxValue`.
+private hexValue(text: string) -> Option[int]
+  if text.isEmpty then return None
+  var n: long = 0
+  for c in text.chars
+    val d = hexDigit(c)
+    if d < 0 then return None
+    n = n * 16 + long(d)
+    if n > long(int.MaxValue) then return None
+  Some(int(n))
+
+// The value of an ASCII hexadecimal digit, -1 for any other character.
+private hexDigit(c: char) -> int =
+  if '0' <= c <= '9' then int(c) - int('0')
+  else if 'a' <= c <= 'f' then int(c) - int('a') + 10
+  else if 'A' <= c <= 'F' then int(c) - int('A') + 10
+  else -1
+
+private closeAll(conns: Vector[Conn])
+  for c in conns
+    _ = c.stream.close()
+
+// The owner of the code running.
+@intrinsic("owner_current")
+private ownerNow() -> long
+
+// Gives every Sysl handle `value` reaches that `from` owns to `to`.
+@intrinsic("hand_over")
+private handOver(value: Any, from: long, to: long)
+
+// The owner a handle in transit has: the next code to use it takes it.
+private val InTransit: long = 0
+
+// One connection a client made, with what it has read ahead of what the exchange on it has taken:
+// the stream, the key of the origin it goes to, when it was made and when it last came back, how many
+// requests have been sent on it, and how many bytes have come since the latest was written.
+@trusted_sendable(
+  "it belongs to one request at a time: a client lends it to one, and hands its handles over before it keeps it for the next"
+)
+private class Conn(val stream: ByteStream, val key: string, val born: Duration): Sendable
+  private var ahead = Array.empty[byte]()
+  private var at = 0
+  var since: Duration = born
+  var uses = 1
+  var received: long = 0
+
+  // Whether bytes have come that no exchange has taken.
+  pending -> bool = at < ahead.length
+
+  // Whether the connection, kept without a request, has something to read: the server has closed it,
+  // or sent what no request asked for, either way leaving it no good.
+  isStale() -> bool = pending || stream.readable()
+
+  // Up to `max` bytes, those read ahead first; an empty array at the connection's end.
+  read(max: int) -> Result[Array[byte], HttpError]
+    if at < ahead.length
+      val n = if ahead.length - at < max then ahead.length - at else max
+      val part = ahead.slice(at, at + n)
+      at += n
+      return Ok(part)
+    val part = stream.read(max).mapErr(e -> Io(e))?
+    received += long(part.length)
+    Ok(part)
+
+  // The next line, without its line feed and a carriage return before it, at most `limit` bytes
+  // with them, else `TooLarge` naming `what`; `None` where the connection ends before any byte of it.
+  line(limit: int, what: string) -> Result[Option[string], HttpError]
+    val out = Buffer[byte]()
+    while true
+      if at >= ahead.length
+        val more = stream.read(8192).mapErr(e -> Io(e))?
+        received += long(more.length)
+        if more.length == 0
+          return if out.length == 0 then Ok(None) else Err(Malformed("the connection closed in a line"))
+        ahead = more
+        at = 0
+      var i = at
+      while i < ahead.length && ahead(i) != byte(10)
+        i += 1
+      if out.length + (i - at) > limit then return Err(TooLarge(s"$what over $limit bytes"))
+      for k in at ..< i
+        out.addOne(ahead(k))
+      if i < ahead.length
+        at = i + 1
+        val n = out.length
+        val bytes = out.toArray()
+        return Ok(
+          Some(string.fromUtf8Lossy(if n > 0 && bytes(n - 1) == byte(13) then bytes.slice(0, n - 1) else bytes))
+        )
+      at = ahead.length
+    Ok(None)
+
+// What a client's mutex answers a request asking for a connection: a kept one, to check before it is
+// used; a place for a new one, counted already; no place in time; or a closed client.
+private data Taking
+  Kept(conn: Conn)
+  Room
+  Full
+  Shut
+
+// The connections a client keeps, by origin, and its counts, reached only holding its mutex: each
+// origin's kept connections, the last to come back last, and how many it has, kept, lent or being
+// made.
+private class Hosts()
+  private val idle = MutableMap[string, Buffer[Conn]]()
+  private val open = MutableMap[string, int]()
+  private var opened: long = 0
+  private var reused: long = 0
+  private var lent = 0
+  private var kept = 0
+  private var closed = false
+  private var swept: Duration = monotonic()
+
+  stats() -> ClientStats = ClientStats(opened, reused, kept, lent)
+
+  // A kept connection to `key`, the latest to come back that is not too old, or a place for a new
+  // one where `key` has fewer than `most`, waiting on `freed` until `until` for one, and every kept
+  // connection found too old, to close.
+  take(
+      key: string,
+      most: int,
+      idleFor: Duration,
+      lifetime: Duration,
+      until: Option[Duration],
+      freed: Condition
+  ) -> (Taking, Vector[Conn])
+    val doomed = Buffer[Conn]()
+    while true
+      if closed then return (Shut, doomed.toVector)
+      val now = monotonic()
+      if now - swept >= seconds(1)
+        swept = now
+        doomed.addAll(expire(now, idleFor, lifetime))
+      idle.get(key) match
+        Some(list) ->
+          while list.length > 0
+            val c = list.remove(list.length - 1)
+            kept -= 1
+            if tooOld(c, now, idleFor, lifetime)
+              less(key)
+              doomed.addOne(c)
+            else
+              lent += 1
+              return (Kept(c), doomed.toVector)
+        None -> ()
+      val count = open.getOrElse(key, 0)
+      if count < most
+        open.update(key, count + 1)
+        lent += 1
+        return (Room, doomed.toVector)
+      until match
+        None -> freed.wait()
+        Some(t) ->
+          val left = t - monotonic()
+          if left <= Duration.Zero then return (Full, doomed.toVector)
+          _ = freed.waitFor(left)
+    (Full, doomed.toVector)
+
+  // A new connection made in a place `take` gave.
+  made() = opened += 1
+
+  // A place `take` gave whose connection could not be made, given up.
+  unmade(key: string)
+    lent -= 1
+    less(key)
+
+  // `c` back from a request: kept where `keep` says so, the client is open and `c` is younger than
+  // `lifetime`, else answered to be closed, its place given up.
+  giveBack(c: Conn, keep: bool, lifetime: Duration) -> Option[Conn]
+    lent -= 1
+    if c.uses > 1 then reused += 1
+    if keep && !closed && !(lifetime > Duration.Zero && c.since - c.born >= lifetime)
+      idle.getOrElseUpdate(c.key, Buffer[Conn]()).addOne(c)
+      kept += 1
+      return None
+    less(c.key)
+    Some(c)
+
+  // Every kept connection too old, taken out to be closed.
+  expire(now: Duration, idleFor: Duration, lifetime: Duration) -> Vector[Conn]
+    val doomed = Buffer[Conn]()
+    for (key, list) in idle
+      val young = Buffer[Conn]()
+      for c in list
+        if tooOld(c, now, idleFor, lifetime)
+          doomed.addOne(c)
+          kept -= 1
+          less(key)
+        else young.addOne(c)
+      list.clear()
+      list.addAll(young)
+    doomed.toVector
+
+  // Every kept connection, taken out to be closed, and the client closed.
+  shut() -> Vector[Conn]
+    closed = true
+    val doomed = Buffer[Conn]()
+    for (key, list) in idle
+      for c in list
+        doomed.addOne(c)
+        less(key)
+      list.clear()
+    kept = 0
+    doomed.toVector
+
+  private less(key: string)
+    val count = open.getOrElse(key, 0)
+    if count <= 1 then _ = open.remove(key) else open.update(key, count - 1)
+
+// Whether `c`, kept since `c.since`, has been kept longer than `idleFor` or lived longer than
+// `lifetime` at `now`; a zero limit is none.
+private tooOld(c: Conn, now: Duration, idleFor: Duration, lifetime: Duration) -> bool =
+  (idleFor > Duration.Zero && now - c.since >= idleFor) || (lifetime > Duration.Zero && now - c.born >= lifetime)
