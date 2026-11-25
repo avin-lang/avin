@@ -1211,6 +1211,8 @@ copyNotes(from: string, to: string) -> Result[unit, IoError]
 | `linkMetadata(file) -> Result[Metadata, IoError]` | As `metadata`, but a symbolic link is described rather than followed: its `kind` is `Symlink`, its `size` the length of the path it holds, and a dangling one answers `Ok`. |
 | `permissions(file) -> Result[int, IoError]` | The permission bits of the file or directory: the nine `rwx` bits with setuid `0o4000`, setgid `0o2000` and the sticky bit `0o1000`, never the file type. |
 | `setPermissions(file, mode) -> Result[unit, IoError]` | Sets the permission bits to exactly `mode`, `0o0` to `0o7777`; not a mask added to what is there, and the umask plays no part. A mode outside that range is an `Err` of kind `Other` naming it, before the path is looked at, and changes nothing. |
+| `setOwner(file, owner, group) -> Result[unit, IoError]` | Sets the owner and group to the numeric ids `owner` and `group` (`0` to `4294967295`; both are set, so pass the one to keep as `metadata` reports it). A program that is not the superuser may name its own ids and gets `PermissionDenied` for any other user; an id outside the range is an `Err` of kind `Other` naming it, before the path is looked at. A symbolic link is followed. |
+| `ownerName(file) -> Result[string, IoError]` | The name the system's user database gives the file's owner (`process.userName(metadata(file).owner)`); an owner with no entry is `NotFound`. Group names are not offered. |
 | `size(file) -> Result[long, IoError]` | The size of the file in bytes. |
 | `modified(file) -> Result[Instant, IoError]` | When the contents of the file or directory last changed, to the file system's resolution. |
 | `setModified(file, when) -> Result[unit, IoError]` | Sets the modification time (the access time moves with it); reading it back may round to the file system's resolution. |
@@ -1282,6 +1284,21 @@ made or emptied and no directory is made. `appendText`, `appendBytes`, `append`,
 changes the file the handle holds even after it is renamed. Where the
 platforms differ the platform decides and the answer says so: macOS refuses the sticky bit on a
 plain file to anyone but the superuser (an `Err`, the mode unchanged), and Linux keeps it.
+
+**Ownership** is numeric. Giving a file away is privileged, so a program that is not the superuser
+may set only its own ids, which changes nothing, and the platform's `PermissionDenied` answers any
+other user:
+
+```avin
+import avin.fs
+import avin.process
+
+main()
+  val file = fs.createTempDir("owner").getOrElse("") + "/token"
+  _ = fs.writeText(file, "x")
+  println(fs.setOwner(file, process.userId(), process.groupId()))
+  println(fs.ownerName(file) == process.userName(process.userId()))
+```
 
 **A temporary directory is the program's to remove.** `createTempDir` makes the directory rather than
 inventing a name, so no other program can take it in between, and nothing removes it at the end:
