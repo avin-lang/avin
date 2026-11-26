@@ -1,0 +1,253 @@
+// expect: exit 0
+// The total bound on a TLS handshake, at both ends, and on connecting before it. `TlsStream.server`
+// and `TlsStream.client` given a `timeout` fail with `TimedOut` at about it against a peer that
+// trickles handshake bytes faster than the connection's own limit, or sends none, and put the
+// connection's own limit back; without one, the default, only that per-wait limit applies; a
+// handshake well inside its bound succeeds, and a bound of a microsecond is spent before the first
+// wait. `TlsStream.connect` bounds the lookup, the connecting and the handshake together, as do an
+// HTTP request's `connectTimeout`, which every `with` method keeps, and a WebSocket's `timeout`.
+// `TcpStream.connect` bounds the lookup and the connecting.
+import avin.fs
+import avin.io.{IoError, TimedOut}
+import avin.net.{TcpListener, TcpStream}
+import avin.net.http
+import avin.net.http.{Io, Request, Unreachable, WebSocket}
+import avin.net.tls.{TlsClient, TlsError, TlsServer, TlsStream, Transport}
+import avin.threads.{Atomic, Thread, sleep, spawn}
+import avin.time
+import avin.time.{Duration, micros, millis, monotonic}
+
+@sysl("avin.rt.resolve_hold")
+resolveHold(on: bool)
+
+ok[T](r: Result[T, IoError]) -> T = r match
+  Ok(v) -> v
+  Err(e) -> fail(e.message)
+
+// A test certificate or key, from the repository root or from `compiler/`.
+fixture(name: string) -> string
+  val here = "tests/fixtures/tls/" + name
+  ok(fs.readText(if fs.exists(here) then here else "../" + here))
+
+trusting() -> TlsClient = TlsClient().trust(fixture("ca.pem"))
+
+identity() -> TlsServer = TlsServer(fixture("localhost.pem"), fixture("localhost.key"))
+
+// What a failed handshake was.
+kind(e: TlsError) -> string = e match
+  Transport(IoError(TimedOut, _, _)) -> "timed out"
+  Transport(_) -> "transport"
+  _ -> "tls"
+
+said[T](r: Result[T, TlsError]) -> string = r match
+  Ok(_) -> "done"
+  Err(e) -> kind(e)
+
+within(took: Duration, lo: Duration, hi: Duration) -> bool = lo <= took < hi
+
+// The first bytes of a TLS record of 512 bytes, then zeros: a peer waits for the whole record.
+record() -> Array[byte]
+  val head = [22, 3, 3, 2, 0, 2, 0, 1, 252, 3, 3]
+  Array.tabulate(512 + 5, i -> if i < head.length then byte(head(i)) else byte(0))
+
+// Sends the first `count` bytes of `record()` on `c`, `every` apart, until a write fails or `stop`
+// is set, then waits for `stop`, reading and dropping what arrives.
+trickle(c: TcpStream, count: int, every: Duration, stop: Atomic[bool])
+  val bytes = record()
+  for i in 0 ..< count
+    if i > 0 then sleep(every)
+    if stop.load() then return
+    if c.write(bytes.slice(i, i + 1)).isErr then return
+  while !stop.load()
+    sleep(millis(20))
+
+// A listener whose next connection is accepted and given `count` bytes of a record, `every` apart,
+// whatever it sends; zero bytes is a peer that never answers. Its port, its thread and its stop.
+peer(count: int, every: Duration) -> (int, Thread[unit], Atomic[bool])
+  val listener = ok(TcpListener.bind("127.0.0.1", 0))
+  val port = listener.port()
+  val stop = Atomic(false)
+  val serving = spawn(() ->
+    defer listener.close()
+    val c = ok(listener.accept())
+    defer c.close()
+    trickle(c, count, every, stop))
+  (port, serving, stop)
+
+ended(served: Thread[unit], stop: Atomic[bool])
+  stop.store(true)
+  _ = served.join()
+
+// A listener whose next connection is answered by a real TLS handshake.
+genuine() -> (int, Thread[unit])
+  val listener = ok(TcpListener.bind("127.0.0.1", 0))
+  val port = listener.port()
+  val serving = spawn(() ->
+    defer listener.close()
+    val tcp = ok(listener.accept())
+    defer tcp.close()
+    ok(tcp.setTimeout(time.seconds(10)))
+    TlsStream.server(tcp, identity()) match
+      Ok(s) ->
+        _ = s.writeText("hello\n")
+        _ = s.close()
+      Err(_) -> ())
+  (port, serving)
+
+main()
+  val bound = millis(400)
+  val late = time.seconds(3)
+
+  // The server's end: a client trickling a ClientHello every 50 ms, far inside the connection's
+  // own five seconds, is cut at about the bound, and the connection's limit is put back.
+  val listener = ok(TcpListener.bind("127.0.0.1", 0))
+  val client = ok(TcpStream.connect("127.0.0.1", listener.port()))
+  val stop = Atomic(false)
+  val sending = spawn(() -> trickle(client, 517, millis(50), stop))
+  val accepted = ok(listener.accept())
+  ok(accepted.setTimeout(time.seconds(5)))
+  val start = monotonic()
+  val served = TlsStream.server(accepted, identity(), bound)
+  val took = monotonic() - start
+  println(s"server, trickled: ${said(served)}, within the bound: ${within(took, bound, late)}")
+  println(s"  its own limit put back: ${accepted.timeout == time.seconds(5)}")
+  stop.store(true)
+  _ = sending.join()
+  _ = client.close()
+  _ = accepted.close()
+
+  // With no bound, the default, the same client is cut only by the connection's limit of 300 ms,
+  // once it stops trickling after a second.
+  val client2 = ok(TcpStream.connect("127.0.0.1", listener.port()))
+  val stop2 = Atomic(false)
+  val sending2 = spawn(() -> trickle(client2, 21, millis(50), stop2))
+  val accepted2 = ok(listener.accept())
+  ok(accepted2.setTimeout(millis(300)))
+  val start2 = monotonic()
+  val served2 = TlsStream.server(accepted2, identity())
+  val took2 = monotonic() - start2
+  println(s"server, no bound: ${said(served2)}, after the trickle: ${within(took2, millis(1000), late)}")
+  println(s"  its limit kept: ${accepted2.timeout == millis(300)}")
+  stop2.store(true)
+  _ = sending2.join()
+  _ = client2.close()
+  _ = accepted2.close()
+  _ = listener.close()
+
+  // The client's end, against a server trickling its answer every 50 ms, and against one that
+  // never answers: cut at about the bound, the connection's limit, none here, put back.
+  for count in [517, 0]
+    val (port, serving, halt) = peer(count, millis(50))
+    val tcp = ok(TcpStream.connect("127.0.0.1", port))
+    val at = monotonic()
+    val made = TlsStream.client(tcp, "localhost", trusting(), bound)
+    val spent = monotonic() - at
+    println(s"client, $count bytes: ${said(made)}, within the bound: ${within(spent, bound, late)}")
+    println(s"  no limit put back: ${tcp.timeout == Duration.Zero}")
+    _ = tcp.close()
+    ended(serving, halt)
+
+  // With no bound, a client whose connection has a limit of 300 ms is cut once the trickle stops.
+  val (port3, serving3, halt3) = peer(21, millis(50))
+  val tcp3 = ok(TcpStream.connect("127.0.0.1", port3))
+  ok(tcp3.setTimeout(millis(300)))
+  val at3 = monotonic()
+  val made3 = TlsStream.client(tcp3, "localhost", trusting())
+  println(s"client, no bound: ${said(made3)}, after the trickle: ${within(monotonic() - at3, millis(1000), late)}")
+  _ = tcp3.close()
+  ended(serving3, halt3)
+
+  // A handshake well inside its bound succeeds; one with a bound of a microsecond never waits.
+  for limit in [time.seconds(10), micros(1)]
+    val (port, serving) = genuine()
+    val tcp = ok(TcpStream.connect("127.0.0.1", port))
+    val made = TlsStream.client(tcp, "localhost", trusting(), limit)
+    val line = made match
+      Ok(s) -> ok(s.readLine()).getOrElse("?")
+      Err(e) -> kind(e)
+    println(s"client, a bound of $limit: $line")
+    _ = tcp.close()
+    _ = serving.join()
+
+  // `TlsStream.connect` bounds the handshake after connecting, its default the same as a bound.
+  val (port4, serving4, halt4) = peer(517, millis(50))
+  val at4 = monotonic()
+  val made4 = TlsStream.connect("localhost", port4, trusting(), bound)
+  println(s"connect, trickled: ${said(made4)}, within the bound: ${within(monotonic() - at4, bound, late)}")
+  ended(serving4, halt4)
+  val (port5, serving5) = genuine()
+  val greeting = TlsStream.connect("localhost", port5, trusting()) match
+    Ok(s) ->
+      val line = ok(s.readLine()).getOrElse("?")
+      _ = s.close()
+      line
+    Err(e) -> kind(e)
+  println(s"connect, by default: $greeting")
+  _ = serving5.join()
+
+  // A lookup that never answers is cut by the bound too: in `TcpStream.connect`, in
+  // `TlsStream.connect`, in an HTTP request's `connectTimeout` and in a WebSocket's `timeout`.
+  resolveHold(true)
+  val at6 = monotonic()
+  val tcp6 = TcpStream.connect("localhost", 1, bound)
+  val lookup = tcp6 match
+    Err(IoError(TimedOut, operation, _)) -> s"timed out, in the $operation"
+    Err(e) -> e.message
+    Ok(_) -> "connected"
+  println(s"tcp connect, lookup held: $lookup, within the bound: ${within(monotonic() - at6, bound, late)}")
+  val at7 = monotonic()
+  println(
+    s"tls connect, lookup held: ${said(TlsStream.connect("localhost", 1, trusting(), bound))}, within the bound: ${within(monotonic() - at7, bound, late)}"
+  )
+  val at8 = monotonic()
+  val request = http.send(Request("GET", "http://localhost:1/").withConnectTimeout(bound))
+  val requested = request match
+    Err(Io(IoError(TimedOut, _, _))) -> "timed out"
+    Err(e) -> e.message
+    Ok(_) -> "answered"
+  println(s"http, lookup held: $requested, within the bound: ${within(monotonic() - at8, bound, late)}")
+  resolveHold(false)
+  // Released, a lookup and connection inside the bound succeed, past an address that refuses.
+  val live = ok(TcpListener.bind("127.0.0.1", 0))
+  val reached = TcpStream.connect("localhost", live.port(), time.seconds(10))
+  println(s"tcp connect, released: ${reached.isOk}")
+  if reached is Ok(c) then _ = c.close()
+  _ = live.close()
+
+  // An HTTP request's `connectTimeout` bounds an `https` URL's handshake.
+  val (port9, serving9, halt9) = peer(517, millis(50))
+  val at9 = monotonic()
+  val secure = http.send(Request("GET", s"https://localhost:$port9/").withTls(trusting()).withConnectTimeout(bound))
+  val answer9 = secure match
+    Err(Io(IoError(TimedOut, _, _))) -> "timed out"
+    Err(e) -> e.message
+    Ok(_) -> "answered"
+  println(s"https, trickled: $answer9, within the bound: ${within(monotonic() - at9, bound, late)}")
+  ended(serving9, halt9)
+
+  // So does a WebSocket's `timeout`, though each wait is far inside it.
+  val (port10, serving10, halt10) = peer(517, millis(50))
+  val at10 = monotonic()
+  val socket = WebSocket.connect(s"wss://localhost:$port10/", tls = trusting(), timeout = bound)
+  val answer10 = socket match
+    Err(Unreachable(Io(IoError(TimedOut, _, _)))) -> "timed out"
+    Err(e) -> e.message
+    Ok(_) -> "opened"
+  println(s"wss, trickled: $answer10, within the bound: ${within(monotonic() - at10, bound, late)}")
+  ended(serving10, halt10)
+
+  // A request's `connectTimeout` is 30 seconds unless asked, and every `with` method keeps it.
+  val d = millis(1234)
+  println(s"default: ${Request("GET", "http://x/").connectTimeout}")
+  val kept = Request("GET", "http://x/")
+    .withConnectTimeout(d)
+    .withHeader("A", "b")
+    .withHeaders(Vector(("C", "d")))
+    .withQueryParam("q", "r")
+    .withBody("text")
+    .withBody(Array.fill(2, byte(1)))
+    .withTimeout(millis(5))
+    .withTls(trusting())
+  println(
+    s"kept: ${kept.connectTimeout}, zero allowed: ${Request("GET", "http://x/").withConnectTimeout(Duration.Zero).connectTimeout}"
+  )

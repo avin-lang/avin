@@ -49,9 +49,18 @@ private ends() -> Ends
     socket_non_blocking(&l).unwrap()
     val to = l.local().unwrap()
     val c = socket(to).unwrap()
-    socket_connect(c, to).unwrap()
+    socket_connect(c, to, 0).unwrap()
     val (s, _) = socket_accept(l).unwrap()
     Ends(l, c, s)
+
+@test("a TCP connection has no peer credentials: either end answers the system's refusal, and a closed one too")
+tcp_has_no_peer_credentials()
+    val e = ends()
+    assert(peer_credentials_of(e.client).is_err())
+    assert(peer_credentials_of(e.served).is_err())
+    var c = e.client
+    c.close().unwrap()
+    assert(peer_credentials_of(e.client).is_err())
 
 @test("a wait with a limit on a socket nothing arrives on answers not ready once the limit has passed")
 fd_wait_times_out()
@@ -78,23 +87,28 @@ send_and_receive()
 receive_answers_what_arrived()
     val e = ends()
     socket_send_all(e.client, "ping".bytes, 0).unwrap()
-    val got = socket_receive(e.served, 65536, 1000).unwrap()
-    assert_eq(got.len, 4usize)
-    assert_eq(got[0], u8('p'))
-    assert_eq(got[3], u8('g'))
+    assert(receives(e.served, 65536, 1000, "ping"))
     socket_send_all(e.client, "abcdef".bytes, 0).unwrap()
-    val first = socket_receive(e.served, 4, 1000).unwrap()
-    assert_eq(first.len, 4usize)
-    assert_eq(first[3], u8('d'))
-    val rest = socket_receive(e.served, 65536, 1000).unwrap()
-    assert_eq(rest.len, 2usize)
-    assert_eq(rest[1], u8('f'))
+    assert(receives(e.served, 4, 1000, "abcd"))
+    assert(receives(e.served, 65536, 1000, "ef"))
     socket_receive(e.served, 1, 20) match
         Ok(_) -> panic("nothing was sent")
         Err(err) -> assert(timed_out(err))
     var c = e.client
     c.close().unwrap()
-    assert_eq(socket_receive(e.served, 65536, 1000).unwrap().len, 0usize)
+    assert(receives(e.served, 65536, 1000, ""))
+
+// Whether a receive of at most `max` bytes on `s`, waiting at most `limit_ms`, answers exactly the
+// bytes of `want`. The bytes received are a share of the carrier's buffer, ended here before the
+// caller's next wait, which may resume it on another carrier.
+private receives(s: Socket, max: int, limit_ms: int, want: string) -> bool
+    val got = socket_receive(s, max, limit_ms).unwrap()
+    got.len == want.bytes.len && same_bytes(got, want.bytes)
+
+private same_bytes(a: []const u8, b: []const u8) -> bool
+    for i in 0..<a.len
+        if a[i] != b[i] then return false
+    true
 
 // What a second thread sees of a carrier while the carrier's thread waits in a receive: how many
 // shares its receiving buffer has, and then the bytes that end the wait, sent on `client`.
@@ -127,20 +141,16 @@ receive_waits_sharing_nothing()
     watch.client = Some(e.client)
     watch.shares.store(0)
     val t = spawn(&watch_receive, &watch).unwrap()
-    val got = socket_receive(e.served, 65536, 10000).unwrap()
+    assert(receives(e.served, 65536, 10000, "late"))
     assert(t.join())
     watch.client = None
-    assert_eq(got.len, 4usize)
-    assert_eq(got[3], u8('e'))
     assert_eq(watch.shares.load(), 1u64)
     assert_eq(receiving_shares(me.carrier), 1u64)
     // A smaller receive takes the same buffer rather than a new one.
     val before: **u8 = ptr_cast(&me.carrier.receiving)
     val storage = before[0]
     socket_send_all(e.client, "again".bytes, 0).unwrap()
-    val small = socket_receive(e.served, 16, 1000).unwrap()
-    assert_eq(small.len, 5usize)
-    assert_eq(small[4], u8('n'))
+    assert(receives(e.served, 16, 1000, "again"))
     assert(before[0] == storage)
     assert_eq(receiving_shares(me.carrier), 1u64)
     // A receive whose wait times out leaves no share behind either.
@@ -165,7 +175,7 @@ connect_refused()
     l.bind(at).unwrap()
     val to = l.local().unwrap()
     l.close().unwrap()
-    socket_connect(socket(to).unwrap(), to) match
+    socket_connect(socket(to).unwrap(), to, 0) match
         Ok(_) -> panic("nobody listens")
         Err(err) -> assert(net_failure(err) is Refused)
 

@@ -1,0 +1,76 @@
+// Statements and connections nothing holds are finalized and closed by the collector: none is
+// leaked, a statement collected while its connection is in a call on another thread is finalized at
+// that connection's next call, and rows read under collections at every allocation keep every value.
+import avin.sqlite
+import avin.sqlite.{Connection, OpenOptions, SqliteError}
+import avin.fs
+import avin.threads.{spawn, sleep}
+import avin.time.millis
+
+private ok[T](r: Result[T, SqliteError]) -> T = r match
+  Ok(v) -> v
+  Err(e) -> fail(e.message)
+
+// Prepares a statement and drops it without closing it.
+private forget(db: Connection, i: int)
+  val s = ok(db.prepare(s"select $i, 'x' || $i"))
+  _ = ok(s.queryOne())
+
+main()
+  val db = ok(sqlite.open(":memory:", OpenOptions(statementCacheSize = 0)))
+  for i in 0 ..< 200
+    forget(db, i)
+  // Garbage, so the collector runs whatever the program's own allocations were.
+  var junk: Vector[string] = []
+  for i in 0 ..< 2000
+    junk = junk :+ s"$i"
+  println(s"statements left: ${if db.openStatements <= 2 then "few" else s"${db.openStatements}"}")
+  // Rows with every storage class, read under collections.
+  ok(db.execute("create table t (i int, r real, s text, b blob, n)"))
+  for i in 0 ..< 300
+    ok(
+      db.execute(
+        "insert into t values (?, ?, ?, ?, null)",
+        i,
+        real(i) / 2.0,
+        s"text $i ✓",
+        Vector.tabulate(i % 17, k -> byte(k))
+      )
+    )
+  var checked = 0
+  for row in ok(db.query("select i, r, s, b, n from t order by i"))
+    val i = ok(row.get[long]("i"))
+    if ok(row.get[real](1)) == real(i) / 2.0 && ok(row.get[string](2)) == s"text $i ✓" && ok(
+      row.get[Vector[byte]](3)
+    ).length == int(i % 17) && ok(row.get[Option[long]](4)) == None
+      checked += 1
+  println(s"rows checked: $checked")
+  // A statement collected while its connection waits on a lock in another thread.
+  val dir = fs.tempDir("avin-sqlite-gc").ok.get
+  val path = dir.path + "/gc.db"
+  val holder = ok(sqlite.open(path))
+  ok(holder.execute("create table w (v int)"))
+  ok(holder.execute("begin immediate"))
+  val waiter = spawn(() ->
+    val c = ok(sqlite.open(path, OpenOptions(busyTimeout = millis(300), statementCacheSize = 0)))
+    for i in 0 ..< 20
+      forget(c, i)
+    val r = c.execute("insert into w values (1)").isErr
+    for i in 0 ..< 20
+      forget(c, i)
+    val left = c.openStatements
+    c.close()
+    (r, left < 40)
+  )
+  sleep(millis(50))
+  var more: Vector[string] = []
+  for i in 0 ..< 2000
+    more = more :+ s"$i"
+  println(s"waiter: ${waiter.join()}")
+  ok(holder.execute("rollback"))
+  holder.close()
+  // Connections never closed are closed by the collector, so the file can be removed after.
+  for i in 0 ..< 20
+    _ = ok(sqlite.open(path)).queryValue[long]("select count(*) from w")
+  db.close()
+  println(dir.close())

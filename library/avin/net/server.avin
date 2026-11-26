@@ -1,6 +1,6 @@
 module avin.net
 
-// A server: a listener that accepts TCP connections and serves each one in an actor of its own, so a
+// A server: a listener that accepts TCP or Unix connections and serves each one in an actor of its own, so a
 // connection that waits holds no operating system thread and a trap in the code serving one ends
 // that connection alone. It holds at most a given number of connections at once, the next waiting to
 // be accepted until one ends, and it shuts down gracefully: it stops accepting, and every connection
@@ -9,6 +9,7 @@ module avin.net
 // serving it waits through `idle`.
 
 import avin.actors.{Stop, spawn as startActor}
+import avin.io
 import avin.io.IoError
 import avin.threads.{Channel, Executor, Mutex, Promise, scope, sleep, spawn}
 import avin.time.{Duration, millis}
@@ -152,35 +153,70 @@ object TcpServer
   // unaccepted until one ends. Each connection's timeout is `timeout` when `serve` begins (none
   // for zero). Where `serve` traps, the trap is reported and fails that connection's actor alone:
   // `failed` runs on the connection, then it is closed, and the server goes on. A
-  // `maxConnections` less than one traps.
+  // `maxConnections` less than one traps. The listener is bound with `listen`, so its `connections`
+  // options are every connection's before `serve` begins.
   start(
       host: string,
       port: int,
       serve: @sendable (TcpStream, TcpServer) -> unit,
       maxConnections: int = 1024,
       timeout: Duration = Duration.Zero,
-      failed: @sendable (TcpStream) -> unit = _ -> ()
+      failed: @sendable (TcpStream) -> unit = _ -> (),
+      listen: ListenOptions = ListenOptions()
   ) -> Result[TcpServer, IoError]
     if maxConnections < 1 then fail(s"a server of at most $maxConnections connections: it holds at least one")
-    val listener = TcpListener.bind(host, port)?
-    val gate = Gate(maxConnections)
-    val server = TcpServer(gate, listener.port())
-    // The connections' actors run on workers of the server's own, one for each connection held,
-    // so a connection parked on its socket never keeps another waiting for a worker.
-    val workers = Executor.fixed(maxConnections)
-    spawn(() -> acceptAll(listener, server, gate, serve, failed, timeout, workers))
-    Ok(server)
+    val listener = TcpListener.bind(host, port, listen)?
+    Ok(running(listener, listener.port(), serve, maxConnections, timeout, failed))
+
+  // Listens at the Unix socket `path`, as `UnixListener.bind` does with `backlog`, or as
+  // `bindReplacing` does where `replacing` is true, and serves each connection as `start` does. Its
+  // `port()` is zero. The socket file stays once the server has stopped, as a listener's does.
+  startUnix(
+      path: string,
+      serve: @sendable (UnixStream, TcpServer) -> unit,
+      maxConnections: int = 1024,
+      timeout: Duration = Duration.Zero,
+      failed: @sendable (UnixStream) -> unit = _ -> (),
+      backlog: int = 128,
+      replacing: bool = false
+  ) -> Result[TcpServer, IoError]
+    if maxConnections < 1 then fail(s"a server of at most $maxConnections connections: it holds at least one")
+    val listener = if replacing then UnixListener.bindReplacing(path, backlog)? else UnixListener.bind(path, backlog)?
+    Ok(running(listener, 0, serve, maxConnections, timeout, failed))
+
+// The server accepting from `listener`, which it listens on from now on.
+private running[S: ByteStream, L: Listener[S]](
+    listener: L,
+    port: int,
+    serve: @sendable (S, TcpServer) -> unit,
+    maxConnections: int,
+    timeout: Duration,
+    failed: @sendable (S) -> unit
+) -> TcpServer
+  val gate = Gate(maxConnections)
+  val server = TcpServer(gate, port)
+  // The connections' actors run on workers of the server's own, one for each connection held,
+  // so a connection parked on its socket never keeps another waiting for a worker.
+  val workers = Executor.fixed(maxConnections)
+  spawn(() -> acceptAll(listener, server, gate, serve, failed, timeout, workers))
+  server
+
+// What a server accepts connections from: a `TcpListener`, whose connections are `TcpStream`s, or
+// a `UnixListener`, whose are `UnixStream`s. A listener is sendable, and closing it stops it.
+trait Listener[S: ByteStream]: Sendable, io.Close
+  // Waits for the next connection.
+  accept() -> Result[S, IoError]
 
 // The acceptor's life: admit, accept and hand each connection to an actor of its own until the server
 // stops, then close the listener. Each `accept` waits through `untilStopped`, so stopping cancels it
 // where it is parked; what follows an accept runs on the acceptor's own thread, which nothing cancels,
 // so every connection counted is handed to its actor.
-private acceptAll(
-    listener: TcpListener,
+private acceptAll[S: ByteStream, L: Listener[S]](
+    listener: L,
     server: TcpServer,
     gate: Gate,
-    serve: @sendable (TcpStream, TcpServer) -> unit,
-    failed: @sendable (TcpStream) -> unit,
+    serve: @sendable (S, TcpServer) -> unit,
+    failed: @sendable (S) -> unit,
     timeout: Duration,
     workers: Executor
 )
@@ -210,11 +246,11 @@ private acceptAll(
 // One connection, served by the server's code in the actor's first turn, after which the actor ends.
 // The connection is closed when the actor ends, and where the code serving it trapped, `failed` runs
 // on it first.
-private actor Connection(
-    stream: TcpStream,
+private actor Connection[S: ByteStream](
+    stream: S,
     server: TcpServer,
-    serve: @sendable (TcpStream, TcpServer) -> unit,
-    failed: @sendable (TcpStream) -> unit
+    serve: @sendable (S, TcpServer) -> unit,
+    failed: @sendable (S) -> unit
 ) receives unit
   var served = false
   // Given before the connection is served, since a `stopping` block is given only once the body

@@ -4,6 +4,7 @@ import sh.sysl.gc
 import sysl.env
 import sysl.fiber
 import sysl.raw.ptr_cast
+import sysl.slices.copy
 import sysl.sync.*
 import sysl.threads.{Condvar, Mutex, SleepLock}
 import sysl.time.monotonic
@@ -105,6 +106,9 @@ struct Context
     request: *u8
     /** How many bytes of objects the thread has allocated, headers not counted. */
     allocated: usize
+    /** The reason of the trap the thread is in, an Avin string, or null while it is in none; a root of
+     * every collection, since the frames of the code that trapped are dropped (`recovery.sysl`). */
+    trap_reason: *u8
 
 @assert(offsetof(Context, caller) == 24, "the compiler writes a context's caller site at 24")
 @assert(offsetof(Context, owner) == OwnerOffset, "the compiler reads a context's owner at 32")
@@ -116,7 +120,7 @@ const Running: u32 = 0
 const Safe: u32 = 1
 
 /** A context no thread is running yet: safe, with an empty stack, and an owner of its own. */
-new_context() -> Context = Context(null, null, Atomic(Safe), null, fresh_owner(), null, null, 0, null, new_waiter(), null, 0, Atomic(0), Atomic(0), null, 0, 0, null, 0)
+new_context() -> Context = Context(null, null, Atomic(Safe), null, fresh_owner(), null, null, 0, null, new_waiter(), null, 0, Atomic(0), Atomic(0), null, 0, 0, null, 0, null)
 
 /** One operating system thread's state: the chunk of the heap that the contexts running on the thread
  * allocate from with no lock, and, on a worker of the scheduler, what the scheduler keeps about the
@@ -354,6 +358,7 @@ private roots(h: *gc.Heap)
         mark_frames(h, c.top)
         mark_defers(h, c)
         if c.request != null then gc.mark(h, c.request)
+        if c.trap_reason != null then gc.mark(h, c.trap_reason)
         c = c.next
 
 /** The frames of module-level values, linked through `prev`: each program's references that live
@@ -641,6 +646,42 @@ collect(c: *Context)
     collect_stopped(c)
     heap_lock.unlock()
 
+/** How many mappings of files, and how many of their bytes, may be made between two collections
+ * before a mapping collects. A mapping costs the heap one small object but holds address space and
+ * one of the system's map entries until its finalizer unmaps it, which only a collection runs, so a
+ * program that maps in a loop and drops what it maps must collect for the mappings' sake as well as
+ * for the heap's. A thousand stays far inside the 65530 map entries Linux allows a process by
+ * default, and a tebibyte far inside the 128 TiB of a process's address space. */
+private const MappingsPerCollection: usize = 1024
+private const MappedBytesPerCollection: u64 = 1099511627776
+
+/** The mappings made since the collection numbered `mapped_epoch`, and their bytes. */
+private var mapped_count: usize = 0
+private var mapped_bytes: u64 = 0
+private var mapped_epoch: usize = 0
+
+/** Counts one mapping of `bytes` bytes just made by the calling thread, and collects, so that
+ * dropped mappings are unmapped, once the mappings made since the last collection reach either
+ * limit. Called by `avin.fs` after each mapping, outside any call that waits. */
+charge_mapping(bytes: long)
+    val c = current_context
+
+    if c == null then return
+
+    lock_heap(c)
+
+    if mapped_epoch != collections
+        mapped_epoch = collections
+        mapped_count = 0
+        mapped_bytes = 0
+
+    mapped_count += 1
+    mapped_bytes += u64(bytes)
+
+    if mapped_count >= MappingsPerCollection || mapped_bytes >= MappedBytesPerCollection then collect_stopped(c)
+
+    heap_lock.unlock()
+
 /** The main thread's context, attached and running, for the program's entry function, which passes on
  * the `argc` arguments at `argv` the platform handed it. */
 @export("avin_rt_start")
@@ -672,6 +713,23 @@ allocate_sized(ctx: *Context, d: *Descriptor, size: usize) -> *u8
         val p = gc.chunk_alloc(&ctx.carrier.chunk, size, &d.kind)
         if p != null then return p
     allocate_locked(ctx, d, size)
+
+/** The delayed argument `p` where something that may outlive the call it was passed to is about to
+ * hold it: `p` itself where it is on the heap or a constant, which holds nothing, and otherwise, a
+ * closure compiled code made in its own frame, a copy of it on the heap. A closure in a frame never
+ * holds another one in a frame (compiled code keeps each it captures here first), so the copy holds
+ * only what lives on its own. The frame that made `p` keeps every reference `p` holds alive while
+ * this allocates. */
+@export("avin_rt_keep_delayed")
+keep_delayed(ctx: *Context, p: *u8) -> *u8
+    val at = usize(p)
+    val start = usize(&block[0])
+    if start <= at && at < start + block.len then return p
+    val d = descriptor_of(p)
+    if d.size == 0 then return p
+    val q = allocate(ctx, d)
+    copy(q[0..<d.size], p[0..<d.size])
+    published(q)
 
 /** How many bytes of objects the calling thread has allocated since it began, headers not counted:
  * the difference across a stretch of code is what that code allocated, which tests of the library's

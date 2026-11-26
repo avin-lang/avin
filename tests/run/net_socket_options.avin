@@ -1,0 +1,126 @@
+// expect: exit 0
+// The options of a TCP connection and listener, each read back from the system: a new connection
+// sends small writes late and is not probed; `setNoDelay`, `setKeepAlive`, the buffer sizes and
+// `configure` change it, keep-alive times kept in whole seconds with a part of one counting as one;
+// `connect`'s options hold from before it connects, and a listener's `connections` on every
+// connection it accepts. A closed or split connection answers every option with an error.
+import avin.io.IoError
+import avin.net.{KeepAlive, ListenOptions, TcpListener, TcpOptions, TcpStream}
+import avin.threads.spawn
+import avin.time.{micros, millis, seconds}
+
+ok[T](r: Result[T, IoError]) -> T = r match
+  Ok(v) -> v
+  Err(e) -> fail(e.message)
+
+shown(k: Option[KeepAlive]) -> string = k match
+  None -> "none"
+  Some(a) -> s"${a.idle.micros / 1000000} s, every ${a.interval.micros / 1000000} s, ${a.count} probes"
+
+// A connection to `l` and the one it accepted.
+pair(l: TcpListener, options: TcpOptions = TcpOptions()) -> (TcpStream, TcpStream)
+  val port = l.port()
+  val accepting = spawn(() -> ok(l.accept()))
+  val c = ok(TcpStream.connect("127.0.0.1", port, options = options))
+  (c, accepting.join())
+
+main()
+  val l = ok(TcpListener.bind("127.0.0.1", 0))
+  val (c, s) = pair(l)
+  println("new: no delay", ok(c.noDelay()), "keep-alive", shown(ok(c.keepAlive())))
+  println("accepted: no delay", ok(s.noDelay()), "keep-alive", shown(ok(s.keepAlive())))
+  println("buffers given", ok(c.sendBuffer()) > 0, ok(c.receiveBuffer()) > 0)
+
+  ok(c.setNoDelay(true))
+  println("no delay on", ok(c.noDelay()))
+  ok(c.setNoDelay(true))
+  println("on twice", ok(c.noDelay()))
+  ok(c.setNoDelay(false))
+  println("off again", ok(c.noDelay()))
+
+  ok(c.setKeepAlive(Some(KeepAlive())))
+  println("default keep-alive:", shown(ok(c.keepAlive())))
+  ok(c.setKeepAlive(Some(KeepAlive(millis(1500), micros(1), 1))))
+  println("rounded up:", shown(ok(c.keepAlive())))
+  ok(c.setKeepAlive(Some(KeepAlive(seconds(1), seconds(1), 1))))
+  println("least:", shown(ok(c.keepAlive())))
+  ok(c.setKeepAlive(Some(KeepAlive(seconds(7200), seconds(75), 9))))
+  println("long:", shown(ok(c.keepAlive())))
+  ok(c.setKeepAlive(None))
+  println("off:", shown(ok(c.keepAlive())))
+
+  ok(c.setSendBuffer(32768))
+  ok(c.setReceiveBuffer(32768))
+  println("buffers at least asked", ok(c.sendBuffer()) >= 32768, ok(c.receiveBuffer()) >= 32768)
+  ok(c.setSendBuffer(1))
+  ok(c.setReceiveBuffer(1))
+  println("one byte asked still buffers", ok(c.sendBuffer()) > 0, ok(c.receiveBuffer()) > 0)
+
+  ok(c.configure(TcpOptions(noDelay = true, keepAlive = Some(KeepAlive(seconds(30), seconds(5), 3)))))
+  println("configured: no delay", ok(c.noDelay()), "keep-alive", shown(ok(c.keepAlive())))
+  ok(c.configure(TcpOptions()))
+  println("plain again: no delay", ok(c.noDelay()), "keep-alive", shown(ok(c.keepAlive())))
+
+  // The connection still carries bytes both ways with its options changed.
+  ok(c.writeText("ping\n"))
+  println("arrived", ok(s.readLine()))
+  ok(s.writeText("pong\n"))
+  println("answered", ok(c.readLine()))
+
+  println("local address", ok(c.localAddress()), "port given", ok(c.localPort()) > 0)
+  println("accepted on the listener's port", ok(s.localPort()) == l.port(), ok(s.localAddress()))
+
+  // `connect`'s options are the connection's from the start.
+  val asked = TcpOptions(true, Some(KeepAlive(seconds(45), seconds(15), 4)), 65536, 65536)
+  val (d, t) = pair(l, asked)
+  println("connected with: no delay", ok(d.noDelay()), "keep-alive", shown(ok(d.keepAlive())))
+  println("buffers", ok(d.sendBuffer()) >= 65536, ok(d.receiveBuffer()) >= 65536)
+  println("its other end keeps its own: no delay", ok(t.noDelay()), "keep-alive", shown(ok(t.keepAlive())))
+
+  // Closed: every option is an error, and so is the local address.
+  ok(d.close())
+  println("closed", d.noDelay().isErr, d.setNoDelay(true).isErr, d.keepAlive().isErr)
+  println(d.setKeepAlive(None).isErr, d.sendBuffer().isErr, d.setSendBuffer(10).isErr)
+  println(d.receiveBuffer().isErr, d.setReceiveBuffer(10).isErr, d.configure(TcpOptions()).isErr)
+  println(d.localAddress().isErr, d.localPort().isErr)
+  d.noDelay() match
+    Err(e) -> println(e.operation, e.message.endsWith(": the connection is closed"))
+    Ok(_) -> ()
+
+  // Split: the halves have the connection, so the whole answers errors.
+  val (reader, writer) = t.split()
+  println("split", t.noDelay().isErr, t.configure(TcpOptions()).isErr, t.localPort().isErr)
+  _ = reader.close()
+  _ = writer.close()
+
+  // A listener's `connections` options are every accepted connection's; buffer sizes are set on the
+  // listener too, so a connection has them from its first byte.
+  val held = TcpOptions(noDelay = true, keepAlive = Some(KeepAlive(seconds(20), seconds(2), 5)), receiveBuffer = 65536)
+  val m = ok(TcpListener.bind("127.0.0.1", 0, ListenOptions(connections = held)))
+  println(
+    "listener options",
+    m.options.backlog,
+    m.options.reuseAddress,
+    m.options.reusePort,
+    m.options.connections == held
+  )
+  println("shares its port", ok(m.reusePort()))
+  for i in 1 ..< 4
+    val (e, u) = pair(m)
+    println(
+      s"accepted $i: no delay",
+      ok(u.noDelay()),
+      "keep-alive",
+      shown(ok(u.keepAlive())),
+      ok(u.receiveBuffer()) >= 65536
+    )
+    println(s"connected $i: no delay", ok(e.noDelay()))
+    ok(e.close())
+    ok(u.close())
+  ok(m.close())
+  println("closed listener", m.reusePort().isErr)
+  println("its options stay", m.options.backlog)
+
+  ok(c.close())
+  ok(s.close())
+  ok(l.close())

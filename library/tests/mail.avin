@@ -1,0 +1,406 @@
+// `avin.net.mail`: a message's headers (dates, mailboxes, names plain, quoted and encoded, folding,
+// subjects in RFC 2047 encoded-words, a caller's headers), its bodies (7bit or quoted-printable, line
+// breaks made CR LF), attachments with RFC 2231 filenames, the multipart structure, every refusal of
+// a line break that would begin another header, and `decodeHeaderValue` reading back what was
+// written. Whole messages are compared in tests/run/mail_render.avin.
+import avin.encoding.fromBase64
+import avin.net.mail.{Attachment, BadAddress, BadHeader, LineBreak, MailError, Mailbox, Message}
+import avin.net.mail.{checkedAddress, decodeHeaderValue, mailDate}
+import avin.time.epochSeconds
+
+// A message with a fixed date, ID and boundary, so its rendering is the same at every run.
+mailFixed(m: Message) -> Message = Message(
+  m.from,
+  m.to,
+  m.cc,
+  m.bcc,
+  m.replyTo,
+  m.subject,
+  m.text,
+  m.html,
+  m.attachments,
+  m.headers,
+  Some(epochSeconds(0)),
+  Some(m.messageId.getOrElse("id@example.com")),
+  Some(m.boundary.getOrElse("b"))
+)
+
+// Whether rendering `m` fails with a `BadHeader`.
+mailBadHeader(m: Message) -> bool = m.render() match
+  Err(BadHeader(_, _)) -> true
+  _ -> false
+
+// The message from Ada to Bob, with whatever `subject` and `text`.
+mailTo(subject: string, text: string) -> Message =
+  mailFixed(
+    Message(Mailbox("ada@example.com"), to = [Mailbox("bob@example.com")], subject = subject, text = Some(text))
+  )
+
+// `m` rendered, its lines checked: each ends in CR LF and is at most 998 characters.
+mailRendered(m: Message) -> string
+  m.render() match
+    Ok(text) ->
+      for line in text.split("\r\n")
+        assert(!line.contains("\r") && !line.contains("\n"), s"a lone line break in `$line`")
+        assert(line.byteLength <= 998, s"a line of ${line.byteLength}")
+      text
+    Err(e) -> fail(s"unexpected error: ${e.message}")
+
+// The header `name` of a rendering, as written (its folding kept), or "" where there is none.
+mailHeader(text: string, name: string) -> string = headerIn(text.split("\r\n\r\n")(0), name)
+
+// The header `name` of a rendering's last part, as written, or "" where there is none.
+mailLastHeader(text: string, name: string) -> string = headerIn(text, name)
+
+// The last header `name` among `text`'s lines.
+headerIn(text: string, name: string) -> string
+  val lines = text.split("\r\n")
+  var found = ""
+  var inside = false
+  for line in lines
+    if line.startsWith(name + ": ")
+      found = line.slice(name.byteLength + 2, line.byteLength)
+      inside = true
+    elif inside && (line.startsWith(" ") || line.startsWith("\t")) then found += "\r\n" + line
+    else inside = false
+  found
+
+// The error rendering `m` answers, or a failure where it renders.
+mailError(m: Message) -> MailError = m.render() match
+  Ok(_) -> fail("rendered where an error was due")
+  Err(e) -> e
+
+@test("mailDate writes RFC 5322's date in UTC with a +0000 zone")
+mailDates()
+  assertEq(mailDate(epochSeconds(0)), "Thu, 01 Jan 1970 00:00:00 +0000")
+  assertEq(mailDate(epochSeconds(784111777)), "Sun, 06 Nov 1994 08:49:37 +0000")
+  assertEq(mailDate(epochSeconds(253402300799)), "Fri, 31 Dec 9999 23:59:59 +0000")
+
+@test("a mailbox is its address alone, or a name of atoms, a quoted string or encoded-words and the address")
+mailMailboxes()
+  val shown = (name: string) -> mailHeader(
+    mailRendered(mailFixed(Message(Mailbox("ada@example.com", name), to = [Mailbox("b@example.com")]))),
+    "From"
+  )
+  assertEq(shown(""), "ada@example.com")
+  assertEq(shown("Ada"), "Ada <ada@example.com>")
+  assertEq(shown("Ada Lovelace"), "Ada Lovelace <ada@example.com>")
+  assertEq(shown("Lovelace, Ada"), "\"Lovelace, Ada\" <ada@example.com>")
+  assertEq(shown("Ada \"the Countess\" L."), "\"Ada \\\"the Countess\\\" L.\" <ada@example.com>")
+  assertEq(shown("back\\slash"), "\"back\\\\slash\" <ada@example.com>")
+  assertEq(shown(" padded"), "\" padded\" <ada@example.com>")
+  assertEq(shown("two  spaces"), "\"two  spaces\" <ada@example.com>")
+  assertEq(shown("Éloise"), "=?UTF-8?B?w4lsb2lzZQ==?= <ada@example.com>")
+  assertEq(decodeHeaderValue(shown("Éloise")), "Éloise <ada@example.com>")
+  assertEq(shown("=?x?="), "=?UTF-8?B?PT94Pz0=?= <ada@example.com>")
+  assertEq(decodeHeaderValue(shown("Ада Лавлейс \u{1f600}")), "Ада Лавлейс \u{1f600} <ada@example.com>")
+
+@test("To and Cc list every mailbox with commas, folded under 78; Bcc is never written but is a recipient")
+mailRecipients()
+  val many = (0 ..< 12).map(i -> Mailbox(s"person$i@example.com", s"Person $i")).toVector
+  val m = mailFixed(
+    Message(
+      Mailbox("ada@example.com"),
+      to = many,
+      cc = [Mailbox("c@example.com")],
+      bcc = [Mailbox("hidden@example.com"), Mailbox("person0@example.com")]
+    )
+  )
+  val text = mailRendered(m)
+  val to = mailHeader(text, "To")
+  for line in to.split("\r\n") do assert(line.byteLength <= 78)
+  assert(to.contains("\r\n "))
+  assertEq(to.replace("\r\n ", " "), many.map(b -> s"${b.name} <${b.address}>").mkString(", "))
+  assertEq(mailHeader(text, "Cc"), "c@example.com")
+  assert(!text.contains("hidden"))
+  assert(!text.contains("Bcc"))
+  assertEq(m.recipients.size, 14)
+  assertEq(m.recipients(12), "c@example.com")
+  assertEq(m.recipients(13), "hidden@example.com")
+  assertEq(Message(Mailbox("a@x.example")).recipients, Vector.empty[string]())
+  assertEq(mailHeader(mailRendered(mailFixed(Message(Mailbox("a@x.example")))), "To"), "")
+
+@test("a plain ASCII subject is itself, folded at spaces; any other is encoded-words of whole characters")
+mailSubjects()
+  assertEq(mailHeader(mailRendered(mailTo("Hello there", "")), "Subject"), "Hello there")
+  assertEq(mailHeader(mailRendered(mailTo("", "")), "Subject"), "")
+  val words = (0 ..< 40).map(i -> s"word$i").mkString(" ")
+  val longSubject = mailHeader(mailRendered(mailTo(words, "")), "Subject")
+  assert(longSubject.contains("\r\n "))
+  assertEq(longSubject.replace("\r\n ", " "), words)
+  assertEq(decodeHeaderValue(longSubject), words)
+  assertEq(mailHeader(mailRendered(mailTo("Grüße", "")), "Subject"), "=?UTF-8?B?R3LDvMOfZQ==?=")
+  for subject in [
+    "Grüße aus Köln",
+    "日本語のメール",
+    "\u{1f600}".repeat(30),
+    "é".repeat(100),
+    "mixed é and \u{1f680} text ".repeat(8)
+  ]
+    val written = mailHeader(mailRendered(mailTo(subject, "")), "Subject")
+    for line in written.split("\r\n")
+      assert(line.byteLength <= 78)
+      for word in line.trim.split(' ')
+        assert(word.byteLength <= 75)
+        assert(word.startsWith("=?UTF-8?B?") && word.endsWith("?="))
+        // Each word holds whole characters: its bytes are UTF-8 on their own.
+        val inner = word.slice(10, word.byteLength - 2)
+        assert(string.fromUtf8(fromBase64(inner).getOrElse(Vector.empty[byte]()).toArray()).isOk)
+    assertEq(decodeHeaderValue(written), subject)
+  // Text a reader would take for an encoded-word is encoded itself.
+  val lookalike = mailHeader(mailRendered(mailTo("=?UTF-8?B?QQ==?=", "")), "Subject")
+  assertEq(decodeHeaderValue(lookalike), "=?UTF-8?B?QQ==?=")
+  // A control character is not plain text.
+  assertEq(decodeHeaderValue(mailHeader(mailRendered(mailTo("bell\u{7}", "")), "Subject")), "bell\u{7}")
+  assertEq(mailHeader(mailRendered(mailTo("tab\there", "")), "Subject"), "tab\there")
+
+@test("a CR or LF in anything that goes into a header is an Err, never written")
+mailInjection()
+  val from = Mailbox("ada@example.com")
+  val to = [Mailbox("bob@example.com")]
+  for evil in ["Hi\r\nBcc: evil@example.com", "Hi\nBcc: x@example.com", "Hi\r", "\r\n", "x\n"]
+    assertEq(mailError(mailTo(evil, "")), LineBreak("Subject"))
+    assertEq(mailError(mailFixed(Message(Mailbox("ada@example.com", evil), to = to))), LineBreak("From"))
+    assertEq(mailError(mailFixed(Message(from, to = [Mailbox("bob@example.com", evil)]))), LineBreak("To"))
+    assertEq(mailError(mailFixed(Message(from, cc = [Mailbox("bob@example.com", evil)]))), LineBreak("Cc"))
+    assertEq(mailError(mailFixed(Message(from, bcc = [Mailbox("bob@example.com", evil)]))), LineBreak("Bcc"))
+    assertEq(mailError(mailFixed(Message(from, replyTo = [Mailbox("bob@example.com", evil)]))), LineBreak("Reply-To"))
+    assertEq(mailError(mailFixed(Message(Mailbox("ada@example.com" + evil)))), LineBreak("From"))
+    assertEq(mailError(mailFixed(Message(from, to = [Mailbox(evil + "bob@example.com")]))), LineBreak("To"))
+    assertEq(mailError(mailFixed(Message(from, headers = [("X-Note", evil)]))), LineBreak("X-Note"))
+    assertEq(mailError(mailFixed(Message(from, headers = [("X-" + evil, "v")]))), LineBreak("header name"))
+    assertEq(mailError(mailFixed(Message(from, messageId = Some("a" + evil + "@x")))), LineBreak("Message-ID"))
+    val file = (name: string, type: string, id: string) -> mailFixed(
+      Message(from, attachments = [Attachment(name, type, Vector[byte](byte(1)), contentId = id)])
+    )
+    assertEq(mailError(file("a" + evil + ".txt", "text/plain", "")), LineBreak("Content-Type"))
+    assertEq(mailError(file("a.txt", "text/plain" + evil, "")), LineBreak("Content-Type"))
+    assertEq(mailError(file("a.txt", "text/plain; charset=x" + evil, "")), LineBreak("Content-Type"))
+    assertEq(mailError(file("a.txt", "text/plain", "id" + evil)), LineBreak("Content-ID"))
+
+@test("an address must be local-part@domain within its lengths and without spaces, brackets or controls")
+mailAddresses()
+  for good in ["a@b", "first.last+tag@example.com", "o'brien@example.com", "x@sub.example.co.uk", "a@b@c.example"]
+    assertEq(checkedAddress("To", good), Ok(good))
+  assertEq(checkedAddress("To", "ü@exämple.com"), Ok("ü@exämple.com"))
+  assertEq(checkedAddress("To", "a@[192.0.2.1]"), Ok("a@[192.0.2.1]"))
+  for bad in [
+    "",
+    "noat",
+    "@example.com",
+    "a@",
+    "a b@example.com",
+    "<a@example.com>",
+    "a@b,c@d",
+    "a@b;",
+    "a\u{7}@b",
+    "a(b)@c",
+    "a\\b@c"
+  ]
+    assert(checkedAddress("To", bad).isErr, s"accepted `$bad`")
+  assertEq(checkedAddress("To", "x".repeat(64) + "@example.com").isOk, true)
+  assertEq(
+    checkedAddress("To", "x".repeat(65) + "@example.com"),
+    Err(BadAddress("To", "x".repeat(65) + "@example.com", "has a local part longer than 64 bytes"))
+  )
+  val longest = "x@" + "d".repeat(252)
+  assertEq(checkedAddress("To", longest).isOk, true)
+  assertEq(checkedAddress("To", longest + "d").isErr, true)
+  assertEq(
+    mailError(mailFixed(Message(Mailbox("ada@example.com"), to = [Mailbox("nobody")]))),
+    BadAddress("To", "nobody", "is not local-part@domain")
+  )
+
+@test("a caller's headers follow the message's own, encoded where needed; its own names and bad names are refused")
+mailExtraHeaders()
+  val from = Mailbox("ada@example.com")
+  val text = mailRendered(
+    mailFixed(Message(from, headers = [("X-Mailer", "avin"), ("X-Name", "Grüße"), ("List-Id", "")]))
+  )
+  assertEq(mailHeader(text, "X-Mailer"), "avin")
+  assertEq(decodeHeaderValue(mailHeader(text, "X-Name")), "Grüße")
+  assert(text.contains("\r\nList-Id:\r\n"), "an empty value is written with no space after the colon")
+  assert(text.indexOf("X-Mailer") > text.indexOf("MIME-Version"))
+  for own in [
+    "Date",
+    "from",
+    "REPLY-TO",
+    "To",
+    "Cc",
+    "Bcc",
+    "Subject",
+    "Message-ID",
+    "MIME-Version",
+    "Content-Type",
+    "content-transfer-encoding",
+    "Content-Disposition",
+    "Content-ID"
+  ]
+    assertEq(
+      mailError(mailFixed(Message(from, headers = [(own, "x")]))),
+      BadHeader(own, "is written by the message itself")
+    )
+  for bad in ["X:Y", "X Y", "Ü", "X\u{7f}"]
+    assertEq(
+      mailError(mailFixed(Message(from, headers = [(bad, "x")]))),
+      BadHeader(bad, "has a name that is not a field name")
+    )
+  assertEq(mailError(mailFixed(Message(from, headers = [("", "x")]))), BadHeader("(empty)", "has no name"))
+  assertEq(
+    mailError(mailFixed(Message(from, headers = [("X-Long", "y".repeat(1000))]))),
+    BadHeader("X-Long", "has a word too long for a line of 998 characters")
+  )
+  val folded = mailHeader(mailRendered(mailFixed(Message(from, headers = [("X-Long", "y".repeat(900))]))), "X-Long")
+  assertEq(folded, "y".repeat(900))
+
+@test("a body is 7bit where it is ASCII with short lines, quoted-printable otherwise, its line breaks CR LF")
+mailBodies()
+  val body = (text: string) -> mailRendered(mailTo("s", text)).split("\r\n\r\n", 2)(1)
+  val encoding = (text: string) -> mailHeader(mailRendered(mailTo("s", text)), "Content-Transfer-Encoding")
+  assertEq(encoding("Hello"), "7bit")
+  assertEq(body("Hello"), "Hello")
+  assertEq(body("a\nb\rc\r\nd\n\ne"), "a\r\nb\r\nc\r\nd\r\n\r\ne")
+  assertEq(body(""), "")
+  assertEq(body(".\n..\n"), ".\r\n..\r\n")
+  assertEq(encoding("x".repeat(998)), "7bit")
+  assertEq(encoding("x".repeat(999)), "quoted-printable")
+  assertEq(encoding("café"), "quoted-printable")
+  assertEq(body("café\n"), "caf=C3=A9\r\n")
+  assertEq(encoding("a=_b"), "quoted-printable")
+  assertEq(body("a=_b"), "a=3D_b")
+  assertEq(encoding("nul\u{0}"), "quoted-printable")
+  assertEq(encoding("a = b"), "7bit")
+  assertEq(mailHeader(mailRendered(mailTo("s", "")), "Content-Type"), "text/plain; charset=utf-8")
+  val none = mailRendered(mailFixed(Message(Mailbox("a@example.com"))))
+  assertEq(mailHeader(none, "Content-Type"), "text/plain; charset=utf-8")
+  assert(none.endsWith("\r\n\r\n"))
+  val html = mailRendered(mailFixed(Message(Mailbox("a@example.com"), html = Some("<p>hi</p>"))))
+  assertEq(mailHeader(html, "Content-Type"), "text/html; charset=utf-8")
+
+@test("text and html are multipart/alternative, inline parts multipart/related, attachments multipart/mixed")
+mailStructure()
+  val from = Mailbox("a@example.com")
+  val file = Attachment("f.bin", "application/octet-stream", Vector[byte](byte(0), byte(255)))
+  val logo = Attachment("logo.png", "image/png", Vector[byte](byte(137)), inline = true, contentId = "logo")
+  val kinds = (m: Message) -> mailRendered(mailFixed(m)).split("\r\n").filter(
+    l -> l.startsWith("Content-Type:")
+  ).mkString("|")
+  assertEq(kinds(Message(from, text = Some("t"))), "Content-Type: text/plain; charset=utf-8")
+  assertEq(
+    kinds(Message(from, text = Some("t"), html = Some("h"))),
+    "Content-Type: multipart/alternative;|Content-Type: text/plain; charset=utf-8|Content-Type: text/html; charset=utf-8"
+  )
+  assertEq(
+    kinds(Message(from, html = Some("h"), attachments = [logo])),
+    "Content-Type: multipart/related;|Content-Type: text/html; charset=utf-8|Content-Type: image/png;"
+  )
+  assertEq(
+    kinds(Message(from, text = Some("t"), attachments = [file])),
+    "Content-Type: multipart/mixed;|Content-Type: text/plain; charset=utf-8|Content-Type: application/octet-stream;"
+  )
+  assertEq(
+    kinds(Message(from, text = Some("t"), html = Some("h"), attachments = [file, logo])),
+    "Content-Type: multipart/mixed;|Content-Type: multipart/related;|Content-Type: multipart/alternative;|Content-Type: text/plain; charset=utf-8|Content-Type: text/html; charset=utf-8|Content-Type: image/png;|Content-Type: application/octet-stream;"
+  )
+  // Each multipart has a boundary of its own, numbered in the order written.
+  val all = mailRendered(mailFixed(Message(from, text = Some("t"), html = Some("h"), attachments = [file, logo])))
+  for k in 1 ..< 4
+    assert(all.contains(s" boundary=\"=_b_$k\"\r\n"))
+    assert(all.contains(s"\r\n--=_b_$k--\r\n"))
+  assert(!all.contains("=_b_4"))
+  assert(all.contains("Content-Disposition: inline;\r\n filename=\"logo.png\"\r\nContent-ID: <logo>\r\n"))
+  // A random boundary where none is given.
+  val random = mailRendered(Message(from, text = Some("t"), html = Some("h")))
+  assert(random.contains(" boundary=\"=_"))
+  assert(mailRendered(Message(from, text = Some("t"), html = Some("h"))) != random)
+
+@test("an attachment is base64 in lines of 76, its filename RFC 2231 where it is not short printable ASCII")
+mailAttachments()
+  val from = Mailbox("a@example.com")
+  val part = (a: Attachment) -> mailRendered(mailFixed(Message(from, attachments = [a])))
+  val big = Vector.tabulate(1000, i -> byte(i % 256))
+  val text = part(Attachment("data.bin", "application/octet-stream", big))
+  val encoded = text.split("Content-Transfer-Encoding: base64\r\n\r\n")(1).split("\r\n--")(0)
+  for line in encoded.split("\r\n") do assert(line.byteLength <= 76)
+  assertEq(encoded.split("\r\n").size, 18)
+  assertEq(fromBase64(encoded.replace("\r\n", "")), Ok(big))
+  val disposition = (name: string) -> mailLastHeader(
+    part(Attachment(name, "text/plain", Vector[byte](byte(1)))),
+    "Content-Disposition"
+  )
+  assertEq(disposition("a.txt"), "attachment;\r\n filename=\"a.txt\"")
+  assertEq(disposition("résumé.pdf"), "attachment;\r\n filename*=UTF-8''r%C3%A9sum%C3%A9.pdf")
+  assertEq(disposition("say \"hi\".txt"), "attachment;\r\n filename*=UTF-8''say%20%22hi%22.txt")
+  assertEq(disposition(""), "attachment")
+  val type = mailLastHeader(part(Attachment("résumé.pdf", "application/pdf", Vector[byte](byte(1)))), "Content-Type")
+  assertEq(type, "application/pdf;\r\n name*=UTF-8''r%C3%A9sum%C3%A9.pdf")
+  // A long name in numbered sections, none splitting a %XX, that join back to the whole.
+  val name = "отчёт за третий квартал две тысячи двадцать шестого года.pdf"
+  val sections = disposition(name).split(";\r\n ").drop(1)
+  assert(sections.size > 1)
+  var joined = ""
+  for i in 0 ..< sections.size
+    assert(sections(i).startsWith(s"filename*$i*="))
+    assert(sections(i).byteLength <= 76)
+    val value = sections(i).slice(sections(i).indexOf('=') + 1, sections(i).byteLength)
+    assert(!value.endsWith("%") && value.byteAt(value.byteLength - 2) != byte(int('%')))
+    joined += value
+  assert(joined.startsWith("UTF-8''"))
+  val ascii = "a".repeat(80) + ".txt"
+  assertEq(disposition(ascii).split(";\r\n ").size, 3)
+  // Content types.
+  assertEq(
+    mailLastHeader(part(Attachment("a", "text/plain; charset=utf-8", Vector[byte]())), "Content-Type"),
+    "text/plain; charset=utf-8;\r\n name=\"a\""
+  )
+  for bad in ["text", "text/", "/plain", "te xt/plain", "text/pl@in", "text/plain; é"]
+    assert(mailBadHeader(mailFixed(Message(from, attachments = [Attachment("a", bad, Vector[byte]())]))), bad)
+
+@test("decodeHeaderValue removes folding and decodes B and Q words in UTF-8, US-ASCII and ISO-8859-1")
+mailDecoding()
+  assertEq(decodeHeaderValue("plain"), "plain")
+  assertEq(decodeHeaderValue("a\r\n b"), "a b")
+  assertEq(decodeHeaderValue("=?UTF-8?B?R3LDvMOfZQ==?="), "Grüße")
+  assertEq(decodeHeaderValue("=?utf-8?b?R3LDvMOfZQ==?="), "Grüße")
+  assertEq(decodeHeaderValue("=?UTF-8?Q?Gr=C3=BC=C3=9Fe_aus?="), "Grüße aus")
+  assertEq(decodeHeaderValue("=?US-ASCII?Q?a_b?="), "a b")
+  assertEq(decodeHeaderValue("=?ISO-8859-1?Q?caf=E9?="), "café")
+  assertEq(decodeHeaderValue("=?UTF-8?Q?a?= =?UTF-8?Q?b?="), "ab")
+  assertEq(decodeHeaderValue("=?UTF-8?Q?a?=\r\n =?UTF-8?Q?b?="), "ab")
+  assertEq(decodeHeaderValue("x =?UTF-8?Q?a?= y"), "x a y")
+  assertEq(decodeHeaderValue("=?UTF-8?Q?a?= and =?UTF-8?Q?b?="), "a and b")
+  // Words that cannot be decoded are kept as they are.
+  assertEq(decodeHeaderValue("=?KOI8-R?Q?x?="), "=?KOI8-R?Q?x?=")
+  assertEq(decodeHeaderValue("=?UTF-8?X?x?="), "=?UTF-8?X?x?=")
+  assertEq(decodeHeaderValue("=?UTF-8?B?!!?="), "=?UTF-8?B?!!?=")
+  assertEq(decodeHeaderValue("=?UTF-8?Q?=G?="), "=?UTF-8?Q?=G?=")
+  assertEq(decodeHeaderValue("=?UTF-8?Q?a b?="), "=?UTF-8?Q?a b?=")
+  assertEq(decodeHeaderValue("=?"), "=?")
+  assertEq(decodeHeaderValue("a =? b"), "a =? b")
+
+@test("a Message-ID is the one given, else random at the sender's domain; a bad one or boundary is refused")
+mailIds()
+  val from = Mailbox("ada@example.com")
+  val one = mailHeader(mailRendered(Message(from)), "Message-ID")
+  val two = mailHeader(mailRendered(Message(from)), "Message-ID")
+  assert(one.startsWith("<") && one.endsWith("@example.com>"))
+  assert(one != two)
+  assert(mailHeader(mailRendered(Message(Mailbox("ü@exämple.com"))), "Message-ID").endsWith("@localhost>"))
+  assertEq(mailHeader(mailRendered(mailFixed(Message(from, messageId = Some("x.y@z")))), "Message-ID"), "<x.y@z>")
+  for bad in ["", "noat", "a b@c", "<a@b>", "a\"@b"]
+    assert(mailBadHeader(mailFixed(Message(from, messageId = Some(bad)))), bad)
+  for bad in ["", "x".repeat(61), "a b", "a\"b", "é"]
+    assert(mailBadHeader(mailFixed(Message(from, boundary = Some(bad)))), bad)
+  assert(Message(from, boundary = Some("x".repeat(60)), text = Some("t"), html = Some("h")).render().isOk)
+  assert(Message(from, boundary = Some("'()+_,-./:=?Az09")).render().isOk)
+
+@test("needsUtf8 is whether an address of the message is beyond ASCII, which is then written as it is")
+mailUtf8()
+  val from = Mailbox("ada@example.com")
+  assertEq(Message(from, to = [Mailbox("b@example.com")]).needsUtf8, false)
+  assertEq(Message(from, to = [Mailbox("b@example.com", "Bé")]).needsUtf8, false)
+  assertEq(Message(from, to = [Mailbox("bé@example.com")]).needsUtf8, true)
+  assertEq(Message(Mailbox("ü@example.com")).needsUtf8, true)
+  assertEq(Message(from, bcc = [Mailbox("x@exämple.com")]).needsUtf8, true)
+  assertEq(Message(from, replyTo = [Mailbox("x@exämple.com")]).needsUtf8, true)
+  assertEq(mailHeader(mailRendered(mailFixed(Message(from, to = [Mailbox("bé@example.com")]))), "To"), "bé@example.com")

@@ -2001,13 +2001,17 @@ private keeps_owners(l: *Lowering, t: &Type) -> bool
 // a behaviour does; a function value, whose captures its type does not show; and `Any`, a trait or
 // an open or abstract class, which may hold anything. A class marked `@keeps_owners` stops the walk, so it holds none, and the scalars and
 // strings hold none. `seen` holds the types being decided, which a recursive type reaches again.
-private holds_handles(l: *Lowering, t: &Type, seen: *Buf[string]) -> bool
+// Where `hidden` is false, only a handle the type shows counts: a function value, `Any`, a trait, an
+// open or abstract class, a union, a type variable and a variant hiding types hold none, and neither
+// does a function a generic type of the standard library keeps — the threads' rule, for a channel's
+// values and a lock's, so a lock of callbacks or of a trait's objects costs no walk.
+private holds_handles(l: *Lowering, t: &Type, seen: *Buf[string], hidden: bool = true) -> bool
     *t match
         Tuple(items) ->
             for item in items
-                if holds_handles(l, item, seen) then return true
+                if holds_handles(l, item, seen, hidden) then return true
             false
-        Opaque(_, _, _, repr) -> holds_handles(l, repr, seen)
+        Opaque(_, _, _, repr) -> holds_handles(l, repr, seen, hidden)
         Data(id, _, args) ->
             val key = type_key(t)
             for s in *seen
@@ -2016,9 +2020,11 @@ private holds_handles(l: *Lowering, t: &Type, seen: *Buf[string]) -> bool
             val d = l.program.data[id]
             for v in 0..<d.variants.len()
                 // A variant hiding types may hold anything its packs do.
-                if hides(l, id, v) then return true
+                if hides(l, id, v) then
+                    if hidden then return true
+                    continue
                 for field in variant_fields_at(d, id, v, args).unwrap_or(buf())
-                    if holds_handles(l, field, seen) then return true
+                    if holds_handles(l, field, seen, hidden) then return true
             false
         Class(id, _, args) ->
             val k = l.program.classes[id]
@@ -2033,20 +2039,21 @@ private holds_handles(l: *Lowering, t: &Type, seen: *Buf[string]) -> bool
             // structure, such as a vector's nodes.
             if (k.module_name == CoreModule || k.module_name.starts_with("avin.")) && args.len() > 0
                 for a in args
-                    if holds_handles(l, a, seen) then return true
-                for f in k.fields
-                    if f.ty is Some(ft)
-                        if *ft is Function(_, _, _) || *ft is ByName(_) then return true
+                    if holds_handles(l, a, seen, hidden) then return true
+                if hidden
+                    for f in k.fields
+                        if f.ty is Some(ft)
+                            if *ft is Function(_, _, _) || *ft is ByName(_) then return true
                 return false
-            if k.decl.modifier == "trait" || k.decl.modifier == "open" || k.decl.modifier == "abstract" then return true
+            if k.decl.modifier == "trait" || k.decl.modifier == "open" || k.decl.modifier == "abstract" then return hidden
             for f in k.fields
-                if holds_handles(l, substitute(f.ty.unwrap_or(ErrorType), class_owner(id), args), seen) then return true
+                if holds_handles(l, substitute(f.ty.unwrap_or(ErrorType), class_owner(id), args), seen, hidden) then return true
             false
-        Function(_, _, _) -> true
-        ByName(_) -> true
-        AnyType -> true
-        Union(_) -> true
-        TypeVar(_, _, _) -> true
+        Function(_, _, _) -> hidden
+        ByName(_) -> hidden
+        AnyType -> hidden
+        Union(_) -> hidden
+        TypeVar(_, _, _) -> hidden
         _ -> false
 
 /** The classes and traits `t` conforms to besides itself and `Any`, each once. A tuple's other
@@ -2708,19 +2715,70 @@ private function_value(l: *Lowering, function: usize, type_args: Buf[&Type]) -> 
     val entry = entry_instance(l, function, concrete_args)
     val shape = closure_shape(l, function, concrete_args, entry)
     if shape.fields.len() == 0 then return ConstClosure(constant_closure(l, function, concrete_args, shape.descriptor, entry))
-    var values: Buf[Operand] = buf()
-    for x in symbol.captured_locals
-        if machine(l, l.locals[x].ty) is Some(_)
-            val place = if l.boxed[x] then l.local_slots[x] else local_place(l, x)
-            values.push(load(l, place).unwrap())
-    for x in symbol.captured_params
-        if param_operand(l, x) is Some(v) then values.push(v)
+    val values = captured_values(l, symbol)
     val object = fresh(l, MRef)
     l.insts.push(Alloc(object, shape.descriptor))
     for i in 0..<values.len()
         store_field(l, Value(object), shape.fields[i], values[i])
     l.insts.push(Publish)
     Value(object)
+
+// What a closure of `symbol` holds, read where it is made: each captured local's value, or its box,
+// then each captured top-level parameter's. A captured delayed argument may be a closure in the
+// frame of a call still running (`delayed_on_stack`), which this closure could outlive, so it is
+// first kept on the heap: no closure ever holds one in a frame, and a closure that is itself in a
+// frame can be copied to the heap whole.
+private captured_values(l: *Lowering, symbol: FunctionSymbol) -> Buf[Operand]
+    var values: Buf[Operand] = buf()
+    for x in symbol.captured_locals
+        if machine(l, l.locals[x].ty) is Some(_)
+            val place = if l.boxed[x] then l.local_slots[x] else local_place(l, x)
+            val v = load(l, place).unwrap()
+            values.push(if !l.boxed[x] && *l.locals[x].ty is ByName(_) then kept_delayed(l, v) else v)
+    val root = symbol.root.unwrap_or(0)
+    for x in symbol.captured_params
+        if param_operand(l, x) is Some(v)
+            values.push(if *l.program.symbols[root].params[x] is ByName(_) then kept_delayed(l, v) else v)
+    values
+
+/** The delayed argument `v`, which may be a closure in a frame, as one on the heap: the same object
+ * where it is already there or captures nothing, otherwise a copy (see `avin_rt_keep_delayed`). */
+private kept_delayed(l: *Lowering, v: Operand) -> Operand
+    if v is ConstClosure(_) then return v
+    runtime_call(l, "avin_rt_keep_delayed", [MRef], MRef, [v])
+
+// A delayed argument passed straight to the call being lowered, made in the caller's own frame
+// rather than on the heap. A delayed argument cannot escape the call it is passed to: a parameter
+// that is only read or forwarded leaves it where it is, and the one way to keep it past the call, a
+// closure capturing the parameter, copies it to the heap first (`captured_values`). So the closure
+// lives exactly as long as the call. The collector does not follow a reference into a frame, so
+// the values the closure holds are pushed on `kept`, which the call's lowering keeps alive across
+// the call with a `Keep`. A closure that captures nothing is the constant one.
+private delayed_on_stack(l: *Lowering, function: usize, type_args: Buf[&Type], kept: *Buf[Operand]) -> Operand
+    val symbol = l.program.symbols[function]
+    val concrete_args = instance_args(l, function, symbol, type_args)
+    val entry = entry_instance(l, function, concrete_args)
+    val shape = closure_shape(l, function, concrete_args, entry)
+    if shape.fields.len() == 0 then return ConstClosure(constant_closure(l, function, concrete_args, shape.descriptor, entry))
+    val values = captured_values(l, symbol)
+    val object = fresh(l, MRef)
+    l.insts.push(StackObject(object, shape.descriptor))
+    for i in 0..<values.len()
+        store_field(l, Value(object), shape.fields[i], values[i])
+        kept.push(values[i])
+    Value(object)
+
+/** The function a delayed argument `a` is the closure of, where `a` is one written at the call. */
+private written_delayed(l: *Lowering, a: &TExpr) -> Option[(usize, Buf[&Type])]
+    if !(*a.ty is ByName(_)) then return None
+    a.kind match
+        FunctionValue(function, type_args) -> if l.program.symbols[function].delayed then Some((function, type_args)) else None
+        _ -> None
+
+/** Ends the life of the delayed arguments a call was passed in its caller's frame: what they hold
+ * stays alive up to here, after the call, and the call is no tail call. */
+private keep_after(l: *Lowering, kept: Buf[Operand])
+    if kept.len() > 0 then l.insts.push(Keep(kept))
 
 /** The constant closure of `function`'s copy at `type_args`, which captures nothing, laid out by
  * `descriptor` and entered at instance `entry`: made when first asked for. */
@@ -2760,6 +2818,14 @@ private note_calls_values(l: *Lowering)
 // slot in the object's class, it takes the parameters `function` takes and yields its result, as
 // machine types, so the call is spelled from `function`'s signature.
 private dispatch(l: *Lowering, function: usize, slot: usize, args: Buf[&TExpr], type_args: Buf[&Type]) -> Option[Operand]
+    var kept: Buf[Operand] = buf()
+    val result = dispatch_keeping(l, function, slot, args, type_args, &kept)
+    keep_after(l, kept)
+    result
+
+// A delayed argument written at the call is made in the caller's frame (`delayed_on_stack`), what it
+// holds pushed on `kept`: every override takes it as a by-name parameter.
+private dispatch_keeping(l: *Lowering, function: usize, slot: usize, args: Buf[&TExpr], type_args: Buf[&Type], kept: *Buf[Operand]) -> Option[Operand]
     // A union with a scalar member has no method table: a member call on one, seen as a trait every
     // member has, goes to the member's own implementation by its tag where it renders the value, and
     // otherwise through the table of the value as an `Any`.
@@ -2771,7 +2837,9 @@ private dispatch(l: *Lowering, function: usize, slot: usize, args: Buf[&TExpr], 
     var operands: Buf[Operand] = buf()
     for i in 0..<args.len()
         val a = if i == 0 then receiver_expr else args[i]
-        val op = lower_expr(l, a)
+        var op: Option[Operand] = None
+        if i > 0 && written_delayed(l, a) is Some((delayed, delayed_args)) then op = Some(delayed_on_stack(l, delayed, delayed_args, kept))
+        else op = lower_expr(l, a)
         // An argument that never finishes ends the code here: the call is never made.
         if *a.ty is Nothing then return None
         // A value of a type parameter that is `Nothing` in this copy, as the value of a `Some` in an
@@ -2991,16 +3059,22 @@ private struct DispatchAnswer
 // A direct call of `function`, the receiver first for a method. A static member's receiver is a
 // type, which is not passed.
 private direct_call(l: *Lowering, e: &TExpr, function: usize, args: Buf[&TExpr], type_args: Buf[&Type]) -> Option[Operand]
+    var kept: Buf[Operand] = buf()
+    val result = direct_call_keeping(l, e, function, args, type_args, &kept)
+    keep_after(l, kept)
+    result
+
+private direct_call_keeping(l: *Lowering, e: &TExpr, function: usize, args: Buf[&TExpr], type_args: Buf[&Type], kept: *Buf[Operand]) -> Option[Operand]
     val callee = l.program.symbols[function]
     // A constructor trait's method is compiled for each constructor implementing it, which follows
     // its type arguments, so its `Self` is the value's own type.
     if constructor_trait_method(l, callee) && args.len() > 0
-        val operands = call_operands(l, callee, args, false)?
+        val operands = call_operands(l, callee, args, false, kept)?
         return call_resolved(l, e, function, callee, args, operands, with_constructor(l, function, args[0].ty, type_args))
     // A trait's default body is compiled once for every conforming type, its `Self` an object: an
     // option kept as a pointer goes in as the object it stands for, and comes out as a pointer again.
     val default_body = is_trait_method(l, callee)
-    val operands = call_operands(l, callee, args, default_body)?
+    val operands = call_operands(l, callee, args, default_body, kept)?
     if default_body && is_self_type(callee.result.unwrap_or(Unit)) && pointer_option(l, e.ty)
         val object = call_resolved(l, e, function, callee, args, operands, type_args)?
         return Some(option_pointer(l, e.ty, object))
@@ -3019,12 +3093,18 @@ private constructor_trait_method(l: *Lowering, symbol: FunctionSymbol) -> bool =
 // member's type receiver left out; `None` where one never finishes, which ends the code there, since
 // the call is never made. In a trait's default body an option kept as a pointer goes in where `Self`
 // is taken as the object it stands for.
-private call_operands(l: *Lowering, callee: FunctionSymbol, args: Buf[&TExpr], default_body: bool) -> Option[Buf[Operand]]
+// A delayed argument written at the call is made in the caller's frame (`delayed_on_stack`), what
+// it holds pushed on `kept`, for a callee that is a function of the program rather than an operation
+// lowered in place.
+private call_operands(l: *Lowering, callee: FunctionSymbol, args: Buf[&TExpr], default_body: bool, kept: *Buf[Operand]) -> Option[Buf[Operand]]
     var operands: Buf[Operand] = buf()
     for i in 0..<args.len()
         val a = args[i]
         if a.kind is TypeReceiver then continue
-        val op = lower_expr(l, a)
+        var op: Option[Operand] = None
+        if callee.intrinsic is None && written_delayed(l, a) is Some((function, type_args))
+            op = Some(delayed_on_stack(l, function, type_args, kept))
+        else op = lower_expr(l, a)
         if *a.ty is Nothing then return None
         if machine(l, a.ty) is Some(_)
             op match
@@ -3058,7 +3138,8 @@ private words_result(l: *Lowering, e: &TExpr, function: usize) -> Buf[FieldSlot]
  * values, read as the words `words` of the call's result. `None` where an argument never finishes. */
 private words_call(l: *Lowering, e: &TExpr, function: usize, args: Buf[&TExpr], type_args: Buf[&Type], words: Buf[FieldSlot]) -> Option[Buf[Operand]]
     val callee = l.program.symbols[function]
-    var operands = call_operands(l, callee, args, false)?
+    var kept: Buf[Operand] = buf()
+    var operands = call_operands(l, callee, args, false, &kept)?
     push_captures(l, callee, &operands)
     val concrete_args = instance_args(l, function, callee, type_args)
     val index = words_instance(l, function, concrete_args)
@@ -3070,6 +3151,7 @@ private words_call(l: *Lowering, e: &TExpr, function: usize, args: Buf[&TExpr], 
         val dest = fresh(l, words[k].ty)
         l.insts.push(CallWord(dest, first, k))
         out.push(Value(dest))
+    keep_after(l, kept)
     Some(out)
 
 /** Whether a function is a method a trait declares, compiled once for every conforming type. */
@@ -3114,9 +3196,9 @@ private call_resolved(l: *Lowering, e: &TExpr, function: usize, callee: Function
             return array_operation(l, name, array, operands, e.span)
         if name.starts_with("string_") then return intrinsic_operation(l, name, operands, e.span)
         if name.starts_with("atomic_") then return atomic_operation(l, name, concrete(l, args[0].ty), operands)
-        if name == "holds_handles"
+        if name == "holds_handles" || name == "shows_handles"
             var seen: Buf[string] = buf()
-            return Some(ConstBool(holds_handles(l, concrete(l, args[0].ty), &seen)))
+            return Some(ConstBool(holds_handles(l, concrete(l, args[0].ty), &seen, name == "holds_handles")))
         // A field's initializer is the only place `field_unset` means anything (the checker leaves
         // the field unstored); anywhere else there is no value to give.
         if name == "field_unset"
@@ -3224,12 +3306,22 @@ private conformance_member(l: *Lowering, receiver: &Type, function: usize, table
 // Calls a function value, a closure or an object of a class or data type that is a function: its
 // descriptor's `call` takes the object before the arguments.
 private call_value(l: *Lowering, callee: &TExpr, args: Buf[&TExpr]) -> Option[Operand]
+    var kept: Buf[Operand] = buf()
+    val result = call_value_keeping(l, callee, args, &kept)
+    keep_after(l, kept)
+    result
+
+// A delayed argument written at the call is made in the caller's frame (`delayed_on_stack`), what it
+// holds pushed on `kept`: whatever function the value is takes it as a by-name parameter.
+private call_value_keeping(l: *Lowering, callee: &TExpr, args: Buf[&TExpr], kept: *Buf[Operand]) -> Option[Operand]
     note_calls_values(l)
     val target = lower_expr(l, callee)?
     var operands: Buf[Operand] = buf()
     operands.push(target)
     for a in args
-        val op = lower_expr(l, a)
+        var op: Option[Operand] = None
+        if written_delayed(l, a) is Some((delayed, delayed_args)) then op = Some(delayed_on_stack(l, delayed, delayed_args, kept))
+        else op = lower_expr(l, a)
         // An argument that never finishes ends the code here: the call is never made.
         if *a.ty is Nothing then return None
         if machine(l, a.ty) is Some(_)
@@ -6295,9 +6387,9 @@ private intrinsic_body(l: *Lowering, symbol: FunctionSymbol)
             if l.param_values[i] is Some(v) then operands.push(Value(v))
         finish(l, Return(atomic_operation(l, name, concrete(l, symbol.params[0]), operands)))
         return
-    if name == "holds_handles"
+    if name == "holds_handles" || name == "shows_handles"
         var seen: Buf[string] = buf()
-        finish(l, Return(Some(ConstBool(holds_handles(l, concrete(l, symbol.params[0]), &seen)))))
+        finish(l, Return(Some(ConstBool(holds_handles(l, concrete(l, symbol.params[0]), &seen, name == "holds_handles")))))
         return
     // An operation of a view or a block calls the runtime's entry point of its name with its receiver
     // and arguments, the descriptor of an array or block it makes, and a site for its traps, which
@@ -9362,6 +9454,13 @@ private write_inst(l: *Lowering, w: *EntryWriter, inst: Inst) -> bool
             w.word("al")
             w.num(dest)
             w.text(l.descriptors[d].name)
+        StackObject(dest, d) ->
+            w.word("so")
+            w.num(dest)
+            w.text(l.descriptors[d].name)
+        Keep(values) ->
+            w.word("kp")
+            return write_operands(l, w, values)
         Publish -> w.word("pu")
         Locate(at, _, _) ->
             // Kept counted from the start of the declaration the instance belongs to, as a trap
@@ -9449,6 +9548,7 @@ private read_inst(l: *Lowering, r: *EntryReader) -> Option[Inst]
             callee = Some(CFunction(symbol, params, result))
         return Some(Call(dest, callee?, read_operands(l, r)?))
     if tag == "pu" then return Some(Publish)
+    if tag == "kp" then return Some(Keep(read_operands(l, r)?))
     if tag == "lo"
         val inside = r.flag()
         val offset = r.num()
@@ -9483,6 +9583,7 @@ private read_inst(l: *Lowering, r: *EntryReader) -> Option[Inst]
         return Some(Convert(dest, conv, read_operand(l, r, true)?))
     if tag == "ld" then return Some(Load(dest, read_operand(l, r, true)?))
     if tag == "al" then return Some(Alloc(dest, descriptor_named(l, r.text())?))
+    if tag == "so" then return Some(StackObject(dest, descriptor_named(l, r.text())?))
     if tag == "aL" then return Some(AtomicLoad(dest, read_operand(l, r, true)?))
     if tag == "aW"
         val address = read_operand(l, r, true)?

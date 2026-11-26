@@ -1,0 +1,195 @@
+module avin.resilience
+
+// A circuit breaker: calls to something that keeps failing, a server that is down for one, stop being
+// made for a while, so the caller fails at once rather than waiting on each, and what failed is not
+// pressed while it recovers. Then a trial call is let through, and its outcome decides whether calls
+// go on or stop again.
+
+import avin.threads.Mutex
+import avin.time.{Duration, monotonic, seconds}
+
+// Where a breaker stands. `Closed`, every call is made; `Open`, none is; `HalfOpen`, only trial calls
+// are, which decide whether it closes again or opens.
+data BreakerState
+  Closed
+  Open
+  HalfOpen
+
+// Why a call through a breaker failed: the breaker did not make it, or it was made and failed.
+data BreakerError[+E]
+  // The breaker is open, or half open with every trial call already being made, so the call was not
+  // made. `retryIn` is how long until the breaker lets a trial call through: zero while trial calls
+  // are being made, whose outcome is not known yet.
+  BreakerOpen(retryIn: Duration)
+  // The call was made and answered `error`.
+  CallFailed(error: E)
+
+impl[E: Error] Error for BreakerError[E]
+  message -> string = breakerErrorMessage(self)
+
+  cause -> Option[Error] = self match
+    CallFailed(e) -> Some(e)
+    _ -> None
+
+// A breaker's failure whose call fails with any error that has a `Display`: the sentence, and for a
+// call that failed, `: ` and its error.
+impl[E: Display] Display for BreakerError[E]
+  display(out: Writer, spec: FormatSpec) = self match
+    CallFailed(e) -> out.writeField(s"${breakerErrorMessage(self)}: $e", spec)
+    _ -> out.writeField(breakerErrorMessage(self), spec)
+
+private breakerErrorMessage[E](e: BreakerError[E]) -> string = e match
+  BreakerOpen(_) -> "the circuit breaker is open"
+  CallFailed(_) -> "the call failed"
+
+// Told of each change of a breaker's state, the state it left and the one it entered.
+type BreakerListener = @sendable (BreakerState, BreakerState) -> unit
+
+// The listener a breaker has unless given one, which does nothing.
+private ignoreChange(from: BreakerState, to: BreakerState) = ()
+
+// Stops calls to what keeps failing. Closed, it makes every call, and `failureThreshold` failures in a
+// row open it. Open, it makes none, answering `BreakerOpen` at once, for `openFor`; then it is half
+// open, and lets `trialCalls` calls through at once, answering `BreakerOpen` to the others. A trial
+// call that fails opens it again for another `openFor`; once `trialCalls` trial calls have succeeded,
+// it closes. A call that ends without an outcome, cancelled by a deadline for one, counts neither way
+// and frees its place as a trial call. A call made while the breaker stood otherwise than it stands
+// when the call ends, one that began closed and ends after the breaker opened for one, counts neither
+// way either: its outcome is about a time the breaker has moved past.
+//
+// A `failureThreshold` or `trialCalls` below one, and a negative `openFor`, trap. The time is read
+// from `clock`; `onChange` is told of every change of state, after it, once the breaker is free, so
+// it may log, count or read the breaker.
+//
+//     val payments = CircuitBreaker(failureThreshold = 3, openFor = seconds(10))
+//     payments.call(() -> charge(card)) match
+//       Ok(receipt) -> receipt
+//       Err(BreakerOpen(_)) -> later(card)
+//       Err(CallFailed(e)) -> declined(e)
+class CircuitBreaker(
+    val failureThreshold: int = 5,
+    val openFor: Duration = seconds(30),
+    val trialCalls: int = 1,
+    private val clock: Clock = monotonic,
+    private val onChange: BreakerListener = ignoreChange
+): Sendable
+  if failureThreshold < 1 then fail(s"a breaker opening at $failureThreshold failures: it is at least one")
+  if openFor.isNegative then fail(s"a breaker open for $openFor: it is not negative")
+  if trialCalls < 1 then fail(s"a breaker letting $trialCalls trial calls through: it is at least one")
+
+  private val core = Mutex(BreakerCore())
+
+  // Where the breaker stands now: an open breaker whose `openFor` has passed is half open.
+  state -> BreakerState
+    val now = clock().micros
+    val wait = openFor.micros
+    told(core.with(c -> c.look(now, wait))).to
+
+  // How many failures in a row the breaker has counted while closed; zero in any other state.
+  failures -> int = core.with(c -> if c.state == Closed then c.failures else 0)
+
+  // Makes the call `body`, where the breaker lets it through, and counts every `Err` it answers as a
+  // failure: `Ok` of its value, `Err(CallFailed(e))` of its error, or `Err(BreakerOpen(_))` where the
+  // call was not made.
+  call[T, E](body: () -> Result[T, E]) -> Result[T, BreakerError[E]] = call(_ -> true, body)
+
+  // `call` that counts only an `Err` that `isFailure` accepts as a failure. Any other says the
+  // service answered, as a not-found does, and counts as a success.
+  call[T, E](isFailure: (E) -> bool, body: () -> Result[T, E]) -> Result[T, BreakerError[E]]
+    val now = clock().micros
+    val wait = openFor.micros
+    val trials = trialCalls
+    val admitted = told(core.with(c -> c.admit(now, wait, trials)))
+    if !admitted.admitted then return Err(BreakerOpen(Duration(admitted.wait)))
+    val generation = admitted.generation
+    var settled = false
+    defer if !settled then core.with(c -> c.abandon(generation))
+    val result = body()
+    val failed = result match
+      Ok(_) -> false
+      Err(e) -> isFailure(e)
+    val at = clock().micros
+    val threshold = failureThreshold
+    settled = true
+    told(core.with(c -> c.settle(generation, failed, at, threshold, trials)))
+    result.mapErr(e -> CallFailed(e))
+
+  // Closes the breaker now, whatever it stands at, with no failures counted.
+  reset()
+    val now = clock().micros
+    told(core.with(c -> c.enter(Closed, now)))
+
+  // Opens the breaker now, for `openFor` from now, whatever it stands at: to stop calls to a service
+  // known to be down, or being worked on.
+  trip()
+    val now = clock().micros
+    told(core.with(c -> c.enter(Open, now)))
+
+  // Tells the listener of the change `step` made, if it made one, and gives the step back.
+  private told(step: Step) -> Step
+    if step.from != step.to then onChange(step.from, step.to)
+    step
+
+// What one look at a breaker did: the state it found and the state it left, whether a call was let
+// through and the generation it was let through in, or how many microseconds until one will be.
+private data Step(from: BreakerState, to: BreakerState, admitted: bool = false, generation: long = 0, wait: long = 0)
+
+// A breaker's state and its counts, read and changed only under the breaker's lock. The generation
+// counts the changes of state, so a call's outcome counts only in the state it was let through in.
+private class BreakerCore()
+  var state: BreakerState = Closed
+  var generation: long = 0
+  var failures = 0
+  var openedAt: long = 0
+  var trials = 0
+  var passed = 0
+
+  // Enters `s` at `now`, with nothing counted, answering the change.
+  enter(s: BreakerState, now: long) -> Step
+    val from = state
+    state = s
+    generation += 1
+    failures = 0
+    trials = 0
+    passed = 0
+    if s == Open then openedAt = now
+    Step(from, s)
+
+  // Half opens the breaker where it is open and `openFor` has passed by `now`, answering the change.
+  look(now: long, openFor: long) -> Step
+    if state == Open && now - openedAt >= openFor then enter(HalfOpen, now) else Step(state, state)
+
+  // Lets a call through at `now`, where the breaker allows one.
+  admit(now: long, openFor: long, trialCalls: int) -> Step
+    val looked = look(now, openFor)
+    state match
+      Closed -> Step(looked.from, state, true, generation)
+      Open -> Step(looked.from, state, wait = openedAt + openFor - now)
+      HalfOpen ->
+        if trials < trialCalls
+          trials += 1
+          Step(looked.from, state, true, generation)
+        else
+          Step(looked.from, state)
+
+  // Counts the outcome of a call let through in `gen`, `failed` or not, at `now`.
+  settle(gen: long, failed: bool, now: long, threshold: int, trialCalls: int) -> Step
+    if gen != generation then return Step(state, state)
+    state match
+      Closed ->
+        if !failed
+          failures = 0
+          Step(state, state)
+        else
+          failures += 1
+          if failures >= threshold then enter(Open, now) else Step(state, state)
+      HalfOpen ->
+        trials -= 1
+        if failed then return enter(Open, now)
+        passed += 1
+        if passed >= trialCalls then enter(Closed, now) else Step(state, state)
+      Open -> Step(state, state)
+
+  // Frees the place of a call let through in `gen` that ended with no outcome.
+  abandon(gen: long) -> unit
+    if gen == generation && state == HalfOpen then trials -= 1

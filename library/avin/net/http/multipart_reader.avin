@@ -1,0 +1,249 @@
+module avin.net.http
+
+// `multipart/form-data` read as it arrives, a part at a time: `MultipartReader.next()` reads a part's
+// head and `read` its body a piece at a time, so a file upload goes on to wherever the program puts
+// it without the body being held whole. The reader reads any `io.Reader`, a streamed request body
+// (`ServerRequest.multipartReader`) above all, by the rules `Multipart.parse` reads a whole body by,
+// under the same `MultipartLimits`.
+
+import avin.io.Reader
+
+// A part's head as a `MultipartReader` reads it: the field's `name`, the `filename` a file was sent
+// with, its `contentType` (`text/plain` where it names none) and its `headers` in order. **A filename
+// is the sender's and is not to be trusted**, as `Part.filename` is not.
+class PartHead(
+    val name: string,
+    val filename: Option[string],
+    val contentType: string,
+    val headers: Vector[(string, string)]
+)
+  // The value of the part's first header of `name`, compared without regard to case.
+  header(name: string) -> Option[string] = headerIn(headers, name)
+
+  // Whether the part is a file: whether it was sent with a filename.
+  isFile -> bool = filename.isDefined
+
+// Where a reader is in its body.
+private data MultipartPhase
+  // Before the first delimiter, in the preamble.
+  Before
+  // Just past a delimiter, before the part's blank line.
+  InHead
+  // In a part's body.
+  InBody
+  // Past the closing delimiter.
+  After
+
+// What a search for a delimiter found in the bytes held.
+private data DelimiterScan
+  // A delimiter from `start`, its line ending at `after`, closing the body or not.
+  Found(start: int, after: int, closing: bool)
+  // One that may be a delimiter from `start`, whose end is still to arrive.
+  Pending(start: int)
+  // None that begins before `safe`.
+  Clear(safe: int)
+
+// The most spaces and tabs a delimiter's line may carry after its boundary.
+private val paddingLimit = 1024
+
+// The parts of a `multipart/form-data` body, read from `source` as they arrive. `next()` answers the
+// next part's head, passing over what was left of the part before, and `None` past the closing
+// delimiter; `read(max)` then answers up to `max` bytes of that part's body, waiting for at least
+// one, and an empty array at its end. The rules are `Multipart.parse`'s: text before the first
+// delimiter and after the last is skipped; a line ends with a carriage return and a line feed; a
+// delimiter followed by anything but `--` or the end of its line is part of the body it stands in; a
+// part's head is read as `Multipart.parse` reads it. The limits are counted as the body is read:
+// `maxParts` as each part begins, `maxHeaderBytes` over each head, and `maxBytes` over every byte read
+// from `source`, the epilogue past the closing delimiter, which is not read, not counted. A fault is
+// answered where it is read, so a body with two may be refused for a different one than `parse`
+// names; a source that fails is `BodyUnreadable`; and once a read fails every later one fails alike.
+// A delimiter's line may carry at most 1024 spaces and tabs after its boundary.
+class MultipartReader(private val source: Reader, private val boundary: string, private val limits: MultipartLimits)
+  if !isBoundary(boundary) then fail(s"`$boundary` is not a multipart boundary")
+  private val delim: Array[byte] = utf8("\r\n--" + boundary)
+  // The bytes held, a line break first so a delimiter at the body's start is found as any other.
+  private var win: Array[byte] = utf8("\r\n")
+  private var at = 0
+  private var pulled: long = 0
+  private var ended = false
+  private var phase: MultipartPhase = Before
+  private var parts = 0
+  private var fault: Option[FormError] = None
+  // Within a head, how far the bytes held have been searched for its blank line and for a delimiter.
+  private var blankFrom = 0
+  private var delimFrom = 0
+
+  // The next part's head, or `None` past the closing delimiter.
+  next() -> Result[Option[PartHead], FormError]
+    if fault is Some(e) then return Err(e)
+    while phase is Before || phase is InBody
+      _ = bodyPiece(65536)?
+    if phase is After then return Ok(None)
+    if parts >= limits.maxParts then return failed(TooManyParts(limits.maxParts))
+    parts += 1
+    head().map(h -> Some(h))
+
+  // Up to `max` bytes of the part's body, `max` being at least one; an empty array at its end, or
+  // where no part has begun.
+  read(max: int) -> Result[Array[byte], FormError]
+    if max < 1 then fail(s"a read of $max bytes: it is at least one")
+    if fault is Some(e) then return Err(e)
+    if !(phase is InBody) then return Ok(Array.empty[byte]())
+    bodyPiece(max)
+
+  // The rest of the part's body.
+  readAll() -> Result[Array[byte], FormError]
+    val out = Buffer[byte]()
+    loop
+      val got = read(65536)?
+      if got.length == 0 then return Ok(out.toArray())
+      out.addAll(got)
+    Ok(out.toArray())
+
+  // Up to `max` bytes of the preamble or of a part's body, an empty array once the delimiter after it
+  // is passed.
+  private bodyPiece(max: int) -> Result[Array[byte], FormError]
+    loop
+      val scan = delimiterFrom(at)?
+      val until = scan match
+        Found(start, after, closing) ->
+          if start == at
+            at = after
+            phase = if closing then After else InHead
+            blankFrom = at
+            delimFrom = at
+            return Ok(Array.empty[byte]())
+          start
+        Pending(start) -> start
+        Clear(safe) -> safe
+      if until > at
+        val end = if until - at > max then at + max else until
+        val out = win.slice(at, end)
+        at = end
+        return Ok(out)
+      val wasEnded = ended
+      if !pull()? && wasEnded
+        return failed(BadMultipart(if phase is Before then "no delimiter of its boundary" else "no closing delimiter"))
+    Ok(Array.empty[byte]())
+
+  // The head of the part whose delimiter was just passed, read up to and past its blank line.
+  private head() -> Result[PartHead, FormError]
+    val blank = utf8("\r\n\r\n")
+    val most = limits.maxHeaderBytes
+    loop
+      val scan = delimiterFrom(delimFrom)?
+      // The earliest a delimiter may begin, ending the part's bytes, and whether one does there.
+      val bound = scan match
+        Found(start, _, _) -> start
+        Pending(start) -> start
+        Clear(safe) -> safe
+      val found = scan is Found(_, _, _)
+      delimFrom = bound
+      val n = win.length
+      if n - at >= 2 && win(at) == byte(13) && win(at + 1) == byte(10)
+        // A head of no headers, unless the part holds no bytes at all.
+        if found && bound == at then return failed(BadMultipart("a part's headers do not end"))
+        if bound > at then return opened(at, at + 2)
+      elif n - at >= 2 || ended
+        val h = find(win, blank, if blankFrom - 3 > at then blankFrom - 3 else at, n)
+        blankFrom = if h >= 0 then h else n
+        // A delimiter before the blank line ends: the part's bytes hold no whole head.
+        if found && (h < 0 || h + 4 > bound)
+          return failed(
+            if bound - at > most then PartHeadersTooLarge(most) else BadMultipart("a part's headers do not end")
+          )
+        if h >= 0 && h + 4 <= bound
+          if h - at > most then return failed(PartHeadersTooLarge(most))
+          return opened(h, h + 4)
+        // Past the limit whatever comes: no delimiter begins before `bound`, and the blank line, found
+        // or still to come, ends beyond the limit.
+        if bound - at > most && (if h >= 0 then h - at > most else n - at > most + 3)
+          return failed(PartHeadersTooLarge(most))
+      // Once the source has ended and the bytes held decide nothing, the part never closes.
+      val wasEnded = ended
+      if !pull()? && wasEnded then return failed(BadMultipart("no closing delimiter"))
+    failed(BadMultipart("no closing delimiter"))
+
+  // Reads the head held from `at` up to `end`, its body beginning at `body`.
+  private opened(end: int, body: int) -> Result[PartHead, FormError]
+    partHeadOf(win.slice(at, end)) match
+      Ok(h) ->
+        at = body
+        phase = InBody
+        Ok(h)
+      Err(e) -> failed(e)
+
+  // The first delimiter beginning at or after `from` in the bytes held.
+  private delimiterFrom(from: int) -> Result[DelimiterScan, FormError]
+    var i = find(win, delim, from, win.length)
+    while i >= 0
+      val j = i + delim.length
+      val n = win.length
+      if j < n && win(j) == byte(int('-'))
+        if j + 1 < n
+          if win(j + 1) == byte(int('-')) then return Ok(Found(i, j + 2, true))
+        elif !ended
+          return Ok(Pending(i))
+      else
+        var k = j
+        while k < n && (win(k) == byte(int(' ')) || win(k) == byte(int('\t')))
+          k += 1
+        if k - j > paddingLimit then return failed(BadMultipart("a delimiter's line does not end"))
+        if k + 1 < n
+          if win(k) == byte(13) && win(k + 1) == byte(10) then return Ok(Found(i, k + 2, false))
+        elif !ended && (k == n || win(k) == byte(13))
+          return Ok(Pending(i))
+      i = find(win, delim, i + 1, win.length)
+    val held = win.length - (delim.length - 1)
+    Ok(Clear(if ended then win.length elif held > from then held else from))
+
+  // Reads the next piece from the source into the bytes held, and answers whether there was one.
+  private pull() -> Result[bool, FormError]
+    if ended then return Ok(false)
+    val got = source.read(65536) match
+      Ok(g) -> g
+      Err(e) -> return failed(BodyUnreadable(e))
+    if got.length == 0
+      ended = true
+      return Ok(false)
+    pulled += long(got.length)
+    if pulled > long(limits.maxBytes) then return failed(FormTooLarge(limits.maxBytes))
+    val kept = Buffer[byte]()
+    kept.addAll(win.slice(at, win.length))
+    kept.addAll(got)
+    blankFrom -= at
+    delimFrom -= at
+    if blankFrom < 0 then blankFrom = 0
+    if delimFrom < 0 then delimFrom = 0
+    win = kept.toArray()
+    at = 0
+    Ok(true)
+
+  // Records `e` as the reader's fault, and answers it.
+  private failed[T](e: FormError) -> Result[T, FormError]
+    fault = Some(e)
+    Err(e)
+
+object MultipartReader
+  // A reader of `source`, a body of the type `contentType`, within `limits`. The type must be
+  // `multipart/form-data` with a `boundary`, as `Multipart.parse` takes it.
+  over(
+      source: Reader,
+      contentType: string,
+      limits: MultipartLimits = MultipartLimits()
+  ) -> Result[MultipartReader, FormError] = multipartReaderOf(source, Some(contentType), limits)
+
+// A reader of `source` as `multipart/form-data`, its type checked against `contentType`.
+private multipartReaderOf(
+    source: Reader,
+    contentType: Option[string],
+    limits: MultipartLimits
+) -> Result[MultipartReader, FormError]
+  val expected = "multipart/form-data"
+  val media = contentType match
+    Some(ct) -> mediaTypeOf(ct)
+    None -> return Err(NotAForm(expected, None))
+  if media.kind != expected then return Err(NotAForm(expected, contentType))
+  paramIn(media.params, "boundary") match
+    Some(b) -> if isBoundary(b) then Ok(MultipartReader(source, b, limits)) else Err(NoBoundary)
+    None -> Err(NoBoundary)

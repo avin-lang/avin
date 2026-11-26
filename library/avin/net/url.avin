@@ -1,10 +1,14 @@
 module avin.net
 
+import avin.net.idna
+
 // URLs, read as RFC 3986 reads a URI: a scheme, an authority of user information, host and port, a
 // path, a query and a fragment. Each component is kept as it was written, percent-escapes and all;
-// `Url.decode` turns one into text. A component may also hold characters beyond ASCII, which are kept
-// as they are. An absent component and an empty one are different things: `http://h?` has an empty
-// query and `http://h` none.
+// `Url.decode` turns one into text. A component other than the host may also hold characters beyond
+// ASCII, which are kept as they are. A host name beyond ASCII is held in the ASCII form DNS carries,
+// as the WHATWG URL standard holds it: `http://Bücher.example/` has the host `xn--bcher-kva.example`,
+// and `unicodeHost` gives `bücher.example` back. An absent component and an empty one are different
+// things: `http://h?` has an empty query and `http://h` none.
 
 // Why text is not a URL, or not a component of one. `at` is the byte offset, in the text that was
 // read, of the first character found to be wrong.
@@ -60,20 +64,13 @@ impl Url
 
   // The query's pairs, decoded, in order: the query is split at each `&`, an empty piece skipped, and
   // each piece at its first `=` into a name and a value, empty where there is no `=`. A `+` stands
-  // for a space, as a form writes one. No query gives no pairs.
-  queryParams -> Vector[(string, string)]
-    val pairs = Buffer[(string, string)]()
-    query match
-      Some(q) ->
-        for piece in q.split("&")
-          if piece.nonEmpty
-            val eq = piece.indexOf("=")
-            if eq < 0
-              pairs.addOne((formDecoded(piece), ""))
-            else
-              pairs.addOne((formDecoded(piece.slice(0, eq)), formDecoded(rest(piece, eq + 1))))
-      None -> ()
-    pairs.toVector
+  // for a space, as a form writes one. No query gives no pairs. The query is read by `Url.formDecode`,
+  // which never fails on a query a `Url` holds.
+  queryParams -> Vector[(string, string)] = query match
+    Some(q) -> Url.formDecode(q) match
+      Ok(pairs) -> pairs
+      Err(e) -> fail(s"${e.message}: $q")
+    None -> Vector.empty[(string, string)]()
 
   // `ref` resolved against this URL as RFC 3986 resolves a reference against a base: the reference
   // read, relative or absolute, then its missing components taken from the base and its dot
@@ -108,9 +105,10 @@ impl Url
   withUserInfo(u: string) -> Url = withUserInfo(Some(u))
 
   // The URL with another host, as written with its escapes or in brackets, or with none, which takes
-  // the authority away. Taking it away while there is user information or a port traps, as does a
-  // host that is not one, a path not beginning with `/` given an authority, or a path beginning with
-  // `//` left without one.
+  // the authority away. A name beyond ASCII is held in its ASCII form, as `Url.parse` holds it. Taking
+  // the authority away while there is user information or a port traps, as does a host that is not
+  // one, a path not beginning with `/` given an authority, or a path beginning with `//` left without
+  // one.
   withHost(h: Option[string]) -> Url
     h match
       Some(t) ->
@@ -119,7 +117,7 @@ impl Url
       None ->
         if userInfo.isDefined || port.isDefined then fail("user information or a port without a host")
         if path.startsWith("//") then fail("a path without an authority may not begin with //")
-    made(scheme, userInfo, h, port, path, query, fragment)
+    made(scheme, userInfo, h.map(t -> asciiHostOrTrap(t)), port, path, query, fragment)
 
   withHost(h: string) -> Url = withHost(Some(h))
 
@@ -167,13 +165,24 @@ impl Url
 
   withFragment(f: string) -> Url = withFragment(Some(f))
 
+  // The host for a person to read: a name with labels in Punycode (`xn--bcher-kva.example`) in
+  // Unicode (`bücher.example`), as `idna.toUnicode` gives it. A name that does not decode to a valid
+  // one, which a URL read from text beyond ASCII never holds, is kept in ASCII, so that what a person
+  // reads is never a name the URL does not reach.
+  unicodeHost -> Option[string] = host.map(h -> unicodeName(h))
+
+  // The URL written out as `display` writes it, with the host as `unicodeHost` gives it:
+  // `Url("http://Bücher.example/").unicodeText` is `http://bücher.example/`, where the URL itself
+  // displays as `http://xn--bcher-kva.example/`.
+  unicodeText -> string = written(unicodeHost)
+
   // The URL written out: `scheme:`, then `//`, the user information and `@`, the host and `:port`
   // where there is an authority, then the path, `?query` and `#fragment`.
-  private written() -> string
+  private written(hostText: Option[string]) -> string
     val out = StringWriter()
     out.write(scheme)
     out.write(":")
-    host match
+    hostText match
       Some(h) ->
         out.write("//")
         userInfo match
@@ -202,7 +211,7 @@ impl Url
     out.text
 
 impl Display for Url
-  display(out: Writer, spec: FormatSpec) = out.writeField(written(), spec)
+  display(out: Writer, spec: FormatSpec) = out.writeField(written(host), spec)
 
 object Url
   // The text read as a URL; text that is not one traps with the error's message and the text.
@@ -238,6 +247,41 @@ object Url
   // `text` with each percent-escape replaced by the byte it names, read as UTF-8; every other
   // character is kept, `+` included.
   decode(text: string) -> Result[string, UrlError] = decodeRange(text, 0, text.byteLength, false)
+
+  // The name and value pairs of `text` written as `application/x-www-form-urlencoded`, in order,
+  // read as the WHATWG URL standard reads them: the text split at each `&`, an empty piece skipped,
+  // each piece at its first `=` into a name and a value (empty where there is no `=`), and each
+  // decoded, a `+` standing for a space. A name given more than once is kept each time. A `%` not
+  // followed by two hexadecimal digits is `BadPercent` and escapes whose bytes are not UTF-8
+  // `InvalidUtf8`, each `at` its byte offset in `text`; any other character is kept as it is.
+  formDecode(text: string) -> Result[Vector[(string, string)], UrlError]
+    val pairs = Buffer[(string, string)]()
+    val n = text.byteLength
+    var start = 0
+    while start < n
+      val amp = byteIndex(text, int('&'), start, n)
+      if amp > start
+        val eq = byteIndex(text, int('='), start, amp)
+        val name = decodeRange(text, start, eq, true)?
+        val value = if eq < amp then decodeRange(text, eq + 1, amp, true)? else ""
+        pairs.addOne((name, value))
+      start = amp + 1
+    Ok(pairs.toVector)
+
+  // `pairs` written as `application/x-www-form-urlencoded`, as the WHATWG URL standard writes them:
+  // each name and value joined by `=`, the pairs by `&`, a space written `+`, and every byte of the
+  // UTF-8 but a letter, a digit, `*`, `-`, `.` and `_` written `%` and two upper-case hexadecimal
+  // digits. `formDecode` reads the text back as the same pairs.
+  formEncode(pairs: Vector[(string, string)]) -> string
+    val out = StringWriter()
+    var first = true
+    for (name, value) in pairs
+      if !first then out.write("&")
+      first = false
+      formEscaped(out, name)
+      out.write("=")
+      formEscaped(out, value)
+    out.text
 
 // A reference as it was read: an absolute URL's components, with the scheme absent from a relative
 // one.
@@ -330,7 +374,7 @@ private parseReference(text: string) -> Result[Reference, UrlError]
     else
       while hostEnd < end && code(text, hostEnd) != int(':') do hostEnd += 1
     checkHost(text, hostStart, hostEnd)?
-    host = Some(text.slice(hostStart, hostEnd))
+    host = Some(asciiHost(text.slice(hostStart, hostEnd), hostStart)?)
     if hostEnd < end
       if code(text, hostEnd) != int(':') then return Err(BadHost(hostEnd))
       port = readPort(text, hostEnd + 1, end)?
@@ -507,10 +551,29 @@ private decodeRange(text: string, from: int, until: int, form: bool) -> Result[s
     Ok(t) -> Ok(t)
     Err(e) -> Err(InvalidUtf8(sources(int(e.offset))))
 
-// A query piece decoded as a form writes it.
-private formDecoded(piece: string) -> string = decodeRange(piece, 0, piece.byteLength, true) match
-  Ok(t) -> t
-  Err(e) -> fail(s"${e.message}: $piece")
+// The offset of the first byte `b` of `text` from `from` up to `until`, or `until` where there is none.
+private byteIndex(text: string, b: int, from: int, until: int) -> int
+  var i = from
+  while i < until && code(text, i) != b
+    i += 1
+  i
+
+// `text` written to `out` as a form writes a name or a value.
+private formEscaped(out: StringWriter, text: string)
+  val n = text.byteLength
+  var plain = 0
+  for i in 0 ..< n
+    val b = code(text, i)
+    if !(isAlpha(b) || isDigit(b) || b == int('*') || b == int('-') || b == int('.') || b == int('_'))
+      if plain < i then out.write(text.slice(plain, i))
+      if b == int(' ')
+        out.write("+")
+      else
+        out.write("%")
+        out.write(hexDigit(b >> 4))
+        out.write(hexDigit(b & 15))
+      plain = i + 1
+  out.write(text.slice(plain, n))
 
 // `r` resolved against `base` by RFC 3986's algorithm (section 5.2.2), strictly: a reference with a
 // scheme keeps it even where it is the base's.
@@ -610,6 +673,51 @@ private lowerHost(h: string) -> string
       i += 1
   out.write(asciiLower(rest(h, plain)))
   out.text
+
+// A host in the form a URL holds it. A registered name holding a character beyond ASCII, written as
+// it is or in percent-escapes, or holding a label that begins `xn--` in any case, is taken through
+// `idna.toAscii` with the WHATWG URL standard's checks (its escapes decoded first), and must come out
+// as letters, digits and the characters a name may hold unescaped. Any other host, an address in
+// brackets or a name in ASCII, is kept as written. `at` is where the host begins in the text read,
+// for the error.
+private asciiHost(h: string, at: int) -> Result[string, UrlError]
+  if h.startsWith("[") || (isAsciiText(h) && !h.contains("%") && !hasPunycodeLabel(h)) then return Ok(h)
+  val name = decodeRange(h, 0, h.byteLength, false)?
+  if isAsciiText(name) && !hasPunycodeLabel(name) then return Ok(h)
+  val ascii = idna.toAscii(name) match
+    Ok(a) -> a
+    Err(_) -> return Err(BadHost(at))
+  if ascii.isEmpty then return Err(BadHost(at))
+  for i in 0 ..< ascii.byteLength
+    val b = code(ascii, i)
+    if !isUnreserved(b) && !isSubDelim(b) then return Err(BadHost(at))
+  Ok(ascii)
+
+// As `asciiHost`, trapping with the error's message and the host where it is not one.
+private asciiHostOrTrap(h: string) -> string = asciiHost(h, 0) match
+  Ok(a) -> a
+  Err(e) -> fail(s"${e.message}: $h")
+
+// Whether every character of `s` is ASCII.
+private isAsciiText(s: string) -> bool
+  for i in 0 ..< s.byteLength
+    if (code(s, i) & 0x80) != 0 then return false
+  true
+
+// Whether a label of the name begins `xn--`, in any case.
+private hasPunycodeLabel(name: string) -> bool
+  for label in name.split(".")
+    if label.byteLength >= 4 && (code(label, 0) | 0x20) == int('x') && (code(label, 1) | 0x20) == int('n')
+      if label.startsWith("--", 2) then return true
+  false
+
+// The name with its labels in Punycode decoded, where it holds any and they decode to a valid name;
+// otherwise as it is.
+private unicodeName(h: string) -> string
+  if h.startsWith("[") || !hasPunycodeLabel(h) then return h
+  idna.toUnicode(h) match
+    Ok(u) -> u
+    Err(_) -> h
 
 // The byte at offset `i` of `s`, as a number.
 private code(s: string, i: int) -> int = int(s.byteAt(i))

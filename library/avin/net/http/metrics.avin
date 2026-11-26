@@ -1,11 +1,13 @@
 module avin.net.http
 
-// Request metrics: a middleware counting the requests it passes on by method, route and status
-// class, timing them into a latency histogram of fixed buckets, and keeping how many are being
-// answered at once, all shown in the Prometheus text format by a handler a router mounts. One
-// `Metrics` is shared by every connection's actor, its counts kept under a lock of its own.
+// Request metrics, kept in an `avin.metrics` registry: a middleware counting the requests it passes on
+// by method, route and status class, timing them into a latency histogram, and keeping how many are
+// being answered at once; the server's own counts, which `serve` keeps where it is given a
+// `ServerMetrics`; and a handler answering a registry in the Prometheus text exposition format.
 
-import avin.threads.{Atomic, Mutex}
+import avin.metrics
+import avin.metrics.{Counter, Gauge, Histogram, HistogramSeries, Registry}
+import avin.threads.Atomic
 import avin.time.{Duration, millis, monotonic, seconds}
 
 // The latency buckets a `Metrics` counts into unless given others: from 5 milliseconds to 10 seconds.
@@ -23,35 +25,68 @@ val defaultBuckets: Vector[Duration] = Vector(
   seconds(10)
 )
 
-// The type of the Prometheus text format, version 0.0.4, which `Metrics.handler` answers.
-val MetricsContentType: string = "text/plain; version=0.0.4; charset=utf-8"
+// The type of the Prometheus text exposition format, version 0.0.4, which a metrics handler answers.
+val MetricsContentType: string = metrics.TextContentType
 
-// The requests a set of routes has answered. Its `middleware` counts each request it passes on in
-// `http_requests_total`, by its method, its route's pattern and the class of its status (`2xx`), and
-// times it into `http_request_duration_seconds`, a histogram of `buckets`, upper bounds in increasing
-// order, each a duration above zero; any other order, or a bound not above zero, traps. A request
-// being answered is counted in the gauge `http_requests_in_flight`. A request no router chose a route
-// for, as one is for a middleware wrapped around a whole router's `handle`, has the route `""`. The
-// time is read from `clock` before and after the handler.
-class Metrics(val buckets: Vector[Duration] = defaultBuckets, private val clock: Clock = monotonic): Sendable
+// A handler answering `registry.render` as `200`, of the type `MetricsContentType`.
+metricsHandler(registry: Registry) -> Handler =
+  _ -> Response(200, reasonPhrase(200), Vector(("Content-Type", MetricsContentType)), utf8(registry.render))
+
+// A `GET` route of `pattern` answered by `metricsHandler(registry)`.
+metricsRoute(registry: Registry, pattern: string = "/metrics") -> Route = Route.get(pattern, metricsHandler(registry))
+
+// The method a request is counted by: one of the methods HTTP defines (`GET`, `HEAD`, `POST`, `PUT`,
+// `DELETE`, `CONNECT`, `OPTIONS`, `TRACE` and `PATCH`) as it is, any other `_other`, so a client
+// sending made-up methods makes no new series.
+methodLabel(method: string) -> string = method match
+  "GET" | "HEAD" | "POST" | "PUT" | "DELETE" | "CONNECT" | "OPTIONS" | "TRACE" | "PATCH" -> method
+  _ -> "_other"
+
+// The requests a set of routes has answered, kept in `registry`. Its `middleware` counts each request
+// it passes on in `http_requests_total`, by its method (as `methodLabel` names it), its route's pattern
+// and the class of its status (`2xx`), and times it into `http_request_duration_seconds`, a histogram
+// of `buckets`, upper bounds in increasing order, each a duration above zero; any other order, or a
+// bound not above zero, traps. A request being answered is counted in the gauge
+// `http_requests_in_flight`. A request no router chose a route for, as one is for a middleware
+// wrapped around a whole router's `handle`, has the route `""`. The time is read from `clock` before
+// and after the handler. Each family holds at most `maxSeries` series, as `avin.metrics` guards them.
+// Making two `Metrics` in one registry traps, as making any name twice does.
+class Metrics(
+    val buckets: Vector[Duration] = defaultBuckets,
+    private val clock: Clock = monotonic,
+    val registry: Registry = Registry(),
+    maxSeries: int = metrics.defaultMaxSeries
+): Sendable
   for i in 0 ..< buckets.length
     if buckets(i).micros <= 0 then fail(s"a latency bucket of ${buckets(i)}: each is above zero")
     if i > 0 && buckets(i) <= buckets(i - 1) then
       fail(s"the latency buckets ${buckets(i - 1)} and ${buckets(i)}: each is above the one before")
 
-  private val table = Mutex(Table())
-  private val active = Atomic(long(0))
+  private val requests: Counter = registry.counter(
+    "http_requests_total",
+    "Requests answered, by method, route and status class.",
+    ["method", "route", "status"],
+    maxSeries
+  )
+  private val latency: Histogram = registry.histogram(
+    "http_request_duration_seconds",
+    "Time taken to answer a request, by method and route.",
+    ["method", "route"],
+    buckets.map(b -> b.toSecondsReal),
+    maxSeries
+  )
+  private val active: Gauge = registry.gauge("http_requests_in_flight", "Requests being answered now.")
 
   // The middleware that counts and times each request it passes on. Wrapping a route or a group in
   // it labels a request by its route; wrapping a router's `handle` labels each `""`.
   middleware -> (Handler) -> Handler = next -> request -> measured(next, request)
 
   private measured(next: Handler, request: ServerRequest) -> Response
-    _ = active.add(1)
+    active.inc()
     val start = clock()
     val response = next(request)
     val took = clock() - start
-    _ = active.sub(1)
+    active.dec()
     observe(request.method, request.route.getOrElse(""), response.status, took)
     response
 
@@ -59,23 +94,19 @@ class Metrics(val buckets: Vector[Duration] = defaultBuckets, private val clock:
   // middleware does for each request, for a program counting requests it answers another way. A
   // negative time counts as zero.
   observe(method: string, route: string, status: int, took: Duration)
-    val micros = if took.micros < 0 then long(0) else took.micros
-    val bucket = buckets.indexWhere(b -> micros <= b.micros)
-    val n = buckets.length
-    table.with(t -> t.count(method, route, statusClass(status), micros, bucket, n))
+    val m = methodLabel(method)
+    requests.labels(m, route, statusClass(status)).inc()
+    latency.labels(m, route).observe(if took.micros < 0 then Duration.Zero else took)
 
   // How many requests the middleware is passing on now, not yet answered.
-  inFlight -> long = active.load()
+  inFlight -> long = long(active.value)
 
-  // The metrics in the Prometheus text format: each family's help and type, then its series, ordered
-  // by route, then method, then status class.
-  render -> string
-    val bounds = buckets.map(b -> b.micros)
-    val gauge = active.load()
-    table.with(t -> t.rendered(bounds, gauge))
+  // The registry in the Prometheus text exposition format: every family in it, these three among
+  // them, each one's series ordered by their label values.
+  render -> string = registry.render
 
   // A handler answering `render` as `200`, of the type `MetricsContentType`.
-  handler -> Handler = _ -> Response(200, reasonPhrase(200), Vector(("Content-Type", MetricsContentType)), utf8(render))
+  handler -> Handler = metricsHandler(registry)
 
   // A `GET` route of `pattern` answered by `handler`, mounted beside the routes it counts.
   route(pattern: string = "/metrics") -> Route = Route.get(pattern, handler)
@@ -83,64 +114,83 @@ class Metrics(val buckets: Vector[Duration] = defaultBuckets, private val clock:
 // The class of a status, its first digit followed by `xx`: `2xx` for 204.
 private statusClass(status: int) -> string = s"${status / 100}xx"
 
-// One route's histogram: the requests in each bucket alone, not counting the ones below, their count
-// and the time they took.
-private class Histogram(n: int)
-  val inBucket: Array[long] = Array.fill(n, long(0))
-  var count: long = 0
-  var sumMicros: long = 0
+// What a server counts of its own, given to `serve` as `metrics`, kept in `registry`: every request it
+// reads and answers in `http_server_requests_total`, by method (as `methodLabel` names it) and status
+// class; the time from the request read to the response written, its body streamed included, in
+// `http_server_request_duration_seconds`, by method, a histogram of `buckets` as `Metrics` takes
+// them; the requests being answered in `http_server_requests_in_flight`; and the requests it refused
+// before any handler saw them (`400`, `408`, `413`, `414`, `431`) in `http_server_rejected_total`, by
+// status code. A handler that traps is counted as answering `500`, its time and its place in flight
+// ending with its connection, so the gauge is exact where a middleware's cannot be. An upgrade is
+// counted as its `101` once that is sent. Making two in one registry traps.
+class ServerMetrics(
+    val buckets: Vector[Duration] = defaultBuckets,
+    private val clock: Clock = monotonic,
+    val registry: Registry = Registry()
+): Sendable
+  for i in 0 ..< buckets.length
+    if buckets(i).micros <= 0 then fail(s"a latency bucket of ${buckets(i)}: each is above zero")
+    if i > 0 && buckets(i) <= buckets(i - 1) then
+      fail(s"the latency buckets ${buckets(i - 1)} and ${buckets(i)}: each is above the one before")
 
-// Every series counted, by method, route and status class, and by method and route.
-private class Table()
-  var totals = HashMap.empty[(string, string, string), long]()
-  var latency = HashMap.empty[(string, string), Histogram]()
+  private val requests: Counter = registry.counter(
+    "http_server_requests_total",
+    "Requests the server answered, by method and status class.",
+    ["method", "status"]
+  )
+  private val latency: Histogram = registry.histogram(
+    "http_server_request_duration_seconds",
+    "Time from a request read to its response written, by method.",
+    ["method"],
+    buckets.map(b -> b.toSecondsReal)
+  )
+  private val active: Gauge = registry.gauge("http_server_requests_in_flight", "Requests the server is answering now.")
+  private val refusals: Counter = registry.counter(
+    "http_server_rejected_total",
+    "Requests the server refused before any handler, by status.",
+    ["status"]
+  )
 
-  // Counts one request, `bucket` being the index of the first bucket it falls in, or -1 for none of
-  // the `n`.
-  count(method: string, route: string, kind: string, micros: long, bucket: int, n: int)
-    val key = (method, route, kind)
-    totals = totals.updated(key, totals.get(key).getOrElse(long(0)) + 1)
-    val h = latency.get((method, route)) match
-      Some(found) -> found
-      None ->
-        val made = Histogram(n)
-        latency = latency.updated((method, route), made)
-        made
-    if bucket >= 0 then h.inBucket(bucket) = h.inBucket(bucket) + 1
-    h.count += 1
-    h.sumMicros += micros
+  // How many requests the server is answering now.
+  inFlight -> long = long(active.value)
 
-  rendered(bounds: Vector[long], inFlight: long) -> string
-    val out = StringWriter()
-    out.write("# HELP http_requests_total Requests answered, by method, route and status class.\n")
-    out.write("# TYPE http_requests_total counter\n")
-    for (k, v) in totals.toVector.sortBy(e -> s"${e.0.1}\u{0}${e.0.0}\u{0}${e.0.2}")
-      out.write(s"http_requests_total{method=${label(k.0)},route=${label(k.1)},status=${label(k.2)}} $v\n")
-    out.write("# HELP http_request_duration_seconds Time taken to answer a request, by method and route.\n")
-    out.write("# TYPE http_request_duration_seconds histogram\n")
-    for (k, h) in latency.toVector.sortBy(e -> s"${e.0.1}\u{0}${e.0.0}")
-      val labels = s"method=${label(k.0)},route=${label(k.1)}"
-      var below: long = 0
-      for i in 0 ..< bounds.length
-        below += h.inBucket(i)
-        out.write(s"http_request_duration_seconds_bucket{$labels,le=\"${secondsText(bounds(i))}\"} $below\n")
-      out.write(s"http_request_duration_seconds_bucket{$labels,le=\"+Inf\"} ${h.count}\n")
-      out.write(s"http_request_duration_seconds_sum{$labels} ${secondsText(h.sumMicros)}\n")
-      out.write(s"http_request_duration_seconds_count{$labels} ${h.count}\n")
-    out.write("# HELP http_requests_in_flight Requests being answered now.\n")
-    out.write("# TYPE http_requests_in_flight gauge\n")
-    out.write(s"http_requests_in_flight $inFlight\n")
-    out.text
+  // The registry in the Prometheus text exposition format.
+  render -> string = registry.render
 
-// A label's value in quotes, a backslash, a quote and a line end escaped as the format asks.
-private label(value: string) -> string =
-  "\"" + value.replace("\\", "\\\\").replace("\"", "\\\"").replace("\n", "\\n") + "\""
+  // A handler answering `render`, as `Metrics.handler` does.
+  handler -> Handler = metricsHandler(registry)
 
-// `micros`, at least zero, as seconds in decimal, without trailing zeros: `0.005`, `2.5`, `10`.
-private secondsText(micros: long) -> string
-  val whole = micros / 1000000
-  val part = micros % 1000000
-  if part == 0 then return whole.toString()
-  var fraction = part.toString().padStart(6, '0')
-  while fraction.endsWith("0") do fraction = fraction.dropRight(1)
-  s"$whole.$fraction"
+  // A `GET` route of `pattern` answered by `handler`.
+  route(pattern: string = "/metrics") -> Route = Route.get(pattern, handler)
+
+  // A request of `method` read and about to be answered: in flight until its `finish`. This is what
+  // `serve` calls for each request; a program answering requests another way calls it too.
+  started(method: string) -> InFlight
+    active.inc()
+    val m = methodLabel(method)
+    InFlight(requests, latency.labels(m), active, clock, m, clock())
+
+  // Counts a request refused with `status` before any handler saw it.
+  rejected(status: int) = refusals.labels(status.toString()).inc()
+
+// A request a `ServerMetrics` counts as being answered. Its first `finish` counts it; any later one
+// does nothing, so a server finishing a request on every way out counts it once.
+class InFlight(
+    private val requests: Counter,
+    private val latency: HistogramSeries,
+    private val active: Gauge,
+    private val clock: Clock,
+    val method: string,
+    val start: Duration
+): Sendable
+  private val done = Atomic(false)
+
+  // Counts the request as answered `status` now, the time since it started observed and its place in
+  // flight given up; answers whether this call counted it.
+  finish(status: int) -> bool
+    if done.swap(true) then return false
+    val took = clock() - start
+    active.dec()
+    requests.labels(method, statusClass(status)).inc()
+    latency.observe(if took.micros < 0 then Duration.Zero else took)
+    true

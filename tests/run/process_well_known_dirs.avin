@@ -1,0 +1,157 @@
+// expect: exit 0
+// The well-known directories of `avin.process`: `homeDir`, `tempRoot`, `cacheDir`, `configDir` and
+// `dataDir`, read from the environment a child copy of this program is given (a cleared one plus
+// what each case sets), so every variable's set, empty, relative and absolute shape is tried. On
+// macOS the three follow `~/Library` and ignore the XDG variables; elsewhere each is its XDG variable
+// when that is an absolute path, else a leaf under the home directory. `setCurrentDir` is checked
+// against what `currentDir` and a relative path then read.
+import avin.fs
+import avin.process
+import avin.process.{Command, MacOS}
+
+// What the child prints: home, temp, cache, config and data, `|` between.
+probe()
+  val parts = [
+    process.homeDir(),
+    Some(process.tempRoot()),
+    process.cacheDir(),
+    process.configDir(),
+    process.dataDir()
+  ]
+  println(parts.map(p -> p.getOrElse("-")).mkString("|"))
+
+// The child's answer under exactly `vars`.
+asked(vars: Vector[(string, string)]) -> string
+  var c = Command(process.executable().getOrElse("/no/program"), "probe").clearEnv
+  for (name, value) in vars do c = c.withEnv(name, value)
+  c.output() match
+    Ok(text) -> text.trim
+    Err(e) -> s"did not run: $e"
+
+isMac() -> bool = process.os() == MacOS
+
+// Checks one case: `linux` is what a machine following the XDG variables answers, `mac` what macOS does.
+check(label: string, vars: Vector[(string, string)], linux: string, mac: string)
+  val want = if isMac() then mac else linux
+  val got = asked(vars)
+  println(if got == want then s"$label ok" else s"$label WRONG: got $got, wanted $want")
+
+main(args: Vector[string])
+  if args == ["probe"]
+    probe()
+    return
+  // Only a home directory: the conventional leaves, and the system temp directory.
+  check(
+    "home only",
+    [("HOME", "/home/u")],
+    "/home/u|/tmp|/home/u/.cache|/home/u/.config|/home/u/.local/share",
+    "/home/u|/tmp|/home/u/Library/Caches|/home/u/Library/Application Support|/home/u/Library/Application Support"
+  )
+  // Every variable absolute: XDG wins on a machine that follows it; macOS ignores it; TMPDIR is
+  // taken as written, a trailing slash included.
+  check(
+    "all set",
+    [
+      ("HOME", "/home/u"),
+      ("TMPDIR", "/var/t/"),
+      ("XDG_CACHE_HOME", "/x/cache"),
+      ("XDG_CONFIG_HOME", "/x/config"),
+      ("XDG_DATA_HOME", "/x/data")
+    ],
+    "/home/u|/var/t/|/x/cache|/x/config|/x/data",
+    "/home/u|/var/t/|/home/u/Library/Caches|/home/u/Library/Application Support|/home/u/Library/Application Support"
+  )
+  // Each variable alone overrides only its own directory.
+  check(
+    "cache only",
+    [("HOME", "/h"), ("XDG_CACHE_HOME", "/x/cache")],
+    "/h|/tmp|/x/cache|/h/.config|/h/.local/share",
+    "/h|/tmp|/h/Library/Caches|/h/Library/Application Support|/h/Library/Application Support"
+  )
+  check(
+    "config only",
+    [("HOME", "/h"), ("XDG_CONFIG_HOME", "/x/config")],
+    "/h|/tmp|/h/.cache|/x/config|/h/.local/share",
+    "/h|/tmp|/h/Library/Caches|/h/Library/Application Support|/h/Library/Application Support"
+  )
+  check(
+    "data only",
+    [("HOME", "/h"), ("XDG_DATA_HOME", "/x/data")],
+    "/h|/tmp|/h/.cache|/h/.config|/x/data",
+    "/h|/tmp|/h/Library/Caches|/h/Library/Application Support|/h/Library/Application Support"
+  )
+  // A variable set to nothing, or to a relative path, is as good as unset.
+  check(
+    "empty and relative",
+    [
+      ("HOME", "/h"),
+      ("TMPDIR", ""),
+      ("XDG_CACHE_HOME", ""),
+      ("XDG_CONFIG_HOME", "relative/dir"),
+      ("XDG_DATA_HOME", ".")
+    ],
+    "/h|/tmp|/h/.cache|/h/.config|/h/.local/share",
+    "/h|/tmp|/h/Library/Caches|/h/Library/Application Support|/h/Library/Application Support"
+  )
+  check(
+    "relative temp",
+    [("HOME", "/h"), ("TMPDIR", "tmp")],
+    "/h|/tmp|/h/.cache|/h/.config|/h/.local/share",
+    "/h|/tmp|/h/Library/Caches|/h/Library/Application Support|/h/Library/Application Support"
+  )
+  // No home: nothing is invented where the machine does not say, but an absolute XDG variable still answers.
+  check("nothing set", [], "-|/tmp|-|-|-", "-|/tmp|-|-|-")
+  check("empty home", [("HOME", "")], "-|/tmp|-|-|-", "-|/tmp|-|-|-")
+  check(
+    "xdg without home",
+    [("XDG_CACHE_HOME", "/x/cache"), ("XDG_DATA_HOME", "/x/data")],
+    "-|/tmp|/x/cache|-|/x/data",
+    "-|/tmp|-|-|-"
+  )
+  // The home directory joins with exactly one separator, whatever it ends with.
+  check(
+    "home with slash",
+    [("HOME", "/home/u/")],
+    "/home/u/|/tmp|/home/u/.cache|/home/u/.config|/home/u/.local/share",
+    "/home/u/|/tmp|/home/u/Library/Caches|/home/u/Library/Application Support|/home/u/Library/Application Support"
+  )
+  check(
+    "root home",
+    [("HOME", "/")],
+    "/|/tmp|/.cache|/.config|/.local/share",
+    "/|/tmp|/Library/Caches|/Library/Application Support|/Library/Application Support"
+  )
+  // Paths with spaces and non-ASCII text pass through whole.
+  check(
+    "unicode",
+    [("HOME", "/home/ü ser"), ("XDG_DATA_HOME", "/dä ta")],
+    "/home/ü ser|/tmp|/home/ü ser/.cache|/home/ü ser/.config|/dä ta",
+    "/home/ü ser|/tmp|/home/ü ser/Library/Caches|/home/ü ser/Library/Application Support|/home/ü ser/Library/Application Support"
+  )
+  // The real environment of this process agrees with the child's reading of the same variables.
+  println(process.tempRoot().startsWith("/"))
+  // A name is never made: nothing was created in the directories the cases named.
+  println(fs.exists("/x/cache") || fs.exists("/h/.cache"))
+
+  // `setCurrentDir`.
+  val start = process.currentDir().getOrElse("")
+  val dir = fs.createTempDir("avin-cwd").getOrElse("")
+  _ = fs.createDir(dir + "/inner")
+  _ = fs.writeText(dir + "/inner/marker", "m")
+  println(process.setCurrentDir(dir + "/inner"))
+  println(fs.readText("marker"))
+  println(process.currentDir().map(d -> d.endsWith("/inner")))
+  println(process.setCurrentDir(".."))
+  println(fs.exists("inner/marker"))
+  // A relative target is read from the directory it is called in.
+  println(process.setCurrentDir("inner"))
+  println(fs.exists("marker"))
+  // A child started now starts there.
+  println(Command("/bin/pwd").output().map(t -> t.trim.endsWith("/inner")))
+  println(process.setCurrentDir(dir + "/missing").map(_ -> "ok").mapErr(e -> s"${e.kind}"))
+  println(process.setCurrentDir(dir + "/inner/marker").map(_ -> "ok").mapErr(e -> s"${e.kind}"))
+  // A failed change leaves the directory where it was.
+  println(process.currentDir().map(d -> d.endsWith("/inner")))
+  println(process.setCurrentDir(start))
+  println(process.currentDir().getOrElse("") == start)
+  _ = fs.removeDirAll(dir)

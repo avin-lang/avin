@@ -1,0 +1,495 @@
+// `avin.net.http`'s form bodies: urlencoded forms read by `ServerRequest.form()` and written by
+// `Request.withForm`, `Url.formDecode` and `Url.formEncode` beneath them, and `multipart/form-data`
+// read by `ServerRequest.multipart` and `Multipart.parse` and written by `Multipart.encoded` and
+// `Request.withMultipart`, with its limits, its boundary rules and its filenames.
+import avin.io.{IoError, Reader}
+import avin.net.{Url, UrlError, BadPercent, InvalidUtf8}
+
+import avin.net.http.{
+  BadEncoding, BadMultipart, BodyUnreadable, Form, FormError, FormTooLarge, Multipart, MultipartLimits, MultipartReader,
+  NoBoundary, NotAForm, Part, PartHeadersTooLarge, Request, ServerRequest, TooManyParts
+}
+
+// The UTF-8 bytes of `text`.
+bytes(text: string) -> Array[byte] = Array.tabulate(text.byteLength, i -> text.byteAt(i))
+
+// A request posting `body` of the type `contentType`, none where it is empty.
+posted(contentType: string, body: string) -> ServerRequest = posted(contentType, bytes(body))
+
+posted(contentType: string, body: Array[byte]) -> ServerRequest =
+  if contentType.isEmpty then ServerRequest("POST", "/", Vector.empty[(string, string)](), body)
+  else ServerRequest("POST", "/", [("Content-Type", contentType)], body)
+
+// What `form()` read, as its pairs or its error.
+formOf(contentType: string, body: string) -> string = posted(contentType, body).form() match
+  Ok(f) -> s"${f.pairs}"
+  Err(e) -> s"error: ${variant(e)}"
+
+// A form error written as its variant and fields.
+variant(e: FormError) -> string = e match
+  NotAForm(expected, found) -> s"NotAForm($expected, ${found.map(f -> s"Some($f)").getOrElse("None")})"
+  BadEncoding(BadPercent(at)) -> s"BadEncoding(BadPercent($at))"
+  BadEncoding(InvalidUtf8(at)) -> s"BadEncoding(InvalidUtf8($at))"
+  BadEncoding(other) -> s"BadEncoding(${other.message})"
+  NoBoundary -> "NoBoundary"
+  BadMultipart(reason) -> s"BadMultipart($reason)"
+  TooManyParts(limit) -> s"TooManyParts($limit)"
+  PartHeadersTooLarge(limit) -> s"PartHeadersTooLarge($limit)"
+  FormTooLarge(limit) -> s"FormTooLarge($limit)"
+  BodyUnreadable(e) -> s"BodyUnreadable(${e.message})"
+
+// A part written out: name, filename, type, body and headers.
+shownPart(p: Part) -> string = s"${p.name}|${p.filename.getOrElse("-")}|${p.contentType}|${p.text}|${p.headers}"
+
+shown(r: Result[Multipart, FormError]) -> string = r match
+  Ok(m) -> m.parts.map(shownPart).mkString(" ; ")
+  Err(e) -> s"error: ${variant(e)}"
+
+// A multipart body of the boundary `b`, read with `limits`: by `Multipart.parse`, and by a
+// `MultipartReader` from a source handing it 1, 2, 3, 5, 64 and 65536 bytes at a time, which must
+// read the same parts or fail the same way.
+multipartOf(body: string, b: string = "XyZ", limits: MultipartLimits = MultipartLimits()) -> string =
+  agreed(bytes(body), s"multipart/form-data; boundary=$b", limits)
+
+agreed(body: Array[byte], contentType: string, limits: MultipartLimits = MultipartLimits()) -> string
+  val whole = shown(Multipart.parse(body, contentType, limits))
+  for size in [1, 2, 3, 5, 64, 65536]
+    assertEq(streamed(body, contentType, limits, size), whole)
+  whole
+
+// `body` read by a `MultipartReader` from a source handing it `size` bytes at a time, each part's body
+// read `size` bytes at a time too, written as `shown` writes the parts `parse` reads.
+streamed(body: Array[byte], contentType: string, limits: MultipartLimits, size: int) -> string
+  val reader = MultipartReader.over(Pieces(body, size), contentType, limits) match
+    Ok(r) -> r
+    Err(e) -> return s"error: ${variant(e)}"
+  val parts = Buffer[Part]()
+  loop
+    val head = reader.next() match
+      Ok(Some(h)) -> h
+      Ok(None) -> break
+      Err(e) -> return s"error: ${variant(e)}"
+    val out = Buffer[byte]()
+    loop
+      val got = reader.read(size) match
+        Ok(g) -> g
+        Err(e) -> return s"error: ${variant(e)}"
+      if got.length == 0 then break
+      out.addAll(got)
+    parts.addOne(Part(head.name, head.filename, head.contentType, head.headers, out.toArray()))
+  parts.toVector.map(shownPart).mkString(" ; ")
+
+// A source handing out `bytes` at most `size` at a time.
+class Pieces(private val bytes: Array[byte], private val size: int): Reader
+  private var at = 0
+
+  override read(max: int) -> Result[Array[byte], IoError]
+    val n = if size < max then size else max
+    val end = if bytes.length - at > n then at + n else bytes.length
+    val out = bytes.slice(at, end)
+    at = end
+    Ok(out)
+
+// The parts `m` read back after being written with `boundary` and parsed from that body.
+roundTrip(m: Multipart, boundary: string) -> string =
+  shown(Multipart.parse(m.encoded(boundary), m.contentType(boundary)))
+
+@test("formDecode splits at & and the first =, skips empty pieces, keeps repeats, and decodes + and escapes")
+formDecodePairs()
+  assertEq(Url.formDecode(""), Ok(Vector.empty[(string, string)]()))
+  assertEq(Url.formDecode("&&&"), Ok(Vector.empty[(string, string)]()))
+  assertEq(
+    Url.formDecode("a=1&b=&c&=v&=&d=x=y"),
+    Ok([("a", "1"), ("b", ""), ("c", ""), ("", "v"), ("", ""), ("d", "x=y")])
+  )
+  assertEq(Url.formDecode("k=1&k=2&j=3&k=4"), Ok([("k", "1"), ("k", "2"), ("j", "3"), ("k", "4")]))
+  assertEq(Url.formDecode("a+b=c+%2B+d&%26=%3D"), Ok([("a b", "c + d"), ("&", "=")]))
+  assertEq(Url.formDecode("n=caf%C3%A9&m=café&e=%F0%9F%98%80"), Ok([("n", "café"), ("m", "café"), ("e", "\u{1f600}")]))
+  assertEq(Url.formDecode("a=%41%62"), Ok([("a", "Ab")]))
+  assertEq(Url.formDecode("x=a b<>\"#"), Ok([("x", "a b<>\"#")]))
+
+@test("formDecode refuses a malformed escape and escapes that are not UTF-8, at their offset")
+formDecodeErrors()
+  assertEq(Url.formDecode("a=%"), Err(BadPercent(2)))
+  assertEq(Url.formDecode("a=%4"), Err(BadPercent(2)))
+  assertEq(Url.formDecode("ok=1&a=%zz"), Err(BadPercent(7)))
+  assertEq(Url.formDecode("%g1=v"), Err(BadPercent(0)))
+  assertEq(Url.formDecode("a=1&b=%FF"), Err(InvalidUtf8(6)))
+  assertEq(Url.formDecode("a=%C3"), Err(InvalidUtf8(2)))
+
+@test("formEncode writes a space as + and escapes all but letters, digits, * - . and _")
+formEncodePairs()
+  assertEq(Url.formEncode(Vector.empty[(string, string)]()), "")
+  assertEq(Url.formEncode([("a", "1")]), "a=1")
+  assertEq(Url.formEncode([("", "")]), "=")
+  assertEq(Url.formEncode([("a b", "c+d&e=f"), ("k", "")]), "a+b=c%2Bd%26e%3Df&k=")
+  assertEq(Url.formEncode([("x", "*-._~!'()")]), "x=*-._%7E%21%27%28%29")
+  assertEq(Url.formEncode([("n", "café ✓")]), "n=caf%C3%A9+%E2%9C%93")
+  assertEq(Url.formEncode([("crlf", "a\r\nb")]), "crlf=a%0D%0Ab")
+
+@test("formEncode and formDecode are inverse, repeats and Unicode included")
+formRoundTrip()
+  val pairs = [("a", "1"), ("a", "2"), ("", ""), ("sp ace", "x=y&z"), ("é", "\u{1f600}+%"), ("k", "")]
+  assertEq(Url.formDecode(Url.formEncode(pairs)), Ok(pairs))
+
+@test("queryParams still reads a query as a form")
+queryParamsAsForm()
+  assertEq(
+    Url("http://h/?a=1&b=&c&&d=x=y&e=%C3%A9+f").queryParams,
+    [("a", "1"), ("b", ""), ("c", ""), ("d", "x=y"), ("e", "\u{e9} f")]
+  )
+  assertEq(Url("http://h/").queryParams, Vector.empty[(string, string)]())
+
+@test("form() reads an urlencoded body, the type matched without regard to case or parameters")
+serverForm()
+  val ct = "application/x-www-form-urlencoded"
+  assertEq(formOf(ct, ""), "[]")
+  assertEq(formOf(ct, "a=1&b=two+words&a=3"), "[(a, 1), (b, two words), (a, 3)]")
+  assertEq(formOf("Application/X-WWW-Form-URLencoded; charset=UTF-8", "k=v"), "[(k, v)]")
+  assertEq(formOf(" application/x-www-form-urlencoded ;charset=iso-8859-1", "k=%C3%A9"), "[(k, é)]")
+  assertEq(formOf(ct, "=&x="), "[(, ), (x, )]")
+  val f = posted(ct, "a=1&b=2&a=3").form().getOrElse(Form(Vector.empty[(string, string)]()))
+  assertEq(f.value("a"), Some("1"))
+  assertEq(f.value("c"), None)
+  assertEq(f.values("a"), ["1", "3"])
+  assertEq(f.values("c"), Vector.empty[string]())
+
+@test("form() refuses another content type, none, a malformed escape and bytes that are not UTF-8")
+serverFormErrors()
+  val ct = "application/x-www-form-urlencoded"
+  assertEq(formOf("text/plain", "a=1"), "error: NotAForm(application/x-www-form-urlencoded, Some(text/plain))")
+  assertEq(formOf("", "a=1"), "error: NotAForm(application/x-www-form-urlencoded, None)")
+  assertEq(
+    formOf("multipart/form-data; boundary=x", "a=1"),
+    "error: NotAForm(application/x-www-form-urlencoded, Some(multipart/form-data; boundary=x))"
+  )
+  assertEq(
+    formOf("application/x-www-form-urlencodedx", "a=1"),
+    "error: NotAForm(application/x-www-form-urlencoded, Some(application/x-www-form-urlencodedx))"
+  )
+  assertEq(formOf(ct, "a=%2"), "error: BadEncoding(BadPercent(2))")
+  assertEq(formOf(ct, "a=%E9"), "error: BadEncoding(InvalidUtf8(2))")
+  val raw = posted(ct, Array(byte(int('a')), byte(int('=')), byte(0xff))).form().map(f -> f.pairs)
+  assertEq(raw, Err(BadEncoding(InvalidUtf8(2))))
+
+@test("a form error answers 415, 413 or 400 with its message")
+formErrorResponses()
+  val e: FormError = NotAForm("application/x-www-form-urlencoded", None)
+  assertEq(e.toResponse().status, 415)
+  assertEq(e.toResponse().text, "the body has no content type, not `application/x-www-form-urlencoded`\n")
+  assertEq((NotAForm("a/b", Some("c/d")): FormError).message, "the body is `c/d`, not `a/b`")
+  assertEq((TooManyParts(3): FormError).toResponse().status, 413)
+  assertEq((PartHeadersTooLarge(3): FormError).toResponse().status, 413)
+  assertEq((FormTooLarge(3): FormError).toResponse().status, 413)
+  assertEq((NoBoundary: FormError).toResponse().status, 400)
+  assertEq((BadMultipart("x"): FormError).toResponse().text, "the multipart body is malformed: x\n")
+  assertEq((BadEncoding(BadPercent(1)): FormError).toResponse().status, 400)
+  assertEq(
+    [
+      (BadEncoding(BadPercent(1)): FormError),
+      NoBoundary,
+      TooManyParts(3),
+      PartHeadersTooLarge(4),
+      FormTooLarge(5)
+    ].map(e -> e.message),
+    [
+      "the form is not urlencoded: malformed percent-escape at index 1",
+      "the multipart body has no valid boundary",
+      "the multipart body has more parts than its limit of 3",
+      "a part's headers are longer than their limit of 4 bytes",
+      "the multipart body is longer than its limit of 5 bytes"
+    ]
+  )
+
+@test("withForm writes the pairs urlencoded and sets the only Content-Type")
+clientForm()
+  val r = Request(
+    "POST",
+    "http://h/",
+    [("content-type", "text/plain"), ("X-A", "1")]
+  ).withForm([("a b", "c&d"), ("é", "")])
+  assertEq(string.fromUtf8Lossy(r.body), "a+b=c%26d&%C3%A9=")
+  assertEq(r.headers, [("X-A", "1"), ("Content-Type", "application/x-www-form-urlencoded")])
+  val empty = Request("POST", "http://h/").withForm(Vector.empty[(string, string)]())
+  assertEq(empty.body.length, 0)
+  val back = ServerRequest("POST", "/", r.headers, r.body).form().map(f -> f.pairs)
+  assertEq(back, Ok([("a b", "c&d"), ("é", "")]))
+
+@test("a multipart body is read into its parts: name, filename, type, headers and body")
+multipartParts()
+  val body = "--XyZ\r\nContent-Disposition: form-data; name=\"title\"\r\n\r\nHello\r\n--XyZ\r\nContent-Disposition: form-data; name=\"doc\"; filename=\"a.txt\"\r\nContent-Type: text/markdown\r\nX-Extra:  kept \r\n\r\n# A\nline\r\n--XyZ--\r\n"
+  assertEq(
+    multipartOf(body),
+    "title|-|text/plain|Hello|[(Content-Disposition, form-data; name=\"title\")] ; doc|a.txt|text/markdown|# A\nline|[(Content-Disposition, form-data; name=\"doc\"; filename=\"a.txt\"), (Content-Type, text/markdown), (X-Extra, kept)]"
+  )
+  val m = Multipart.parse(bytes(body), "multipart/form-data; boundary=XyZ").getOrElse(Multipart(Vector.empty[Part]()))
+  assertEq(m.field("title"), Some("Hello"))
+  assertEq(m.field("doc"), None)
+  assertEq(m.file("doc").map(p -> p.filename), Some(Some("a.txt")))
+  assertEq(m.file("title").isDefined, false)
+  assertEq(m.named("doc").length, 1)
+  assertEq(m.named("none").length, 0)
+  assertEq(m.file("doc").map(p -> p.header("x-extra")), Some(Some("kept")))
+
+@test("the boundary parameter may be quoted, in any case, among other parameters")
+multipartBoundaryQuoting()
+  val body = "--a b:c\r\nContent-Disposition: form-data; name=x\r\n\r\n1\r\n--a b:c--"
+  assertEq(
+    shown(Multipart.parse(bytes(body), "multipart/form-data; charset=utf-8; BOUNDARY=\"a b:c\"")),
+    "x|-|text/plain|1|[(Content-Disposition, form-data; name=x)]"
+  )
+  assertEq(
+    shown(Multipart.parse(bytes(body), "Multipart/Form-Data;boundary=\"a b:c\"")),
+    "x|-|text/plain|1|[(Content-Disposition, form-data; name=x)]"
+  )
+  val escaped = "--q\"r\r\nContent-Disposition: form-data; name=x\r\n\r\n1\r\n--q\"r--"
+  assertEq(shown(Multipart.parse(bytes(escaped), "multipart/form-data; boundary=\"q\\\"r\"")), "error: NoBoundary")
+  val plain = "--tok\r\nContent-Disposition: form-data; name=x\r\n\r\n1\r\n--tok--"
+  assertEq(
+    shown(Multipart.parse(bytes(plain), "multipart/form-data; boundary=tok")),
+    "x|-|text/plain|1|[(Content-Disposition, form-data; name=x)]"
+  )
+
+@test("a missing, empty, too long or ill-charactered boundary is NoBoundary; another type is NotAForm")
+multipartBoundaryErrors()
+  val body = "--b\r\nContent-Disposition: form-data; name=x\r\n\r\n1\r\n--b--"
+  assertEq(shown(Multipart.parse(bytes(body), "multipart/form-data")), "error: NoBoundary")
+  assertEq(shown(Multipart.parse(bytes(body), "multipart/form-data; boundary=\"\"")), "error: NoBoundary")
+  assertEq(shown(Multipart.parse(bytes(body), "multipart/form-data; boundary=\"b \"")), "error: NoBoundary")
+  assertEq(shown(Multipart.parse(bytes(body), "multipart/form-data; boundary=\"a{b\"")), "error: NoBoundary")
+  assertEq(shown(Multipart.parse(bytes(body), "multipart/form-data; boundary")), "error: NoBoundary")
+  val seventy = "b".repeat(70)
+  val longest = s"--$seventy\r\nContent-Disposition: form-data; name=x\r\n\r\n1\r\n--$seventy--"
+  assertEq(multipartOf(longest, seventy), "x|-|text/plain|1|[(Content-Disposition, form-data; name=x)]")
+  assertEq(multipartOf(longest, seventy + "b"), "error: NoBoundary")
+  assertEq(
+    shown(Multipart.parse(bytes(body), "multipart/mixed; boundary=b")),
+    "error: NotAForm(multipart/form-data, Some(multipart/mixed; boundary=b))"
+  )
+  assertEq(shown(posted("", body).multipart()), "error: NotAForm(multipart/form-data, None)")
+  assertEq(
+    shown(posted("multipart/form-data; boundary=b", body).multipart()),
+    "x|-|text/plain|1|[(Content-Disposition, form-data; name=x)]"
+  )
+
+@test("a preamble and an epilogue are skipped, and a delimiter's line may end in spaces and tabs")
+multipartPreambleEpilogue()
+  val body = "This is the preamble.\r\n--XyZ \t\r\nContent-Disposition: form-data; name=a\r\n\r\n1\r\n--XyZ--\r\nThis is the epilogue.\r\n--XyZ\r\nContent-Disposition: form-data; name=b\r\n\r\n2\r\n--XyZ--"
+  assertEq(multipartOf(body), "a|-|text/plain|1|[(Content-Disposition, form-data; name=a)]")
+  val noFinalCrlf = "--XyZ\r\nContent-Disposition: form-data; name=a\r\n\r\n1\r\n--XyZ--"
+  assertEq(multipartOf(noFinalCrlf), "a|-|text/plain|1|[(Content-Disposition, form-data; name=a)]")
+  val dashInPreamble = "--XyZnot\r\n--XyZ\r\nContent-Disposition: form-data; name=a\r\n\r\n1\r\n--XyZ--"
+  assertEq(multipartOf(dashInPreamble), "a|-|text/plain|1|[(Content-Disposition, form-data; name=a)]")
+
+@test("only CRLF ends a line: a body of bare line feeds has no delimiter")
+multipartCrlf()
+  assertEq(
+    multipartOf("--XyZ\nContent-Disposition: form-data; name=a\n\n1\n--XyZ--\n"),
+    "error: BadMultipart(no delimiter of its boundary)"
+  )
+  assertEq(
+    multipartOf("--XyZ\r\nContent-Disposition: form-data; name=a\n\n1\r\n--XyZ--"),
+    "error: BadMultipart(a part's headers do not end)"
+  )
+  val lfInBody = "--XyZ\r\nContent-Disposition: form-data; name=a\r\n\r\nx\ny\r\rz\n\r\n--XyZ--"
+  assertEq(multipartOf(lfInBody), "a|-|text/plain|x\ny\r\rz\n|[(Content-Disposition, form-data; name=a)]")
+  val crlfBody = "--XyZ\r\nContent-Disposition: form-data; name=a\r\n\r\n\r\n\r\n\r\n--XyZ--"
+  assertEq(multipartOf(crlfBody), "a|-|text/plain|\r\n\r\n|[(Content-Disposition, form-data; name=a)]")
+
+@test("an empty body part, a part of no headers, and a body of no parts")
+multipartEmpty()
+  assertEq(
+    multipartOf("--XyZ\r\nContent-Disposition: form-data; name=a\r\n\r\n\r\n--XyZ--"),
+    "a|-|text/plain||[(Content-Disposition, form-data; name=a)]"
+  )
+  assertEq(multipartOf("--XyZ--\r\n"), "")
+  assertEq(multipartOf("--XyZ--"), "")
+  assertEq(multipartOf("--XyZ\r\n\r\nbody\r\n--XyZ--"), "error: BadMultipart(a part has no Content-Disposition)")
+  assertEq(multipartOf("--XyZ\r\n\r\n--XyZ--"), "error: BadMultipart(a part's headers do not end)")
+  assertEq(multipartOf(""), "error: BadMultipart(no delimiter of its boundary)")
+
+@test("bytes that look like a boundary but are not a delimiter stay in the body")
+multipartBinaryLookalikes()
+  val inner = "a--XyZ b\r\n--XyZx\r\n--XyZ-x\r\n-XyZ\r\n--Xy"
+  val body = s"--XyZ\r\nContent-Disposition: form-data; name=f; filename=bin\r\nContent-Type: application/octet-stream\r\n\r\n$inner\r\n--XyZ--"
+  assertEq(
+    multipartOf(body),
+    s"f|bin|application/octet-stream|$inner|[(Content-Disposition, form-data; name=f; filename=bin), (Content-Type, application/octet-stream)]"
+  )
+  val all = Array.tabulate(256, i -> byte(i))
+  val m = Multipart([Part.file("f", "all.bin", "application/octet-stream", all)])
+  val back = Multipart.parse(m.encoded("XyZ"), m.contentType("XyZ")).map(r -> r.parts(0).body.toVector)
+  assertEq(back, Ok(all.toVector))
+
+@test("a body that never closes, or whose part breaks off, is malformed")
+multipartMissingFinal()
+  assertEq(
+    multipartOf("--XyZ\r\nContent-Disposition: form-data; name=a\r\n\r\n1\r\n"),
+    "error: BadMultipart(no closing delimiter)"
+  )
+  assertEq(
+    multipartOf("--XyZ\r\nContent-Disposition: form-data; name=a\r\n\r\n1\r\n--XyZ\r\n"),
+    "error: BadMultipart(no closing delimiter)"
+  )
+  assertEq(
+    multipartOf("--XyZ\r\nContent-Disposition: form-data; name=a\r\n\r\n1\r\n--XyZ"),
+    "error: BadMultipart(no closing delimiter)"
+  )
+  assertEq(
+    multipartOf("--XyZ\r\nContent-Disposition: form-data; name=a\r\n\r\n1--XyZ--"),
+    "error: BadMultipart(no closing delimiter)"
+  )
+  assertEq(multipartOf("--XyZ"), "error: BadMultipart(no delimiter of its boundary)")
+
+@test("a part's disposition must be form-data with a name, and its header lines headers")
+multipartBadParts()
+  assertEq(
+    multipartOf("--XyZ\r\nContent-Disposition: attachment; name=a\r\n\r\n1\r\n--XyZ--"),
+    "error: BadMultipart(a part's disposition `attachment; name=a` is not form-data)"
+  )
+  assertEq(
+    multipartOf("--XyZ\r\nContent-Disposition: form-data\r\n\r\n1\r\n--XyZ--"),
+    "error: BadMultipart(a part has no name)"
+  )
+  assertEq(
+    multipartOf("--XyZ\r\nContent-Disposition: form-data; filename=a\r\n\r\n1\r\n--XyZ--"),
+    "error: BadMultipart(a part has no name)"
+  )
+  assertEq(
+    multipartOf("--XyZ\r\nContent-Disposition: form-data; name=\"a\r\n\r\n1\r\n--XyZ--"),
+    "error: BadMultipart(a part's disposition `form-data; name=\"a` does not read)"
+  )
+  assertEq(
+    multipartOf("--XyZ\r\nContent-Disposition: form-data; name=a b\r\n\r\n1\r\n--XyZ--"),
+    "error: BadMultipart(a part's disposition `form-data; name=a b` does not read)"
+  )
+  assertEq(
+    multipartOf("--XyZ\r\nno colon\r\n\r\n1\r\n--XyZ--"),
+    "error: BadMultipart(a part's header line `no colon` is not a header)"
+  )
+  assertEq(
+    multipartOf("--XyZ\r\n: v\r\n\r\n1\r\n--XyZ--"),
+    "error: BadMultipart(a part's header line `: v` is not a header)"
+  )
+  assertEq(
+    multipartOf("--XyZ\r\nContent-Disposition: form-data; name=a\r\n folded\r\n\r\n1\r\n--XyZ--"),
+    "error: BadMultipart(a part's header line ` folded` is not a header)"
+  )
+  assertEq(
+    multipartOf("--XyZ\r\nBad Name: v\r\n\r\n1\r\n--XyZ--"),
+    "error: BadMultipart(`Bad Name` is not a header name)"
+  )
+  val notUtf8 = Array(
+    bytes("--XyZ\r\nContent-Disposition: form-data; name=\"").toVector,
+    Vector(byte(0xff)),
+    bytes("\"\r\n\r\n1\r\n--XyZ--").toVector
+  ).flatMap(v -> v)
+  assertEq(
+    shown(Multipart.parse(notUtf8, "multipart/form-data; boundary=XyZ")),
+    "error: BadMultipart(a part's headers are not UTF-8)"
+  )
+
+@test("names and filenames are read as the WHATWG standard writes them, Unicode kept as UTF-8")
+multipartNames()
+  val body = "--XyZ\r\nContent-Disposition: FORM-DATA; NAME=\"a%22b%0D%0Ac;d\" ; Filename=\"../../etc/pass wd;.txt\"\r\n\r\n1\r\n--XyZ\r\ncontent-disposition: form-data; name=\"café\"; filename=\"C:\\dir\\ü.png\"\r\n\r\n2\r\n--XyZ--"
+  val m = Multipart.parse(bytes(body), "multipart/form-data; boundary=XyZ").getOrElse(Multipart(Vector.empty[Part]()))
+  assertEq(m.parts.map(p -> p.name), ["a\"b\r\nc;d", "café"])
+  assertEq(m.parts.map(p -> p.filename), [Some("../../etc/pass wd;.txt"), Some("C:\\dir\\ü.png")])
+  assertEq(m.parts(0).contentType, "text/plain")
+  val empty = "--XyZ\r\nContent-Disposition: form-data; name=\"\"; filename=\"\"\r\n\r\n\r\n--XyZ--"
+  assertEq(multipartOf(empty), "||text/plain||[(Content-Disposition, form-data; name=\"\"; filename=\"\")]")
+
+@test("filename* in UTF-8 or ISO-8859-1 is preferred to filename; one that does not read is ignored")
+multipartExtendedFilename()
+  val cd = "--XyZ\r\nContent-Disposition: form-data; name=f; "
+  val end = "\r\n\r\nx\r\n--XyZ--"
+  val name = (params: string) -> Multipart.parse(
+    bytes(cd + params + end),
+    "multipart/form-data; boundary=XyZ"
+  ).map(m -> m.parts(0).filename)
+  assertEq(name("filename=\"plain.txt\"; filename*=UTF-8''%E2%82%AC%20rates.txt"), Ok(Some("€ rates.txt")))
+  assertEq(name("filename*=utf-8'en'caf%C3%A9.txt; filename=\"cafe.txt\""), Ok(Some("café.txt")))
+  assertEq(name("filename*=iso-8859-1''caf%E9.txt"), Ok(Some("café.txt")))
+  assertEq(name("filename*=UTF-8''%FF.txt; filename=\"fallback.txt\""), Ok(Some("fallback.txt")))
+  assertEq(name("filename*=UTF-8''%Z1.txt; filename=\"fallback.txt\""), Ok(Some("fallback.txt")))
+  assertEq(name("filename*=koi8-r''x.txt; filename=\"fallback.txt\""), Ok(Some("fallback.txt")))
+  assertEq(name("filename*=UTF-8'no-second-quote; filename=\"fallback.txt\""), Ok(Some("fallback.txt")))
+  assertEq(name("filename*=koi8-r''x.txt"), Ok(None))
+  assertEq(name("filename*=iso-8859-1''%E9%"), Ok(None))
+
+@test("the part, header and byte limits each refuse a body one over them and take one at them")
+multipartLimits()
+  val one = "--XyZ\r\nContent-Disposition: form-data; name=a\r\n\r\n1\r\n"
+  val two = one + "--XyZ\r\nContent-Disposition: form-data; name=b\r\n\r\n2\r\n--XyZ--"
+  assertEq(multipartOf(two, "XyZ", MultipartLimits(maxParts = 2)).split(" ; ").length, 2)
+  assertEq(multipartOf(two, "XyZ", MultipartLimits(maxParts = 1)), "error: TooManyParts(1)")
+  assertEq(multipartOf("--XyZ--", "XyZ", MultipartLimits(maxParts = 0)), "")
+  assertEq(multipartOf(two, "XyZ", MultipartLimits(maxParts = 0)), "error: TooManyParts(0)")
+  val headerBytes = "Content-Disposition: form-data; name=a".byteLength
+  assertEq(multipartOf(two, "XyZ", MultipartLimits(maxHeaderBytes = headerBytes)).split(" ; ").length, 2)
+  assertEq(
+    multipartOf(two, "XyZ", MultipartLimits(maxHeaderBytes = headerBytes - 1)),
+    s"error: PartHeadersTooLarge(${headerBytes - 1})"
+  )
+  val unended = "--XyZ\r\nContent-Disposition: form-data; name=a" + "x".repeat(100) + "\r\n--XyZ--"
+  assertEq(multipartOf(unended, "XyZ", MultipartLimits(maxHeaderBytes = 50)), "error: PartHeadersTooLarge(50)")
+  val size = two.byteLength
+  assertEq(multipartOf(two, "XyZ", MultipartLimits(maxBytes = size)).split(" ; ").length, 2)
+  assertEq(multipartOf(two, "XyZ", MultipartLimits(maxBytes = size - 1)), s"error: FormTooLarge(${size - 1})")
+  assertEq(multipartOf("", "XyZ", MultipartLimits(maxBytes = 0)), "error: BadMultipart(no delimiter of its boundary)")
+  val defaults = MultipartLimits()
+  assertEq((defaults.maxParts, defaults.maxHeaderBytes, defaults.maxBytes), (1000, 8192, 10485760))
+
+@test("Multipart.encoded writes each part's disposition, its type where needed, and its other headers")
+multipartEncoded()
+  val extra = Part("note", None, "text/plain", [("Content-Disposition", "ignored"), ("X-Note", "n")], bytes("hi"))
+  val m = Multipart([Part.field("a\"b\r\n", "café"), Part.file("up", "x\".txt", "text/plain", bytes("data")), extra])
+  assertEq(
+    string.fromUtf8Lossy(m.encoded("B")),
+    "--B\r\nContent-Disposition: form-data; name=\"a%22b%0D%0A\"\r\n\r\ncafé\r\n--B\r\nContent-Disposition: form-data; name=\"up\"; filename=\"x%22.txt\"\r\nContent-Type: text/plain\r\n\r\ndata\r\n--B\r\nContent-Disposition: form-data; name=\"note\"\r\nX-Note: n\r\n\r\nhi\r\n--B--\r\n"
+  )
+  assertEq(string.fromUtf8Lossy(Multipart(Vector.empty[Part]()).encoded("B")), "--B--\r\n")
+  assertEq(Multipart(Vector.empty[Part]()).contentType("B"), "multipart/form-data; boundary=B")
+  assertEq(Multipart(Vector.empty[Part]()).contentType("a b:c"), "multipart/form-data; boundary=\"a b:c\"")
+  val typed = Multipart([Part("j", None, "application/json", Vector.empty[(string, string)](), bytes("{}"))])
+  assertEq(
+    string.fromUtf8Lossy(typed.encoded("B")),
+    "--B\r\nContent-Disposition: form-data; name=\"j\"\r\nContent-Type: application/json\r\n\r\n{}\r\n--B--\r\n"
+  )
+
+@test("a multipart form written by the client reads back as the same parts on the server")
+multipartRoundTrip()
+  val parts = [
+    Part.field("title", "Hello, world"),
+    Part.field("title", ""),
+    Part.field("ünï \"q\"\r\n", "line1\r\nline2\r\n"),
+    Part.file(
+      "upload",
+      "../evil\".bin",
+      "application/octet-stream",
+      Array(byte(0), byte(13), byte(10), byte(45), byte(45), byte(255))
+    ),
+    Part.file("empty", "", "text/plain", Array.empty[byte]())
+  ]
+  val m = Multipart(parts)
+  val expected = shown(Ok(m))
+  assertEq(roundTrip(m, "XyZ"), expected)
+  assertEq(roundTrip(m, "a b'()+_,-./:=?"), expected)
+  assertEq(roundTrip(m, "x".repeat(70)), expected)
+  val r = Request("POST", "http://h/", [("Content-Type", "text/plain")]).withMultipart(m)
+  assertEq(r.headers.length, 1)
+  val ct = r.header("Content-Type").getOrElse("")
+  assertEq(ct.startsWith("multipart/form-data; boundary=avin-"), true)
+  assertEq(ct.byteLength, "multipart/form-data; boundary=avin-".byteLength + 32)
+  assertEq(shown(ServerRequest("POST", "/", r.headers, r.body).multipart()), expected)
+  val fixed = Request("POST", "http://h/").withMultipart(m, "fixed")
+  assertEq(fixed.header("Content-Type"), Some("multipart/form-data; boundary=fixed"))
+  assertEq(fixed.body.toVector, m.encoded("fixed").toVector)
+
+@test("newBoundary gives a fresh boundary of avin- and 32 hexadecimal digits each time")
+newBoundaries()
+  val a = Multipart.newBoundary()
+  val b = Multipart.newBoundary()
+  assertEq(a == b, false)
+  assertEq(a.byteLength, 37)
+  assertEq(a.slice(5, 37).indexWhere(c -> !(('0' <= c <= '9') || ('a' <= c <= 'f'))), -1)

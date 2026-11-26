@@ -1,0 +1,149 @@
+// expect: exit 0
+// The `Date` header of the HTTP server (RFC 9110 section 6.6.1): on every response, whatever its
+// status (a handler's `200`, `404`, `500`, a `204` and a `304`, `HEAD`, the server's own `400`), on
+// sized, chunked, closing and event-stream responses, once only, kept where the handler gave its own
+// (in any case of its name), absent with `date = false` and from the `101` of an upgrade; its value
+// reads back with `parseHttpDate` within two seconds of the clock; `DateHeader` hands one text for
+// every read within a second, rolls over at the second's boundary, never serves a stale second, and
+// follows a clock that goes back; threads share it.
+import avin.io.IoError
+import avin.net.{TcpServer, TcpStream}
+import avin.net.http
+import avin.net.http.{DateHeader, Response, Route, Router}
+import avin.threads.{Atomic, spawn}
+import avin.time
+import avin.time.{Instant, epochMicros, now, parseHttpDate}
+
+ok[T](r: Result[T, IoError]) -> T = r match
+  Ok(v) -> v
+  Err(e) -> fail(e.message)
+
+// Everything the server sends for `text` until it closes the connection.
+whole(server: TcpServer, text: string) -> string
+  val c = ok(TcpStream.connect("127.0.0.1", server.port()))
+  ok(c.setTimeout(time.seconds(10)))
+  ok(c.writeText(text))
+  val got = string.fromUtf8Lossy(ok(c.readAll()))
+  _ = c.close()
+  got
+
+// The head of the response `whole` gave: its lines before the blank one.
+head(text: string) -> Vector[string] = text.split("\r\n\r\n")(0).split("\r\n")
+
+// The values of the response's `Date` headers, found in any case of the name.
+dates(text: string) -> Vector[string] =
+  head(text).filter(l -> l.toLower.startsWith("date:")).map(l -> l.slice(5, l.byteLength).trim)
+
+get(path: string, method: string = "GET", version: string = "1.1") -> string =
+  s"$method $path HTTP/$version\r\nHost: t\r\nConnection: close\r\n\r\n"
+
+// What a response's `Date` shows: its count, and where there is one, whether it reads back and lies
+// within two seconds of now.
+shown(text: string) -> string
+  val found = dates(text)
+  if found.length != 1 then return s"${head(text)(0)} -> ${found.length} dates"
+  parseHttpDate(found(0)) match
+    Ok(t) ->
+      val off = (now().epochMicros - t.epochMicros).abs
+      s"${head(text)(0)} -> one date, reads back, within 2 s: ${off <= 2000000}, GMT: ${found(0).endsWith(" GMT")}"
+    Err(e) -> s"${head(text)(0)} -> unreadable date `${found(0)}`"
+
+main()
+  val router = Router(
+    [
+      Route.get("/ok", _ -> Response.text(200, "fine")),
+      Route.get("/five", _ -> Response.text(500, "broken")),
+      Route.get("/none", _ -> Response.empty(204)),
+      Route.get("/same", _ -> Response.empty(304)),
+      Route.get("/chunked", _ -> Response.stream(200, "text/plain", w ->
+        _ = w.write("a")
+        _ = w.write("b"))),
+      Route.get("/sized", _ -> Response.stream(200, "text/plain", 3, w -> _ = w.write("abc"))),
+      Route.get("/events", _ -> Response.events(es -> _ = es.send("one"))),
+      Route.get("/own", _ -> Response.text(200, "own").withHeader("Date", "Sun, 06 Nov 1994 08:49:37 GMT")),
+      Route.get("/lower", _ -> Response.text(200, "own").withHeader("date", "yesterday")),
+      Route.get("/upgrade", _ -> Response.upgrade("h2c", _ -> ()))
+    ]
+  )
+  val server = ok(http.serve("127.0.0.1", 0, router.handle))
+
+  println("-- statuses")
+  println(shown(whole(server, get("/ok"))))
+  println(shown(whole(server, get("/missing"))))
+  println(shown(whole(server, get("/five"))))
+  println(shown(whole(server, get("/none"))))
+  println(shown(whole(server, get("/same"))))
+  println(shown(whole(server, get("/ok", "HEAD"))))
+  println(shown(whole(server, get("/ok", "GET", "1.0"))))
+  println("-- the server's own answers")
+  println(shown(whole(server, "NONSENSE\r\n\r\n")))
+  println(shown(whole(server, "POST /ok HTTP/1.1\r\nHost: t\r\nContent-Length: nope\r\n\r\n")))
+  println("-- streamed")
+  println(shown(whole(server, get("/chunked"))))
+  println(shown(whole(server, get("/chunked", "GET", "1.0"))))
+  println(shown(whole(server, get("/sized"))))
+  println(shown(whole(server, get("/events"))))
+  println("-- the handler's own Date is kept")
+  println(dates(whole(server, get("/own"))))
+  println(dates(whole(server, get("/lower"))))
+  println("-- a later request on one connection has its own")
+  val c = ok(TcpStream.connect("127.0.0.1", server.port()))
+  ok(c.setTimeout(time.seconds(10)))
+  ok(c.writeText("GET /ok HTTP/1.1\r\nHost: t\r\n\r\nGET /missing HTTP/1.1\r\nHost: t\r\nConnection: close\r\n\r\n"))
+  val both = string.fromUtf8Lossy(ok(c.readAll())).split("HTTP/1.1 ").filter(p -> !p.isEmpty)
+  println(both.map(p -> dates("HTTP/1.1 " + p).length))
+  _ = c.close()
+  println("-- an upgrade's 101 has none")
+  val up = whole(server, "GET /upgrade HTTP/1.1\r\nHost: t\r\nConnection: Upgrade\r\nUpgrade: h2c\r\n\r\n")
+  println(s"${head(up)(0)} -> ${dates(up).length} dates")
+  server.shutdown()
+
+  println("-- date = false")
+  val quiet = ok(http.serve("127.0.0.1", 0, router.handle, date = false))
+  for path in ["/ok", "/missing", "/five", "/chunked", "/events"]
+    println(s"$path ${dates(whole(quiet, get(path))).length}")
+  println(s"/own ${dates(whole(quiet, get("/own")))}")
+  println(s"bad ${dates(whole(quiet, "NONSENSE\r\n\r\n")).length}")
+  quiet.shutdown()
+
+  println("-- DateHeader")
+  val dial = Atomic(long(784111777000000))
+  val header = DateHeader(() -> epochMicros(dial.load()))
+  println(header.value())
+  dial.store(784111777999999)
+  println(s"same second: ${header.value()}")
+  dial.store(784111778000000)
+  println(s"next second: ${header.value()}")
+  dial.store(784111778000000 + 1)
+  println(s"no later: ${header.value()}")
+  dial.store(784111777500000)
+  println(s"back within an earlier second: ${header.value()}")
+  dial.store(784111778500000)
+  println(s"forward again: ${header.value()}")
+  dial.store(784200000000000)
+  println(s"a day on: ${header.value()}")
+  dial.store(0)
+  println(s"epoch: ${header.value()}")
+  dial.store(-1)
+  println(s"just before the epoch: ${header.value()}")
+
+  println("-- a leap day")
+  dial.store(951782400000000)
+  val leap = DateHeader(() -> epochMicros(dial.load()))
+  println(leap.value())
+
+  println("-- the real clock")
+  val wall = DateHeader()
+  val t = parseHttpDate(wall.value()).getOrElse(Instant.Epoch)
+  println(s"within 2 s: ${(now().epochMicros - t.epochMicros).abs <= 2000000}")
+
+  println("-- every thread reads a whole text")
+  val moving = Atomic(long(1000000000))
+  val shared = DateHeader(() -> epochMicros(moving.load()))
+  val workers = (0 ..< 4).map(i -> spawn(() ->
+    var bad = 0
+    for k in 0 ..< 2000
+      moving.add(300000)
+      if parseHttpDate(shared.value()).isErr then bad += 1
+    bad)).toVector
+  println(workers.map(w -> w.join()))
