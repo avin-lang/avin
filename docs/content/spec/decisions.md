@@ -12039,6 +12039,63 @@ Settled on the user's delegation 2026-11-11 (built on branch `json-derive`): **J
   that takes it is chosen; where two can, the call is still refused. Alternatives: trying every
   collection literal against every candidate first (a literal that fits as it stands would then
   choose differently than it did).
+- Settled on the user's delegation 2026-11-24 (branch `idna`): **Internationalized domain names are
+  `avin.net.idna`, in Avin, from tables of Unicode 17.0.0, and a `Url` holds a host beyond ASCII in
+  its ASCII form** ([system library](/spec/system-library/#internationalized-domain-names)).
+  - **Unicode 17.0.0**, the version `string.normalize` answers from (its utf8proc), so a name is
+    mapped by the same database it is normalized by. Alternatives: the latest IDNA table with an
+    older normalizer (a mapped character could then come out of NFC unnormalized), or binding a C
+    library (macOS ships none for UTS #46; libidn2 is IDNA2008 without UTS #46's mapping by
+    default, and a dependency for one table).
+  - **Tables generated, not bound.** `scripts/idna_tables.avin` reads `IdnaMappingTable.txt` and
+    `DerivedBidiClass.txt`, `DerivedJoiningType.txt`, `DerivedCombiningClass.txt` and writes
+    `library/avin/net/idna/idna_tables.avin`: the mapping as runs of a status, a constant offset
+    merging runs of case pairs, or a sequence; the properties CheckBidi and CheckJoiners read (the
+    bidirectional class, the joining type, a virama) as runs of one value. Each table is decoded
+    once, on first use, into `ArraySeq`s searched by halving, as the display-width table is. A
+    combining mark at a label's start is read from `sysl.unicode.is_mark`, the same database. The
+    generated file is 36 KB of source (a 30 KB mapping string and a 4 KB property string); the Unicode License v3 is repeated in it and in
+    `tests/fixtures/unicode/LICENSE.txt`, beside the vendored `IdnaTestV2.txt`. Alternatives: a
+    dense array per plane (far larger), the tables as `Array[int]` literals (slower to compile than
+    one string).
+  - **Non-transitional processing only**, as the WHATWG URL standard and UTS #46 since 15.1
+    recommend: `ß`, `ς`, ZWJ and ZWNJ are valid and kept, so `faß.de` is `xn--fa-hia.de`, not
+    `fass.de`. A `transitional` flag was weighed and left out: it exists for compatibility with
+    IDNA2003 registrations and no current client uses it. Review with the user: whether a caller
+    might still need transitional processing.
+  - **The flags are named parameters with the URL standard's values** (`checkHyphens = false`,
+    `checkBidi = true`, `checkJoiners = true`, `useStd3AsciiRules = false`, `verifyDnsLength =
+    false`), so `idna.toAscii(name)` is what a browser does and the strict form is one argument
+    away. `toUnicode` has no `verifyDnsLength`: UTS #46 gives it none, and the conformance file's
+    `X4_2` (an empty label reported by `toUnicode`) is a compatibility code it does not need.
+  - **Errors as a `Result` with the first error and its label**, rather than UTS #46's string with
+    U+FFFD substituted plus a flag: a caller that has a `Result` cannot use the half-converted name
+    by mistake. `toUnicode` therefore does not give a best-effort display of an invalid name; a
+    display falls back to the ASCII form (below).
+  - **`MaxLabelLength`, 1024 code points, for a label beyond ASCII or in Punycode, whatever the
+    flags.** Punycode's decoder inserts into the label for every character and its encoder scans
+    the label per distinct character, so the work grows with the square of a label's length; a
+    host in a hostile URL could otherwise cost seconds. DNS allows 63, so no resolvable name is
+    refused. An ASCII label, whose processing is linear, has no limit. Alternatives: no limit (the
+    URL standard sets none), 63 always (refuses names the standard accepts with `beStrict` off).
+    Punycode itself (`encodePunycode`, `decodePunycode`) takes any length, and checks every
+    addition and multiplication against `int`'s range, answering `Overflow` rather than trapping.
+  - **`Url` converts a registered name holding a character beyond ASCII (as written or in
+    percent-escapes) or a label beginning `xn--`, in every scheme**, with `idna.toAscii`'s
+    defaults, after decoding its escapes; the result must hold only RFC 3986's unescaped name
+    characters (so `℀`, mapped to `a/c`, is `BadHost`). An ASCII name without such a label is
+    kept as written, escapes and all, as before, and an address in brackets is never converted.
+    `parse`, `resolve` and `withHost` all hold the ASCII form, so `Url("http://bücher.example/")`
+    equals `Url("http://xn--bcher-kva.example/")` and the HTTP and WebSocket clients look up,
+    connect to, send `Host:` with, and over TLS name (SNI) and verify the ASCII form with no change
+    of their own. Alternatives: converting only the WHATWG standard's special schemes (`http`,
+    `https`, `ws`, `wss`, `ftp`, `file`), since it keeps other schemes' hosts opaque; but this
+    `Url` reads every scheme as RFC 3986 does, whose registered names are DNS names, and RFC 3987
+    maps them to A-labels likewise. Holding the Unicode form and converting at connection time was
+    weighed and refused: two URLs for one host would compare unequal.
+  - **`unicodeHost` and `unicodeText` for display**, decoding each `xn--` label with
+    `idna.toUnicode`; a name that does not decode to a valid one is shown in ASCII, so a person is
+    never shown a name the URL does not reach. `display` stays ASCII, the form that round-trips.
 
 ## Proposed
 

@@ -4403,7 +4403,17 @@ one**: `http://h?` has the query `Some("")` and `http://h` has `None`; `file:///
 written, percent-escapes and all, and `Url.decode` turns one into text. A host is a name, an IPv4
 address, or an address in brackets, kept with them: an IPv6 address, with an optional zone written
 `%25` and its name (`[fe80::1%25eth0]`), or an address of a later form (`[v7.x]`). A component may
-hold characters beyond ASCII other than controls and spaces, kept as they are.
+hold characters beyond ASCII other than controls and spaces, kept as they are, except the host.
+
+**A host name beyond ASCII is held in the ASCII form DNS carries**, as the WHATWG URL standard holds
+it: a name holding a character beyond ASCII, written as it is or in percent-escapes, or a label
+beginning `xn--` in any case, is taken through [`idna.toAscii`](#internationalized-domain-names)
+with its defaults, so `Url("http://Bücher.example/")` has the host `xn--bcher-kva.example` and
+equals `Url("http://xn--bcher-kva.example/")`. A name that is not a valid one, or whose ASCII form
+holds a character a name may not (`℀` is mapped to `a/c`), is `BadHost`. `parse`, `resolve` and
+`withHost` all hold the ASCII form, so the HTTP and WebSocket clients look the name up, connect to
+it, send it as `Host:` and, over TLS, send it as the server name and verify the certificate against
+it. An ASCII name with no `xn--` label is kept as written, escapes and all.
 
 The scheme and host are held in lower case (a zone's name and a host's percent-escapes as written),
 and a port that is the scheme's default is held as `None`, so URLs differing only in those are
@@ -4413,6 +4423,8 @@ equal, and a `Url` displays as the text it was read from with exactly those diff
 | Member | Meaning |
 | --- | --- |
 | `u.portOrDefault -> Option[int]` | The port, or where none is written the scheme's default: 80 for `http` and `ws`, 443 for `https` and `wss`. |
+| `u.unicodeHost -> Option[string]` | The host for a person to read: each `xn--` label decoded, as `idna.toUnicode` gives it (`bücher.example`). A name that does not decode to a valid one is kept in ASCII, so a person is never shown a name the URL does not reach. |
+| `u.unicodeText -> string` | The URL written as it displays, with `unicodeHost` for the host: `http://bücher.example/`. |
 | `u.queryParams -> Vector[(string, string)]` | The query split at each `&` (an empty piece skipped) and each piece at its first `=`, decoded, a `+` standing for a space as a form writes one; no `=` gives an empty value, no query no pairs. |
 | `u.resolve(ref: string) -> Result[Url, UrlError]` | The reference, relative or absolute, resolved against `u` by RFC 3986 §5.2: its missing components taken from `u` and its dot segments removed, strictly, so `http:g` stays `http:g`. |
 | `u.resolve(ref: Url) -> Url` | An absolute reference with its dot segments removed. |
@@ -4428,6 +4440,75 @@ equal, and a `Url` displays as the text it was read from with exactly those diff
 `message` says it in words. **Every component's escapes must decode to UTF-8 for the text to be a
 URL**, so `parse` refuses `http://h/%FF` with `InvalidUtf8(9)` and `queryParams` never fails on a
 `Url` it read.
+
+### Internationalized domain names
+
+`import avin.net.idna` brings in the conversion between a domain name written in any script,
+`bücher.example`, and the ASCII form DNS carries, `xn--bcher-kva.example`, in which each label beyond
+ASCII is `xn--` and its Punycode (RFC 3492).
+
+```text run
+import avin.net.Url
+import avin.net.idna
+
+main()
+  println(idna.toAscii("Bücher.example"))
+  println(idna.toUnicode("xn--bcher-kva.example"))
+  println(idna.toAscii("faß.de"))
+  println(idna.toAscii("a\u{200d}b.example"))
+  val u = Url("https://Bücher.example/katalog")
+  println(u)
+  println(u.unicodeText)
+```
+
+```text output
+Ok(xn--bcher-kva.example)
+Ok(bücher.example)
+Ok(xn--fa-hia.de)
+Err(a zero-width joiner not allowed in label 0)
+https://xn--bcher-kva.example/katalog
+https://bücher.example/katalog
+```
+
+`toAscii` and `toUnicode` process a name as UTS #46 defines, with the tables of Unicode 17.0.0, the
+version `normalize` answers from. Each character is mapped: upper case to lower case, fullwidth and
+compatibility forms to their plain letters, the ideographic full stop `。` to `.`, and a few, such
+as the soft hyphen, removed. The result is put in normalization form NFC and split into labels at
+`.`, a label beginning `xn--` is decoded from Punycode, and each label is checked. **Processing is
+non-transitional**, as the WHATWG URL standard's is: `ß`, `ς` and the zero-width joiners are kept,
+so `faß.de` is `xn--fa-hia.de` and not `fass.de`.
+
+| Function | Meaning |
+| --- | --- |
+| `idna.toAscii(domain, checkHyphens = false, checkBidi = true, checkJoiners = true, useStd3AsciiRules = false, verifyDnsLength = false) -> Result[string, IdnaError]` | The name processed and each label beyond ASCII written as `xn--` and its Punycode, or the first error found. |
+| `idna.toUnicode(domain, checkHyphens = false, checkBidi = true, checkJoiners = true, useStd3AsciiRules = false) -> Result[string, IdnaError]` | The name processed, each label in Punycode decoded, or the first error found. |
+| `idna.encodePunycode(text) -> Result[string, PunycodeError]` | The text in Punycode: its ASCII characters, `-` where there were any, then the others as digits; `bücher` is `bcher-kva`. |
+| `idna.decodePunycode(text) -> Result[string, PunycodeError]` | The text Punycode encodes; digits are read in either case. |
+
+**The defaults are the URL standard's**, so `toAscii(name)` converts a name as a browser does, and
+the strict form is an argument away. A name is always refused where a label holds a character UTS
+#46 disallows (unassigned, private use, U+FFFD …), begins with a combining mark, or is Punycode that
+does not decode to a valid label: one that decodes to nothing, to ASCII only, to text not in NFC, or
+to characters mapping would have changed. `checkJoiners` refuses a zero-width joiner or non-joiner
+where RFC 5892's rules do not allow one (after a virama, or a non-joiner between letters that join);
+`checkBidi` applies RFC 5893's six rules to every label of a name holding a right-to-left one, so
+`àא` is refused. `checkHyphens` adds that a label neither begins nor ends with `-` nor has `--` in
+its third and fourth places; `useStd3AsciiRules` that its ASCII is lower-case letters, digits and
+`-` only (without it a name may hold `_` or a space); `verifyDnsLength` that each label of the ASCII
+form is 1 to 63 characters and the name at most 253, a final `.` not counted.
+
+**`MaxLabelLength`, 1024 code points, bounds a label beyond ASCII or in Punycode whatever the
+flags say**: such a label is `LabelLength`. Punycode's work grows with the square of a label's
+length, and DNS has no use for a label past 63, so the limit only refuses names no server could
+answer to. An ASCII label, whose processing is linear, has none.
+
+`IdnaError` names what is wrong and the index of the label, from 0: `Disallowed(label)`,
+`BadPunycode(label)`, `Hyphens(label)`, `LeadingMark(label)`, `Joiners(label)`, `Bidi(label)`,
+`LabelLength(label)` and `DomainLength`. `PunycodeError` is `InvalidInput(at)` (a character that is
+not ASCII before the last `-`, one that is not a digit after it, or text ending inside a number, at
+its byte offset), `Overflow` (a number past `int`'s range: text no encoder writes, or text to encode
+with some two thousand characters before a high code point) or `InvalidCodePoint(value)` (a value
+that is not a Unicode scalar value). Both have `message`.
 
 ### `http`
 
