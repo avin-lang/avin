@@ -15,11 +15,11 @@ trait MsgpackEncoder
   encode(out: MsgpackWriter)
   isMsgpackNone() -> bool = false
 
-// A value read from MessagePack. `whenMissing` is the value of a field absent from the input, where
-// the type has one: `None` for an `Option`, and nothing for any other type, whose absence is an error.
-trait MsgpackDecoder
+// A value read from MessagePack. The value of a field absent from the input is the core's `Missable`
+// answer for its type, the one every format's decoder shares: `Some(None)` for an `Option`, and
+// otherwise `None`, an absence that is an error.
+trait MsgpackDecoder: Missable
   static decode(r: MsgpackReader) -> Result[Self, MsgpackError]
-  static whenMissing() -> Option[Self]
 
 // A field's or a variant's name in the map, in place of its name in the program.
 data MsgpackKey(name: string)
@@ -90,7 +90,6 @@ impl MsgpackEncoder for bool
 
 impl MsgpackDecoder for bool
   static decode(r: MsgpackReader) -> Result[bool, MsgpackError] = r.readBool()
-  static whenMissing() -> Option[bool] = None
 
 impl MsgpackEncoder for int
   encode(out: MsgpackWriter) = out.integer(long(self))
@@ -98,7 +97,6 @@ impl MsgpackEncoder for int
 
 impl MsgpackDecoder for int
   static decode(r: MsgpackReader) -> Result[int, MsgpackError] = r.readInt()
-  static whenMissing() -> Option[int] = None
 
 impl MsgpackEncoder for long
   encode(out: MsgpackWriter) = out.integer(self)
@@ -106,7 +104,6 @@ impl MsgpackEncoder for long
 
 impl MsgpackDecoder for long
   static decode(r: MsgpackReader) -> Result[long, MsgpackError] = r.readLong()
-  static whenMissing() -> Option[long] = None
 
 impl MsgpackEncoder for real
   encode(out: MsgpackWriter) = out.float(self)
@@ -114,7 +111,6 @@ impl MsgpackEncoder for real
 
 impl MsgpackDecoder for real
   static decode(r: MsgpackReader) -> Result[real, MsgpackError] = r.readReal()
-  static whenMissing() -> Option[real] = None
 
 impl MsgpackEncoder for string
   encode(out: MsgpackWriter) = out.textString(self)
@@ -122,7 +118,6 @@ impl MsgpackEncoder for string
 
 impl MsgpackDecoder for string
   static decode(r: MsgpackReader) -> Result[string, MsgpackError] = r.readText()
-  static whenMissing() -> Option[string] = None
 
 impl MsgpackEncoder for Array[byte]
   encode(out: MsgpackWriter) = out.binary(self)
@@ -130,14 +125,14 @@ impl MsgpackEncoder for Array[byte]
 
 impl MsgpackDecoder for Array[byte]
   static decode(r: MsgpackReader) -> Result[Array[byte], MsgpackError] = r.readBytes()
-  static whenMissing() -> Option[Array[byte]] = None
 
 impl MsgpackEncoder for Msgpack
   encode(out: MsgpackWriter) = out.value(self)
 
 impl MsgpackDecoder for Msgpack
   static decode(r: MsgpackReader) -> Result[Msgpack, MsgpackError] = r.readValue()
-  static whenMissing() -> Option[Msgpack] = None
+
+impl Missable for Msgpack
 
 // An `Option` is nil when it is `None`, and its value otherwise; a field of an `Option` type absent
 // from the input is `None`.
@@ -150,7 +145,6 @@ impl[A: MsgpackEncoder] MsgpackEncoder for Option[A]
 impl[A: MsgpackDecoder] MsgpackDecoder for Option[A]
   static decode(r: MsgpackReader) -> Result[Option[A], MsgpackError]
     if r.takeNil()? then Ok(None) else A.decode(r).map(a -> Some(a))
-  static whenMissing() -> Option[Option[A]] = Some(None)
 
 // A vector and a list are arrays, the path of an error in an element naming its index.
 impl[A: MsgpackEncoder] MsgpackEncoder for Vector[A]
@@ -161,7 +155,6 @@ impl[A: MsgpackEncoder] MsgpackEncoder for Vector[A]
 
 impl[A: MsgpackDecoder] MsgpackDecoder for Vector[A]
   static decode(r: MsgpackReader) -> Result[Vector[A], MsgpackError] = decodeElements[A](r)
-  static whenMissing() -> Option[Vector[A]] = None
 
 private decodeElements[A: MsgpackDecoder](r: MsgpackReader) -> Result[Vector[A], MsgpackError]
   r.beginArray()?
@@ -178,7 +171,6 @@ impl[A: MsgpackEncoder] MsgpackEncoder for List[A]
 
 impl[A: MsgpackDecoder] MsgpackDecoder for List[A]
   static decode(r: MsgpackReader) -> Result[List[A], MsgpackError] = decodeElements[A](r).map(items -> items.toList)
-  static whenMissing() -> Option[List[A]] = None
 
 // A map, a `HashMap` or a `TreeMap`, is a MessagePack map of its entries in the map's own order, a key
 // of any type the program can encode; a key written twice in the input keeps its last value.
@@ -187,14 +179,12 @@ impl[K: MsgpackEncoder, A: MsgpackEncoder] MsgpackEncoder for HashMap[K, A]
 
 impl[K: MsgpackDecoder, A: MsgpackDecoder] MsgpackDecoder for HashMap[K, A]
   static decode(r: MsgpackReader) -> Result[HashMap[K, A], MsgpackError] = decodeEntries(r, HashMap.newBuilder[K, A]())
-  static whenMissing() -> Option[HashMap[K, A]] = None
 
 impl[K: MsgpackEncoder, A: MsgpackEncoder] MsgpackEncoder for TreeMap[K, A]
   encode(out: MsgpackWriter) = encodeEntries(out, self.size, self.iterator())
 
 impl[K: MsgpackDecoder, A: MsgpackDecoder] MsgpackDecoder for TreeMap[K, A]
   static decode(r: MsgpackReader) -> Result[TreeMap[K, A], MsgpackError] = decodeEntries(r, TreeMap.newBuilder[K, A]())
-  static whenMissing() -> Option[TreeMap[K, A]] = None
 
 private encodeEntries[K: MsgpackEncoder, A: MsgpackEncoder](out: MsgpackWriter, length: int, entries: Iterator[(K, A)])
   out.beginMap(length)
@@ -252,10 +242,10 @@ impl FieldWriter
 // The derived decoder reads as the bytes come: the discriminator first, where the type has several
 // variants, then each key, decoding its value at that field's type. A key no field has is skipped, a
 // key written twice is an error, and a field absent from the input takes its default, or its type's
-// `whenMissing`, or is an error naming it.
+// `whenMissing`, or is an error naming it. The deriving type keeps `Missable`'s default, `None`, unless
+// it implements `Missable` itself.
 derive MsgpackDecoder for T
   static decode(r: MsgpackReader) -> Result[T, MsgpackError] = T.build(FieldReader(r))
-  static whenMissing() -> Option[T] = None
 
 private data FieldReader(r: MsgpackReader)
 

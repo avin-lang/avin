@@ -300,9 +300,8 @@ impl JsonError
 trait JsonEncoder
   encode(out: JsonWriter)
 
-trait JsonDecoder
+trait JsonDecoder: Missable // a value for a field absent from the input is the core's answer
   static decode(r: JsonReader) -> Result[Self, JsonError]
-  static whenMissing() -> Option[Self] // a value for a field absent from the input
 
 data JsonKey(name: string) // a field's or variant's name in JSON
 impl Annotation for JsonKey
@@ -324,12 +323,10 @@ impl JsonEncoder for string
 
 impl JsonDecoder for string
   static decode(r: JsonReader) -> Result[string, JsonError] = r.readString()
-  static whenMissing() -> Option[string] = None
 
 impl[A: JsonDecoder] JsonDecoder for Option[A]
   static decode(r: JsonReader) -> Result[Option[A], JsonError] =
     if r.takeNull() then Ok(None) else A.decode(r).map(a -> Some(a))
-  static whenMissing() -> Option[Option[A]] = Some(None)
 
 impl[A: JsonDecoder] JsonDecoder for Vector[A]
   static decode(r: JsonReader) -> Result[Vector[A], JsonError] =
@@ -338,8 +335,10 @@ impl[A: JsonDecoder] JsonDecoder for Vector[A]
     while r.nextElement()?
       items.addOne(A.decode(r).mapErr(e -> e.atIndex(items.length))?)
     Ok(items.toVector)
-  static whenMissing() -> Option[Vector[A]] = None
 ```
+
+The decoders give no `whenMissing`: each type has the core's [`Missable`](#absent-fields-missable)
+answer, `Some(None)` for the `Option` and `None` for the others, which every format shares.
 
 The encoder's derivation. A sum type writes its discriminator first:
 
@@ -373,7 +372,6 @@ the value at that field's type, skipping keys it does not know:
 ```text
 derive JsonDecoder for T
   static decode(r: JsonReader) -> Result[T, JsonError] = T.build(FieldReader(r))
-  static whenMissing() -> Option[T] = None
 
 data FieldReader(r: JsonReader)
 
