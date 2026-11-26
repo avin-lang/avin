@@ -1,0 +1,69 @@
+// expect: exit 0
+// The HTTP server's header limits against a hostile client, each refusal answered and the connection
+// closed: a request line over `maxHeaderBytes` is `414`, a megabyte long among them; one header over
+// it, a megabyte long among them, `431`; more header lines than `maxHeaders` `431`, a hundred thousand
+// among them; many headers each within the limits but together over `maxHeaderBytes` `431`. The
+// defaults are 16 KiB and 100 lines: 100 lines are served and 101 are not. At a small limit the
+// request line and headers, with their line ends, may fill it exactly, and a byte more is `431`; a
+// `maxHeaders` of one takes `Host` alone. A client that goes on sending after its refusal is closed.
+import avin.io.IoError
+import avin.net.{TcpServer, TcpStream}
+import avin.net.http
+import avin.net.http.{Response, ServerRequest}
+import avin.time
+
+ok[T](r: Result[T, IoError]) -> T = r match
+  Ok(v) -> v
+  Err(e) -> fail(e.message)
+
+echoCount(r: ServerRequest) -> Response = Response.text(200, s"${r.headers.length} headers")
+
+// The status line the server answers `text` with, read once it has closed the connection, and the
+// body where it is served. A write the server cuts off by closing is not a failure here.
+answer(server: TcpServer, text: string) -> string
+  val c = ok(TcpStream.connect("127.0.0.1", server.port()))
+  ok(c.setTimeout(time.seconds(10)))
+  _ = c.writeText(text)
+  val got = c.readAll() match
+    Ok(bytes) -> string.fromUtf8Lossy(bytes)
+    Err(e) -> s"(${e.message})"
+  _ = c.close()
+  val end = got.indexOf('\r')
+  val body = got.indexOf("\r\n\r\n")
+  val status = if end >= 0 then got.slice(0, end) else got
+  if status.startsWith("HTTP/1.1 200") then s"$status: ${got.slice(body + 4, got.byteLength)}" else status
+
+say(name: string, got: string)
+  println(s"$name $got")
+
+get(headers: string) -> string = s"GET / HTTP/1.1\r\nHost: t\r\n${headers}Connection: close\r\n\r\n"
+
+main()
+  val server = ok(http.serve("127.0.0.1", 0, echoCount, date = false))
+  say("line of a megabyte:", answer(server, s"GET /${"a".repeat(1 << 20)} HTTP/1.1\r\nHost: t\r\n\r\n"))
+  // A line of the limit leaves no room for its headers; a byte more is too long a line.
+  say("line of the limit:", answer(server, s"GET /${"a".repeat(16384 - 14)} HTTP/1.1\r\nHost: t\r\n\r\n"))
+  say("line a byte over:", answer(server, s"GET /${"a".repeat(16384 - 13)} HTTP/1.1\r\nHost: t\r\n\r\n"))
+  say("header of a megabyte:", answer(server, get(s"X-Big: ${"b".repeat(1 << 20)}\r\n")))
+  say("header just over:", answer(server, get(s"X-Big: ${"b".repeat(16384)}\r\n")))
+  // `Host` and `Connection` are two of the lines.
+  say("98 more:", answer(server, get("a: b\r\n".repeat(98))))
+  say("99 more:", answer(server, get("a: b\r\n".repeat(99))))
+  say("a hundred thousand:", answer(server, get("a:\r\n".repeat(100000))))
+  say("80 of 300 bytes:", answer(server, get(s"X-Many: ${"c".repeat(290)}\r\n".repeat(80))))
+  // After its refusal, the client keeps sending: it is still closed.
+  say("then more:", answer(server, get("a: b\r\n".repeat(200)) + "GET / HTTP/1.1\r\nHost: t\r\n\r\n".repeat(1000)))
+  server.shutdown()
+
+  // At 64 bytes: `GET / HTTP/1.1\r\n` is 16, `Host: t\r\n` 9, `Connection: close\r\n` 19, leaving 20.
+  val narrow = ok(http.serve("127.0.0.1", 0, echoCount, maxHeaderBytes = 64, date = false))
+  say("filled:", answer(narrow, get(s"X: ${"d".repeat(15)}\r\n")))
+  say("a byte over:", answer(narrow, get(s"X: ${"d".repeat(16)}\r\n")))
+  say("a line of 64:", answer(narrow, s"GET /${"e".repeat(50)} HTTP/1.1\r\n\r\n"))
+  say("a line of 65:", answer(narrow, s"GET /${"e".repeat(51)} HTTP/1.1\r\n\r\n"))
+  narrow.shutdown()
+
+  val one = ok(http.serve("127.0.0.1", 0, echoCount, date = false, maxHeaders = 1))
+  say("Host alone:", answer(one, "GET / HTTP/1.0\r\nHost: t\r\n\r\n"))
+  say("and another:", answer(one, "GET / HTTP/1.0\r\nHost: t\r\nX: y\r\n\r\n"))
+  one.shutdown()

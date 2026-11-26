@@ -1,0 +1,280 @@
+// Writes `library/avin/net/idna/idna_tables.avin`, the tables `avin.net.idna` maps and checks domain
+// names with, from the IDNA mapping table of UTS #46 and three files of the Unicode Character
+// Database:
+//
+//     avin run scripts/idna_tables.avin -- <unicode directory> library/avin/net/idna/idna_tables.avin
+//
+// The directory holds, side by side, `IdnaMappingTable.txt` (from
+// `https://www.unicode.org/Public/17.0.0/idna/`) and `DerivedBidiClass.txt`,
+// `DerivedJoiningType.txt` and `DerivedCombiningClass.txt` (from the database's `extracted/`
+// directory, `https://www.unicode.org/Public/17.0.0/ucd/extracted/`), all of one version: the one
+// `sysl.unicode` normalizes with, 17.0.0. The data files are under the Unicode License v3, which the
+// generated file repeats.
+//
+// Both tables are runs: every code point from 0 to 0x10FFFF gets a value, neighbours with the same
+// value are merged into a run, and the numbers are written in base 32, a digit to a character, as
+// `scripts/unicode_tables.avin` describes. A signed number is written zigzag: 0, -1, 1, -2 … as 0,
+// 1, 2, 3 ….
+//
+// The mapping table is each run's length, then its kind, then for a mapped run its mapping:
+//
+// - 0, valid: the code point stays. A deviation (`ß`, `ς`, the two zero-width joiners) is valid,
+//   since the library processes names non-transitionally, as the WHATWG URL standard does.
+// - 1, ignored: the code point is removed.
+// - 2, disallowed: the code point stays, and the name holding it is refused.
+// - 3, mapped to a sequence: every code point of the run becomes the same sequence, written as its
+//   length and then each code point as its difference from the one before (the first from the run's
+//   first code point), signed.
+// - 4, mapped by an offset: each code point of the run becomes the one a fixed distance away, the
+//   distance written next, signed.
+//
+// The property table is each run's length and a value: the bidirectional class in the low four bits
+// (0 L, 1 R, 2 AL, 3 AN, 4 EN, 5 ES, 6 CS, 7 ET, 8 ON, 9 BN, 10 NSM, 11 any other), the joining type
+// in the next three (0 none, 1 L, 2 D, 3 R, 4 T; a join-causing character counts as none, since the
+// joiner rule names only these four), and 128 for a virama (canonical combining class 9).
+import avin.fs
+import avin.process
+
+val Limit: int = 0x110000
+
+// The digits of the encoding: the first 32 end a number, the last 32 are followed by more digits.
+val Digits: string = "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz-_"
+
+val Valid: int = 0
+val Ignored: int = 1
+val Disallowed: int = 2
+val MappedSequence: int = 3
+val MappedOffset: int = 4
+
+// One line of a data file: its first and last code point and its fields after the code points.
+data Entry(first: int, last: int, fields: Vector[string])
+
+main(args: Vector[string]) -> int
+  if args.length != 2
+    eprintln("usage: idna_tables <unicode directory> <output file>")
+    return 2
+  val dir = args(0)
+  val version = idnaVersion(dir)
+  for name in ["DerivedBidiClass.txt", "DerivedJoiningType.txt", "DerivedCombiningClass.txt"]
+    val v = versionOf(dir, name)
+    if v != version
+      eprintln(s"$name is Unicode $v and IdnaMappingTable.txt $version")
+      return 1
+
+  val out = StringWriter()
+  out.write("module avin.net.idna\n\n")
+  out.write(s"// The IDNA mapping table of UTS #46 and the character properties its checks read, Unicode $version,\n")
+  out.write("// written by `scripts/idna_tables.avin`, which says how they are encoded. Do not edit: run the\n")
+  out.write("// script again.\n")
+  out.write("//\n")
+  out.write("// Made from `IdnaMappingTable.txt`, `DerivedBidiClass.txt`, `DerivedJoiningType.txt` and\n")
+  out.write("// `DerivedCombiningClass.txt`, © Unicode, Inc., under the Unicode License v3\n")
+  out.write("// (https://www.unicode.org/license.txt): Permission is hereby granted, free of charge, to any\n")
+  out.write("// person obtaining a copy of data files and any associated documentation (the \"Data Files\") or\n")
+  out.write("// software and any associated documentation (the \"Software\") to deal in the Data Files or\n")
+  out.write("// Software without restriction, including without limitation the rights to use, copy, modify,\n")
+  out.write("// merge, publish, distribute, and/or sell copies of the Data Files or Software, and to permit\n")
+  out.write("// persons to whom the Data Files or Software are furnished to do so, provided that either (a)\n")
+  out.write("// this copyright and permission notice appear with all copies of the Data Files or Software, or\n")
+  out.write("// (b) this copyright and permission notice appear in associated Documentation. THE DATA FILES\n")
+  out.write("// AND SOFTWARE ARE PROVIDED \"AS IS\", WITHOUT WARRANTY OF ANY KIND.\n\n")
+  out.write("// Every code point's status and mapping, as runs.\n")
+  out.write("private val IdnaMappingRuns: string = \"" + mappingRuns(dir) + "\"\n\n")
+  out.write("// Every code point's bidirectional class, joining type and whether it is a virama, as runs.\n")
+  out.write("private val IdnaPropertyRuns: string = \"" + propertyRuns(dir) + "\"\n")
+  fs.writeText(args(1), out.text) match
+    Ok(_) ->
+      println(s"wrote ${args(1)} from Unicode $version")
+      0
+    Err(e) ->
+      eprintln(s"${args(1)}: ${e.message}")
+      1
+
+// The mapping table's runs, from `IdnaMappingTable.txt`.
+mappingRuns(dir: string) -> string
+  val kinds = Array.fill(Limit, -1)
+  val targets = Array.fill(Limit, Vector.empty[int]())
+  for e in entries(dir, "IdnaMappingTable.txt")
+    val status = e.fields(0)
+    val kind = status match
+      "valid" -> Valid
+      "deviation" -> Valid
+      "ignored" -> Ignored
+      "disallowed" -> Disallowed
+      "mapped" -> MappedSequence
+      _ ->
+        eprintln(s"unknown status $status")
+        process.exit(1)
+    val target = if kind == MappedSequence then e.fields(1).split(" ").map(
+      h -> hexValue(h)
+    ).toVector else Vector.empty[int]()
+    for c in e.first .. e.last
+      kinds(c) = kind
+      targets(c) = target
+  for c in 0 ..< Limit
+    if kinds(c) < 0
+      eprintln(s"IdnaMappingTable.txt gives no status to code point $c")
+      process.exit(1)
+
+  val out = StringWriter()
+  var start = 0
+  while start < Limit
+    val kind = kinds(start)
+    var end = start + 1
+    if kind != MappedSequence
+      while end < Limit && kinds(end) == kind do end += 1
+      encodeNumber(out, end - start)
+      encodeNumber(out, kind)
+    else
+      val target = targets(start)
+      val single = target.length == 1
+      val offset = if single then target(0) - start else 0
+      val sameNext = start + 1 < Limit && kinds(start + 1) == MappedSequence && targets(start + 1) == target
+      if single && !sameNext
+        while end < Limit && kinds(end) == MappedSequence && targets(end).length == 1 && targets(end)(0) - end == offset
+          end += 1
+        encodeNumber(out, end - start)
+        encodeNumber(out, MappedOffset)
+        encodeNumber(out, zigzag(offset))
+      else
+        while end < Limit && kinds(end) == MappedSequence && targets(end) == target do end += 1
+        encodeNumber(out, end - start)
+        encodeNumber(out, MappedSequence)
+        encodeNumber(out, target.length)
+        var before = start
+        for t in target
+          encodeNumber(out, zigzag(t - before))
+          before = t
+    start = end
+  out.text
+
+// The property table's runs, from the three files of the database.
+propertyRuns(dir: string) -> string
+  val values = Array.fill(Limit, 0)
+  // The bidirectional classes, first the defaults the `@missing` lines give unlisted code points.
+  for e in missing(dir, "DerivedBidiClass.txt")
+    val v = bidiValue(e.fields(0))
+    for c in e.first .. e.last do values(c) = v
+  for e in entries(dir, "DerivedBidiClass.txt")
+    val v = bidiValue(e.fields(0))
+    for c in e.first .. e.last do values(c) = v
+  for e in entries(dir, "DerivedJoiningType.txt")
+    val j = e.fields(0) match
+      "L" -> 1
+      "D" -> 2
+      "R" -> 3
+      "T" -> 4
+      _ -> 0
+    for c in e.first .. e.last do values(c) = values(c) | (j << 4)
+  var viramas = 0
+  for e in entries(dir, "DerivedCombiningClass.txt")
+    if e.fields(0) == "9"
+      for c in e.first .. e.last
+        values(c) = values(c) | 128
+        viramas += 1
+  if viramas == 0
+    eprintln("no virama in DerivedCombiningClass.txt")
+    process.exit(1)
+  val out = StringWriter()
+  var start = 0
+  for c in 1 .. Limit
+    if c == Limit || values(c) != values(start)
+      encodeNumber(out, c - start)
+      encodeNumber(out, values(start))
+      start = c
+  out.text
+
+// A bidirectional class by its short or long name, as the table numbers it.
+bidiValue(name: string) -> int = name match
+  "L" -> 0
+  "Left_To_Right" -> 0
+  "R" -> 1
+  "Right_To_Left" -> 1
+  "AL" -> 2
+  "Arabic_Letter" -> 2
+  "AN" -> 3
+  "EN" -> 4
+  "ES" -> 5
+  "CS" -> 6
+  "ET" -> 7
+  "European_Terminator" -> 7
+  "ON" -> 8
+  "BN" -> 9
+  "NSM" -> 10
+  _ ->
+    if !["B", "S", "WS", "LRE", "LRO", "RLE", "RLO", "PDF", "LRI", "RLI", "FSI", "PDI"].contains(name)
+      eprintln(s"unknown bidirectional class $name")
+      process.exit(1)
+    11
+
+zigzag(n: int) -> int = if n >= 0 then 2 * n else -2 * n - 1
+
+readFile(dir: string, name: string) -> string = fs.readText(dir + "/" + name) match
+  Ok(text) -> text
+  Err(e) ->
+    eprintln(s"$dir/$name: ${e.message}")
+    process.exit(1)
+
+// The version of the mapping table, from its `# Version: 17.0.0` line.
+idnaVersion(dir: string) -> string
+  for line in readFile(dir, "IdnaMappingTable.txt").lines
+    if line.startsWith("# Version: ") then return line.slice(11, line.byteLength).trim
+  eprintln("IdnaMappingTable.txt names no version")
+  process.exit(1)
+
+// The version a data file's first line names: `# DerivedBidiClass-17.0.0.txt` is `17.0.0`.
+versionOf(dir: string, name: string) -> string
+  val first = readFile(dir, name).lines(0)
+  val dash = first.lastIndexOf("-")
+  val dot = first.lastIndexOf(".txt")
+  if dash < 0 || dot < dash then "unknown" else first.slice(dash + 1, dot)
+
+// The lines of a file that give code points a value: `first..last ; fields`, comments dropped.
+entries(dir: string, name: string) -> Vector[Entry]
+  val found = Buffer[Entry]()
+  for line in readFile(dir, name).lines
+    val hash = line.indexOf("#")
+    val content = (if hash >= 0 then line.slice(0, hash) else line).trim
+    if content.nonEmpty then found.addOne(entry(content))
+  found.toVector
+
+// The defaults a file's `# @missing: first..last; value` lines give, in the order written, a later
+// one taking precedence over an earlier one.
+missing(dir: string, name: string) -> Vector[Entry]
+  val found = Buffer[Entry]()
+  for line in readFile(dir, name).lines
+    if line.startsWith("# @missing:") then found.addOne(entry(line.slice(11, line.byteLength).trim))
+  found.toVector
+
+entry(content: string) -> Entry
+  val fields = content.split(";").map(f -> f.trim)
+  val codes = fields(0)
+  val dots = codes.indexOf("..")
+  val first = hexValue(if dots >= 0 then codes.slice(0, dots) else codes)
+  val last = if dots >= 0 then hexValue(codes.slice(dots + 2, codes.byteLength)) else first
+  Entry(first, last, fields.drop(1))
+
+hexValue(text: string) -> int
+  var n = 0
+  for c in text.chars
+    val d = c.asDigit
+    if !(0 <= d < 16)
+      eprintln(s"not a hexadecimal number: $text")
+      process.exit(1)
+    n = n * 16 + d
+  n
+
+// A number in the encoding: its digits from the most significant, every one but the last marked as
+// followed by more.
+encodeNumber(out: StringWriter, n: int)
+  val digits = Buffer[int]()
+  var rest = n
+  loop
+    digits.addOne(rest % 32)
+    rest = rest / 32
+    if rest == 0 then break
+  var k = digits.length - 1
+  while k >= 0
+    val d = if k > 0 then digits(k) + 32 else digits(k)
+    out.writeChar(Digits.charAt(d))
+    k -= 1

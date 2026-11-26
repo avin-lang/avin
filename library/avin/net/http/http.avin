@@ -1,16 +1,15 @@
 module avin.net.http
 
-// An HTTP/1.1 client over a TCP connection: `get`, `head`, `delete`, `post`, `put` and `patch`, each
-// taking headers to send, and `send` for any request. One request
-// goes on each connection, and a status is an answer rather than a failure, so a `404` is an `Ok`.
-// A `GET` or `HEAD` follows up to five redirects, each resolved against the URL that answered it.
-// An `https` URL is fetched over TLS, its certificate checked for the URL's host against the
-// machine's trusted authorities and those the request's `TlsClient` adds. The server, `serve`, is in
-// `server.avin` beside this file; a `Response` is what its handlers answer.
+// HTTP/1.1's requests and responses, which the client sends and reads and the server reads and
+// answers. The client, `send`, `get` and the others and the pooling `Client`, is in `client.avin`
+// beside this file, and the server, `serve`, in `server.avin`; a `Response` is what its handlers
+// answer.
 
+import avin.encoding.toBase64
+import avin.html.Html
 import avin.io.IoError
-import avin.net.{ByteStream, TcpStream, Url, UrlError}
-import avin.net.tls.{TlsClient, TlsError, TlsStream, Transport}
+import avin.net.{Url, UrlError}
+import avin.net.tls.{TlsClient, TlsError}
 import avin.time.{Duration, seconds}
 
 // Why a request has no response.
@@ -28,6 +27,12 @@ data HttpError
   // handshake failed, or a certificate the request trusts cannot be read. A connection that could
   // not be made, broke or timed out is `Io`, for `https` as for `http`.
   Tls(error: TlsError)
+  // The reply is over one of the client's limits: its head over `maxHeaderBytes`, or the body of a
+  // response read whole over `maxResponseBytes`.
+  TooLarge(text: string)
+  // The proxy an `https` URL goes by answered its `CONNECT` with `status`, not a `2xx`, opening no
+  // tunnel: a `407` where it wants credentials it was not given or refuses those it was.
+  ProxyRefused(status: int, reason: string)
 
 impl Error for HttpError
   // A sentence saying what went wrong, for a message to a person.
@@ -37,21 +42,30 @@ impl Error for HttpError
     Malformed(t) -> s"malformed reply: $t"
     Unsupported(t) -> s"unsupported: $t"
     Tls(e) -> e.message
+    TooLarge(t) -> s"reply too large: $t"
+    ProxyRefused(status, reason) -> s"the proxy refused the tunnel: $status $reason"
 
 // A request: its method, its URL as text, the headers sent besides the ones the client writes, its
-// body, how long a read or write on its connection may wait, and the TLS settings an `https` URL is
-// fetched with, by redirect too. A method is a token, such as `GET`, a header's name is a token and
-// its value holds no line break; a request where one does not hold traps as it is made, its headers
-// given to the constructor as much as those added by `withHeader`.
+// body, how long a read or write on its connection may wait, the TLS settings an `https` URL is
+// fetched with, by redirect too, how long looking the host up, connecting and an `https` URL's
+// TLS handshake may take together, for each connection the request makes, and how long the whole
+// request may take, redirects and reading the response included. A method is a token, such
+// as `GET`, a header's name is a token and its value holds no line break; a request where one does
+// not hold, or whose `connectTimeout` or `totalTimeout` is negative, traps as it is made, its
+// headers given to the constructor as much as those added by `withHeader`.
 class Request(
     val method: string,
     val url: string,
     val headers: Vector[(string, string)] = Vector.empty[(string, string)](),
     val body: Array[byte] = Array.empty[byte](),
     val timeout: Option[Duration] = None,
-    val tls: TlsClient = TlsClient()
+    val tls: TlsClient = TlsClient(),
+    val connectTimeout: Duration = seconds(30),
+    val totalTimeout: Duration = Duration.Zero
 )
   if method.isEmpty || method.indexWhere(c -> !isTokenChar(c)) >= 0 then fail(s"`$method` is not an HTTP method")
+  if connectTimeout.isNegative then fail(s"a connect timeout of $connectTimeout: it is at least zero")
+  if totalTimeout.isNegative then fail(s"a total timeout of $totalTimeout: it is at least zero")
   for (name, value) in headers
     checkHeader(name, value)
 
@@ -63,30 +77,109 @@ class Request(
     headers :+ (name, value),
     body,
     timeout,
-    tls
+    tls,
+    connectTimeout,
+    totalTimeout
+  )
+
+  // The value of the first header of `name`, compared without regard to case.
+  header(name: string) -> Option[string] = headerIn(headers, name)
+
+  // The request with `Authorization: Basic` and `user` and `password` (RFC 7617), as UTF-8, for its
+  // only `Authorization`. Like every `Authorization`, it is dropped on a redirect to another origin. A
+  // `user` holding `:`, or either holding a control character, traps.
+  withBasicAuth(user: string, password: string) -> Request
+    if user.indexOf(':') >= 0 then fail("a user name for basic authentication holds `:`")
+    if user.exists(isControl) || password.exists(isControl)
+      fail("a user name or password for basic authentication holds a control character")
+    authorized("Basic " + toBase64(s"$user:$password"))
+
+  // The request with `Authorization: Bearer token` (RFC 6750) for its only `Authorization`, dropped on
+  // a redirect to another origin as `withBasicAuth`'s is. A `token` that is empty or not a `token68`
+  // (letters, digits, `-`, `.`, `_`, `~`, `+` and `/`, then any `=`) traps.
+  withBearer(token: string) -> Request
+    if !isToken68(token) then fail("a bearer token is not a token68")
+    authorized("Bearer " + token)
+
+  private authorized(value: string) -> Request = Request(
+    method,
+    url,
+    withoutHeader(headers, "Authorization") :+ ("Authorization", value),
+    body,
+    timeout,
+    tls,
+    connectTimeout,
+    totalTimeout
   )
 
   // The request with the headers of `more` added after the ones it has, in order.
-  withHeaders(more: Vector[(string, string)]) -> Request = Request(method, url, headers ++ more, body, timeout, tls)
+  withHeaders(more: Vector[(string, string)]) -> Request =
+    Request(method, url, headers ++ more, body, timeout, tls, connectTimeout, totalTimeout)
 
   // The request with the query parameter `name=value` added after any its URL has, each encoded by
   // `Url.encode`, and before the URL's fragment.
   withQueryParam(name: string, value: string) -> Request =
-    Request(method, withParam(url, name, value), headers, body, timeout, tls)
+    Request(method, withParam(url, name, value), headers, body, timeout, tls, connectTimeout, totalTimeout)
 
   // The request with `text`, as UTF-8, for its body.
-  withBody(text: string) -> Request = Request(method, url, headers, utf8(text), timeout, tls)
+  withBody(text: string) -> Request = withBody(utf8(text))
 
   // The request with `bytes` for its body.
-  withBody(bytes: Array[byte]) -> Request = Request(method, url, headers, bytes, timeout, tls)
+  withBody(bytes: Array[byte]) -> Request =
+    Request(method, url, headers, bytes, timeout, tls, connectTimeout, totalTimeout)
+
+  // The request with `pairs` for its body, written as `application/x-www-form-urlencoded` by
+  // `Url.formEncode`, and that for its `Content-Type`, replacing any it has.
+  withForm(pairs: Vector[(string, string)]) -> Request =
+    typed("application/x-www-form-urlencoded", utf8(Url.formEncode(pairs)))
+
+  // The request with `form` for its body, written as `multipart/form-data` between delimiters of a
+  // fresh `Multipart.newBoundary()`, and that type with the boundary for its `Content-Type`,
+  // replacing any it has.
+  withMultipart(form: Multipart) -> Request = withMultipart(form, Multipart.newBoundary())
+
+  // As `withMultipart(form)`, with `boundary` for the delimiters; one `Multipart.encoded` refuses
+  // traps.
+  withMultipart(form: Multipart, boundary: string) -> Request = typed(
+    form.contentType(boundary),
+    form.encoded(boundary)
+  )
+
+  // The request with `bytes` for its body and `contentType` for its only `Content-Type`.
+  private typed(contentType: string, bytes: Array[byte]) -> Request = Request(
+    method,
+    url,
+    withoutHeader(headers, "Content-Type") :+ ("Content-Type", contentType),
+    bytes,
+    timeout,
+    tls,
+    connectTimeout,
+    totalTimeout
+  )
 
   // The request with a read or write on its connection, the TLS handshake's included, failing with
   // `TimedOut` after waiting `d`.
-  withTimeout(d: Duration) -> Request = Request(method, url, headers, body, Some(d), tls)
+  withTimeout(d: Duration) -> Request =
+    Request(method, url, headers, body, Some(d), tls, connectTimeout, totalTimeout)
 
   // The request fetching an `https` URL with `client`'s settings: the machine's trusted
   // authorities and those `client` adds.
-  withTls(client: TlsClient) -> Request = Request(method, url, headers, body, timeout, client)
+  withTls(client: TlsClient) -> Request =
+    Request(method, url, headers, body, timeout, client, connectTimeout, totalTimeout)
+
+  // The request with looking the host up, connecting and an `https` URL's TLS handshake together
+  // failing with `TimedOut` once they have taken `d`, on each connection it makes; zero takes the
+  // limit away, and a negative `d` traps. A `Client` waiting for a place among its connections to
+  // the host waits within the same limit.
+  withConnectTimeout(d: Duration) -> Request =
+    Request(method, url, headers, body, timeout, tls, d, totalTimeout)
+
+  // The request with the whole of it, from the call that sends it until its response is answered,
+  // failing with `TimedOut` once it has taken `d`: getting a connection, writing the request, every
+  // redirect followed, and reading the response, its body included, or, for `Client.stream`, the
+  // function given the response. Zero, the default, takes the limit away; a negative `d` traps.
+  withTotalTimeout(d: Duration) -> Request =
+    Request(method, url, headers, body, timeout, tls, connectTimeout, d)
 
 // A response: its status and reason, its headers as they came, name and value, and its body. A
 // response a server writes may instead be `streamed`, its body written as the handler makes it,
@@ -181,6 +274,10 @@ object Response
   html(status: int, text: string) -> Response =
     Response(status, reasonPhrase(status), Vector(("Content-Type", "text/html; charset=utf-8")), utf8(text))
 
+  // A response of `status` whose body is the markup `page`, such as `html"…"` builds, as UTF-8, of
+  // the type `text/html; charset=utf-8`.
+  html(status: int, page: Html) -> Response = html(status, page.text)
+
   // A response of `status` whose body is `text`, JSON already written, as UTF-8, of the type
   // `application/json`. The text is sent as it is given, not checked to be JSON.
   json(status: int, text: string) -> Response =
@@ -244,244 +341,18 @@ reasonPhrase(504) = "Gateway Timeout"
 reasonPhrase(505) = "HTTP Version Not Supported"
 reasonPhrase(_) = ""
 
-// Fetches `url`, sending `headers` besides the ones the client writes.
-get(url: string, headers: Vector[(string, string)] = Vector.empty[(string, string)]()) -> Result[Response, HttpError] =
-  send(Request("GET", url, headers))
-
-// Asks for `url`'s headers without its body.
-head(url: string, headers: Vector[(string, string)] = Vector.empty[(string, string)]()) -> Result[Response, HttpError] =
-  send(Request("HEAD", url, headers))
-
-// Asks the server to delete `url`.
-delete(
-    url: string,
-    headers: Vector[(string, string)] = Vector.empty[(string, string)]()
-) -> Result[Response, HttpError] =
-  send(Request("DELETE", url, headers))
-
-// Sends `body`, as UTF-8, to `url` with the content type `contentType`, and answers the response.
-post(
-    url: string,
-    body: string,
-    contentType: string,
-    headers: Vector[(string, string)] = Vector.empty[(string, string)]()
-) -> Result[Response, HttpError] =
-  send(withContent("POST", url, body, contentType, headers))
-
-// Stores `body`, as UTF-8, at `url` with the content type `contentType`.
-put(
-    url: string,
-    body: string,
-    contentType: string,
-    headers: Vector[(string, string)] = Vector.empty[(string, string)]()
-) -> Result[Response, HttpError] =
-  send(withContent("PUT", url, body, contentType, headers))
-
-// Changes `url` by `body`, as UTF-8, of the content type `contentType`.
-patch(
-    url: string,
-    body: string,
-    contentType: string,
-    headers: Vector[(string, string)] = Vector.empty[(string, string)]()
-) -> Result[Response, HttpError] =
-  send(withContent("PATCH", url, body, contentType, headers))
-
-// A request with a body: its `Content-Type` first, then `headers`.
-private withContent(
-    method: string,
-    url: string,
-    body: string,
-    contentType: string,
-    headers: Vector[(string, string)]
-) -> Request =
-  Request(method, url, Vector(("Content-Type", contentType)) ++ headers, utf8(body))
-
-// Sends `request` and answers its response, following up to five redirects of a `GET` or `HEAD`.
-send(request: Request) -> Result[Response, HttpError]
-  var at = Url.parse(request.url).mapErr(e -> BadUrl(e))?
-  var followed = 0
-  while true
-    val response = exchange(request, at)?
-    val follows = request.method == "GET" || request.method == "HEAD"
-    if !follows || followed == MaxRedirects || !isRedirect(response.status) then return Ok(response)
-    response.header("Location") match
-      Some(location) ->
-        at = at.resolve(location.trim).mapErr(e -> BadUrl(e))?
-        followed += 1
-      None -> return Ok(response)
-  fail("unreachable")
-
-// How many redirects a request follows before it answers the redirect itself.
-private val MaxRedirects = 5
-
-private isRedirect(status: int) -> bool =
-  status == 301 || status == 302 || status == 303 || status == 307 || status == 308
-
-// One request on a connection of its own, and the response read from it.
-private exchange(request: Request, url: Url) -> Result[Response, HttpError]
-  val secure = url.scheme == "https"
-  if !secure && url.scheme != "http" then return Err(Unsupported(s"the scheme `${url.scheme}`"))
-  val host = url.host.getOrElse("")
-  if host.isEmpty then return Err(Unsupported(s"a URL without a host: $url"))
-  val port = url.portOrDefault.getOrElse(if secure then 443 else 80)
-  val tcp = TcpStream.connect(addressOf(host), port).mapErr(e -> Io(e))?
-  request.timeout match
-    Some(d) ->
-      tcp.setTimeout(d) match
-        Ok(_) -> ()
-        Err(e) ->
-          _ = tcp.close()
-          return Err(Io(e))
-    None -> ()
-  // Once the exchange has answered, or failed for its own reason, a failure to close the
-  // connection says nothing more about the request, so it is dropped.
-  if !secure
-    val answer = over(tcp, request, url, host)
-    _ = tcp.close()
-    return answer
-  val stream = TlsStream.client(tcp, addressOf(host), request.tls) match
-    Ok(s) -> s
-    Err(e) ->
-      _ = tcp.close()
-      return Err(e match
-        Transport(io) -> Io(io)
-        other -> Tls(other))
-  val answer = over(stream, request, url, host)
-  _ = stream.close()
-  answer
-
-// The request written on `stream` and its response read, the connection left for the caller to close.
-private over(stream: ByteStream, request: Request, url: Url, host: string) -> Result[Response, HttpError]
-  stream.write(utf8(requestHead(request, url, host))).mapErr(e -> Io(e))?
-  if request.body.length > 0 then stream.write(request.body).mapErr(e -> Io(e))?
-  while true
-    val response = readResponse(stream, request.method == "HEAD")?
-    // An interim answer, such as `100 Continue`, is followed by the real one.
-    if response.status < 100 || response.status >= 200 || response.status == 101 then return Ok(response)
-  fail("unreachable")
-
-// The request line and headers, ending in the empty line.
-private requestHead(request: Request, url: Url, host: string) -> string
-  val out = StringWriter()
-  val target = (if url.path.isEmpty then "/" else url.path) + url.query.map(q -> "?" + q).getOrElse("")
-  out.write(s"${request.method} $target HTTP/1.1\r\n")
-  if headerIn(request.headers, "Host").isEmpty
-    out.write(s"Host: $host${url.port.map(p -> s":$p").getOrElse("")}\r\n")
-  val sendsLength = request.body.length > 0
-    || request.method == "POST"
-    || request.method == "PUT"
-    || request.method == "PATCH"
-  if sendsLength && headerIn(request.headers, "Content-Length").isEmpty
-    out.write(s"Content-Length: ${request.body.length}\r\n")
-  if headerIn(request.headers, "Connection").isEmpty then out.write("Connection: close\r\n")
-  for (name, value) in request.headers
-    out.write(s"$name: $value\r\n")
-  out.write("\r\n")
-  out.text
-
-// The status line, headers and body of one response.
-private readResponse(stream: ByteStream, headOnly: bool) -> Result[Response, HttpError]
-  val statusLine = stream.readLine().mapErr(e -> Io(e))? match
-    Some(line) -> line
-    None -> return Err(Malformed("the connection closed before a response"))
-  val (status, reason) = parseStatus(statusLine)?
-  val headers = Buffer[(string, string)]()
-  while true
-    val line = stream.readLine().mapErr(e -> Io(e))? match
-      Some(l) -> l
-      None -> return Err(Malformed("the connection closed in the headers"))
-    if line.isEmpty then break
-    val colon = line.indexOf(':')
-    if colon <= 0 then return Err(Malformed(s"not a header: `$line`"))
-    headers.addOne((line.slice(0, colon).trim, line.slice(colon + 1, line.byteLength).trim))
-  val all = headers.toVector
-  val noBody = headOnly || (100 <= status < 200) || status == 204 || status == 304
-  val body = if noBody then Array.empty[byte]() else readBody(stream, all)?
-  Ok(Response(status, reason, all, body))
-
-// `HTTP/1.1 200 OK` as its status and reason.
-private parseStatus(line: string) -> Result[(int, string), HttpError]
-  val bad = Malformed(s"not a status line: `$line`")
-  if !line.startsWith("HTTP/") then return Err(bad)
-  val space = line.indexOf(' ')
-  if space < 0 || line.byteLength < space + 4 then return Err(bad)
-  val code = line.slice(space + 1, space + 4)
-  if code.indexWhere(c -> c < '0' || c > '9') >= 0 then return Err(bad)
-  if line.byteLength > space + 4 && line.byteAt(space + 4) != byte(32) then return Err(bad)
-  val reason = if line.byteLength > space + 5 then line.slice(space + 5, line.byteLength) else ""
-  Ok((code.toInt(), reason))
-
-// The body a response's headers announce: chunked, of a `Content-Length`, or to the connection's end.
-private readBody(stream: ByteStream, headers: Vector[(string, string)]) -> Result[Array[byte], HttpError]
-  val encoding = headerIn(headers, "Transfer-Encoding").getOrElse("")
-  if encoding.toLower.contains("chunked") then return readChunked(stream)
-  headerIn(headers, "Content-Length") match
-    Some(text) -> text.toIntOption() match
-      Some(n) if n >= 0 -> readExactly(stream, n)
-      _ -> Err(Malformed(s"a Content-Length of `$text`"))
-    None -> stream.readAll().mapErr(e -> Io(e))
-
-// Exactly `n` bytes, or `Malformed` where the connection ends before them.
-private readExactly(stream: ByteStream, n: int) -> Result[Array[byte], HttpError]
-  val out = Buffer[byte]()
-  while out.length < n
-    val left = n - out.length
-    val part = stream.read(if left > 65536 then 65536 else left).mapErr(e -> Io(e))?
-    if part.length == 0 then return Err(Malformed(s"the body ended after ${out.length} of $n bytes"))
-    out.addAll(part)
-  Ok(out.toArray())
-
-// A chunked body: chunks, each its size in hexadecimal on a line and then its bytes, until one of
-// size zero, then trailer lines until an empty one.
-private readChunked(stream: ByteStream) -> Result[Array[byte], HttpError]
-  val out = Buffer[byte]()
-  while true
-    val line = stream.readLine().mapErr(e -> Io(e))? match
-      Some(l) -> l
-      None -> return Err(Malformed("the connection closed in a chunked body"))
-    val semicolon = line.indexOf(';')
-    val sizeText = (if semicolon >= 0 then line.slice(0, semicolon) else line).trim
-    val size = hexValue(sizeText) match
-      Some(n) -> n
-      None -> return Err(Malformed(s"not a chunk size: `$line`"))
-    if size == 0
-      while true
-        stream.readLine().mapErr(e -> Io(e))? match
-          Some(trailer) -> if trailer.isEmpty then return Ok(out.toArray())
-          None -> return Ok(out.toArray())
-    out.addAll(readExactly(stream, size)?)
-    stream.readLine().mapErr(e -> Io(e))? match
-      Some(end) -> if !end.isEmpty then return Err(Malformed("a chunk longer than its size"))
-      None -> return Err(Malformed("the connection closed in a chunked body"))
-  Ok(out.toArray())
-
-// The value of hexadecimal digits, `None` for none or for a value above `int.MaxValue`.
-private hexValue(text: string) -> Option[int]
-  if text.isEmpty then return None
-  var n: long = 0
-  for c in text.chars
-    val d = hexDigit(c)
-    if d < 0 then return None
-    n = n * 16 + long(d)
-    if n > long(int.MaxValue) then return None
-  Some(int(n))
-
-// The value of an ASCII hexadecimal digit, -1 for any other character.
-private hexDigit(c: char) -> int =
-  if '0' <= c <= '9' then int(c) - int('0')
-  else if 'a' <= c <= 'f' then int(c) - int('a') + 10
-  else if 'A' <= c <= 'F' then int(c) - int('A') + 10
-  else -1
-
 // The value of the first header of `name` in `headers`, compared without regard to case.
 private headerIn(headers: Vector[(string, string)], name: string) -> Option[string]
   for (n, v) in headers
     if n.equalsIgnoreCase(name) then return Some(v)
   None
 
-// The host as a connection names it: an IPv6 address without its brackets, its zone's `%25` as `%`.
-private addressOf(host: string) -> string =
-  if host.startsWith("[") then host.slice(1, host.byteLength - 1).replace("%25", "%") else host
+// `headers` without those of `name`, compared without regard to case.
+private withoutHeader(headers: Vector[(string, string)], name: string) -> Vector[(string, string)]
+  val kept = Buffer[(string, string)]()
+  for (n, v) in headers
+    if !n.equalsIgnoreCase(name) then kept.addOne((n, v))
+  kept.toVector
 
 // A character a method or a header's name may hold: a letter, a digit, or one of RFC 9110's marks.
 private isTokenChar(c: char) -> bool =
@@ -502,3 +373,16 @@ private withParam(url: string, name: string, value: string) -> string
 
 // The UTF-8 bytes of `text`.
 private utf8(text: string) -> Array[byte] = Array.tabulate(text.byteLength, i -> text.byteAt(i))
+
+// Whether `text` is a `token68` (RFC 9110 section 11.2): one or more of letters, digits, `-`, `.`,
+// `_`, `~`, `+` and `/`, then any number of `=`.
+private isToken68(text: string) -> bool
+  val end = text.indexWhere(c -> c == '=')
+  val body = if end < 0 then text else text.slice(0, end)
+  val pad = if end < 0 then "" else text.slice(end, text.byteLength)
+  !body.isEmpty && body.forall(c ->
+    (
+      'a' <= c <= 'z'
+    ) || ('A' <= c <= 'Z') || ('0' <= c <= '9') || c == '-' || c == '.' || c == '_' || c == '~' || c == '+'
+      || c == '/'
+  ) && pad.forall(c -> c == '=')

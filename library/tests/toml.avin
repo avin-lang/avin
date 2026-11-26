@@ -1,0 +1,656 @@
+// `avin.toml`: each production of the TOML 1.0 grammar read into its value, the errors with their
+// lines and columns, the limits on hostile input, Unicode, the accessors, the text `render` writes and
+// the round trip back through `parse`.
+
+import avin.toml
+import avin.toml.{Toml, TomlError, PathStep}
+import avin.time.{date, dateTime, fixedZone, hours, minutes, time, utc, Zoned}
+
+private ok(text: string) -> Toml = toml.parse(text) match
+  Ok(t) -> t
+  Err(e) -> fail(s"expected TOML, got: $e")
+
+// The error `text` is, as it displays, or `accepted`.
+private err(text: string) -> string = toml.parse(text) match
+  Ok(_) -> "accepted"
+  Err(e) -> s"$e"
+
+// The value of `v` in a one-line document.
+private value(text: string) -> Toml = ok(s"v = $text").get("v").get
+
+@test("an empty document, or one of blank lines and comments, is an empty table")
+tomlEmpty()
+  for text in ["", "\n", "\r\n", "   \t\n", "# only a comment", "# a\n\n  # b\r\n"]
+    assertEq(ok(text), Toml.table())
+  assertEq(ok("\u{feff}a = 1"), Toml.table(("a", Toml.num(1))))
+
+@test("a basic string reads every escape TOML has, and the four- and eight-digit Unicode ones")
+tomlBasicStrings()
+  assertEq(value("\"\""), Toml.str(""))
+  assertEq(value("\"a b\""), Toml.str("a b"))
+  assertEq(value("\"\\b\\t\\n\\f\\r\\\"\\\\\""), Toml.str("\u{8}\t\n\u{c}\r\"\\"))
+  assertEq(value("\"\\u00e9\\u20AC\""), Toml.str("é€"))
+  assertEq(value("\"\\U0001F600\\U00000041\""), Toml.str("😀A"))
+  assertEq(value("\"tab\there\""), Toml.str("tab\there"))
+  assertEq(value("\"#not a comment\""), Toml.str("#not a comment"))
+  assertEq(value("\"日本語 ünï\""), Toml.str("日本語 ünï"))
+
+@test("a basic string refuses an unknown escape, a bad Unicode escape, a control character and a line end")
+tomlBasicStringErrors()
+  assertEq(err("v = \"\\x41\""), "the escape '\\x' is not one TOML has at line 1, column 6")
+  assertEq(err("v = \"\\e\""), "the escape '\\e' is not one TOML has at line 1, column 6")
+  assertEq(err("v = \"\\ \""), "the escape '\\ ' is not one TOML has at line 1, column 6")
+  assertEq(err("v = \"\\u12\""), "\\u needs 4 hexadecimal digits at line 1, column 6")
+  assertEq(err("v = \"\\UFFFFFFFF\""), "the escape names no Unicode character at line 1, column 6")
+  assertEq(err("v = \"\\U00110000\""), "the escape names no Unicode character at line 1, column 6")
+  assertEq(err("v = \"\\uD800\""), "the escape names a surrogate, which is no Unicode character at line 1, column 6")
+  assertEq(err("v = \"\\uDFFF\""), "the escape names a surrogate, which is no Unicode character at line 1, column 6")
+  assertEq(
+    err("v = \"a\u{1}\""),
+    "the control character U+0001 in a string, which must be written as an escape at line 1, column 7"
+  )
+  assertEq(
+    err("v = \"a\u{7f}\""),
+    "the control character U+007F in a string, which must be written as an escape at line 1, column 7"
+  )
+  assertEq(err("v = \"a\nb\""), "a line end inside a string, where '\"' was expected at line 1, column 7")
+  assertEq(err("v = \"abc"), "the end of the text inside a string, where '\"' was expected at line 1, column 9")
+  assertEq(err("v = \"\\"), "the end of the text after '\\' at line 1, column 6")
+
+@test("a multi-line basic string trims its first line end and a line-ending backslash, and holds one or two quotes")
+tomlMultiLineBasic()
+  assertEq(value("\"\"\"\"\"\""), Toml.str(""))
+  assertEq(value("\"\"\"\nab\ncd\"\"\""), Toml.str("ab\ncd"))
+  assertEq(value("\"\"\"\r\nab\r\ncd\"\"\""), Toml.str("ab\r\ncd"))
+  assertEq(value("\"\"\"a \\\n   \n  b\"\"\""), Toml.str("a b"))
+  assertEq(value("\"\"\"a \\  \t\r\n  b\"\"\""), Toml.str("a b"))
+  assertEq(value("\"\"\"a\\tb\\u00e9\"\"\""), Toml.str("a\tbé"))
+  assertEq(value("\"\"\"one \" two \"\" end\"\"\""), Toml.str("one \" two \"\" end"))
+  assertEq(value("\"\"\"x\"\"\"\""), Toml.str("x\""))
+  assertEq(value("\"\"\"x\"\"\"\"\""), Toml.str("x\"\""))
+  assertEq(value("\"\"\"\"x\"\"\""), Toml.str("\"x"))
+  assertEq(
+    err("v = \"\"\"x\"\"\"\"\"\""),
+    "more than five quotes at the end of a multi-line string at line 1, column 14"
+  )
+  assertEq(
+    err("v = \"\"\"x"),
+    "the end of the text inside a multi-line string, where '\"\"\"' was expected at line 1, column 9"
+  )
+  assertEq(err("v = \"\"\"a\rb\"\"\""), "a carriage return not followed by a line feed at line 1, column 9")
+  assertEq(
+    err("v = \"\"\"a\u{0}\"\"\""),
+    "the control character U+0000 in a string, which must be written as an escape at line 1, column 9"
+  )
+
+@test("a literal string is every character as it stands, on one line or several")
+tomlLiteralStrings()
+  assertEq(value("''"), Toml.str(""))
+  assertEq(value("'C:\\Users\\nodejs\\templates'"), Toml.str("C:\\Users\\nodejs\\templates"))
+  assertEq(value("'<\\i\\c*\\s*>'"), Toml.str("<\\i\\c*\\s*>"))
+  assertEq(value("'\"quoted\"'"), Toml.str("\"quoted\""))
+  assertEq(value("'''\nfirst\n  second\\n'''"), Toml.str("first\n  second\\n"))
+  assertEq(value("'''I [dw]on't need \\d{2} apples'''"), Toml.str("I [dw]on't need \\d{2} apples"))
+  assertEq(value("''''one'''"), Toml.str("'one"))
+  assertEq(value("'''two'''''"), Toml.str("two''"))
+  assertEq(err("v = 'a\nb'"), "a line end inside a literal string, where \"'\" was expected at line 1, column 7")
+  assertEq(err("v = 'a"), "the end of the text inside a literal string, where \"'\" was expected at line 1, column 7")
+  assertEq(err("v = 'a\u{8}'"), "the control character U+0008 in a literal string at line 1, column 7")
+  assertEq(
+    err("v = '''a''''''"),
+    "more than five quotes at the end of a multi-line literal string at line 1, column 14"
+  )
+
+@test("an integer is decimal with a sign, or hexadecimal, octal or binary, with underscores between digits")
+tomlIntegers()
+  assertEq(value("0"), Toml.num(0))
+  assertEq(value("+0"), Toml.num(0))
+  assertEq(value("-0"), Toml.num(0))
+  assertEq(value("+99"), Toml.num(99))
+  assertEq(value("-17"), Toml.num(-17))
+  assertEq(value("1_000"), Toml.num(1000))
+  assertEq(value("5_349_221"), Toml.num(5349221))
+  assertEq(value("0xDEADBEEF"), Toml.num(long(3735928559)))
+  assertEq(value("0xdead_beef"), Toml.num(long(3735928559)))
+  assertEq(value("0x00ff"), Toml.num(255))
+  assertEq(value("0o755"), Toml.num(493))
+  assertEq(value("0b1101_0110"), Toml.num(214))
+  assertEq(value("9223372036854775807"), Toml.num(long.MaxValue))
+  assertEq(value("-9223372036854775808"), Toml.num(long.MinValue))
+  assertEq(value("0x7fffffffffffffff"), Toml.num(long.MaxValue))
+  assertEq(value("0b0"), Toml.num(0))
+
+@test("an integer with a leading zero, a stray underscore, a sign before a base or a digit outside it is an error")
+tomlIntegerErrors()
+  assertEq(err("v = 01"), "`01`: a decimal number has no leading zero at line 1, column 5")
+  assertEq(err("v = -01"), "`-01`: a decimal number has no leading zero at line 1, column 5")
+  assertEq(err("v = 1__0"), "`1__0` is not a number at line 1, column 5")
+  assertEq(err("v = _1"), "'_' where a value was expected at line 1, column 5")
+  assertEq(err("v = 1_"), "`1_` is not a number at line 1, column 5")
+  assertEq(err("v = +0x1"), "`+0x1`: an integer written in another base has no sign at line 1, column 5")
+  assertEq(err("v = 0x"), "`0x` is not an integer at line 1, column 5")
+  assertEq(err("v = 0xg"), "`0xg` is not an integer at line 1, column 5")
+  assertEq(err("v = 0o8"), "`0o8` is not an integer at line 1, column 5")
+  assertEq(err("v = 0b2"), "`0b2` is not an integer at line 1, column 5")
+  assertEq(err("v = 0X1"), "`0X1` is not a number at line 1, column 5")
+  assertEq(err("v = 0x_1"), "`0x_1` is not an integer at line 1, column 5")
+  assertEq(err("v = 1 2"), "'2' after a value, where the line should end at line 1, column 7")
+
+@test("an integer outside 64 bits is an error, however many digits it has")
+tomlHugeIntegers()
+  assertEq(err("v = 9223372036854775808"), "`9223372036854775808` does not fit in a 64-bit integer at line 1, column 5")
+  assertEq(
+    err("v = -9223372036854775809"),
+    "`-9223372036854775809` does not fit in a 64-bit integer at line 1, column 5"
+  )
+  assertEq(err("v = 0x8000000000000000"), "`0x8000000000000000` does not fit in a 64-bit integer at line 1, column 5")
+  assertEq(
+    err("v = 0b1" + "0".repeat(64)),
+    s"`0b1${"0".repeat(64)}` does not fit in a 64-bit integer at line 1, column 5"
+  )
+  val digits = "9".repeat(100000)
+  assertEq(err(s"v = $digits"), s"`$digits` does not fit in a 64-bit integer at line 1, column 5")
+
+@test("a float has a fraction, an exponent or both, and inf and nan have an optional sign")
+tomlFloats()
+  assertEq(value("+1.0"), Toml.num(1.0))
+  assertEq(value("3.1415"), Toml.num(3.1415))
+  assertEq(value("-0.01"), Toml.num(-0.01))
+  assertEq(value("5e+22"), Toml.num(5e22))
+  assertEq(value("1e06"), Toml.num(1e6))
+  assertEq(value("-2E-2"), Toml.num(-0.02))
+  assertEq(value("6.626e-34"), Toml.num(6.626e-34))
+  assertEq(value("224_617.445_991_228"), Toml.num(224617.445991228))
+  assertEq(value("1e1_0"), Toml.num(1e10))
+  assertEq(value("0e0"), Toml.num(0.0))
+  assertEq(value("0.0"), Toml.num(0.0))
+  assertEq(value("-0.0").asReal.get.toBits, (-0.0).toBits)
+  assertEq(value("inf"), Toml.num(real.PositiveInfinity))
+  assertEq(value("+inf"), Toml.num(real.PositiveInfinity))
+  assertEq(value("-inf"), Toml.num(real.NegativeInfinity))
+  for text in ["nan", "+nan", "-nan"]
+    assert(value(text).asReal.get.isNaN)
+  assertEq(value("1e-400"), Toml.num(0.0))
+
+@test("a float with no digit on a side of its point, an empty exponent, a leading zero or no finite value is an error")
+tomlFloatErrors()
+  assertEq(err("v = .5"), "'.' where a value was expected at line 1, column 5")
+  assertEq(err("v = 5."), "`5.`: a float's '.' has digits on both sides at line 1, column 5")
+  assertEq(err("v = 1.e5"), "`1.e5`: a float's '.' has digits on both sides at line 1, column 5")
+  assertEq(err("v = 1e"), "`1e`: a float's exponent is digits after 'e' at line 1, column 5")
+  assertEq(err("v = 1e+"), "`1e+`: a float's exponent is digits after 'e' at line 1, column 5")
+  assertEq(err("v = 1e_5"), "`1e_5`: a float's exponent is digits after 'e' at line 1, column 5")
+  assertEq(err("v = 1_.5"), "`1_.5` is not a number at line 1, column 5")
+  assertEq(err("v = 1._5"), "`1._5`: a float's '.' has digits on both sides at line 1, column 5")
+  assertEq(err("v = 03.14"), "`03.14`: a decimal number has no leading zero at line 1, column 5")
+  assertEq(err("v = 1.5.5"), "`1.5.5`: a float's '.' has digits on both sides at line 1, column 5")
+  assertEq(err("v = infinity"), "`infinity` is not a number at line 1, column 5")
+  assertEq(err("v = Inf"), "'I' where a value was expected at line 1, column 5")
+  assertEq(err("v = NaN"), "'N' where a value was expected at line 1, column 5")
+  assertEq(err("v = 1e309"), "`1e309` is too large for a 64-bit float at line 1, column 5")
+  assertEq(err("v = -1e309"), "`-1e309` is too large for a 64-bit float at line 1, column 5")
+
+@test("true and false are the booleans, in lower case and nothing after them")
+tomlBooleans()
+  assertEq(value("true"), Toml.Bool(true))
+  assertEq(value("false"), Toml.Bool(false))
+  assertEq(err("v = True"), "'T' where a value was expected at line 1, column 5")
+  assertEq(err("v = truex"), "'t' where a value was expected at line 1, column 5")
+  assertEq(err("v = fals"), "'f' where a value was expected at line 1, column 5")
+
+@test("the four date-time kinds read into avin.time's types, a fraction past microseconds cut off")
+tomlDateTimes()
+  val reading = dateTime(date(1979, 5, 27), time(7, 32, 0))
+  assertEq(value("1979-05-27T07:32:00Z"), Toml.OffsetDateTime(Zoned(reading, minutes(0), utc)))
+  assertEq(value("1979-05-27t07:32:00z"), Toml.OffsetDateTime(Zoned(reading, minutes(0), utc)))
+  assertEq(value("1979-05-27 07:32:00Z"), Toml.OffsetDateTime(Zoned(reading, minutes(0), utc)))
+  assertEq(value("1979-05-27T07:32:00+00:00"), Toml.OffsetDateTime(Zoned(reading, minutes(0), utc)))
+  assertEq(value("1979-05-27T07:32:00-00:00"), Toml.OffsetDateTime(Zoned(reading, minutes(0), utc)))
+  val minus7 = minutes(-420)
+  assertEq(
+    value("1979-05-27T00:32:00.999999-07:00"),
+    Toml.OffsetDateTime(Zoned(dateTime(date(1979, 5, 27), time(0, 32, 0, 999999)), minus7, fixedZone(minus7)))
+  )
+  val plus530 = minutes(330)
+  assertEq(value("2000-01-01T00:00:00+05:30").asZoned.get.offset, plus530)
+  assertEq(
+    value("2000-01-01T00:00:00+05:30").asZoned.get.toInstant,
+    value("1999-12-31T18:30:00Z").asZoned.get.toInstant
+  )
+  assertEq(value("1979-05-27T07:32:00"), Toml.LocalDateTime(reading))
+  assertEq(value("1979-05-27 07:32:00"), Toml.LocalDateTime(reading))
+  assertEq(value("1979-05-27T00:32:00.5"), Toml.LocalDateTime(dateTime(date(1979, 5, 27), time(0, 32, 0, 500000))))
+  assertEq(
+    value("1979-05-27T00:32:00.1234569"),
+    Toml.LocalDateTime(dateTime(date(1979, 5, 27), time(0, 32, 0, 123456)))
+  )
+  assertEq(value("1979-05-27"), Toml.LocalDate(date(1979, 5, 27)))
+  assertEq(value("0000-01-01"), Toml.LocalDate(date(0, 1, 1)))
+  assertEq(value("9999-12-31"), Toml.LocalDate(date(9999, 12, 31)))
+  assertEq(value("2024-02-29"), Toml.LocalDate(date(2024, 2, 29)))
+  assertEq(value("07:32:00"), Toml.LocalTime(time(7, 32, 0)))
+  assertEq(value("00:32:00.999999"), Toml.LocalTime(time(0, 32, 0, 999999)))
+  assertEq(value("23:59:59.000000001"), Toml.LocalTime(time(23, 59, 59, 0)))
+  assertEq(ok("v = 1979-05-27 # a date\n").get("v"), Some(Toml.LocalDate(date(1979, 5, 27))))
+
+@test("a date-time naming no day or time, with no seconds, or with an offset out of range is an error")
+tomlDateTimeErrors()
+  assertEq(err("v = 1979-13-01"), "there is no such date: 1979-13-01 at line 1, column 5")
+  assertEq(err("v = 1979-02-29"), "there is no such date: 1979-02-29 at line 1, column 5")
+  assertEq(err("v = 1979-04-31"), "there is no such date: 1979-04-31 at line 1, column 5")
+  assertEq(err("v = 1979-00-10"), "there is no such date: 1979-00-10 at line 1, column 5")
+  assertEq(err("v = 1979-01-00"), "there is no such date: 1979-01-00 at line 1, column 5")
+  assertEq(err("v = 24:00:00"), "there is no such time of day: 24:00:00 at line 1, column 5")
+  assertEq(err("v = 23:60:00"), "there is no such time of day: 23:60:00 at line 1, column 5")
+  assertEq(err("v = 23:59:60"), "there is no such time of day: 23:59:60 at line 1, column 5")
+  assertEq(
+    err("v = 07:32"),
+    "the end of the text where ':' after the minutes, and the seconds was expected at line 1, column 10"
+  )
+  assertEq(
+    err("v = 1979-05-27T07:32Z"),
+    "'Z' where ':' after the minutes, and the seconds was expected at line 1, column 21"
+  )
+  assertEq(err("v = 1979-5-27"), "'-' where the month's two digits were expected at line 1, column 11")
+  assertEq(err("v = 1979-05-27T07:32:00+0700"), "'0' where ':' in the offset was expected at line 1, column 27")
+  assertEq(
+    err("v = 1979-05-27T07:32:00+24:00"),
+    "the offset of 1979-05-27T07:32:00+24:00 is outside ±23:59 at line 1, column 5"
+  )
+  assertEq(err("v = 1979-05-27T07:32:00."), "a digit after the '.' of a second's fraction at line 1, column 25")
+  assertEq(err("v = 07:32:00Z"), "'Z' after a value, where the line should end at line 1, column 13")
+  assertEq(err("v = 1979-05-27T"), "the end of the text where the hour's two digits were expected at line 1, column 16")
+
+@test("an array holds values of any kinds over any lines, with comments and a comma after the last")
+tomlArrays()
+  assertEq(value("[]"), Toml.arr())
+  assertEq(value("[ 1, 2, 3 ]"), Toml.arr(Toml.num(1), Toml.num(2), Toml.num(3)))
+  assertEq(value("[1,2,]"), Toml.arr(Toml.num(1), Toml.num(2)))
+  assertEq(value("[\n  1, # one\n  'a', # two\n\n]"), Toml.arr(Toml.num(1), Toml.str("a")))
+  assertEq(value("[[1, 2], ['a'], [], [{x = 1}]]").size, 4)
+  assertEq(value("[ 0.1, \"x\", 1979-05-27, true ]").size, 4)
+  assertEq(value("[\r\n1\r\n]"), Toml.arr(Toml.num(1)))
+  assertEq(err("v = [1 2]"), "'2' in an array, where ',' or ']' was expected at line 1, column 8")
+  assertEq(err("v = [1,,2]"), "',' where a value was expected at line 1, column 8")
+  assertEq(err("v = [,]"), "',' where a value was expected at line 1, column 6")
+  assertEq(err("v = [1"), "the end of the text in an array, where ',' or ']' was expected at line 1, column 7")
+  assertEq(err("v = [1, # x \u{1}\n]"), "the control character U+0001 in a comment at line 1, column 13")
+
+@test("an inline table is on one line, takes dotted keys, and no comma after its last pair")
+tomlInlineTables()
+  assertEq(value("{}"), Toml.table())
+  assertEq(
+    value("{ first = \"Tom\", last = \"Preston-Werner\" }"),
+    Toml.table(("first", Toml.str("Tom")), ("last", Toml.str("Preston-Werner")))
+  )
+  assertEq(value("{ type.name = \"pug\" }"), Toml.table(("type", Toml.table(("name", Toml.str("pug"))))))
+  assertEq(value("{ a.b = 1, a.c = 2 }"), Toml.table(("a", Toml.table(("b", Toml.num(1)), ("c", Toml.num(2))))))
+  assertEq(value("{a={b={}}}"), Toml.table(("a", Toml.table(("b", Toml.table())))))
+  assertEq(err("v = { a = 1, }"), "unexpected '}' after ',' in an inline table at line 1, column 14")
+  assertEq(err("v = { a = 1\n}"), "an inline table is written on one line at line 1, column 12")
+  assertEq(err("v = {\na = 1}"), "the control character U+000A where a key was expected at line 1, column 6")
+  assertEq(err("v = { a = 1 b = 2 }"), "'b' in an inline table, where ',' or '}' was expected at line 1, column 13")
+  assertEq(err("v = { a = 1, a = 2 }"), "the key `v.a` is defined twice at line 1, column 14")
+  assertEq(err("v = { a.b = 1, a = 2 }"), "the key `v.a` is defined twice at line 1, column 16")
+  assertEq(
+    err("v = { a = {}, a.b = 1 }"),
+    "`v.a` is already a table, so a dotted key cannot add to it at line 1, column 15"
+  )
+  assertEq(err("[t]\nv = [{ a = 1, a = 2 }]"), "the key `t.v.a` is defined twice at line 2, column 15")
+
+@test("an inline table and a static array are finished: no header or dotted key adds to them")
+tomlFinishedValues()
+  assertEq(err("a = {}\n[a]\n"), "`a` is already a table, so it cannot be a table at line 2, column 1")
+  assertEq(err("a = { b = 1 }\n[a.c]\n"), "`a` is already a table, so it cannot hold a table at line 2, column 1")
+  assertEq(
+    err("a = { b = 1 }\na.c = 2\n"),
+    "`a` is already a table, so a dotted key cannot add to it at line 2, column 1"
+  )
+  assertEq(err("a = []\n[[a]]\n"), "`a` is already an array, so it cannot be an array of tables at line 2, column 1")
+  assertEq(err("a = 1\n[a]\n"), "`a` is already an integer, so it cannot be a table at line 2, column 1")
+  assertEq(err("a = 1\na.b = 2\n"), "`a` is already an integer, so a dotted key cannot add to it at line 2, column 1")
+
+@test("keys are bare, quoted with either string, dotted with spaces around the dots, and never multi-line")
+tomlKeys()
+  val doc = ok(
+    "bare_key-1 = 1\n\"127.0.0.1\" = 2\n'quoted \"x\"' = 3\n\"\" = 4\n1234 = 5\nsite . \"google.com\" = true\n\"ʎǝʞ\" = 6\n"
+  )
+  assertEq(doc.keys, ["bare_key-1", "127.0.0.1", "quoted \"x\"", "", "1234", "site", "ʎǝʞ"])
+  assertEq(doc.at(["site", "google.com"]), Some(Toml.Bool(true)))
+  assertEq(ok("3.14159 = 'pi'").at(["3", "14159"]), Some(Toml.str("pi")))
+  assertEq(ok("true = 1\ninf = 2\n").keys, ["true", "inf"])
+  assertEq(ok("\"a\\u0041\" = 1").keys, ["aA"])
+  assertEq(err("= 1"), "'=' where a key was expected at line 1, column 1")
+  assertEq(err("a b = 1"), "'b' after a key, where '=' was expected at line 1, column 3")
+  assertEq(err("a = \n"), "the control character U+000A where a value was expected at line 1, column 5")
+  assertEq(err("a ="), "the end of the text where a value was expected at line 1, column 4")
+  assertEq(err("a.= 1"), "'=' where a key was expected at line 1, column 3")
+  assertEq(err("\"\"\"a\"\"\" = 1"), "a multi-line string cannot be a key at line 1, column 1")
+  assertEq(err("'''a''' = 1"), "a multi-line string cannot be a key at line 1, column 1")
+  assertEq(err("ʎ = 1"), "'ʎ' where a key was expected at line 1, column 1")
+  assertEq(err("a = 1 b = 2"), "'b' after a value, where the line should end at line 1, column 7")
+
+@test("a key defined twice is an error at the second, quoted or bare alike")
+tomlDuplicateKeys()
+  assertEq(err("a = 1\na = 2"), "the key `a` is defined twice at line 2, column 1")
+  assertEq(err("a = 1\n\"a\" = 2"), "the key `a` is defined twice at line 2, column 1")
+  assertEq(err("a = 1\n'a' = 2"), "the key `a` is defined twice at line 2, column 1")
+  assertEq(err("a.b = 1\na.b = 2"), "the key `a.b` is defined twice at line 2, column 1")
+  assertEq(err("a.b = 1\na = 2"), "the key `a` is defined twice at line 2, column 1")
+  assertEq(err("[t]\n  x = 1\n  x = 2"), "the key `t.x` is defined twice at line 3, column 3")
+  assertEq(err("[[t]]\nx = 1\n[[t]]\nx = 2\nx = 3"), "the key `t.x` is defined twice at line 5, column 1")
+  assertEq(err("\"a b\" = 1\n'a b' = 2"), "the key `\"a b\"` is defined twice at line 2, column 1")
+
+@test("dotted keys make tables, which later lines of the same section add to and no later section may")
+tomlDottedKeys()
+  val doc = ok("fruit.apple.color = \"red\"\nfruit.apple.taste.sweet = true\nfruit.orange = 2\n")
+  assertEq(doc.at(["fruit", "apple", "color"]), Some(Toml.str("red")))
+  assertEq(doc.at(["fruit", "apple", "taste", "sweet"]), Some(Toml.Bool(true)))
+  assertEq(doc.at(["fruit", "orange"]), Some(Toml.num(2)))
+  val sub = ok("[fruit]\napple.color = \"red\"\n\n[fruit.apple.texture]\nsmooth = true\n")
+  assertEq(sub.at(["fruit", "apple", "texture", "smooth"]), Some(Toml.Bool(true)))
+  assertEq(
+    err("[fruit]\napple.color = 'red'\n[fruit.apple]\n"),
+    "the table `fruit.apple` is defined twice at line 3, column 1"
+  )
+  assertEq(
+    err("[fruit]\napple.taste.sweet = true\n[fruit.apple.taste]\n"),
+    "the table `fruit.apple.taste` is defined twice at line 3, column 1"
+  )
+  assertEq(
+    err("[a.b]\nz = 1\n[a]\nb.y = 2\n"),
+    "the table `a.b` is already defined, so a dotted key cannot add to it at line 4, column 1"
+  )
+  assertEq(err("[a]\nb.c = 1\n[a.x]\nb.d = 1\n"), "accepted")
+  assertEq(err("[a]\nb = { c.d = 1, c.d = 2 }\n"), "the key `a.b.c.d` is defined twice at line 2, column 16")
+  assertEq(err("a.b = 1\n[x]\n[a]\n"), "the table `a` is defined twice at line 3, column 1")
+  assertEq(ok("[a.b.c]\nz = 1\n[a]\nb.d = 2\n").at(["a", "b", "d"]), Some(Toml.num(2)))
+  assertEq(ok("a.b = 1\n[a.c]\nd = 2\n").at(["a", "c", "d"]), Some(Toml.num(2)))
+
+@test("a header defines a table once, its super-tables before or after it, in any order")
+tomlTables()
+  val doc = ok("[x.y.z.w]\na = 1\n[x]\nb = 2\n[ x . y ]\nc = 3\n[\"q.r\"]\n['s'.t]\n")
+  assertEq(doc.at(["x", "y", "z", "w", "a"]), Some(Toml.num(1)))
+  assertEq(doc.at(["x", "b"]), Some(Toml.num(2)))
+  assertEq(doc.at(["x", "y", "c"]), Some(Toml.num(3)))
+  assertEq(doc.keys, ["x", "q.r", "s"])
+  assertEq(ok("[a]\n[b]\n").keys, ["a", "b"])
+  assertEq(ok("[a] # comment\nb = 1 # comment\n").at(["a", "b"]), Some(Toml.num(1)))
+  assertEq(err("[a]\n[a]"), "the table `a` is defined twice at line 2, column 1")
+  assertEq(err("[a]\nb = 1\n[a.b]"), "`a.b` is already an integer, so it cannot be a table at line 3, column 1")
+  assertEq(err("[a.b]\n[a]\n[a]"), "the table `a` is defined twice at line 3, column 1")
+  assertEq(err("[]"), "']' where a key was expected at line 1, column 2")
+  assertEq(err("[a"), "the end of the text in a table's header, where ']' was expected at line 1, column 3")
+  assertEq(err("[a]b = 1"), "'b' after a table's header, where the line should end at line 1, column 4")
+  assertEq(err("[a.]"), "']' where a key was expected at line 1, column 4")
+  assertEq(
+    err("[a\nb]"),
+    "the control character U+000A in a table's header, where ']' was expected at line 1, column 3"
+  )
+
+@test("an array of tables takes a new table for each header, and sub-tables go into its last element")
+tomlArraysOfTables()
+  val doc = ok("[[products]]\nname = \"Hammer\"\n[[products]]\n[[products]]\nname = \"Nail\"\n")
+  assertEq(doc("products").size, 3)
+  assertEq(doc("products")(1), Toml.table())
+  assertEq(doc("products")(2)("name"), Toml.str("Nail"))
+  val nested = ok(
+    "[[fruits]]\nname = 'apple'\n[fruits.physical]\ncolor = 'red'\n[[fruits.varieties]]\nname = 'red delicious'\n[[fruits.varieties]]\nname = 'granny smith'\n[[fruits]]\nname = 'banana'\n[[fruits.varieties]]\nname = 'plantain'\n"
+  )
+  assertEq(nested("fruits")(0)("physical")("color"), Toml.str("red"))
+  assertEq(nested("fruits")(0)("varieties").size, 2)
+  assertEq(nested("fruits")(1)("varieties")(0)("name"), Toml.str("plantain"))
+  assertEq(
+    err("[fruit.physical]\n[[fruit]]\n"),
+    "`fruit` is a table, so it cannot be an array of tables at line 2, column 1"
+  )
+  assertEq(err("[[fruit]]\n[fruit]\n"), "`fruit` is an array of tables, so it cannot be a table at line 2, column 1")
+  assertEq(err("[a]\n[[a]]\n"), "`a` is a table, so it cannot be an array of tables at line 2, column 1")
+  assertEq(err("[[a]]\nb.c = 1\n[a.b]\n"), "the table `a.b` is defined twice at line 3, column 1")
+  assertEq(err("[[a] ]"), "' ' after an array of tables' header, where ']]' was expected at line 1, column 5")
+  assertEq(err("[ [a]]"), "'[' where a key was expected at line 1, column 3")
+  assertEq(err("[[a]]\nx.y = 1\n[[a.x]]\n"), "`a.x` is a table, so it cannot be an array of tables at line 3, column 1")
+
+@test("line ends are a line feed or a carriage return and a line feed, never a carriage return alone")
+tomlLineEnds()
+  assertEq(ok("a = 1\r\nb = 2\r\n"), Toml.table(("a", Toml.num(1)), ("b", Toml.num(2))))
+  assertEq(err("a = 1\rb = 2"), "a carriage return not followed by a line feed at line 1, column 6")
+  assertEq(err("# x\r"), "a carriage return not followed by a line feed at line 1, column 4")
+  assertEq(err("a = 1\n\u{0}"), "the control character U+0000 where a key was expected at line 2, column 1")
+  assertEq(err("# a \u{7f} b"), "the control character U+007F in a comment at line 1, column 5")
+  assertEq(ok("# a \t tab\n"), Toml.table())
+
+@test("an error's line and column count lines and characters, Unicode ones as one each")
+tomlErrorPlaces()
+  val e = toml.parse("# ünïcödé\nname = \"日本\"\nname = 1\n").err.get
+  assertEq(e.line, long(3))
+  assertEq(e.column, long(1))
+  val f = toml.parse("k = \"日本語\" x").err.get
+  assertEq((f.line, f.column), (long(1), long(11)))
+  assertEq(f.offset, long(16))
+  assertEq(f.path, List.empty[PathStep]())
+  assertEq(f.message, "'x' after a value, where the line should end")
+
+@test("bytes are read as UTF-8, and bytes that are not are an error at the first of them")
+tomlBytes()
+  assertEq(toml.parse("a = 'é'".bytes.toArray()), Ok(Toml.table(("a", Toml.str("é")))))
+  val bad = Array[byte](byte(0x61), byte(0x20), byte(0x3d), byte(0x20), byte(0x22), byte(0xff), byte(0x22))
+  assertEq(s"${toml.parse(bad).err.get}", "bytes that are not UTF-8 at line 1, column 6")
+  val cut = Array[byte](byte(0x0a), byte(0x61), byte(0xc3))
+  assertEq(s"${toml.parse(cut).err.get}", "bytes that are not UTF-8 at line 2, column 2")
+
+@test("nesting is limited: 128 deep by default, any limit given, counting arrays, inline tables and every key")
+tomlDepthLimits()
+  val deep = "v = " + "[".repeat(100000) + "]".repeat(100000)
+  assertEq(err(deep), "tables and arrays nested more than 128 deep at line 1, column 133")
+  assertEq(err("v = " + "{a=".repeat(100000)), "tables and arrays nested more than 128 deep at line 1, column 389")
+  assertEq(ok("v = " + "[".repeat(128) + "]".repeat(128)).get("v").isDefined, true)
+  assertEq(
+    err("v = " + "[".repeat(129) + "]".repeat(129)),
+    "tables and arrays nested more than 128 deep at line 1, column 133"
+  )
+  assertEq(toml.parse("v = [[[[]]]]", maxDepth = 4).isOk, true)
+  assertEq(
+    s"${toml.parse("v = [[[[[]]]]]", maxDepth = 4).err.get}",
+    "tables and arrays nested more than 4 deep at line 1, column 9"
+  )
+  assertEq(toml.parse("v = { a = { b = [] } }", maxDepth = 3).isOk, true)
+  assertEq(
+    s"${toml.parse("v = { a = { b = [[]] } }", maxDepth = 3).err.get}",
+    "tables and arrays nested more than 3 deep at line 1, column 18"
+  )
+  val dotted = Vector.fill(200, "k").mkString(".")
+  assertEq(err(s"$dotted = 1"), "tables and arrays nested more than 128 deep at line 1, column 1")
+  assertEq(err(s"[$dotted]"), "tables and arrays nested more than 128 deep at line 1, column 1")
+  assertEq(err(s"[[$dotted]]"), "tables and arrays nested more than 128 deep at line 1, column 1")
+  assertEq(toml.parse("a.b.c.d = 1", maxDepth = 3).isOk, true)
+  assertEq(
+    s"${toml.parse("a.b.c.d.e = 1", maxDepth = 3).err.get}",
+    "tables and arrays nested more than 3 deep at line 1, column 1"
+  )
+  assertEq(toml.parse("[a.b.c]", maxDepth = 3).isOk, true)
+  assertEq(
+    s"${toml.parse("[a.b.c.d]", maxDepth = 3).err.get}",
+    "tables and arrays nested more than 3 deep at line 1, column 1"
+  )
+  assertEq(toml.parse("a = [1]", maxDepth = 1).isOk, true)
+  assertEq(
+    s"${toml.parse("a.b = [1]", maxDepth = 1).err.get}",
+    "tables and arrays nested more than 1 deep at line 1, column 7"
+  )
+  assertEq(
+    s"${toml.parse("[a]\nb.c = 1", maxDepth = 1).err.get}",
+    "tables and arrays nested more than 1 deep at line 2, column 1"
+  )
+  assertEq(toml.parse("a = 1", maxDepth = 0).isOk, true)
+  assertEq(
+    s"${toml.parse("a = []", maxDepth = 0).err.get}",
+    "tables and arrays nested more than 0 deep at line 1, column 5"
+  )
+
+@test("long strings, many keys and long arrays read whole, in time linear in their size")
+tomlLargeInput()
+  val text = "x".repeat(1000000)
+  assertEq(value(s"\"$text\"").asString.get.byteLength, 1000000)
+  assertEq(value(s"'$text'").asString.get.byteLength, 1000000)
+  assertEq(value(s"\"\"\"$text\"\"\"").asString.get.byteLength, 1000000)
+  assertEq(value(s"\"${"é\\n".repeat(100000)}\"").asString.get.charCount, 200000)
+  val keys = StringWriter()
+  for i in 0 ..< 50000
+    keys.write(s"k$i = $i\n")
+  val doc = ok(keys.text)
+  assertEq(doc.size, 50000)
+  assertEq(doc("k49999"), Toml.num(49999))
+  val items = Vector.fill(100000, "1").mkString(", ")
+  assertEq(value(s"[$items]").size, 100000)
+  val tables = StringWriter()
+  for i in 0 ..< 20000
+    tables.write(s"[[t]]\nn = $i\n")
+  assertEq(ok(tables.text)("t").size, 20000)
+
+@test("Unicode keys and values read, write and read back as they were, astral characters included")
+tomlUnicode()
+  val doc = Toml.table(
+    ("名前", Toml.str("日本語のテキスト")),
+    ("emoji 😀", Toml.str("🎉 \u{10FFFF} \u{FEFF}")),
+    ("arr", Toml.arr(Toml.str("α"), Toml.str("ω"))),
+    ("ключ", Toml.table(("ü", Toml.str("é\u{301}"))))
+  )
+  val text = doc.render
+  assertEq(
+    text,
+    "\"名前\" = \"日本語のテキスト\"\n\"emoji 😀\" = \"🎉 \u{10FFFF} \u{FEFF}\"\narr = [\"α\", \"ω\"]\n\n[\"ключ\"]\n\"ü\" = \"é\u{301}\"\n"
+  )
+  assertEq(ok(text), doc)
+  assertEq(value("\"\\U0010FFFF\""), Toml.str("\u{10FFFF}"))
+  assertEq(ok("'キー' = '値'").get("キー"), Some(Toml.str("値")))
+
+@test("render writes plain keys, then tables under headers and arrays of tables under one header each")
+tomlRender()
+  val doc = Toml.table(
+    ("title", Toml.str("TOML")),
+    ("owner", Toml.table(("name", Toml.str("Tom")), ("dob", value("1979-05-27T07:32:00-08:00")))),
+    ("n", Toml.num(1)),
+    ("empty", Toml.table()),
+    ("products", Toml.arr(Toml.table(("name", Toml.str("Hammer"))), Toml.table())),
+    ("mixed", Toml.arr(Toml.num(1), Toml.table(("a", Toml.num(2))))),
+    ("deep", Toml.table(("a", Toml.table(("b", Toml.table(("c", Toml.num(1)))))))),
+    ("none", Toml.arr())
+  )
+  assertEq(
+    doc.render,
+    "title = \"TOML\"\nn = 1\nmixed = [1, { a = 2 }]\nnone = []\n\n[owner]\nname = \"Tom\"\ndob = 1979-05-27T07:32:00-08:00\n\n[empty]\n\n[[products]]\nname = \"Hammer\"\n\n[[products]]\n\n[deep]\n\n[deep.a]\n\n[deep.a.b]\nc = 1\n"
+  )
+  val again = ok(doc.render)
+  assertEq(again.keys, ["title", "n", "mixed", "none", "owner", "empty", "products", "deep"])
+  for k in doc.keys
+    assertEq(again.get(k), doc.get(k))
+  assertEq(again.render, doc.render)
+  assertEq(Toml.table().render, "")
+
+@test("render writes each scalar so that it reads back: escapes, floats with a point, the date-times")
+tomlRenderScalars()
+  assertEq(Toml.str("a\"b\\c\n\t\r\u{8}\u{c}\u{1}\u{7f}").render, "\"a\\\"b\\\\c\\n\\t\\r\\b\\f\\u0001\\u007F\"")
+  assertEq(Toml.num(1.0).render, "1.0")
+  assertEq(Toml.num(-0.5).render, "-0.5")
+  assertEq(Toml.num(real.PositiveInfinity).render, "inf")
+  assertEq(Toml.num(real.NegativeInfinity).render, "-inf")
+  assertEq(Toml.num(real.NaN).render, "nan")
+  assertEq(Toml.num(long.MinValue).render, "-9223372036854775808")
+  assertEq(Toml.Bool(false).render, "false")
+  for x in [1e300, 5e-324, 1.7976931348623157e308, 0.1, 123456789.125, -0.0, 1e21, 1e-7]
+    assertEq(value(Toml.num(x).render).asReal.get.toBits, x.toBits)
+  assertEq(value("1979-05-27T07:32:00.25Z").render, "1979-05-27T07:32:00.25Z")
+  assertEq(value("1979-05-27T07:32:00+05:30").render, "1979-05-27T07:32:00+05:30")
+  assertEq(value("1979-05-27 07:32:00").render, "1979-05-27T07:32:00")
+  assertEq(value("0001-01-01").render, "0001-01-01")
+  assertEq(value("07:32:00.000001").render, "07:32:00.000001")
+  assertEq(
+    Toml.table(("a b", Toml.num(1)), ("", Toml.num(2)), ("a.b", Toml.num(3)), ("A-_9", Toml.num(4))).render,
+    "\"a b\" = 1\n\"\" = 2\n\"a.b\" = 3\nA-_9 = 4\n"
+  )
+  assertEq(Toml.table(("t", Toml.table(("x y", Toml.table(("z", Toml.num(1))))))).render, "[t]\n\n[t.\"x y\"]\nz = 1\n")
+
+@test(should_trap: "TOML writes the years 0 to 9999, and +10000-01-01 is outside them")
+tomlRenderYearAfterTraps()
+  Toml.LocalDate(date(10000, 1, 1)).render
+
+@test(should_trap: "TOML writes the years 0 to 9999")
+tomlRenderYearBeforeTraps()
+  Toml.table(("d", Toml.LocalDateTime(dateTime(date(-1, 1, 1), time(0, 0))))).render
+
+@test(should_trap: "no key \"nope\" in this TOML value")
+tomlApplyMissingKeyTraps()
+  Toml.table()("nope")
+
+@test(should_trap: "no element 5 in this TOML value")
+tomlApplyMissingIndexTraps()
+  Toml.arr(Toml.num(1))(5)
+
+@test("the accessors answer the value of their kind, and None for any other")
+tomlAccessors()
+  val doc = ok(
+    "s = 'x'\ni = 7\nbig = 9999999999\nf = 1.5\nb = true\nz = 1979-05-27T07:32:00Z\nl = 1979-05-27T07:32:00\nd = 1979-05-27\nt = 07:32:00\na = [1]\n[tab]\nk = 1\n"
+  )
+  assertEq(doc("s").asString, Some("x"))
+  assertEq(doc("i").asInt, Some(7))
+  assertEq(doc("i").asLong, Some(long(7)))
+  assertEq(doc("i").asReal, Some(7.0))
+  assertEq(doc("big").asInt, None)
+  assertEq(doc("big").asLong, Some(long(9999999999)))
+  assertEq(doc("f").asReal, Some(1.5))
+  assertEq(doc("f").asLong, None)
+  assertEq(doc("b").asBool, Some(true))
+  assertEq(doc("z").asZoned.map(z -> z.hour), Some(7))
+  assertEq(doc("l").asDateTime, Some(dateTime(date(1979, 5, 27), time(7, 32, 0))))
+  assertEq(doc("d").asDate, Some(date(1979, 5, 27)))
+  assertEq(doc("t").asTime, Some(time(7, 32, 0)))
+  assertEq(doc("a").asVector, Some([Toml.num(1)]))
+  assertEq(doc("tab").asMembers, Some([("k", Toml.num(1))]))
+  assertEq(doc("s").asInt, None)
+  assertEq(doc("s").asVector, None)
+  assertEq(doc("a").get(0), Some(Toml.num(1)))
+  assertEq(doc("a").get(1), None)
+  assertEq(doc("a").get(-1), None)
+  assertEq(doc.get("missing"), None)
+  assertEq(doc("s").get("k"), None)
+  assertEq(doc.has("tab"), true)
+  assertEq(doc.has("nope"), false)
+  assertEq(doc.at(["tab", "k"]), Some(Toml.num(1)))
+  assertEq(doc.at(["tab", "nope"]), None)
+  assertEq(doc.at([]), Some(doc))
+  assertEq(doc("tab").keys, ["k"])
+  assertEq(doc("s").keys, Vector.empty[string]())
+  assertEq(doc("s").size, 0)
+  assertEq(doc("tab").with("k", Toml.num(2)), Toml.table(("k", Toml.num(2))))
+  assertEq(doc("tab").with("j", Toml.num(2)), Toml.table(("k", Toml.num(1)), ("j", Toml.num(2))))
+  assertEq(doc("s").with("j", Toml.num(2)), doc("s"))
+  assertEq(
+    [
+      doc("s"),
+      doc("i"),
+      doc("f"),
+      doc("b"),
+      doc("z"),
+      doc("l"),
+      doc("d"),
+      doc("t"),
+      doc("a"),
+      doc("tab")
+    ].map(v -> v.kind),
+    [
+      "a string", "an integer", "a float", "a boolean", "an offset date-time", "a local date-time", "a local date",
+      "a local time", "an array", "a table"
+    ]
+  )
+  assertEq(s"${doc("a")}", "[1]")
+  assertEq(s"${doc("tab")}", "k = 1\n")
+
+@test("an error displays its path where it has one, and its place where it has one")
+tomlErrorDisplay()
+  assertEq(s"${TomlError("bad", 2, 3, 10)}", "bad at line 2, column 3")
+  assertEq(s"${TomlError("bad", 0, 0, 0)}", "bad")
+  val e = TomlError("bad", 0, 0, 0).atIndex(2).inField("servers").inField("top")
+  assertEq(e.pathText(), "top.servers[2]")
+  assertEq(s"$e", "top.servers[2]: bad")
+  assertEq(e.message, "bad")

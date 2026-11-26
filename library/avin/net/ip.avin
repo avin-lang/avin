@@ -1,0 +1,207 @@
+module avin.net
+
+// IP addresses, and the lookup of the addresses a host name stands for.
+//
+//     for a in lookup("localhost")? do println(a)
+//     val here = IpAddress.parse("::1").getOrElse(fail("not an address"))
+//
+// An `IpAddress` is a value: version 4 or version 6, without a port, compared and hashed by its
+// version, its bytes and, for a version 6 one, the interface it is scoped to. It may be handed to
+// another thread, so it is a key of a `Map` or a `Set` as it stands. One that arrives as text is read
+// with `IpAddress.parse`, which answers `None` for text that is not one rather than trapping, since
+// the text came from outside.
+
+import avin.io
+import avin.io.IoError
+
+// The bytes of a version 4 address (four) or a version 6 one (sixteen), the most significant first,
+// and the interface a version 6 address is scoped to, a number, zero for none. The constructor takes
+// them as they are: `IpAddress.parse`, `IpAddress.fromBytes`, `IpAddress.v4` and `lookup` are how one
+// is made, each answering only well-formed addresses.
+class IpAddress(private val octets: Vector[byte], private val zone: int = 0): Sendable
+  // Whether it is a version 4 address.
+  isIpv4 -> bool = octets.length == 4
+
+  // Whether it is a version 6 address.
+  isIpv6 -> bool = octets.length == 16
+
+  // The bytes, the most significant first: four of a version 4 address, sixteen of a version 6 one.
+  bytes() -> Vector[byte] = octets
+
+  // The interface a version 6 address is scoped to, as the platform numbers interfaces, written after
+  // a `%` (`fe80::1%4`); zero for none, and for every version 4 address.
+  scopeId -> int = zone
+
+  // Whether it is this machine's own: `127.0.0.0/8`, or `::1`.
+  isLoopback -> bool =
+    if isIpv4 then int(octets(0)) == 127 else octets.take(15).forall(b -> b == byte(0)) && int(octets(15)) == 1
+
+  // Whether it is the address of no machine in particular, which a socket binds to for every address
+  // the machine answers on: `0.0.0.0`, or `::`.
+  isUnspecified -> bool = octets.forall(b -> b == byte(0))
+
+  // Whether it is a multicast group's: `224.0.0.0/4`, or `ff00::/8`.
+  isMulticast -> bool = if isIpv4 then 224 <= int(octets(0)) <= 239 else int(octets(0)) == 255
+
+// `ip` as a socket holds it, at `port`.
+private socketAddress(ip: IpAddress, port: int) -> Address = ipAddressRaw(ip.bytes().toArray(), ip.scopeId, port)
+
+@sysl("avin.rt.ip_address")
+private ipAddressRaw(octets: Array[byte], scope: int, port: int) -> Address
+
+@sysl("avin.rt.address_octets")
+private addressOctets(a: Address) -> Array[byte]
+
+// Whether the lookup's error `e` is the resolver finding no address, rather than the runtime failing
+// to make the lookup.
+@sysl("avin.rt.lookup_not_found")
+private lookupNotFound(e: SyslError) -> bool
+
+// The digits of the interface number an address's text carries after a `%`, zero where it has none.
+private scopeOf(text: string) -> int
+  val at = text.indexOf('%')
+  if at < 0 then 0 else text.slice(at + 1, text.byteLength).toIntOption().getOrElse(0)
+
+// The address a socket's `a` holds, without its port.
+private ipOf(a: Address) -> IpAddress = IpAddress(addressOctets(a).toVector, scopeOf(a.text()))
+
+// The four bytes of `s` as an IPv4 address in dotted decimal: four numbers of at most 255, each
+// without a leading zero, apart by dots. `None` for anything else.
+private dottedOf(s: string) -> Option[Vector[byte]]
+  val parts = s.split('.')
+  if parts.length != 4 then return None
+  val out = Array.fill[byte](4, byte(0))
+  for i in 0 ..< 4
+    val p = parts(i)
+    val b = p.bytes
+    if b.length == 0 || b.length > 3 then return None
+    if b.length > 1 && b(0) == byte(int('0')) then return None
+    var v = 0
+    for k in 0 ..< b.length
+      val c = int(b(k))
+      if !(int('0') <= c <= int('9')) then return None
+      v = v * 10 + (c - int('0'))
+    if v > 255 then return None
+    out(i) = byte(v)
+  Some(out.toVector)
+
+// The 16-bit groups `side` writes apart by `:`, each of one to four hexadecimal digits, the last of
+// them an IPv4 address where `last` says it may be one, as two groups. `None` where a group is empty
+// or not one. An empty side writes none.
+private groupsOf(side: string, last: bool) -> Option[Vector[int]]
+  if side.isEmpty then return Some(Vector.empty[int]())
+  val parts = side.split(':')
+  var out = Vector.empty[int]()
+  for i in 0 ..< parts.length
+    val p = parts(i)
+    if last && i == parts.length - 1 && p.contains(".")
+      val four = dottedOf(p)?
+      out = out :+ (int(four(0)) * 256 + int(four(1)))
+      out = out :+ (int(four(2)) * 256 + int(four(3)))
+    else
+      val b = p.bytes
+      if b.length == 0 || b.length > 4 then return None
+      var v = 0
+      for k in 0 ..< b.length
+        val d = hexValue(int(b(k)))
+        if d < 0 then return None
+        v = v * 16 + d
+      out = out :+ v
+  Some(out)
+
+// The sixteen bytes of `s` as an IPv6 address: eight groups of one to four hexadecimal digits apart by
+// `:`, the last two of which may be an IPv4 address, with one run of one or more zero groups written
+// `::`. `None` for anything else.
+private groupedOf(s: string) -> Option[Vector[byte]]
+  val halves = s.split("::")
+  if halves.length > 2 then return None
+  val groups =
+    if halves.length == 2
+      val head = groupsOf(halves(0), false)?
+      val tail = groupsOf(halves(1), true)?
+      if head.length + tail.length > 7 then return None
+      head ++ Vector.fill(8 - head.length - tail.length, 0) ++ tail
+    else
+      val all = groupsOf(s, true)?
+      if all.length != 8 then return None
+      all
+  Some(Vector.tabulate(16, i -> byte(if i % 2 == 0 then groups(i / 2) / 256 else groups(i / 2) % 256)))
+
+object IpAddress
+  // `127.0.0.1` and `::1`: this machine, over each version.
+  val Localhost: IpAddress = IpAddress(Vector(byte(127), byte(0), byte(0), byte(1)))
+  val LocalhostV6: IpAddress = IpAddress(Vector.fill(15, byte(0)) :+ byte(1))
+  // `0.0.0.0` and `::`: every address the machine answers on, over each version, for a socket to bind.
+  val Unspecified: IpAddress = IpAddress(Vector.fill(4, byte(0)))
+  val UnspecifiedV6: IpAddress = IpAddress(Vector.fill(16, byte(0)))
+
+  // The version 4 address `a.b.c.d`; each part is from 0 to 255, and one outside traps.
+  v4(a: int, b: int, c: int, d: int) -> IpAddress
+    for p in [a, b, c, d]
+      if p < 0 || p > 255 then fail(s"an IPv4 address's part $p is outside 0 to 255")
+    IpAddress(Vector(byte(a), byte(b), byte(c), byte(d)))
+
+  // The address of four bytes (version 4) or sixteen (version 6), the most significant first, or `None`
+  // for any other number.
+  fromBytes(bytes: Vector[byte]) -> Option[IpAddress] =
+    if bytes.length == 4 || bytes.length == 16 then Some(IpAddress(bytes)) else None
+
+  // The address `text` writes: four decimal numbers of at most 255 without leading zeros apart by dots
+  // (`192.168.0.1`), or eight groups of one to four hexadecimal digits apart by colons, one run of zero
+  // groups shortened to `::` and the last two groups perhaps an IPv4 address (`::1`,
+  // `::ffff:10.0.0.1`), in either case, followed by `%` and the number of the interface it is scoped
+  // to. `None` for anything else: brackets, a port, surrounding white space, an interface named
+  // rather than numbered.
+  parse(text: string) -> Option[IpAddress]
+    if text.contains(":")
+      val percent = text.indexOf('%')
+      val body = if percent < 0 then text else text.slice(0, percent)
+      var zone = 0
+      if percent >= 0
+        val digits = text.slice(percent + 1, text.byteLength)
+        if digits.isEmpty || digits.byteLength > 10 || !digits.forall(c -> '0' <= c <= '9') then return None
+        val n = digits.toLongOption()?
+        if n > long(int.MaxValue) then return None
+        zone = int(n)
+      groupedOf(body).map(o -> IpAddress(o, zone))
+    else
+      dottedOf(text).map(o -> IpAddress(o))
+
+// Two addresses are equal when they are of one version, with the same bytes and the same scope.
+impl Eq for IpAddress
+  equals(other: IpAddress) -> bool = zone == other.zone && octets == other.octets
+
+impl Hash for IpAddress
+  hash() -> long = octets.hash() *% 31 +% long(zone)
+
+// The address's numeric form as RFC 5952 writes it: `127.0.0.1`, `::1`, `fe80::1%4`, an IPv4-mapped
+// one as `::ffff:1.2.3.4`, lower case, the longest run of two or more zero groups as `::`.
+impl Display for IpAddress
+  display(out: Writer, spec: FormatSpec) = out.writeField(socketAddress(self, 0).text(), spec)
+
+impl Debug for IpAddress
+  debug(out: Writer, spec: FormatSpec) = out.writeField("IpAddress(" + toString() + ")", spec)
+
+// The most bytes a host name a lookup is asked for may have: a name the DNS carries is at most 253,
+// and one more for a trailing dot.
+val HostNameMost = 254
+
+// Every address `host` stands for, in the order the platform prefers them, each once; a numeric
+// address (`127.0.0.1`, `::1`) stands for itself and asks nothing of the network. The lookup is made
+// on a helper thread of the runtime's and waited for as a socket is, so a lightweight thread parks,
+// leaving its worker to other threads, and a cancellation ends the wait at once. A name the resolver
+// finds no address for fails with `HostNotFound`, as does one that could not be a host's: empty, longer
+// than `HostNameMost` bytes, or holding white space or a control character.
+lookup(host: string) -> Result[Vector[IpAddress], IoError]
+  val notFound = IoError(io.HostNotFound, "look up", host)
+  if IpAddress.parse(host) is Some(a) then return Ok(Vector(a))
+  if host.isEmpty || host.byteLength > HostNameMost || host.exists(c -> int(c) <= int(' ') || int(c) == 127) then
+    return Err(notFound)
+  afterWait(resolveRaw(host, 0, 0)) match
+    Ok(found) ->
+      var out = Vector.empty[IpAddress]()
+      for a in found
+        val ip = ipOf(a)
+        if !out.contains(ip) then out = out :+ ip
+      if out.isEmpty then Err(notFound) else Ok(out)
+    Err(e) -> Err(if lookupNotFound(e) then notFound else failed("look up", host)(e))

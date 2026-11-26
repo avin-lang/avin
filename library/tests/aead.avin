@@ -1,0 +1,368 @@
+// `avin.crypto`'s authenticated encryption: AES-128-GCM, AES-256-GCM and ChaCha20-Poly1305 against
+// RFC 8439's example and Wycheproof's vectors, valid and tampered; then every byte of a sealed message
+// changed one at a time, the associated data changed, the wrong key, nonce and cipher, every length
+// from empty up past several blocks and a mebibyte, the random-nonce form, keys of the wrong length,
+// and a key's text.
+import avin.crypto.{Aead, Aes128Gcm, Aes256Gcm, ChaCha20Poly1305, AeadKey, CryptoError, InvalidKey, Unauthentic}
+import avin.encoding.toHex
+
+// The text whose UTF-8 bytes are `bytes`.
+utf8(bytes: Vector[byte]) -> string = string.fromUtf8Lossy(bytes.toArray())
+
+keyOf(aead: Aead, bytes: Vector[byte]) -> AeadKey = aead.key(bytes).getOrElse(fail(s"a $aead key"))
+
+// Whether `r` is an `Unauthentic` refusal.
+unauthentic(r: Result[Vector[byte], CryptoError]) -> bool = r is Err(Unauthentic)
+
+flipped(bytes: Vector[byte], at: int, bit: int) -> Vector[byte] =
+  Vector.tabulate(bytes.length, i -> if i == at then bytes(i) ^ byte(1 << bit) else bytes(i))
+
+val Ciphers = [Aes128Gcm, Aes256Gcm, ChaCha20Poly1305]
+
+// (cipher, tcId, key, nonce, aad, plaintext, ciphertext with its tag, valid): RFC 8439 § 2.8.2 (Wycheproof
+// ChaCha20-Poly1305 1) and Wycheproof's AES-GCM and ChaCha20-Poly1305 vectors.
+val Vectors = [
+  (
+    ChaCha20Poly1305,
+    1,
+    "808182838485868788898a8b8c8d8e8f909192939495969798999a9b9c9d9e9f",
+    "070000004041424344454647",
+    "50515253c0c1c2c3c4c5c6c7",
+    "4c616469657320616e642047656e746c656d656e206f662074686520636c617373206f66202739393a204966204920636f756c64206f6666657220796f75206f6e6c79206f6e652074697020666f7220746865206675747572652c2073756e73637265656e20776f756c642062652069742e",
+    "d31a8d34648e60db7b86afbc53ef7ec2a4aded51296e08fea9e2b5a736ee62d63dbea45e8ca9671282fafb69da92728b1a71de0a9e060b2905d6a5b67ecd3b3692ddbd7f2d778b8c9803aee328091b58fab324e4fad675945585808b4831d7bc3ff4def08e4b7a9de576d26586cec64b61161ae10b594f09e26a7e902ecbd0600691",
+    true
+  ),
+  (
+    ChaCha20Poly1305,
+    2,
+    "80ba3192c803ce965ea371d5ff073cf0f43b6a2ab576b208426e11409c09b9b0",
+    "4da5bf8dfd5852c1ea12379d",
+    "",
+    "",
+    "76acb342cf3166a5b63c0c0ea1383c8d",
+    true
+  ),
+  (
+    ChaCha20Poly1305,
+    3,
+    "7a4cd759172e02eb204db2c3f5c746227df584fc1345196391dbb9577a250742",
+    "a92ef0ac991dd516a3c6f689",
+    "bd506764f2d2c410",
+    "",
+    "906fa6284b52f87b7359cbaa7563c709",
+    true
+  ),
+  (
+    ChaCha20Poly1305,
+    4,
+    "cc56b680552eb75008f5484b4cb803fa5063ebd6eab91f6ab6aef4916a766273",
+    "99e23ec48985bccdeeab60f1",
+    "",
+    "2a",
+    "3acac27dec0968801e9f6eded69d807522",
+    true
+  ),
+  (
+    ChaCha20Poly1305,
+    5,
+    "46f0254965f769d52bdb4a70b443199f8ef207520d1220c55e4b70f0fda620ee",
+    "ab0dca716ee051d2782f4403",
+    "91ca6c592cbcca53",
+    "51",
+    "c4168310ca45b1f7c66cad4e99e43f72b9",
+    true
+  ),
+  (
+    ChaCha20Poly1305,
+    6,
+    "2f7f7e4f592bb389194989743507bf3ee9cbde1786b6695fe6c025fd9ba4c100",
+    "461af122e9f2e0347e03f2db",
+    "",
+    "5c60",
+    "4d1391e8b61efb39c122195453077b22e5e2",
+    true
+  ),
+  (
+    ChaCha20Poly1305,
+    146,
+    "202122232425262728292a2b2c2d2e2f303132333435363738393a3b3c3d3e3f",
+    "000102030405060708090a0b",
+    "000102",
+    "",
+    "f5409bb729039d0814ac514054323f44",
+    false
+  ),
+  (
+    ChaCha20Poly1305,
+    171,
+    "202122232425262728292a2b2c2d2e2f303132333435363738393a3b3c3d3e3f",
+    "000102030405060708090a0b",
+    "000102",
+    "000102030405060708090a0b0c0d0e0f",
+    "d03bcb3ca52d48d1d203b1e7b1a5995a29914007a7119dd3f109bba21ce9a7d6",
+    false
+  ),
+  (
+    ChaCha20Poly1305,
+    196,
+    "202122232425262728292a2b2c2d2e2f303132333435363738393a3b3c3d3e3f",
+    "000102030405060708090a0b",
+    "000102",
+    "000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f20",
+    "d03bcb3ca52d48d1d203b1e7b1a5995af1a0466a61bb386a2e12d189a2c4ea15e966405a16e8b44eba92aa46f5cea52b7a",
+    false
+  ),
+  (
+    Aes128Gcm,
+    1,
+    "5b9604fe14eadba931b0ccf34843dab9",
+    "028318abc1824029138141a2",
+    "",
+    "001d0c231287c1182784554ca3a21908",
+    "26073cc1d851beff176384dc9896d5ff0a3ea7a5487cb5f7d70fb6c58d038554",
+    true
+  ),
+  (
+    Aes128Gcm,
+    2,
+    "5b9604fe14eadba931b0ccf34843dab9",
+    "921d2507fa8007b7bd067d34",
+    "00112233445566778899aabbccddeeff",
+    "001d0c231287c1182784554ca3a21908",
+    "49d8b9783e911913d87094d1f63cc7651e348ba07cca2cf04c618cb4d43a5b92",
+    true
+  ),
+  (
+    Aes128Gcm,
+    3,
+    "aa023d0478dcb2b2312498293d9a9129",
+    "0432bc49ac34412081288127",
+    "aac39231129872a2",
+    "2035af313d1346ab00154fea78322105",
+    "eea945f3d0f98cc0fbab472a0cf24e874bb9b4812519dadf9e1232016d068133",
+    true
+  ),
+  (
+    Aes128Gcm,
+    4,
+    "bedcfb5a011ebc84600fcb296c15af0d",
+    "438a547a94ea88dce46c6c85",
+    "",
+    "",
+    "960247ba5cde02e41a313c4c0136edc3",
+    true
+  ),
+  (
+    Aes128Gcm,
+    5,
+    "384ea416ac3c2f51a76e7d8226346d4e",
+    "b30c084727ad1c592ac21d12",
+    "",
+    "35",
+    "547c1e4ae88bb27e5638343cb9fd3f6337",
+    true
+  ),
+  (
+    Aes128Gcm,
+    41,
+    "000102030405060708090a0b0c0d0e0f",
+    "505152535455565758595a5b",
+    "",
+    "202122232425262728292a2b2c2d2e2f",
+    "eb156d081ed6b6b55f4612f021d87b39d9847dbc326a06e988c77ad3863e6083",
+    false
+  ),
+  (
+    Aes128Gcm,
+    48,
+    "000102030405060708090a0b0c0d0e0f",
+    "505152535455565758595a5b",
+    "",
+    "202122232425262728292a2b2c2d2e2f",
+    "eb156d081ed6b6b55f4612f021d87b39d8847dbc326a066988c77ad3863e6083",
+    false
+  ),
+  (
+    Aes256Gcm,
+    91,
+    "92ace3e348cd821092cd921aa3546374299ab46209691bc28b8752d17f123c20",
+    "00112233445566778899aabb",
+    "00000000ffffffff",
+    "00010203040506070809",
+    "e27abdd2d2a53d2f136b9a4a2579529301bcfb71c78d4060f52c",
+    true
+  ),
+  (
+    Aes256Gcm,
+    92,
+    "29d3a44f8723dc640239100c365423a312934ac80239212ac3df3421a2098123",
+    "00112233445566778899aabb",
+    "aabbccddeeff",
+    "",
+    "2a7d77fa526b8250cb296078926b5020",
+    true
+  ),
+  (
+    Aes256Gcm,
+    93,
+    "80ba3192c803ce965ea371d5ff073cf0f43b6a2ab576b208426e11409c09b9b0",
+    "4da5bf8dfd5852c1ea12379d",
+    "",
+    "",
+    "4771a7c404a472966cea8f73c8bfe17a",
+    true
+  ),
+  (
+    Aes256Gcm,
+    94,
+    "cc56b680552eb75008f5484b4cb803fa5063ebd6eab91f6ab6aef4916a766273",
+    "99e23ec48985bccdeeab60f1",
+    "",
+    "2a",
+    "06633c1e9703ef744ffffb40edf9d14355",
+    true
+  ),
+  (
+    Aes256Gcm,
+    130,
+    "000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f",
+    "505152535455565758595a5b",
+    "",
+    "202122232425262728292a2b2c2d2e2f",
+    "b2061457c0759fc1749f174ee1ccadfa9de8fef6d8ab1bf1bf887232eab590dd",
+    false
+  ),
+  (
+    Aes256Gcm,
+    135,
+    "000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f",
+    "505152535455565758595a5b",
+    "",
+    "202122232425262728292a2b2c2d2e2f",
+    "b2061457c0759fc1749f174ee1ccadfa9ce8fef6d9ab1bf1bf887232eab590dd",
+    false
+  )
+]
+
+@test(
+  "each cipher seals RFC 8439's and Wycheproof's messages to their ciphertexts, opens them, and refuses the tampered tags"
+)
+aeadVectors()
+  for (aead, tc, k, nonce, aad, plaintext, sealed, valid) in Vectors
+    val key = keyOf(aead, hex(k))
+    if valid then
+      assertEq(s"$aead $tc ${toHex(key.sealWithNonce(hex(nonce), hex(plaintext), hex(aad)))}", s"$aead $tc $sealed")
+      assertEq(
+        s"$aead $tc ${key.openWithNonce(hex(nonce), hex(sealed), hex(aad)).map(toHex)}",
+        s"$aead $tc Ok($plaintext)"
+      )
+    else
+      assert(unauthentic(key.openWithNonce(hex(nonce), hex(sealed), hex(aad))), s"$aead $tc opened")
+
+@test("changing any one bit of a sealed message, or its associated data, makes it not open")
+everyByteTampered()
+  for aead in Ciphers
+    val key = aead.generateKey()
+    val nonce = hex("000102030405060708090a0b")
+    val aad = "header".bytes
+    val sealed = key.sealWithNonce(nonce, "a short secret".bytes, aad)
+    assertEq(sealed.length, 14 + 16)
+    for at in 0 ..< sealed.length
+      for bit in [0, 7]
+        assert(unauthentic(key.openWithNonce(nonce, flipped(sealed, at, bit), aad)), s"$aead byte $at bit $bit")
+    for at in 0 ..< aad.length
+      assert(unauthentic(key.openWithNonce(nonce, sealed, flipped(aad, at, 0))))
+    assert(unauthentic(key.openWithNonce(nonce, sealed, Vector())))
+    assert(unauthentic(key.openWithNonce(nonce, sealed, aad ++ hex("00"))))
+    assert(unauthentic(key.openWithNonce(nonce, sealed.slice(0, sealed.length - 1), aad)))
+    assert(unauthentic(key.openWithNonce(nonce, sealed ++ hex("00"), aad)))
+    assert(unauthentic(key.openWithNonce(nonce, sealed.slice(1, sealed.length), aad)))
+    assert(unauthentic(key.openWithNonce(nonce, sealed.slice(0, 16), aad)))
+    assert(unauthentic(key.openWithNonce(nonce, sealed.slice(0, 15), aad)))
+    assert(unauthentic(key.openWithNonce(nonce, Vector(), aad)))
+    assert(unauthentic(key.openWithNonce(flipped(nonce, 11, 0), sealed, aad)))
+    assert(unauthentic(aead.generateKey().openWithNonce(nonce, sealed, aad)))
+    assertEq(key.openWithNonce(nonce, sealed, aad).map(utf8), Ok("a short secret"))
+
+@test("a message sealed under one cipher does not open under another with the same key bytes")
+crossCipher()
+  val bytes = Vector.tabulate(32, i -> byte(i))
+  val nonce = Vector.fill(12, byte(9))
+  val sealed = keyOf(Aes256Gcm, bytes).sealWithNonce(nonce, "x".bytes)
+  assert(unauthentic(keyOf(ChaCha20Poly1305, bytes).openWithNonce(nonce, sealed)))
+  val back = keyOf(ChaCha20Poly1305, bytes).sealWithNonce(nonce, "x".bytes)
+  assert(unauthentic(keyOf(Aes256Gcm, bytes).openWithNonce(nonce, back)))
+  assert(sealed != back)
+
+@test(
+  "every length round trips: empty, one byte, each side of a block, several blocks, a mebibyte, with and without associated data"
+)
+sealedEveryLength()
+  for aead in Ciphers
+    val key = aead.generateKey()
+    val nonce = Vector.fill(12, byte(1))
+    for n in [0, 1, 15, 16, 17, 31, 32, 33, 63, 64, 65, 255, 256, 257, 1000, 1048576 + 5]
+      val message = Vector.tabulate(n, i -> byte(i * 31 % 256))
+      for aad in [Vector(), "a".bytes, Vector.tabulate(100, i -> byte(i))]
+        val sealed = key.sealWithNonce(nonce, message, aad)
+        assertEq(sealed.length, n + 16)
+        assert(key.openWithNonce(nonce, sealed, aad).getOrElse(Vector()) == message, s"$aead $n")
+
+@test("seal draws a fresh nonce each time and puts it in front, so one message sealed twice differs and both open")
+randomNonces()
+  for aead in Ciphers
+    val key = aead.generateKey()
+    val a = key.seal("same".bytes, "ad".bytes)
+    val b = key.seal("same".bytes, "ad".bytes)
+    assertEq(a.length, 12 + 4 + 16)
+    assert(a != b)
+    assert(a.slice(0, 12) != b.slice(0, 12))
+    assertEq(key.open(a, "ad".bytes).map(utf8), Ok("same"))
+    assertEq(key.open(b, "ad".bytes).map(utf8), Ok("same"))
+    assert(unauthentic(key.open(a)))
+    assert(unauthentic(key.open(a, "ae".bytes)))
+    // What `seal` made is the nonce and what `sealWithNonce` makes under it.
+    assertEq(key.openWithNonce(a.slice(0, 12), a.slice(12, a.length), "ad".bytes).map(utf8), Ok("same"))
+    assertEq(toHex(key.sealWithNonce(a.slice(0, 12), "same".bytes, "ad".bytes)), toHex(a.slice(12, a.length)))
+    // Text seals as its UTF-8 bytes; anything shorter than a nonce and a tag is refused.
+    val text = key.seal("héllo ✓ 😀")
+    assertEq(key.open(text).map(utf8), Ok("héllo ✓ 😀"))
+    assertEq(key.open(key.seal("")).map(toHex), Ok(""))
+    for n in [0, 1, 12, 27]
+      assert(unauthentic(key.open(Vector.fill(n, byte(0)))))
+    assert(unauthentic(key.open(text.slice(0, 28))))
+
+@test("a key is the cipher's length; any other is refused; a generated key is that long and new each time")
+keyLengths()
+  assertEq(Aes128Gcm.keyLength, 16)
+  assertEq(Aes256Gcm.keyLength, 32)
+  assertEq(ChaCha20Poly1305.keyLength, 32)
+  for aead in Ciphers
+    assertEq(aead.nonceLength, 12)
+    assertEq(aead.tagLength, 16)
+    for n in [0, 1, 15, 17, 24, 31, 33, 64]
+      if n != aead.keyLength then
+        assert(aead.key(Vector.fill(n, byte(1))) is Err(InvalidKey(_)), s"$aead $n")
+    val k = aead.generateKey()
+    assertEq(k.toBytes().length, aead.keyLength)
+    assert(k.aead == aead)
+    assert(k.toBytes() != aead.generateKey().toBytes())
+    assert(
+      keyOf(aead, k.toBytes()).openWithNonce(
+        Vector.fill(12, byte(0)),
+        k.sealWithNonce(Vector.fill(12, byte(0)), "m".bytes)
+      ) is Ok(_)
+    )
+  assertEq(
+    Aes128Gcm.key(Vector()).err.map(e -> e.message),
+    Some("not a usable key: a AES-128-GCM key is 16 bytes, and these are 0")
+  )
+
+@test("a key's text names its cipher and shows nothing of the key")
+keyDisplay()
+  val k = keyOf(Aes256Gcm, Vector.fill(32, byte(0xab)))
+  assertEq(s"$k", "AeadKey(AES-256-GCM)")
+  assertEq(s"${Aes128Gcm.generateKey()}", "AeadKey(AES-128-GCM)")
+  assertEq(s"${ChaCha20Poly1305.generateKey()}", "AeadKey(ChaCha20-Poly1305)")
+  assert(!s"${[k]}".contains("ab"))
+  assertEq(s"${Unauthentic.message}", "the message does not authenticate")

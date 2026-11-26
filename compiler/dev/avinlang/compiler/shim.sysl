@@ -56,7 +56,7 @@ struct MirrorLines
  * the Sysl packages `sysl` the program's manifests name. */
 shim_manifest(runtime_dir: string, sysl: Buf[SyslPackage]) -> string
     var out = str_builder()
-    out.push("package { name = \"avin-shims\", version = \"0.1.0\", sysl = \"0.10.7\" }\n")
+    out.push("package { name = \"avin-shims\", version = \"0.1.0\", sysl = \"0.13.7\" }\n")
     out.push("dependencies {\n  avin-runtime { path = " + hocon_text(runtime_dir) + " }\n")
     for p in sysl
         val entry = p.origin match
@@ -95,7 +95,8 @@ private struct ShimWriter
     // The callbacks, `call_<i>_<k>`, whose integer answer is the Avin type itself, and the integer
     // parameters, `param_<i>_<k>`, passed as the Avin type itself: a closure answering, or a
     // parameter of, a type parameter of a generic Sysl function, which says no integer to convert
-    // into.
+    // into; and the bindings, `waits_<i>`, whose Sysl function may park the thread, which hold the
+    // strings they pass by an atomic count.
     fixed: Buf[string]
 
 // Whether `name` is one of the callbacks or parameters `w` leaves unconverted.
@@ -227,6 +228,8 @@ shim_source_fixing(bindings: Buf[MirBinding], handles: Buf[MirHandle], fixed: Bu
         var args: Buf[string] = buf()
         var lists: Buf[string] = buf()
         var handles: Buf[PassedHandle] = buf()
+        // The locals the arguments are made from, written once the signature is.
+        var put_later: Buf[string] = buf()
         // A handle's method takes the handle first, and reads the Sysl value it holds. A mirror's
         // method takes the mirror first, converted into the Sysl value its method is called on.
         val by_value = b.reach is ValueMethod(_)
@@ -257,8 +260,18 @@ shim_source_fixing(bindings: Buf[MirBinding], handles: Buf[MirHandle], fixed: Bu
             elif p.form is Handle(_)
                 handles.push(PassedHandle(args.len(), handle_index(&w, p), s"a$k", s"${i}_$k"))
                 args.push("")
-            // An array the Sysl function may fill is passed as a slice of its own, read back after.
+            // An array of bytes is lent to the Sysl function as a view of its own storage, which the
+            // collector never moves and the frame below keeps, so what the function writes is in the
+            // array at once; the view is made at the call, so no local holds it across a call that
+            // parks the thread, which may resume on another worker. Any other array the function may
+            // fill is passed as a slice of its own, read back after.
+            elif p.form is Bytes then args.push(s"array_elements(a$k)[0..<n$k]")
             elif filled(p) then args.push(s"s$k")
+            // A string passed to a call that parks the thread is held by an atomic count, since the
+            // thread may resume on another worker and let go of it there.
+            elif *p.ty is Str && p.form is Plain && is_fixed(&w, s"waits_$i")
+                put_later.push(s"\n    val t$k: &sync string = text_in(a$k)")
+                args.push(s"*t$k")
             else args.push(into_expr(&w, p, s"a$k", s"ep$k", 0))
         // Each parameter's layouts, then the result's.
         for k in 0..<b.params.len()
@@ -297,8 +310,13 @@ shim_source_fixing(bindings: Buf[MirBinding], handles: Buf[MirHandle], fixed: Bu
             val p = b.params[k]
             if (receiver is Some(_) && k == 0) || !filled(p) then continue
             fills.push(k)
-            val made = if p.form is Bytes then s"bytes_in(a$k)" else s"in_${function_of(&w, p, false).unwrap()}(ctx, a$k, ep$k)"
-            put(&w, s"\n    val s$k = $made\n    var root$k = Root(Frame(ctx.top, 1usize), a$k)\n    ctx.top = ptr_cast(&root$k)")
+            if p.form is Bytes
+                put(&w, s"\n    val n$k = array_length(array_held(a$k))")
+            else
+                put(&w, s"\n    val s$k = in_${function_of(&w, p, false).unwrap()}(ctx, a$k, ep$k)")
+            put(&w, s"\n    var root$k = Root(Frame(ctx.top, 1usize), a$k)\n    ctx.top = ptr_cast(&root$k)")
+        for line in put_later
+            put(&w, line)
         // `close()` gives back the handle's share of its Sysl value, and the handle holds nothing.
         if b.reach is Release
             put(&w, s"\n    give_back_${receiver.unwrap()}(a0)\n")
@@ -645,8 +663,9 @@ private call_lines(w: *ShimWriter, b: &MirBinding, callee: string, args: Buf[str
     var given: Buf[string] = buf()
     // A call that may wait is made with the thread safe for the collector, which may run, and free
     // a handle's object, meanwhile: every argument is converted, and each handle's share of its Sysl
-    // value taken, before it, so the call reads no Avin object; and what it answers is converted
-    // once the thread is running again.
+    // value taken, before it, so the call reads no Avin object but an array of bytes lent to it, which
+    // its frame keeps and the collector never moves; and what it answers is converted once the thread
+    // is running again.
     if b.blocking
         for k in 0..<args.len()
             if args[k] == "()"
@@ -862,11 +881,9 @@ private scalar(t: &Type) -> bool = *t match
     _ -> false
 
 // Copies the slice `s<k>` the Sysl function was passed back into the array its frame `root<k>` holds:
-// it has the array's length, since a slice never grows.
+// it has the array's length, since a slice never grows. An array of bytes was lent as a view of its
+// own storage, so it holds what was written already.
 private copy_back(w: *ShimWriter, p: &Crossing, k: usize, indent: string)
-    if p.form is Bytes
-        put(w, indent + s"copy(array_elements(root$k.object)[0..<s$k.len], s$k)\n")
-        return
     p.form match
         Elements(element, _) ->
             val side = crossing_c_side(element)
@@ -1454,17 +1471,19 @@ ensure_shims(tc: Toolchain, bindings: Buf[MirBinding], handles: Buf[MirHandle], 
     publish_file(pending, archive).map_err(e -> e.to_string())?
     Ok(archive)
 
-// The callbacks, `call_<i>_<k>`, whose integer answer, and the integer parameters, `param_<i>_<k>`,
-// whose Sysl type, Sysl could not infer a type for in `output`, the diagnostics of `shim`. Where any
-// other of a binding's type arguments could not be inferred, its integer parameters may be what left
-// it unsaid, as the arguments of a generic Sysl function that infers a type parameter from them do:
-// every integer parameter of that binding is passed as the Avin type itself.
-private unsaid_answers(output: string, shim: ShimSource, bindings: Buf[MirBinding]) -> Buf[string]
+/** The callbacks, `call_<i>_<k>`, whose integer answer, and the integer parameters, `param_<i>_<k>`,
+ * whose Sysl type, Sysl could not infer a type for in `output`, the diagnostics of `shim`. Where any
+ * other of a binding's type arguments could not be inferred, its integer parameters may be what left
+ * it unsaid, as the arguments of a generic Sysl function that infers a type parameter from them do:
+ * every integer parameter of that binding is passed as the Avin type itself. A binding whose call
+ * Sysl says can reach `sysl.fiber.switch` holding a count is `waits_<i>`. */
+unsaid_answers(output: string, shim: ShimSource, bindings: Buf[MirBinding]) -> Buf[string]
     var out: Buf[string] = buf()
     val marker = "cannot infer the type argument '"
     var stalled = false
     var untyped = false
     var unrounded = false
+    var parks = false
     for text in output.split("\n")
         // The place of an error that left another type argument unsaid names its binding.
         if stalled && text.trim().starts_with("--> ") && text.contains("/avin/shims/shims.sysl:")
@@ -1494,8 +1513,18 @@ private unsaid_answers(output: string, shim: ShimSource, bindings: Buf[MirBindin
                         if p.form is Plain && *p.ty is Real then out = add_name(out, s"round_${i}_$k")
                 None -> ()
             continue
+        // A call that may park the thread, which may then resume on another worker, holds each string
+        // it is given by an atomic count: `waits_<i>`.
+        if parks && text.trim().starts_with("--> ") && text.contains("/avin/shims/shims.sysl:")
+            parks = false
+            owner_of(shim, line_of(text.trim()["--> ".bytes.len..])) match
+                Some(i) -> out = add_name(out, s"waits_$i")
+                None -> ()
+            continue
         if text.starts_with("error: ")
             stalled = false
+            parks = text.contains("can reach 'sysl.fiber.switch'")
+            if parks then continue
             unrounded = refuses_real(text)
             if unrounded then continue
             untyped = text.contains("has no type here — nothing says what this closure takes")
