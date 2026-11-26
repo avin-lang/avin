@@ -1,0 +1,148 @@
+// expect: exit 0
+// The application protocols (ALPN) and protocol versions a TLS connection settles, at both ends.
+// Where both offer protocols the server takes the first of its own the client offered, and none in
+// common fails the handshake; where either offers none the protocol is `None`. Names are bytes,
+// Unicode and 255-byte ones included. The versions are TLS 1.2 and TLS 1.3 by default, the newest
+// spoken, and either end may narrow them; ranges that do not meet fail the handshake. What was
+// settled is still known after the connection is closed or split. The settings' builders keep what
+// they do not change.
+import avin.fs
+import avin.io.IoError
+
+import avin.net.tls.{
+  Certificate, Credentials, Handshake, Tls12, Tls13, TlsClient, TlsError, TlsServer, TlsStream, TlsVersion, Transport
+}
+
+import avin.net.TcpListener
+import avin.threads.{Thread, spawn}
+import avin.time
+
+ok[T](r: Result[T, IoError]) -> T = r match
+  Ok(v) -> v
+  Err(e) -> fail(s"unexpected error: ${e.message}")
+
+tls[T](r: Result[T, TlsError]) -> T = r match
+  Ok(v) -> v
+  Err(e) -> fail(s"unexpected error: ${e.message}")
+
+// A test certificate or key, from the repository root or from `compiler/`.
+fixture(name: string) -> string
+  val here = "tests/fixtures/tls/" + name
+  ok(fs.readText(if fs.exists(here) then here else "../" + here))
+
+identity() -> TlsServer = tls(TlsServer.of(fixture("localhost.pem"), fixture("localhost.key")))
+
+trusting() -> TlsClient = TlsClient().trust(fixture("ca.pem"))
+
+kind(e: TlsError) -> string = e match
+  Transport(_) -> "transport"
+  Certificate(_, _) -> "certificate"
+  Handshake(_) -> "handshake"
+  Credentials(_) -> "credentials"
+
+shown(p: Option[string]) -> string = p match
+  Some(name) -> s"\"$name\""
+  None -> "none"
+
+// The port of a listener whose next connection is answered by a TLS handshake under `server`, and
+// the thread serving it, which answers what the server's end settled.
+once(server: TlsServer) -> (int, Thread[string])
+  val listener = ok(TcpListener.bind("127.0.0.1", 0))
+  val port = listener.port()
+  val serving = spawn(() ->
+    defer listener.close()
+    val tcp = ok(listener.accept())
+    ok(tcp.setTimeout(time.seconds(20)))
+    TlsStream.server(tcp, server) match
+      Ok(s) ->
+        defer s.close()
+        ok(s.writeText("hi\n"))
+        s"${shown(s.protocol)} over ${s.version}"
+      Err(e) ->
+        _ = tcp.close()
+        s"failed (${kind(e)})")
+  (port, serving)
+
+// Connects under `client` to a server under `server`, and says what each end settled.
+meet(label: string, server: TlsServer, client: TlsClient)
+  val (port, serving) = once(server)
+  val mine = TlsStream.connect("localhost", port, client) match
+    Ok(c) ->
+      val line = ok(c.readLine()).getOrElse("?")
+      val settled = s"${shown(c.protocol)} over ${c.version}, read $line"
+      _ = c.close()
+      settled
+    Err(e) -> s"failed (${kind(e)})"
+  println(s"$label: client $mine; server ${serving.join()}")
+
+main()
+  // Protocols.
+  meet("neither offers", identity(), trusting())
+  meet("both offer one", identity().offer(["h2"]), trusting().offer(["h2"]))
+  meet("the server's order wins", identity().offer(["c", "b", "a"]), trusting().offer(["a", "b"]))
+  meet("the server's order wins again", identity().offer(["http/1.1", "h2"]), trusting().offer(["h2", "http/1.1"]))
+  meet("only the client offers", identity(), trusting().offer(["h2"]))
+  meet("only the server offers", identity().offer(["h2"]), trusting())
+  meet("none in common", identity().offer(["b"]), trusting().offer(["a"]))
+  meet("a prefix is not a match", identity().offer(["h2"]), trusting().offer(["h2c"]))
+  meet("case counts", identity().offer(["H2"]), trusting().offer(["h2"]))
+  meet("unicode", identity().offer(["протокол/1", "✓"]), trusting().offer(["✓", "протокол/1"]))
+  val longest = "x".repeat(255)
+  meet("a 255-byte name", identity().offer(["a", longest]), trusting().offer([longest]))
+  meet("one byte", identity().offer(["z"]), trusting().offer(["z"]))
+  meet("offering none again", identity().offer(["h2"]).offer([]), trusting().offer(["h2"]))
+
+  // Versions.
+  meet("the default versions", identity(), trusting())
+  meet("a client of TLS 1.2 alone", identity(), trusting().versions(Tls12, Tls12))
+  meet("a server of TLS 1.2 alone", identity().versions(Tls12, Tls12), trusting())
+  meet("TLS 1.3 alone at both ends", identity().versions(Tls13, Tls13), trusting().versions(Tls13, Tls13))
+  meet("a client of TLS 1.3 alone", identity(), trusting().versions(Tls13, Tls13))
+  meet("ranges that do not meet", identity().versions(Tls12, Tls12), trusting().versions(Tls13, Tls13))
+  meet("ranges that do not meet the other way", identity().versions(Tls13, Tls13), trusting().versions(Tls12, Tls12))
+  meet("both together", identity().offer(["h2"]).versions(Tls12, Tls12), trusting().offer(["h2"]))
+
+  // What was settled outlives the connection's TLS state.
+  val (port, serving) = once(identity().offer(["h2"]))
+  val c = tls(TlsStream.connect("localhost", port, trusting().offer(["h2"]).versions(Tls12, Tls13)))
+  println(s"open: ${shown(c.protocol)} over ${c.version}")
+  val (reader, writer) = c.split()
+  println(s"split: ${shown(c.protocol)} over ${c.version}")
+  println(s"the reader reads: ${ok(reader.readLine()).getOrElse("?")}")
+  _ = reader.close()
+  _ = writer.close()
+  println(s"server: ${serving.join()}")
+  val (port2, serving2) = once(identity())
+  val d = tls(TlsStream.connect("localhost", port2, trusting().versions(Tls12, Tls12)))
+  _ = d.close()
+  println(s"closed: ${shown(d.protocol)} over ${d.version}; closing again: ${d.close().isOk}")
+  println(s"server: ${serving2.join()}")
+
+  // The versions, as values.
+  val versions: Vector[TlsVersion] = [Tls12, Tls13]
+  for v in versions
+    println(s"${v.name} shown as $v, equal to itself: ${v == v}")
+  println(s"they differ: ${Tls12 != Tls13}")
+
+  // The settings and their builders.
+  val plain = TlsClient()
+  println(s"a client by default: ${plain.protocols.length} protocols, ${plain.minVersion} to ${plain.maxVersion}")
+  val built = TlsClient().offer(["h2", "http/1.1"]).versions(Tls13, Tls13).trust(fixture("ca.pem"))
+  println(s"built: ${built.protocols}, ${built.minVersion} to ${built.maxVersion}, ${built.trusted.length} trusted")
+  val rebuilt = built.trust(fixture("selfsigned.pem")).offer(["x"])
+  println(
+    s"rebuilt: ${rebuilt.protocols}, ${rebuilt.minVersion} to ${rebuilt.maxVersion}, ${rebuilt.trusted.length} trusted"
+  )
+  println(s"the first is unchanged: ${built.protocols}, ${built.trusted.length} trusted")
+  val server = identity()
+  println(s"a server by default: ${server.protocols.length} protocols, ${server.minVersion} to ${server.maxVersion}")
+  val tuned = server.offer(["h2"]).versions(Tls12, Tls12)
+  println(s"tuned: ${tuned.protocols}, ${tuned.minVersion} to ${tuned.maxVersion}")
+  println(s"the same certificate and key: ${tuned.certificate == server.certificate && tuned.key == server.key}")
+  println(s"a server is its own source: ${server.current === server}")
+  val direct = TlsServer(fixture("localhost.pem"), fixture("localhost.key"), ["h2"], Tls13, Tls13)
+  println(s"made directly: ${direct.protocols}, ${direct.minVersion} to ${direct.maxVersion}")
+  meet("made directly", direct, trusting().offer(["h2"]))
+  // ALPN carries 65535 bytes of names in all, each with its length byte: 257 names of 254 bytes.
+  val most = Vector.tabulate(257, i -> s"$i:" + "n".repeat(253 - s"$i".byteLength))
+  println(s"the most names: ${TlsClient().offer(most).protocols.length}")

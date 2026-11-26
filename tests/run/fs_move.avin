@@ -1,0 +1,101 @@
+// expect: exit 0
+// `fs.move` within one file system: a file, a directory with its contents, a link and a dangling
+// link moved whole; `replace` both ways onto a file, a link, an empty and a full directory; a file
+// onto a directory and a directory onto a file; a directory into itself; a name onto itself;
+// `createParents`; a missing source; and a `replace = false` move whose source cannot be removed,
+// which puts everything back as it was.
+import avin.fs
+import avin.io.IoError
+
+var root = ""
+
+say(line: Any)
+  println(if root == "" then s"$line" else s"$line".replace(root, "DIR"))
+
+outcome(r: Result[unit, IoError]) -> string = r match
+  Ok(_) -> "ok"
+  Err(e) -> e.message
+
+main()
+  val dir = fs.createTempDir("avin-fs-move") match
+    Ok(d) -> d
+    Err(e) ->
+      say(s"no directory: $e")
+      return
+  root = dir
+  // A file moves, keeping its inode: it is renamed, not copied.
+  _ = fs.writeText(dir + "/a", "alpha")
+  val before = fs.metadata(dir + "/a").map(m -> m.inode).getOrElse(-1)
+  say(outcome(fs.move(dir + "/a", dir + "/b")))
+  say(s"${fs.exists(dir + "/a")} ${fs.readText(dir + "/b")} ${fs.metadata(dir + "/b").map(m -> m.inode == before)}")
+  // A directory moves with what it holds; a link and a dangling link move as links.
+  _ = fs.writeText(dir + "/d/inner/x", "x", createParents = true)
+  say(outcome(fs.move(dir + "/d", dir + "/e")))
+  say(s"${fs.exists(dir + "/d")} ${fs.readText(dir + "/e/inner/x")}")
+  _ = fs.symlink("b", dir + "/link")
+  say(outcome(fs.move(dir + "/link", dir + "/link2")))
+  say(s"${fs.readLink(dir + "/link2")} ${fs.readText(dir + "/link2")}")
+  _ = fs.symlink(dir + "/nowhere", dir + "/dangling")
+  say(outcome(fs.move(dir + "/dangling", dir + "/dangling2")))
+  say(s"${fs.exists(dir + "/dangling2", followLinks = false)} ${fs.exists(dir + "/dangling", followLinks = false)}")
+  // `replace = true` replaces a file, a link and an empty directory; a full one is refused.
+  _ = fs.writeText(dir + "/old", "old, and longer")
+  _ = fs.writeText(dir + "/new", "new")
+  say(outcome(fs.move(dir + "/new", dir + "/old")))
+  say(fs.readText(dir + "/old"))
+  _ = fs.writeText(dir + "/onto", "onto the link")
+  say(outcome(fs.move(dir + "/onto", dir + "/link2")))
+  say(s"${fs.isLink(dir + "/link2")} ${fs.readText(dir + "/link2")} ${fs.readText(dir + "/b")}")
+  _ = fs.createDir(dir + "/hollow")
+  say(outcome(fs.move(dir + "/e", dir + "/hollow")))
+  say(fs.readText(dir + "/hollow/inner/x"))
+  _ = fs.writeText(dir + "/full/keep", "keep", createParents = true)
+  _ = fs.createDir(dir + "/f")
+  say(outcome(fs.move(dir + "/f", dir + "/full")))
+  say(s"${fs.isDir(dir + "/f")} ${fs.readText(dir + "/full/keep")}")
+  // A file onto a directory, and a directory onto a file, are refused.
+  say(outcome(fs.move(dir + "/b", dir + "/full")))
+  say(outcome(fs.move(dir + "/f", dir + "/b")))
+  say(s"${fs.readText(dir + "/b")} ${fs.isDir(dir + "/f")}")
+  // A directory into itself is refused; a name onto itself changes nothing.
+  say(outcome(fs.move(dir + "/full", dir + "/full/inside")))
+  say(outcome(fs.move(dir + "/b", dir + "/b")))
+  say(fs.readText(dir + "/b"))
+  // `replace = false`: made where nothing is; refused where anything is, a dangling link included,
+  // for a file, a directory and a link alike, and the source stays.
+  say(outcome(fs.move(dir + "/b", dir + "/c", replace = false)))
+  say(s"${fs.exists(dir + "/b")} ${fs.readText(dir + "/c")}")
+  say(outcome(fs.move(dir + "/c", dir + "/old", replace = false)))
+  say(s"${fs.readText(dir + "/c")} ${fs.readText(dir + "/old")}")
+  say(outcome(fs.move(dir + "/c", dir + "/dangling2", replace = false)))
+  say(outcome(fs.move(dir + "/f", dir + "/hollow", replace = false)))
+  _ = fs.symlink("c", dir + "/lnk")
+  say(outcome(fs.move(dir + "/lnk", dir + "/old", replace = false)))
+  say(outcome(fs.move(dir + "/c", dir + "/c", replace = false)))
+  say(s"${fs.readText(dir + "/c")} ${fs.isDir(dir + "/f")} ${fs.isLink(dir + "/lnk")}")
+  say(outcome(fs.move(dir + "/f", dir + "/g", replace = false)))
+  say(outcome(fs.move(dir + "/lnk", dir + "/lnk2", replace = false)))
+  say(s"${fs.isDir(dir + "/g")} ${fs.readLink(dir + "/lnk2")} ${fs.exists(dir + "/lnk", followLinks = false)}")
+  // `createParents` makes the directories above `to`; without it they must be there.
+  say(outcome(fs.move(dir + "/c", dir + "/no/such/c")))
+  say(outcome(fs.move(dir + "/c", dir + "/made/above/c", createParents = true)))
+  say(fs.readText(dir + "/made/above/c"))
+  say(outcome(fs.move(dir + "/made/above/c", dir + "/made2/c", replace = false, createParents = true)))
+  say(fs.readText(dir + "/made2/c"))
+  // A missing source moves nothing, either way.
+  say(outcome(fs.move(dir + "/missing", dir + "/x")))
+  say(outcome(fs.move(dir + "/missing", dir + "/x", replace = false)))
+  // Unicode names.
+  _ = fs.writeText(dir + "/naïve ☃", "snow")
+  say(outcome(fs.move(dir + "/naïve ☃", dir + "/𝄞 clef")))
+  say(fs.readText(dir + "/𝄞 clef"))
+  // A `replace = false` move whose source's directory cannot be written to: the file is linked at `to`
+  // but cannot leave `from`, so the link is taken away again and the error is the removal's.
+  _ = fs.writeText(dir + "/sealed/s", "sealed", createParents = true)
+  _ = fs.createDir(dir + "/open")
+  _ = fs.setPermissions(dir + "/sealed", 0o500)
+  say(outcome(fs.move(dir + "/sealed/s", dir + "/open/s", replace = false)))
+  say(s"${fs.readText(dir + "/sealed/s")} ${fs.exists(dir + "/open/s")}")
+  say(outcome(fs.move(dir + "/sealed/s", dir + "/open/s")))
+  _ = fs.setPermissions(dir + "/sealed", 0o700)
+  say(fs.removeDirAll(dir))

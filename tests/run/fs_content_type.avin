@@ -1,0 +1,116 @@
+// `avin.fs` content types: the extension table, the signature sniff of a file's first bytes, and
+// `probeContentType` joining them.
+// expect: exit 0
+import avin.fs
+import avin.io.{IoError, NotFound}
+
+shown(t: Option[string]) -> string = t.getOrElse("none")
+
+named(names: Vector[string])
+  for n in names
+    println(s"name $n -> ${shown(fs.contentTypeOfName(n))}")
+
+arr(codes: Vector[int]) -> Array[byte] = codes.map(i -> byte(i)).toArray()
+
+// `n` copies of the byte value `v`.
+rep(n: int, v: int) -> Vector[int]
+  val out = Buffer[int]()
+  for _ in 0 ..< n
+    out.addOne(v)
+  out.toVector
+
+sniffed(label: string, bytes: Vector[int])
+  println(s"sniff $label -> ${shown(fs.sniffContentType(arr(bytes)))}")
+
+text(label: string, s: string)
+  println(s"sniff $label -> ${shown(fs.sniffContentType(s.utf8))}")
+
+main()
+  named(
+    [
+      "a.png", "A.PNG", "dir.d/a.JpEg", "x/y/app.js", "a.tar.gz", "noext", "", ".png", "dir.png/file", "a.",
+      "a.unknownext", "/a/b.html", "weird name.css", "é.svg"
+    ]
+  )
+  println(s"table has html ${fs.contentTypes.get("html").isDefined} and no exe ${fs.contentTypes.get("exe").isEmpty}")
+
+  sniffed("empty", [])
+  sniffed("png", [0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A, 0, 0])
+  sniffed("png short", [0x89, 0x50, 0x4E, 0x47])
+  sniffed("jpeg", [0xFF, 0xD8, 0xFF, 0xE0])
+  sniffed("jpeg short", [0xFF, 0xD8])
+  sniffed("gif87", [0x47, 0x49, 0x46, 0x38, 0x37, 0x61, 1, 0])
+  sniffed("gif89", [0x47, 0x49, 0x46, 0x38, 0x39, 0x61, 1, 0])
+  sniffed("gif88", [0x47, 0x49, 0x46, 0x38, 0x38, 0x61])
+  sniffed("pdf", [0x25, 0x50, 0x44, 0x46, 0x2D, 0x31, 0x2E, 0x37])
+  sniffed("zip", [0x50, 0x4B, 0x03, 0x04, 0, 0])
+  sniffed("zip empty", [0x50, 0x4B, 0x05, 0x06, 0, 0])
+  sniffed("gzip", [0x1F, 0x8B, 0x08, 0])
+  sniffed("wasm", [0x00, 0x61, 0x73, 0x6D, 1, 0, 0, 0])
+  sniffed("elf", [0x7F, 0x45, 0x4C, 0x46, 2, 1, 1])
+  sniffed("macho64", [0xCF, 0xFA, 0xED, 0xFE, 7, 0, 0, 1])
+  sniffed("macho32", [0xCE, 0xFA, 0xED, 0xFE])
+  sniffed("macho big 32", [0xFE, 0xED, 0xFA, 0xCE])
+  sniffed("macho big 64", [0xFE, 0xED, 0xFA, 0xCF])
+  sniffed("webp", [0x52, 0x49, 0x46, 0x46, 1, 2, 3, 4, 0x57, 0x45, 0x42, 0x50])
+  sniffed("wav", [0x52, 0x49, 0x46, 0x46, 1, 2, 3, 4, 0x57, 0x41, 0x56, 0x45])
+  sniffed("riff other", [0x52, 0x49, 0x46, 0x46, 1, 2, 3, 4, 0x41, 0x56, 0x49, 0x20])
+  sniffed("riff short", [0x52, 0x49, 0x46, 0x46])
+  sniffed("nul", [0x68, 0x69, 0x00])
+  sniffed("control", [0x68, 0x69, 0x01])
+  sniffed("high bytes", [0xFF, 0xFE, 0xFD])
+  sniffed("one byte text", [0x41])
+  text("ascii", "hello\n")
+  text("tabs and escapes", "a\tb\r\n\u000c\u001b[0m")
+  text("unicode", "héllo wörld, 日本語, 😀")
+  text("bom", "﻿text")
+  text("long text", "x".repeat(2000))
+  text("cut character at 512", "x".repeat(511) + "é")
+  text("cut at 4-byte character", "x".repeat(509) + "😀")
+  text("repeated two-byte characters", "x".repeat(10) + "é".repeat(5))
+  sniffed("lone continuation", [0x68, 0x80, 0x69])
+  sniffed("overlong", [0xC0, 0xAF])
+  sniffed("nul after 512", rep(512, 0x78) ++ [0x00])
+  sniffed("signature then junk", [0x1F, 0x8B] ++ rep(600, 0x00))
+
+  val dir = fs.createTempDir("avin-fs-mime") match
+    Ok(d) -> d
+    Err(e) -> fail(e.message)
+  val png = fs.join(dir, "pic.png")
+  val noExt = fs.join(dir, "blob")
+  val textFile = fs.join(dir, "notes")
+  val emptyFile = fs.join(dir, "empty")
+  val lying = fs.join(dir, "lie.png")
+  val unknownExt = fs.join(dir, "x.weird")
+  _ = fs.writeText(png, "not really a png")
+  _ = fs.writeBytes(noExt, arr([0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A]))
+  _ = fs.writeText(textFile, "just words\n")
+  _ = fs.writeText(emptyFile, "")
+  _ = fs.writeText(lying, "<html>")
+  _ = fs.writeBytes(unknownExt, arr([0x1F, 0x8B, 8, 0]))
+  for (label, f) in [
+    ("known extension", png),
+    ("no extension, png bytes", noExt),
+    ("no extension, text", textFile),
+    ("empty", emptyFile),
+    ("extension wins over bytes", lying),
+    ("unknown extension, gzip bytes", unknownExt)
+  ]
+    val r = fs.probeContentType(f) match
+      Ok(t) -> shown(t)
+      Err(e) -> s"error ${e.message}"
+    println(s"probe $label -> $r")
+  println(
+    "probe a known name needs no file: " + shown(fs.probeContentType(fs.join(dir, "missing.css")).getOrElse(None))
+  )
+  val missing = fs.probeContentType(fs.join(dir, "missing"))
+  println("probe missing unknown name: " + (missing match
+    Ok(_) -> "ok"
+    Err(e) -> if e.kind == NotFound then "NotFound" else "other"
+  ))
+  val asDir = fs.probeContentType(dir)
+  println("probe directory: " + (if asDir.isErr then "error" else "ok"))
+  val big = fs.join(dir, "big")
+  _ = fs.writeText(big, "y".repeat(100000))
+  println("probe big text: " + shown(fs.probeContentType(big).getOrElse(None)))
+  _ = fs.removeDirAll(dir)

@@ -1,0 +1,91 @@
+// expect: exit 0
+// A `Client` with a `CookieJar` against `http.serve`: the cookies a redirect sets stored and sent on
+// the hops after it, each origin's own and no other's; a request's own `Cookie` header joined with the
+// jar's into one, and dropped on a redirect to another origin while the jar's for that origin are
+// sent; a cookie removed by `Max-Age=0`; a `Secure` cookie from an `http` URL refused; a client with no
+// jar storing and sending none; `withBasicAuth` and `withBearer` kept on a redirect to the same origin
+// and dropped on one to another; and one jar shared by many threads sending at once.
+import avin.io.IoError
+import avin.net.http
+import avin.net.http.{Client, CookieJar, HttpError, Request, Response, ServerRequest}
+import avin.threads.spawn
+
+ok[T](r: Result[T, IoError]) -> T = r match
+  Ok(v) -> v
+  Err(e) -> fail(e.message)
+
+// What a request carried, as the server saw it.
+echo(r: ServerRequest) -> string =
+  s"${r.target} cookie=${r.header("Cookie").getOrElse("-")} auth=${r.header("Authorization").getOrElse("-")}"
+
+moved(location: string) -> Response = Response.empty(302).withHeader("Location", location)
+
+main()
+  val far = ok(http.serve("127.0.0.1", 0, r ->
+    if r.target == "/back" then moved(r.header("X-Back").getOrElse("/")).withHeader("Set-Cookie", "far=1")
+    else Response.text(200, echo(r))))
+  val farBase = s"http://localhost:${far.port()}"
+  val server = ok(http.serve("127.0.0.1", 0, r -> r.target.split("?")(0) match
+    "/login" -> moved("/home").withHeader("Set-Cookie", "sid=abc; Path=/").withHeader(
+      "Set-Cookie",
+      "pref=dark; Path=/home"
+    )
+    "/away" -> moved(s"$farBase/echo").withHeader("Set-Cookie", "left=1")
+    "/twice" -> moved("/home")
+    "/logout" -> Response.text(200, "bye").withHeader("Set-Cookie", "sid=; Max-Age=0; Path=/")
+    "/secure" -> Response.text(200, "no").withHeader("Set-Cookie", "s=1; Secure")
+    "/set" -> Response.text(200, "set").withHeader("Set-Cookie", s"${r.target.split("=")(1)}=1")
+    _ -> Response.text(200, echo(r))))
+  val base = s"http://127.0.0.1:${server.port()}"
+  val show = (label: string, r: Result[Response, HttpError]) -> r match
+    Ok(res) -> println(s"$label: ${res.status} ${res.text}")
+    Err(e) -> println(s"$label: error ${e.message}")
+
+  // The cookies a redirect sets, sent on the hop after it, the longer path first.
+  val jar = CookieJar()
+  val client = Client(cookies = Some(jar))
+  show("login", client.get(s"$base/login"))
+  show("root", client.get(s"$base/"))
+  println(s"held: ${jar.all().map(c -> s"${c.name}@${c.domain}${c.path}").mkString(", ")}")
+
+  // Another origin: none of this one's, and its own stored from the redirect that sent it back.
+  show("away", client.get(s"$base/away"))
+  show("far and back", client.send(Request("GET", s"$farBase/back").withHeader("X-Back", s"$base/home")))
+  show("far again", client.get(s"$farBase/echo"))
+
+  // A request's own cookies joined with the jar's, and dropped crossing to another origin.
+  show("own", client.send(Request("GET", s"$base/home").withHeader("Cookie", "mine=1")))
+  show("own, away", client.send(Request("GET", s"$base/away").withHeader("Cookie", "mine=1")))
+
+  // Removed by `Max-Age=0`; a `Secure` cookie from `http` refused.
+  show("logout", client.get(s"$base/logout"))
+  show("after", client.get(s"$base/home"))
+  show("secure", client.get(s"$base/secure"))
+  println(s"held: ${jar.all().map(c -> c.name).mkString(", ")}")
+
+  // No jar: none stored, none sent.
+  val bare = Client()
+  show("bare login", bare.get(s"$base/login"))
+
+  // Credentials: kept to the same origin, dropped crossing to another, the jar's cookies still sent.
+  show("basic, same origin", client.send(Request("GET", s"$base/twice").withBasicAuth("Aladdin", "open sesame")))
+  show("basic, away", client.send(Request("GET", s"$base/away").withBasicAuth("Aladdin", "open sesame")))
+  show("bearer, same origin", client.send(Request("GET", s"$base/twice").withBearer("tok.en")))
+  show("bearer, away", client.send(Request("GET", s"$base/away").withBearer("tok.en")))
+
+  // One jar, one client, many threads at once.
+  val shared = CookieJar()
+  val many = Client(cookies = Some(shared))
+  val threads = (0 ..< 8).map(t -> spawn(() ->
+    var fine = true
+    for i in 0 ..< 10
+      fine = fine && many.get(s"$base/set?k=t${t}x$i").isOk
+    fine))
+  val allFine = threads.forall(t -> t.join())
+  println(s"threads: $allFine, ${shared.size} cookies")
+  val sent = many.get(s"$base/home") match
+    Ok(res) -> res.text.split("cookie=")(1).split(" auth=")(0).split("; ").length
+    Err(_) -> -1
+  println(s"sent back: $sent")
+  server.stop()
+  far.stop()

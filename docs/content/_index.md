@@ -50,5 +50,6 @@ main()
 - [The specification](/spec/), starting with its [design choices](/spec/design/)
 - [The compiler architecture](/compiler/) and [roadmap](/compiler/roadmap/)
 - [Getting started](/getting-started/)
+- [The Avin Book](/book/), which teaches Avin through programs, from hello world to complete ones
 
 Avin is early: the specification is the design, and the compiler is being built to it.

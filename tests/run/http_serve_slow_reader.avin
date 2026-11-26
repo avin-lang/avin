@@ -1,0 +1,68 @@
+// expect: exit 0
+// Keep-alive abuse against the HTTP server: a client pipelining requests without end and never reading
+// a response holds its connection only until a response cannot be written within `writeTimeout`;
+// the server reads its requests one at a time, a piece of 8 KiB ahead at most, so it answers only as
+// many as the socket buffers hold, not every request sent, and closes the connection, whose next
+// write fails. A client that pipelines many and reads every response is answered every one, in
+// order, on one connection.
+import avin.io.IoError
+import avin.net.TcpStream
+import avin.net.http
+import avin.net.http.{Response, ServerRequest}
+import avin.threads.Atomic
+import avin.time
+import avin.time.{millis, monotonic}
+
+ok[T](r: Result[T, IoError]) -> T = r match
+  Ok(v) -> v
+  Err(e) -> fail(e.message)
+
+val answered = Atomic(0)
+
+val padding = "x".repeat(16384)
+
+// A response of 16 KiB, counted.
+padded(r: ServerRequest) -> Response
+  answered.store(answered.load() + 1)
+  Response.text(200, s"${r.target}$padding")
+
+main()
+  val server = ok(http.serve("127.0.0.1", 0, padded, writeTimeout = millis(200), date = false))
+
+  // Never reading: 32 MiB of requests, about 1.2 million, far more than the buffers between the two
+  // ends hold, so the client's write stops until the server closes the connection.
+  val hog = ok(TcpStream.connect("127.0.0.1", server.port()))
+  ok(hog.setTimeout(time.seconds(10)))
+  val request = "GET /r HTTP/1.1\r\nHost: t\r\n\r\n"
+  val sent = request.repeat(32 * 1048576 / request.byteLength)
+  val start = monotonic()
+  val wrote = hog.writeText(sent)
+  val took = monotonic() - start
+  println(s"the write failed: ${wrote.isErr}, soon: ${took < time.seconds(8)}")
+  val n = answered.load()
+  println(s"answered some: ${n > 0}, answered far fewer than sent: ${n < 10000}")
+  _ = hog.close()
+
+  // Reading every response: 200 pipelined, in four writes, answered in order.
+  val good = ok(TcpStream.connect("127.0.0.1", server.port()))
+  ok(good.setTimeout(time.seconds(10)))
+  var read = 0
+  var inOrder = true
+  for batch in 0 ..< 4
+    val text = StringWriter()
+    for i in 0 ..< 50 do text.write(s"GET /${batch * 50 + i} HTTP/1.1\r\nHost: t\r\n\r\n")
+    ok(good.writeText(text.text))
+    for i in 0 ..< 50
+      var length = 0
+      var line = ok(good.readLine()).getOrElse("")
+      if line != "HTTP/1.1 200 OK" then inOrder = false
+      while !line.isEmpty
+        line = ok(good.readLine()).getOrElse("")
+        if line.toLower.startsWith("content-length:") then length = line.slice(15, line.byteLength).trim.toInt()
+      val body = Buffer[byte]()
+      while body.length < length do body.addAll(ok(good.read(length - body.length)))
+      if !string.fromUtf8Lossy(body.toArray()).startsWith(s"/${batch * 50 + i}x") then inOrder = false
+      read++
+  println(s"read: $read, in order: $inOrder")
+  _ = good.close()
+  server.shutdown()

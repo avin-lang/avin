@@ -1,0 +1,223 @@
+// `avin.net.http`'s `Proxy`: which proxy a URL goes by, the `noProxy` list and its matching table
+// (names and the hosts under them, addresses, CIDR networks for IPv4 and IPv6, ports, `*`, entries
+// that are none), `Proxy.fromEnvironment` reading the variables tools on the machine read, and the
+// `Authorization` helpers `Request.withBasicAuth` and `Request.withBearer`.
+import avin.net.http.{Proxy, Request}
+
+// A lookup answering the variables of `pairs`.
+envOf(pairs: Vector[(string, string)]) -> (string) -> Option[string] = name ->
+  var found: Option[string] = None
+  for (k, v) in pairs
+    if k == name then found = Some(v)
+  found
+
+// Whether `noProxy` sends a request to `url` directly.
+bypassed(noProxy: string, url: string) -> bool = Proxy(noProxy = noProxy).bypasses(url)
+
+@test("the NO_PROXY table: names match themselves and the hosts under them, without regard to case")
+noProxyNames()
+  val table: Vector[(string, string, bool)] = [
+    ("", "http://example.com/", false),
+    ("example.com", "http://example.com/", true),
+    ("example.com", "http://www.example.com/", true),
+    ("example.com", "http://a.b.example.com:8080/", true),
+    ("example.com", "http://badexample.com/", false),
+    ("example.com", "http://example.com.evil.test/", false),
+    ("example.com", "http://com/", false),
+    (".example.com", "http://example.com/", true),
+    (".example.com", "http://x.example.com/", true),
+    ("*.example.com", "http://example.com/", true),
+    ("*.example.com", "http://x.example.com/", true),
+    ("EXAMPLE.Com", "http://Example.COM/", true),
+    ("example.com.", "http://example.com/", true),
+    ("example.com", "http://example.com./", true),
+    ("localhost", "http://localhost:3000/", true),
+    ("localhost", "http://127.0.0.1/", false),
+    ("internal", "https://svc.internal/", true)
+  ]
+  for (entry, url, expected) in table
+    assertEq((entry, url, bypassed(entry, url)), (entry, url, expected))
+
+@test("the NO_PROXY table: an entry with a port matches only that port, the scheme's default included")
+noProxyPorts()
+  val table: Vector[(string, string, bool)] = [
+    ("example.com:8080", "http://example.com:8080/", true),
+    ("example.com:8080", "http://example.com/", false),
+    ("example.com:8080", "http://www.example.com:8080/", true),
+    ("example.com:443", "https://example.com/", true),
+    ("example.com:80", "http://example.com/", true),
+    ("example.com:80", "https://example.com/", false),
+    ("10.1.2.3:81", "http://10.1.2.3:81/", true),
+    ("10.1.2.3:81", "http://10.1.2.3/", false),
+    ("[::1]:8080", "http://[::1]:8080/", true),
+    ("[::1]:8080", "http://[::1]/", false),
+    ("example.com:0", "http://example.com/", false),
+    ("example.com:65536", "http://example.com:65535/", false),
+    ("example.com:http", "http://example.com/", false),
+    ("[::1]8080", "http://[::1]:8080/", false)
+  ]
+  for (entry, url, expected) in table
+    assertEq((entry, url, bypassed(entry, url)), (entry, url, expected))
+
+@test("the NO_PROXY table: addresses and CIDR networks, IPv4 and IPv6, never a host name")
+noProxyAddresses()
+  val table: Vector[(string, string, bool)] = [
+    ("10.1.2.3", "http://10.1.2.3/", true),
+    ("10.1.2.3", "http://10.1.2.30/", false),
+    ("10.0.0.0/8", "http://10.200.3.4/", true),
+    ("10.0.0.0/8", "http://11.0.0.1/", false),
+    ("192.168.0.0/16", "http://192.168.255.1/", true),
+    ("192.168.0.0/16", "http://192.169.0.1/", false),
+    ("172.16.0.0/12", "http://172.31.255.255/", true),
+    ("172.16.0.0/12", "http://172.32.0.0/", false),
+    ("10.1.2.3/32", "http://10.1.2.3/", true),
+    ("10.1.2.3/31", "http://10.1.2.2/", true),
+    ("10.1.2.3/31", "http://10.1.2.4/", false),
+    ("0.0.0.0/0", "http://8.8.8.8/", true),
+    ("0.0.0.0/0", "http://host.test/", false),
+    ("0.0.0.0/0", "http://[::1]/", false),
+    ("::1", "http://[::1]:80/", true),
+    ("[::1]", "http://[::1]/", true),
+    ("::1", "http://[::2]/", false),
+    ("0:0:0:0:0:0:0:1", "http://[::1]/", true),
+    ("fe80::/10", "http://[fe80::1%25eth0]/", true),
+    ("fe80::/10", "http://[febf:ffff::1]/", true),
+    ("fe80::/10", "http://[fec0::1]/", false),
+    ("2001:db8::/32", "http://[2001:DB8:1::5]/", true),
+    ("2001:db8::/32", "http://[2001:db9::5]/", false),
+    ("::ffff:10.0.0.0/104", "http://[::ffff:10.1.1.1]/", true),
+    ("::/0", "http://[2001:db8::1]/", true),
+    ("::/0", "http://10.0.0.1/", false),
+    ("10.0.0.0/8", "http://[::ffff:10.0.0.1]/", false),
+    ("1.2.3.4", "http://1.2.3.4.nip.io/", false),
+    ("3.4", "http://1.2.3.4/", false)
+  ]
+  for (entry, url, expected) in table
+    assertEq((entry, url, bypassed(entry, url)), (entry, url, expected))
+
+@test("the NO_PROXY table: * alone matches everything, and entries that are none are passed over")
+noProxyOdd()
+  val table: Vector[(string, string, bool)] = [
+    ("*", "http://anything.test/", true),
+    ("*", "https://10.0.0.1:8443/", true),
+    ("a.test, *", "http://b.test/", true),
+    ("*example.com", "http://www.example.com/", false),
+    ("10.0.0.0/33", "http://10.0.0.1/", false),
+    ("10.0.0.0/-1", "http://10.0.0.1/", false),
+    ("10.0.0.0/x", "http://10.0.0.1/", false),
+    ("::1/129", "http://[::1]/", false),
+    ("not/an/address", "http://not/", false),
+    ("1:2:3:4:5:6:7:8:9", "http://[::1]/", false),
+    ("1::2::3", "http://[1::3]/", false),
+    ("[::1", "http://[::1]/", false),
+    ("., *., .", "http://a.test/", false),
+    (",, ,", "http://a.test/", false)
+  ]
+  for (entry, url, expected) in table
+    assertEq((entry, url, bypassed(entry, url)), (entry, url, expected))
+
+@test("entries are separated by commas, spaces and tabs, and a bad one leaves the others")
+noProxyLists()
+  val list = "a.test, b.test c.test\td.test,,bogus/9,10.0.0.0/8"
+  for host in ["a.test", "b.test", "c.test", "d.test", "x.d.test", "10.9.9.9"]
+    assert(bypassed(list, s"http://$host/"))
+  assert(!bypassed(list, "http://e.test/"))
+
+@test("forUrl answers the scheme's proxy, none where noProxy names the host, and none for others")
+choosing()
+  val p = Proxy(http = Some("http://plain:3128"), https = Some("secure:8443"), noProxy = "direct.test")
+  assertEq(p.forUrl("http://a.test/x"), Some("http://plain:3128"))
+  assertEq(p.forUrl("https://a.test/x"), Some("secure:8443"))
+  assertEq(p.forUrl("http://direct.test/"), None)
+  assertEq(p.forUrl("https://api.direct.test/"), None)
+  assertEq(p.forUrl("ws://a.test/"), None)
+  assertEq(p.forUrl("not a url"), None)
+  assertEq(Proxy().forUrl("http://a.test/"), None)
+  assertEq(Proxy(http = Some("")).forUrl("http://a.test/"), None)
+  assertEq(Proxy(https = Some("p:1")).forUrl("http://a.test/"), None)
+  val all = Proxy.to("http://one:1", "skip.test")
+  assertEq(all.forUrl("http://a.test/"), Some("http://one:1"))
+  assertEq(all.forUrl("https://a.test/"), Some("http://one:1"))
+  assertEq(all.forUrl("https://skip.test/"), None)
+  assert(!Proxy().bypasses("not a url"))
+
+@test("fromEnvironment: lower case first, then upper case, then all_proxy, empty values unset")
+environment()
+  val lower = Proxy.fromEnvironment(
+    envOf(
+      [
+        ("http_proxy", "http://lower:1"),
+        ("HTTP_PROXY", "http://upper:1"),
+        ("https_proxy", "http://lower:2"),
+        ("HTTPS_PROXY", "http://upper:2"),
+        ("no_proxy", "lower.test"),
+        ("NO_PROXY", "upper.test")
+      ]
+    )
+  )
+  assertEq((lower.http, lower.https, lower.noProxy), (Some("http://lower:1"), Some("http://lower:2"), "lower.test"))
+  val upper = Proxy.fromEnvironment(
+    envOf(
+      [
+        ("http_proxy", ""),
+        ("HTTP_PROXY", "http://upper:1"),
+        ("HTTPS_PROXY", " http://upper:2 "),
+        ("NO_PROXY", "upper.test")
+      ]
+    )
+  )
+  assertEq((upper.http, upper.https, upper.noProxy), (Some("http://upper:1"), Some("http://upper:2"), "upper.test"))
+  val fallback = Proxy.fromEnvironment(envOf([("ALL_PROXY", "http://all:1"), ("https_proxy", "http://s:2")]))
+  assertEq((fallback.http, fallback.https), (Some("http://all:1"), Some("http://s:2")))
+  val both = Proxy.fromEnvironment(envOf([("all_proxy", "http://a:1"), ("ALL_PROXY", "http://b:1")]))
+  assertEq((both.http, both.https), (Some("http://a:1"), Some("http://a:1")))
+  val none = Proxy.fromEnvironment(envOf([("http_proxy", "  "), ("NO_PROXY", "")]))
+  assertEq((none.http, none.https, none.noProxy), (None, None, ""))
+  assertEq(none.forUrl("http://a.test/"), None)
+
+@test("fromEnvironment under CGI, REQUEST_METHOD set, does not read HTTP_PROXY")
+environmentCgi()
+  val cgi = Proxy.fromEnvironment(
+    envOf([("REQUEST_METHOD", "GET"), ("HTTP_PROXY", "http://attacker:1"), ("HTTPS_PROXY", "http://upper:2")])
+  )
+  assertEq((cgi.http, cgi.https), (None, Some("http://upper:2")))
+  val chosen = Proxy.fromEnvironment(envOf([("REQUEST_METHOD", "POST"), ("http_proxy", "http://mine:1")]))
+  assertEq(chosen.http, Some("http://mine:1"))
+  val all = Proxy.fromEnvironment(
+    envOf([("REQUEST_METHOD", "GET"), ("HTTP_PROXY", "http://x:1"), ("ALL_PROXY", "http://all:1")])
+  )
+  assertEq(all.http, Some("http://all:1"))
+
+@test("fromEnvironment with no variables set is no proxy at all")
+environmentEmpty()
+  val p = Proxy.fromEnvironment(_ -> None)
+  assertEq((p.http, p.https, p.noProxy), (None, None, ""))
+
+@test("withBasicAuth writes RFC 7617's examples and replaces any Authorization")
+basicAuth()
+  val r = Request("GET", "http://a.test/").withBasicAuth("Aladdin", "open sesame")
+  assertEq(r.header("Authorization"), Some("Basic QWxhZGRpbjpvcGVuIHNlc2FtZQ=="))
+  assertEq(
+    Request("GET", "http://a.test/").withBasicAuth("test", "123£").header("Authorization"),
+    Some("Basic dGVzdDoxMjPCow==")
+  )
+  assertEq(Request("GET", "http://a.test/").withBasicAuth("", "").header("Authorization"), Some("Basic Og=="))
+  assertEq(
+    Request("GET", "http://a.test/").withBasicAuth("u", "p:w:d").header("Authorization"),
+    Some("Basic dTpwOnc6ZA==")
+  )
+  val replaced = Request("GET", "http://a.test/")
+    .withHeader("authorization", "Bearer old")
+    .withHeader("X-Kept", "1")
+    .withBasicAuth("Aladdin", "open sesame")
+  assertEq(replaced.headers, [("X-Kept", "1"), ("Authorization", "Basic QWxhZGRpbjpvcGVuIHNlc2FtZQ==")])
+
+@test("withBearer writes the token and replaces any Authorization, token68 padding included")
+bearer()
+  assertEq(
+    Request("GET", "http://a.test/").withBearer("mF_9.B5f-4.1JqM").header("Authorization"),
+    Some("Bearer mF_9.B5f-4.1JqM")
+  )
+  assertEq(Request("GET", "http://a.test/").withBearer("a+b/c~d==").header("Authorization"), Some("Bearer a+b/c~d=="))
+  val twice = Request("GET", "http://a.test/").withBasicAuth("u", "p").withBearer("t")
+  assertEq(twice.headers, [("Authorization", "Bearer t")])

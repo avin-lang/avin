@@ -1,6 +1,6 @@
 import * as vscode from "vscode"
 import { LanguageClient, type LanguageClientOptions, type ServerOptions, TransportKind } from "vscode-languageclient/node"
-import { findExecutable, missingServerMessage, serverCommand, SERVER_SETTINGS } from "./server"
+import { findExecutable, mayStartServer, missingServerMessage, serverCommand, SERVER_SETTINGS } from "./server"
 
 let client: LanguageClient | undefined
 
@@ -15,6 +15,7 @@ function warnOnce(message: string): void {
 }
 
 async function start(): Promise<void> {
+    if (!mayStartServer(vscode.workspace.isTrusted)) return
     const config = vscode.workspace.getConfiguration("avin")
     const server = serverCommand(config.get<string>("server.path"), config.get<string>("server.repository"))
 
@@ -73,6 +74,9 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
                 warned = false
                 await restart()
             }
+        }),
+        vscode.workspace.onDidGrantWorkspaceTrust(async () => {
+            if (client === undefined) await start()
         }),
         { dispose: () => void stop() },
     )

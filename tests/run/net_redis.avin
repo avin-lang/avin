@@ -1,0 +1,136 @@
+// expect: exit 0
+// `avin.net.redis` against a small in-memory server of the program's own, so the corpus runs it under
+// the collector's stress at both optimization levels: values of many sizes, Unicode among them, set
+// and read back one by one and in a long pipeline, a transaction, a scan over many keys, messages
+// published to a subscriber, and a pool shared by threads, every reply parsed while the collector
+// moves what the parser holds.
+import avin.net.{ByteStream, TcpServer}
+
+import avin.net.redis.{
+  ArrayValue, MapValue, Null, Number, Push, Redis, RedisError, SimpleError, SimpleString, Subscriber, RespParser, Value,
+  blobOf, encode
+}
+
+import avin.threads.{Atomic, Channel, Mutex, scope}
+
+// The reply to one command over the store's keys and values.
+answer(store: Mutex[Map[string, string]], words: Vector[string]) -> Value = words(0) match
+  "HELLO" -> MapValue(Vector((blobOf("proto"), Number(3))))
+  "SET" ->
+    _ = store.update(m -> m.updated(words(1), words(2)))
+    SimpleString("OK")
+  "GET" -> store.get().get(words(1)).map(v -> blobOf(v)).getOrElse(Null)
+  "INCR" ->
+    val key = words(1)
+    val m = store.update(m -> m.updated(key, s"${m.get(key).map(v -> v.toLong()).getOrElse(0) + 1}"))
+    Number(m(key).toLong())
+  "SCAN" ->
+    val keys = store.get().keys.toVector.sorted
+    val from = words(1).toInt()
+    val next = if from + 25 >= keys.length then 0 else from + 25
+    ArrayValue(Vector(blobOf(s"$next"), ArrayValue(keys.drop(from).take(25).map(k -> blobOf(k)))))
+  _ -> SimpleError(s"ERR unknown ${words(0)}")
+
+// One connection: commands answered over the store, `MULTI` queueing until `EXEC`, `PUBLISH` handed
+// to `published`, and a `SUBSCRIBE` turning the connection into one that sends every message
+// published until `<end>`.
+serve(conn: ByteStream, store: Mutex[Map[string, string]], published: Channel[string])
+  val p = RespParser()
+  var queued: Option[Vector[Vector[string]]] = None
+  while true
+    p.next() match
+      Ok(Some(v)) ->
+        val words = v.asItems.get.map(x -> x.asText.get)
+        val reply = words(0) match
+          "MULTI" ->
+            queued = Some(Vector.empty[Vector[string]]())
+            SimpleString("OK")
+          "EXEC" ->
+            val all = queued.getOrElse(Vector.empty[Vector[string]]())
+            queued = None
+            ArrayValue(all.map(c -> answer(store, c)))
+          "PUBLISH" ->
+            published.send(words(2))
+            Number(1)
+          "SUBSCRIBE" ->
+            _ = conn.write(encode(Push(Vector(blobOf("subscribe"), blobOf(words(1)), Number(1)))))
+            for m in published
+              if m == "<end>" then return
+              _ = conn.write(encode(Push(Vector(blobOf("message"), blobOf(words(1)), blobOf(m)))))
+            return
+          _ -> queued match
+            Some(q) ->
+              queued = Some(q :+ words)
+              SimpleString("QUEUED")
+            None -> answer(store, words)
+        if conn.write(encode(reply)).isErr then return
+      Ok(None) -> conn.read(4096) match
+        Ok(bytes) if bytes.length > 0 -> p.feed(bytes)
+        _ -> return
+      Err(_) -> return
+
+ok[T](r: Result[T, RedisError]) -> T = r match
+  Ok(v) -> v
+  Err(e) -> fail(e.message)
+
+main()
+  val store = Mutex(Map.empty[string, string]())
+  val published = Channel[string]()
+  val server = TcpServer.start("127.0.0.1", 0, (conn, _) -> serve(conn, store, published)).ok.get
+  val r = ok(Redis.connect("127.0.0.1", server.port()))
+  println(r.protocol)
+
+  // Values of many sizes up to some tens of kilobytes, each arriving in several reads, Unicode in
+  // them, one by one.
+  var same = 0
+  for i in 0 ..< 12
+    val v = "é😀x".repeat(i * i * 40)
+    ok(r.set(s"v$i", v))
+    if r.get(s"v$i") == Ok(Some(v)) then same += 1
+  println(s"read back $same of 12")
+
+  // A pipeline of sets and gets, its replies in order.
+  val replies = ok(r.pipeline(p ->
+    for i in 0 ..< 200
+      p.command("SET", s"k$i", s"value $i ${"ü".repeat(i % 40)}")
+      p.command("GET", s"k$i")))
+  var right = 0
+  for i in 0 ..< 200
+    if replies(2 * i + 1) == Ok(blobOf(s"value $i ${"ü".repeat(i % 40)}")) then right += 1
+  println(s"${replies.length} replies, $right gets right")
+
+  // A transaction, and a number counted up.
+  println(ok(r.transaction(t ->
+    t.command("SET", "t", "1")
+    t.command("INCR", "t"))))
+  for _ in 0 ..< 50 do _ = r.incr("n")
+  println(r.get("n"))
+
+  // A scan over every key, page by page.
+  var keys = 0
+  for k in r.scan() do if k.isOk then keys += 1
+  println(s"scanned $keys keys")
+
+  // A pool shared by four threads.
+  val pool = Redis.pool("127.0.0.1", server.port(), maxSize = 3)
+  val done = Atomic(0)
+  scope(s ->
+    for _ in 0 ..< 4
+      s.spawn(() ->
+        for _ in 0 ..< 10
+          if pool.use(c -> c.incr("pooled")) is Ok(Ok(_)) then _ = done.add(1)))
+  println(s"${done.load()} pooled increments, ${pool.use(c -> c.get("pooled"))}")
+  pool.close()
+
+  // Messages to a subscriber.
+  val sub = ok(Subscriber.connect("127.0.0.1", server.port()))
+  ok(sub.subscribe("news"))
+  for i in 0 ..< 30 do _ = r.publish("news", s"message $i ${"ö".repeat(i * 10)}")
+  var heard = 0
+  for i in 0 ..< 30
+    if ok(sub.receive()).text == s"message $i ${"ö".repeat(i * 10)}" then heard += 1
+  println(s"heard $heard of 30")
+  _ = r.publish("news", "<end>")
+  _ = sub.close()
+  _ = r.close()
+  server.stop()

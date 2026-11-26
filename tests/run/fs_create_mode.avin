@@ -1,0 +1,211 @@
+// expect: exit 0
+// Files made with a mode: `create`, `createUpdate`, `writeLines`, `writeTextAtomic` and
+// `writeBytesAtomic` take `mode`, which a new file has from the moment it exists, narrowed by the
+// umask; a file already there keeps its mode; a mode outside 0o0 to 0o7777 is an `Err` that touches
+// nothing. `File.setPermissions` on a file open to write, open only to read, renamed while open, and
+// closed. An atomic write keeps the exact bits of the file it replaces and leaves no pending file. The
+// umask is whatever the test runs under: it is measured first, and every expected mode is `mode`
+// without the bits it takes, so the output is the same under any umask.
+import avin.fs
+import avin.io
+import avin.io.IoError
+
+// The temporary directory the test works in, written as `DIR` in what it prints.
+var root = ""
+
+// The bits the umask takes from a new file.
+var umask = 0
+
+say(line: Any)
+  println(if root == "" then s"$line" else s"$line".replace(root, "DIR"))
+
+bits(file: string) -> int = fs.permissions(file).getOrElse(-1)
+
+// Whether `file` has exactly the bits a new file asked for `mode` gets.
+madeWith(file: string, mode: int) -> bool = bits(file) == (mode & ~umask)
+
+// What a call answered: `Ok`, or the kind of its `Err`.
+outcome[T](r: Result[T, IoError]) -> string = r match
+  Ok(_) -> "Ok"
+  Err(e) -> s"Err ${e.kind}"
+
+// Makes `file` with each of the creating calls and `mode`, and says whether each has the bits.
+everyWay(file: string, mode: int)
+  val created = fs.create(file, mode).map(f -> f.close())
+  val a = madeWith(file, mode)
+  _ = fs.remove(file)
+  val updated = fs.createUpdate(file, mode).map(f -> f.close())
+  val b = madeWith(file, mode)
+  _ = fs.remove(file)
+  val lines = fs.writeLines(file, ["x", "y"], mode = mode)
+  val c = madeWith(file, mode)
+  _ = fs.remove(file)
+  val text = fs.writeTextAtomic(file, "t", mode = mode)
+  val d = madeWith(file, mode)
+  _ = fs.remove(file)
+  val bytes = fs.writeBytesAtomic(file, [byte(1)], mode = mode)
+  val e = madeWith(file, mode)
+  _ = fs.remove(file)
+  say(
+    f"${mode}%o: ${outcome(created)} $a, ${outcome(updated)} $b, ${outcome(lines)} $c, ${outcome(text)} $d, ${outcome(bytes)} $e"
+  )
+
+main()
+  val dir = fs.createTempDir("avin-fs-create-mode").getOrElse("")
+  root = dir
+  // The umask, measured by asking for every rwx bit.
+  val probe = dir + "/probe"
+  _ = fs.create(probe, 0o777).map(f -> f.close())
+  umask = 0o777 & ~bits(probe)
+  _ = fs.remove(probe)
+  // The umask never takes the owner's bits from a file the test makes.
+  say(s"owner kept: ${(umask & 0o700) == 0}")
+  // A new file has the mode asked for, less the umask, through every creating call.
+  for mode in [0o600, 0o644, 0o640, 0o0, 0o400, 0o700, 0o755, 0o777, 0o666]
+    everyWay(dir + "/made", mode)
+  // An owner-only file is owner-only whatever the umask.
+  _ = fs.create(dir + "/secret", 0o600).map(f -> f.close())
+  say(f"secret: ${bits(dir + "/secret")}%o")
+  // The default mode is 0o666 less the umask, as before.
+  _ = fs.create(dir + "/plain").map(f -> f.close())
+  _ = fs.createUpdate(dir + "/plain-update").map(f -> f.close())
+  _ = fs.writeLines(dir + "/plain-lines", ["a"])
+  _ = fs.writeTextAtomic(dir + "/plain-atomic", "a")
+  say(
+    s"default: ${madeWith(dir + "/plain", 0o666)} ${madeWith(dir + "/plain-update", 0o666)} ${madeWith(dir + "/plain-lines", 0o666)} ${madeWith(dir + "/plain-atomic", 0o666)}"
+  )
+  // A file made with no permission at all can still be written through the handle that made it.
+  val none = dir + "/none"
+  val nf0 = fs.create(none, 0o0).getOrElse(fail("create"))
+  val wrote = nf0.writeText("kept")
+  say(outcome(nf0.close()))
+  say(f"no bits: ${outcome(wrote)} ${bits(none)}%o ${fs.size(none)}")
+  _ = fs.setPermissions(none, 0o600)
+  say(fs.readText(none))
+
+  // A file already there keeps its mode, whatever mode is asked for; its contents go.
+  val old = dir + "/old"
+  _ = fs.writeText(old, "before")
+  _ = fs.setPermissions(old, 0o640)
+  say(outcome(fs.create(old, 0o600).map(f -> f.close())))
+  say(f"create: ${bits(old)}%o ${fs.size(old)}")
+  _ = fs.writeText(old, "before")
+  say(outcome(fs.createUpdate(old, 0o777).map(f -> f.close())))
+  say(f"createUpdate: ${bits(old)}%o ${fs.size(old)}")
+  say(outcome(fs.writeLines(old, ["z"], mode = 0o600)))
+  say(f"writeLines: ${bits(old)}%o ${fs.readText(old)}")
+  _ = fs.setPermissions(old, 0o0)
+  say(outcome(fs.create(old, 0o600)))
+  say(f"refused: ${bits(old)}%o")
+  _ = fs.setPermissions(old, 0o640)
+
+  // A mode outside 0o0 to 0o7777 is an `Err` naming it, before anything is touched: a missing file
+  // is not made, an existing one is not emptied, missing parents are not made.
+  val fresh = dir + "/fresh"
+  for mode in [-1, 0o10000, 0o100644, 2147483647, -2147483648]
+    say(fs.create(fresh, mode).map(f -> f.isClosed()))
+  say(fs.createUpdate(fresh, 0o10000).map(f -> f.isClosed()))
+  say(fs.writeLines(fresh, ["x"], mode = -1))
+  say(fs.writeTextAtomic(fresh, "x", mode = 0o10000))
+  say(fs.writeBytesAtomic(fresh, [byte(1)], mode = -1))
+  say(s"fresh made: ${fs.exists(fresh)}")
+  _ = fs.writeText(old, "intact")
+  say(outcome(fs.create(old, -1)))
+  say(outcome(fs.createUpdate(old, 0o10000)))
+  say(outcome(fs.writeLines(old, ["x"], mode = 0o10000)))
+  say(outcome(fs.writeTextAtomic(old, "x", mode = -1)))
+  say(outcome(fs.writeBytesAtomic(old, [byte(1)], mode = 0o10000)))
+  say(f"${fs.readText(old)} ${bits(old)}%o")
+  say(outcome(fs.writeLines(dir + "/p1/p2/f", ["x"], createParents = true, mode = -1)))
+  say(outcome(fs.writeTextAtomic(dir + "/p1/p2/f", "x", createParents = true, mode = 0o10000)))
+  say(s"parents made: ${fs.exists(dir + "/p1")}")
+  // The edges of the range are accepted.
+  say(outcome(fs.create(dir + "/edge", 0o0).map(f -> f.close())))
+  _ = fs.remove(dir + "/edge")
+  // A missing directory is the platform's error, not the mode's.
+  say(outcome(fs.create(dir + "/missing/f", 0o600)))
+  say(outcome(fs.createUpdate(dir + "/missing/f", 0o600)))
+
+  // `File.setPermissions` on a file open to write.
+  val held = dir + "/held"
+  val w = fs.create(held, 0o644).getOrElse(fail("create"))
+  for mode in [0o600, 0o640, 0o0, 0o755, 0o4700, 0o600]
+    say(f"${outcome(w.setPermissions(mode))} ${bits(held)}%o")
+  // The handle keeps writing after its file has lost every write bit.
+  say(outcome(w.setPermissions(0o400)))
+  say(outcome(w.writeText("still")))
+  // A refused mode changes nothing.
+  for mode in [-1, 0o10000, 0o170777]
+    say(w.setPermissions(mode))
+  say(f"${bits(held)}%o")
+  // The file the handle holds changes even after its name has moved.
+  _ = fs.rename(held, dir + "/moved")
+  say(f"${outcome(w.setPermissions(0o640))} ${bits(dir + "/moved")}%o")
+  say(outcome(w.close()))
+  say(fs.readText(dir + "/moved"))
+  // A closed file is an `Err`, and so is a refused mode on one.
+  say(w.setPermissions(0o600))
+  say(f"${bits(dir + "/moved")}%o")
+  // A file open only to read may have its mode set by its owner.
+  val r = fs.open(dir + "/moved").getOrElse(fail("open"))
+  say(f"${outcome(r.setPermissions(0o600))} ${bits(dir + "/moved")}%o")
+  say(f"${outcome(r.setPermissions(0o0))} ${bits(dir + "/moved")}%o")
+  say(r.readText())
+  _ = r.close()
+  say(outcome(r.setPermissions(0o600)))
+  // Open to update and to append.
+  val u = fs.openUpdate(dir + "/secret").getOrElse(fail("openUpdate"))
+  say(f"${outcome(u.setPermissions(0o644))} ${bits(dir + "/secret")}%o")
+  _ = u.close()
+  val ap = fs.append(dir + "/secret").getOrElse(fail("append"))
+  say(f"${outcome(ap.setPermissions(0o600))} ${bits(dir + "/secret")}%o")
+  _ = ap.close()
+
+  // An atomic write over a file keeps its exact bits, the mode asked for playing no part, the umask
+  // included: 0o666 survives where a new file would lose the umask's bits.
+  val kept = dir + "/kept"
+  for mode in [0o600, 0o640, 0o666, 0o755, 0o0, 0o4700, 0o777]
+    _ = fs.writeText(kept, "old")
+    _ = fs.setPermissions(kept, mode)
+    val t = fs.writeTextAtomic(kept, "new")
+    val tb = bits(kept)
+    val b = fs.writeBytesAtomic(kept, [byte(65)], mode = 0o644)
+    val bb = bits(kept)
+    _ = fs.setPermissions(kept, 0o600)
+    say(f"${mode}%o: ${outcome(t)} ${tb}%o ${outcome(b)} ${bb}%o ${fs.readText(kept)}")
+  // A file at 0o600 stays at 0o600 over many replacements, and none leaves a pending file.
+  val many = dir + "/many"
+  _ = fs.createDir(many)
+  _ = fs.writeTextAtomic(many + "/token", "t0", mode = 0o600)
+  for i in 1 ..< 10
+    _ = fs.writeTextAtomic(many + "/token", s"t$i", mode = 0o644)
+  say(f"${bits(many + "/token")}%o ${fs.readText(many + "/token")} ${fs.listDir(many)}")
+  // A new atomic file takes `mode`, under a directory made for it too.
+  say(outcome(fs.writeTextAtomic(dir + "/q1/q2/token", "s", createParents = true, mode = 0o600)))
+  say(f"${bits(dir + "/q1/q2/token")}%o ${fs.listDir(dir + "/q1/q2")}")
+  // An atomic write onto a directory fails and leaves it and nothing else.
+  _ = fs.createDir(dir + "/adir")
+  _ = fs.setPermissions(dir + "/adir", 0o750)
+  say(outcome(fs.writeTextAtomic(dir + "/adir", "x", mode = 0o600)))
+  say(f"${fs.isDir(dir + "/adir")} ${bits(dir + "/adir")}%o ${fs.listDir(dir + "/adir")}")
+  // An atomic write into a missing directory, without `createParents`.
+  say(outcome(fs.writeTextAtomic(dir + "/nowhere/f", "x", mode = 0o600)))
+  // Large contents over an owner-only file.
+  _ = fs.writeBytesAtomic(dir + "/big", Array.fill(1000000, byte(7)), mode = 0o600)
+  _ = fs.writeBytesAtomic(dir + "/big", Array.fill(2000000, byte(8)))
+  say(f"${bits(dir + "/big")}%o ${fs.size(dir + "/big")}")
+
+  // Unicode names.
+  val named = dir + "/日本語-é 🙂"
+  _ = fs.createDir(named)
+  everyWay(named + "/秘密.txt", 0o600)
+  everyWay(named + "/ключ", 0o640)
+  _ = fs.writeTextAtomic(named + "/ключ", "a", mode = 0o600)
+  _ = fs.writeTextAtomic(named + "/ключ", "b", mode = 0o644)
+  say(f"${bits(named + "/ключ")}%o ${fs.listDir(named)}")
+  val nf = fs.create(named + "/ñ", 0o644).getOrElse(fail("create"))
+  say(f"${outcome(nf.setPermissions(0o600))} ${bits(named + "/ñ")}%o")
+  _ = nf.close()
+
+  _ = fs.removeDirAll(dir)
+  say(fs.exists(dir))

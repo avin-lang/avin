@@ -1,0 +1,167 @@
+// expect: exit 0
+// UDP sockets over the IPv4 and IPv6 loopbacks: a datagram each way with who sent it, an empty one,
+// one longer than the receive's room (truncated, and said to be), the longest the protocol carries,
+// one longer still (refused), a connected socket's `send` and its filtering, sends to the other
+// version's addresses refused, a receive's timeout, buffer sizes, two sockets sharing a port, and
+// what a closed socket answers.
+import avin.io
+import avin.io.IoError
+import avin.net.{Datagram, DatagramMost, DatagramMostIpv4, DatagramMostIpv6, IpAddress, UdpSocket}
+import avin.time.{millis, monotonic}
+
+ok[T](r: Result[T, IoError]) -> T = r match
+  Ok(v) -> v
+  Err(e) -> fail(e.message)
+
+text(d: Datagram) -> string = string.fromUtf8Lossy(d.bytes)
+
+// An error's message with the port the platform chose, `port`, written `PORT`.
+said(e: IoError, port: int) -> string = e.message.replace(s":$port:", ":PORT:")
+
+// One datagram each way between `a` and `b`, both bound to `host`.
+bothWays(host: string, address: IpAddress)
+  val a = ok(UdpSocket.bind(host, 0))
+  val b = ok(UdpSocket.bind(address, 0))
+  if a.port() == 0 || b.port() == 0 || a.port() == b.port() then fail("the ports were not chosen")
+  if a.localAddress() != address || b.localAddress() != address then fail("bound to another address")
+  ok(a.sendTo("ping".utf8, address, b.port()))
+  val got = ok(b.receiveFrom(1500))
+  println(
+    s"$host: ${text(got)} from ${got.sender}, its port the sender's: ${got.senderPort == a.port()}, truncated: ${got.truncated}"
+  )
+  ok(b.sendTo("pong ü".utf8, got.sender, got.senderPort))
+  val back = ok(a.receiveFrom(1500))
+  println(s"$host: ${text(back)} from ${back.sender}, ${back.bytes.length} bytes")
+  // An empty datagram is a datagram.
+  ok(a.sendTo(Array.empty[byte](), address, b.port()))
+  val empty = ok(b.receiveFrom(10))
+  println(s"$host: an empty datagram arrives as ${empty.bytes.length} bytes, truncated: ${empty.truncated}")
+  ok(a.close())
+  ok(b.close())
+
+// The longest datagram `address` carries, and `refused` bytes, which it does not.
+longest(address: IpAddress, most: int, refused: int)
+  val a = ok(UdpSocket.bind(address, 0))
+  val b = ok(UdpSocket.bind(address, 0))
+  ok(b.setReceiveBufferSize(262144))
+  val big = Array.tabulate(most, i -> byte(i % 251))
+  ok(a.sendTo(big, address, b.port()))
+  val got = ok(b.receiveFrom(DatagramMost))
+  var same = got.bytes.length == most
+  for i in 0 ..< got.bytes.length
+    if got.bytes(i) != big(i) then same = false
+  println(s"$address: $most bytes arrive whole: $same, truncated: ${got.truncated}")
+  ok(a.sendTo(big, address, b.port()))
+  val bigger = ok(b.receiveFrom(DatagramMost + 1000))
+  println(s"$address: a receive of more than the most: ${bigger.bytes.length} bytes, truncated: ${bigger.truncated}")
+  a.sendTo(Array.fill(refused, byte(1)), address, b.port()) match
+    Ok(_) -> fail("a datagram longer than the protocol carries was sent")
+    Err(e) -> println(said(e, b.port()))
+  // A connected socket's `send` is held to the same most.
+  ok(a.connect(address, b.port()))
+  a.send(Array.fill(refused, byte(1))) match
+    Ok(_) -> fail("a connected socket sent a datagram longer than the protocol carries")
+    Err(e) -> println(said(e, b.port()))
+  ok(a.send(Array.fill(most, byte(2))))
+  println(s"$address: a connected send of the most arrives: ${ok(b.receiveFrom(DatagramMost)).bytes.length}")
+  ok(a.close())
+  ok(b.close())
+
+main()
+  bothWays("127.0.0.1", IpAddress.Localhost)
+  bothWays("::1", IpAddress.LocalhostV6)
+
+  // Truncation: the receive's room, and no more, and the datagram after it whole.
+  val a = ok(UdpSocket.bind("127.0.0.1", 0))
+  val b = ok(UdpSocket.bind("127.0.0.1", 0))
+  ok(a.sendTo("0123456789".utf8, IpAddress.Localhost, b.port()))
+  ok(a.sendTo("0123456789".utf8, IpAddress.Localhost, b.port()))
+  ok(a.sendTo("0123456789".utf8, IpAddress.Localhost, b.port()))
+  ok(a.sendTo("x".utf8, IpAddress.Localhost, b.port()))
+  val cut = ok(b.receiveFrom(4))
+  println(s"room for 4: ${text(cut)}, truncated: ${cut.truncated}")
+  val exact = ok(b.receiveFrom(10))
+  println(s"room for exactly 10: ${text(exact)}, truncated: ${exact.truncated}")
+  val one = ok(b.receiveFrom(1))
+  println(s"room for 1: ${text(one)}, truncated: ${one.truncated}")
+  val next = ok(b.receiveFrom(1))
+  println(s"the next datagram is whole: ${text(next)}, truncated: ${next.truncated}")
+
+  longest(IpAddress.Localhost, DatagramMostIpv4, DatagramMostIpv4 + 1)
+  longest(IpAddress.LocalhostV6, DatagramMostIpv6, DatagramMostIpv6 + 1)
+  longest(IpAddress.LocalhostV6, DatagramMostIpv6, 1000000)
+
+  // A send names the socket's own version only.
+  a.sendTo("x".utf8, IpAddress.LocalhostV6, b.port()) match
+    Ok(_) -> fail("an IPv4 socket sent to an IPv6 address")
+    Err(e) -> println(said(e, b.port()))
+  a.connect(IpAddress.LocalhostV6, b.port()) match
+    Ok(_) -> fail("an IPv4 socket connected to an IPv6 address")
+    Err(e) -> println(said(e, b.port()))
+  val six = ok(UdpSocket.bind("::1", 0))
+  six.sendTo("x".utf8, IpAddress.Localhost, b.port()) match
+    Ok(_) -> fail("an IPv6 socket sent to an IPv4 address")
+    Err(e) -> println(said(e, b.port()))
+  // A name with no address of the socket's version: `127.0.0.1` has no IPv6 one.
+  six.sendTo("x".utf8, "127.0.0.1", b.port()) match
+    Ok(_) -> fail("an IPv6 socket sent to a name with only an IPv4 address")
+    Err(e) -> println(said(e, b.port()))
+  ok(six.close())
+  // A host name resolves to an address of the socket's version.
+  ok(a.sendTo("by name".utf8, "localhost", b.port()))
+  println(s"sent by name: ${text(ok(b.receiveFrom(100)))}")
+
+  // A connected socket sends without naming where, and receives only from there.
+  val c = ok(UdpSocket.bind("127.0.0.1", 0))
+  c.send("x".utf8) match
+    Ok(_) -> fail("an unconnected socket sent")
+    Err(e) -> println(said(e, c.port()))
+  if c.connectedTo().nonEmpty then fail("connected before connect")
+  ok(c.connect(IpAddress.Localhost, b.port()))
+  println(s"connected to b: ${c.connectedTo() == Some((IpAddress.Localhost, b.port()))}")
+  ok(c.send("from c".utf8))
+  println(s"b received: ${text(ok(b.receiveFrom(100)))}")
+  ok(a.sendTo("from a, ignored".utf8, IpAddress.Localhost, c.port()))
+  ok(b.sendTo("from b".utf8, IpAddress.Localhost, c.port()))
+  println(s"c received only b's: ${text(ok(c.receiveFrom(100)))}")
+
+  // A receive with nothing coming times out after its limit.
+  ok(b.setTimeout(millis(50)))
+  println(s"the timeout: ${b.timeout}")
+  val start = monotonic()
+  b.receiveFrom(100) match
+    Ok(_) -> fail("a datagram came from nowhere")
+    Err(e) ->
+      val took = (monotonic() - start).micros / 1000
+      println(s"${e.kind == io.TimedOut}, within bounds: ${50 <= took < 5000}")
+  ok(b.setTimeout(millis(0)))
+  println(s"no timeout: ${b.timeout}")
+
+  // Buffer sizes: the platform gives at least what the protocol needs to send its longest.
+  println(s"send buffer room for the longest: ${ok(a.sendBufferSize()) > 65507}")
+  ok(a.setReceiveBufferSize(100000))
+  println(s"receive buffer at least asked: ${ok(a.receiveBufferSize()) >= 100000}")
+
+  // Two sockets share a port where each asks to.
+  val first = ok(UdpSocket.bind("127.0.0.1", 0, reusePort = true))
+  val second = ok(UdpSocket.bind("127.0.0.1", first.port(), reusePort = true))
+  println(s"shared port: ${second.port() == first.port()}")
+  UdpSocket.bind("127.0.0.1", first.port()) match
+    Ok(_) -> fail("a third socket took the port without asking")
+    Err(e) -> println(s"without reusePort: ${e.operation}")
+  ok(first.close())
+  ok(second.close())
+
+  // A closed socket answers errors, and closing again does nothing.
+  ok(c.close())
+  ok(c.close())
+  println(c.sendTo("x".utf8, IpAddress.Localhost, b.port()).isErr)
+  println(c.send("x".utf8).isErr)
+  println(c.receiveFrom(10).isErr)
+  println(c.connect(IpAddress.Localhost, b.port()).isErr)
+  println(c.setTimeout(millis(1)).isErr)
+  println(c.readable())
+  println(c.writable())
+  println(c.readinessDescriptor())
+  ok(a.close())
+  ok(b.close())
