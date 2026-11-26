@@ -1,0 +1,397 @@
+// `avin.compress`: gzip, zlib and raw deflate, whole and streamed. The fixtures in
+// tests/fixtures/compress were made by the system's gzip, and what this codec writes is read back by
+// the system's gzip, so each direction is checked against a codec that is not this one. Streams go
+// in pieces from one byte to 64 KiB; decompression is held to its limit (a bomb of zeros), and
+// truncated and corrupt input, trailing bytes, members, and failing readers and writers are each an
+// `Err` that every later call repeats.
+import avin.compress.{
+  CompressError, Corrupt, Decoder, Encoder, Format, Gzip, RawDeflate, TooLarge, Truncated, Zlib, compress, decompress,
+  defaultLevel, defaultMaxBytes, gunzip, gzip
+}
+
+import avin.fs
+import avin.io.{ByteWriter, IoError, Other, Reader}
+import avin.process.Command
+
+// The value of a result a test expects to succeed; its error's message stops the test.
+impl[T, E: Error] Result[T, E]
+  unwrap() -> T = self match
+    Ok(v) -> v
+    Err(e) -> fail(e.message)
+
+fixture(name: string) -> Array[byte] = fs.readBytes(s"tests/fixtures/compress/$name").unwrap()
+
+// Whether `a` and `b` hold the same bytes.
+same(a: Array[byte], b: Array[byte]) -> bool
+  if a.length != b.length then return false
+  for i in 0 ..< a.length
+    if a(i) != b(i) then return false
+  true
+
+joined(a: Array[byte], b: Array[byte]) -> Array[byte]
+  val out = Buffer[byte]()
+  out.addAll(a)
+  out.addAll(b)
+  out.toArray()
+
+// `n` bytes that compress: a short sentence over and over.
+repetitive(n: int) -> Array[byte]
+  val line = "the quick brown fox jumps over the lazy dog, café 日本 🎉\n".utf8
+  Array.tabulate(n, i -> line(i % line.length))
+
+// `n` bytes that do not compress, from a fixed seed.
+noise(n: int) -> Array[byte]
+  var x: long = 88172645463325252
+  Array.tabulate(n, i ->
+    x = x *% 6364136223846793005 +% 1442695040888963407
+    byte(int((x >> 33) & 255)))
+
+val formats: Vector[Format] = [Gzip, Zlib, RawDeflate]
+
+// A reader handing out `bytes` at most `size` at a time, then failing with `failure` where it has one
+// instead of ending.
+class Dribble(
+    private val bytes: Array[byte],
+    private val size: int,
+    private val failure: Option[IoError] = None
+): Reader
+  private var at = 0
+  override read(max: int) -> Result[Array[byte], IoError]
+    if at == bytes.length && failure is Some(e) then return Err(e)
+    val step = if max < size then max else size
+    val end = if bytes.length - at > step then at + step else bytes.length
+    val out = bytes.slice(at, end)
+    at = end
+    Ok(out)
+
+// A writer keeping what it is given, failing every write after the first `good` where `good` is
+// given.
+class ByteSink(private val good: Option[int] = None): ByteWriter
+  val held = Buffer[byte]()
+  var writes = 0
+  override write(bytes: Array[byte]) -> Result[unit, IoError]
+    writes += 1
+    if good is Some(n) && writes > n then return Err(IoError(Other("the sink is full"), "write", "a sink"))
+    held.addAll(bytes)
+    Ok(())
+
+// Everything `decoder` answers, read `max` at a time, or the failure it ends with.
+drain(decoder: Decoder, max: int) -> Result[Array[byte], IoError]
+  val out = Buffer[byte]()
+  loop
+    val got = decoder.read(max)?
+    if got.length == 0 then return Ok(out.toArray())
+    out.addAll(got)
+  Ok(out.toArray())
+
+// `bytes` written into an `Encoder` of `format` in pieces of `size`, then finished.
+encodedInPieces(bytes: Array[byte], format: Format, size: int) -> Array[byte]
+  val sink = ByteSink()
+  val e = Encoder(sink, format)
+  var at = 0
+  while at < bytes.length
+    val end = if bytes.length - at > size then at + size else bytes.length
+    e.write(bytes.slice(at, end)).unwrap()
+    at = end
+  e.finish().unwrap()
+  sink.held.toArray()
+
+@test(
+  "the system gzip's files decompress to what it compressed: a named header, level 1, incompressible data, an empty member"
+)
+goldenFiles()
+  val text = fixture("text.txt")
+  assert(same(gunzip(fixture("text.txt.gz")).unwrap(), text))
+  assert(same(gunzip(fixture("text-1.txt.gz")).unwrap(), text))
+  assert(same(gunzip(fixture("random.bin.gz")).unwrap(), fixture("random.bin")))
+  assertEq(gunzip(fixture("empty.gz")).unwrap().length, 0)
+  assert(same(decompress(fixture("text.txt.gz"), Gzip).unwrap(), text))
+
+@test("the system gzip's files decompress read in pieces of 1 byte to 64 KiB, and answered in pieces as small")
+goldenFilesStreamed()
+  val text = fixture("text.txt")
+  val random = fixture("random.bin")
+  for size in [1, 2, 3, 7, 64, 1000, 4096, 16384, 65536]
+    assert(same(drain(Decoder(Dribble(fixture("text.txt.gz"), size)), size).unwrap(), text), s"text in pieces of $size")
+    assert(
+      same(drain(Decoder(Dribble(fixture("random.bin.gz"), size)), size).unwrap(), random),
+      s"random in pieces of $size"
+    )
+    assertEq(drain(Decoder(Dribble(fixture("empty.gz"), size)), size).unwrap().length, 0)
+
+@test("what this codec writes as gzip, at every level, the system gzip decompresses to the same bytes")
+systemGzipReadsOurs()
+  val dir = fs.createTempDir("avin-compress").unwrap()
+  defer _ = fs.removeAll(dir)
+  for (name, data) in [("text", fixture("text.txt")), ("random", noise(70000)), ("empty", Array.empty[byte]())]
+    for level in 0 ..< 10
+      val packed = dir + s"/$name-$level.gz"
+      val back = dir + s"/$name-$level.out"
+      fs.writeBytes(packed, gzip(data, level)).unwrap()
+      assertEq(Command("gzip", "-dc", packed).toFile(back).run().unwrap().isSuccess, true)
+      assert(same(fs.readBytes(back).unwrap(), data), s"$name at level $level")
+
+@test("the zlib and raw deflate of `hello` are the known bytes, both ways")
+knownVectors()
+  val zlibHello: Array[byte] = [
+    byte(0x78),
+    byte(0x9c),
+    byte(0xcb),
+    byte(0x48),
+    byte(0xcd),
+    byte(0xc9),
+    byte(0xc9),
+    byte(0x07),
+    byte(0x00),
+    byte(0x06),
+    byte(0x2c),
+    byte(0x02),
+    byte(0x15)
+  ]
+  val rawHello: Array[byte] = [byte(0xcb), byte(0x48), byte(0xcd), byte(0xc9), byte(0xc9), byte(0x07), byte(0x00)]
+  assert(same(compress("hello".utf8, Zlib), zlibHello))
+  assert(same(compress("hello".utf8, RawDeflate), rawHello))
+  assertEq(string.fromUtf8Lossy(decompress(zlibHello, Zlib).unwrap()), "hello")
+  assertEq(string.fromUtf8Lossy(decompress(rawHello, RawDeflate).unwrap()), "hello")
+  val g = gzip("hello".utf8)
+  assertEq([g(0), g(1), g(2)], [byte(0x1f), byte(0x8b), byte(8)])
+
+@test("every format at every level round-trips empty, one byte, Unicode text, noise and a megabyte")
+formatRoundTrips()
+  val inputs: Vector[Array[byte]] = [
+    Array.empty[byte](),
+    [byte(0)],
+    [byte(255)],
+    "ℵ₀ café 日本語 🎉".utf8,
+    noise(100000),
+    repetitive(1048576)
+  ]
+  for format in formats
+    for level in 0 ..< 10
+      for data in inputs
+        val packed = compress(data, format, level)
+        assert(same(decompress(packed, format).unwrap(), data), s"$format at $level, ${data.length} bytes")
+  // Data that repeats compresses, at every level but 0.
+  assert(gzip(repetitive(1048576), 1).length < 20000)
+  assert(gzip(repetitive(1048576), 0).length > 1048576)
+
+@test("an encoder written in pieces of 1 byte to 64 KiB makes a stream that decompresses whole, in pieces as small")
+encoderInPieces()
+  val data = joined(repetitive(150000), noise(50000))
+  for format in formats
+    for size in [1, 2, 7, 100, 4096, 65536]
+      val packed = encodedInPieces(if size < 64 then data.slice(0, 5000) else data, format, size)
+      val expected = if size < 64 then data.slice(0, 5000) else data
+      assert(same(decompress(packed, format).unwrap(), expected), s"$format written in pieces of $size")
+      assert(
+        same(drain(Decoder(Dribble(packed, size), format), size).unwrap(), expected),
+        s"$format read in pieces of $size"
+      )
+
+@test("a flush hands on everything written so far, which decompresses before the stream ends")
+flushes()
+  for format in formats
+    val sink = ByteSink()
+    val e = Encoder(sink, format)
+    e.write("first part, ".utf8).unwrap()
+    e.flush().unwrap()
+    val afterFirst = sink.held.toArray()
+    e.write("second part".utf8).unwrap()
+    e.flush().unwrap()
+    val afterSecond = sink.held.toArray()
+    e.finish().unwrap()
+    // Each flushed prefix decompresses to everything written before it, then reads as truncated.
+    val d1 = Decoder(Dribble(afterFirst, 1000), format)
+    assertEq(string.fromUtf8Lossy(d1.read(1000).unwrap()), "first part, ")
+    assertEq(d1.read(1000).isErr, true)
+    assertEq(d1.failure, Some(Truncated))
+    val d2 = Decoder(Dribble(afterSecond, 1000), format)
+    assertEq(string.fromUtf8Lossy(drainUntilError(d2)), "first part, second part")
+    assertEq(string.fromUtf8Lossy(decompress(sink.held.toArray(), format).unwrap()), "first part, second part")
+    // writeFlushed hands on the header, the data and the flush in one write, which decompresses alone.
+    val once = ByteSink()
+    val w = Encoder(once, format)
+    w.writeFlushed("one piece".utf8).unwrap()
+    assertEq(once.writes, 1)
+    assertEq(string.fromUtf8Lossy(drainUntilError(Decoder(Dribble(once.held.toArray(), 1000), format))), "one piece")
+    w.writeFlushed("two".utf8).unwrap()
+    assertEq(once.writes, 2)
+    w.writeFlushed(Array.empty[byte]()).unwrap()
+    w.finish().unwrap()
+    assertEq(string.fromUtf8Lossy(decompress(once.held.toArray(), format).unwrap()), "one piecetwo")
+    // A write of more than 64 KiB that does not compress is handed on in pieces of 64 KiB.
+    val large = ByteSink()
+    val l = Encoder(large, format, 0)
+    l.writeFlushed(noise(200000)).unwrap()
+    assert(large.writes >= 3, s"${large.writes} writes")
+    // A flush with nothing new written still ends on a byte boundary, and the stream stays whole.
+    val idle = ByteSink()
+    val quiet = Encoder(idle, format)
+    quiet.flush().unwrap()
+    quiet.flush().unwrap()
+    quiet.finish().unwrap()
+    assertEq(decompress(idle.held.toArray(), format).unwrap().length, 0)
+
+// What `decoder` answers before it fails.
+drainUntilError(decoder: Decoder) -> Array[byte]
+  val out = Buffer[byte]()
+  loop
+    decoder.read(1000) match
+      Ok(got) ->
+        if got.length == 0 then break
+        out.addAll(got)
+      Err(_) -> break
+  out.toArray()
+
+@test("a bomb of zeros stops at the limit: one byte more is TooLarge, exactly the limit is not")
+bombs()
+  val zeros = Array.fill(10485760, byte(0))
+  for format in formats
+    val bomb = compress(zeros, format, 9)
+    assert(bomb.length < 20000)
+    assertEq(decompress(bomb, format, 1048576).map(b -> b.length), Err(TooLarge(1048576)))
+    assertEq(decompress(bomb, format, 10485759).map(b -> b.length), Err(TooLarge(10485759)))
+    assertEq(decompress(bomb, format, 10485760).map(b -> b.length), Ok(10485760))
+    assertEq(decompress(bomb, format, 0).map(b -> b.length), Err(TooLarge(0)))
+    // Streamed, the reads stop at the limit too, never answering a byte past it.
+    val d = Decoder(Dribble(bomb, 100), format, 100000)
+    var got: long = 0
+    loop
+      d.read(65536) match
+        Ok(piece) ->
+          if piece.length == 0 then break
+          got += long(piece.length)
+        Err(_) -> break
+    assert(got <= 100000)
+    assertEq(d.failure, Some(TooLarge(100000)))
+  // An empty stream fits a limit of zero.
+  assertEq(decompress(gzip(Array.empty[byte]()), Gzip, 0).map(b -> b.length), Ok(0))
+  assertEq(gunzip(gzip("x".utf8), 1).map(b -> b.length), Ok(1))
+
+@test("every strict prefix of a stream is Truncated, the empty input among them")
+truncatedStreams()
+  val whole = fixture("text.txt.gz")
+  for n in 0 ..< whole.length
+    assertEq(gunzip(whole.slice(0, n)).map(b -> b.length), Err(Truncated))
+  for format in [Zlib, RawDeflate]
+    val packed = compress(repetitive(3000), format)
+    for n in 0 ..< packed.length
+      assertEq(decompress(packed.slice(0, n), format).map(b -> b.length), Err(Truncated))
+
+@test("corrupt input is Corrupt: a wrong magic number, a flipped byte, a bad CRC or length, a wrong format")
+corrupt()
+  val whole = fixture("text-1.txt.gz")
+  val badMagic = whole.slice(0, whole.length)
+  badMagic(0) = byte(0x1e)
+  assertEq(isCorrupt(gunzip(badMagic)), true)
+  val badCrc = whole.slice(0, whole.length)
+  badCrc(whole.length - 8) = badCrc(whole.length - 8) ^ byte(1)
+  assertEq(isCorrupt(gunzip(badCrc)), true)
+  val badLength = whole.slice(0, whole.length)
+  badLength(whole.length - 1) = badLength(whole.length - 1) ^ byte(1)
+  assertEq(isCorrupt(gunzip(badLength)), true)
+  // A byte flipped anywhere in the stream never decompresses to other data: the decoder or the CRC
+  // refuses it, or the bit was one no decoder reads (padding after the final block, the code length
+  // of a symbol the data never uses) and the data is the same. Most flips are refused.
+  val text = fixture("text.txt")
+  var refused = 0
+  for i in 10 ..< whole.length
+    val flipped = whole.slice(0, whole.length)
+    flipped(i) = flipped(i) ^ byte(0x40)
+    gunzip(flipped) match
+      Ok(back) -> assert(same(back, text), s"a flip at $i decompressed to other data")
+      Err(_) -> refused += 1
+  assert(refused > (whole.length - 10) * 9 / 10, s"only $refused flips refused")
+  val zlibData = compress("hello, hello".utf8, Zlib)
+  val badAdler = zlibData.slice(0, zlibData.length)
+  badAdler(zlibData.length - 1) = badAdler(zlibData.length - 1) ^ byte(1)
+  assertEq(isCorrupt(decompress(badAdler, Zlib)), true)
+  // One format read as another.
+  assertEq(isCorrupt(decompress(gzip("abc".utf8), Zlib)), true)
+  assertEq(isCorrupt(decompress(compress("abc".utf8, Zlib), Gzip)), true)
+  assertEq(isCorrupt(gunzip("plain text, not gzip".utf8)), true)
+  // Corrupt says what zlib found.
+  assertEq(gunzip(badMagic).mapErr(e -> e.message), Err("the compressed data is corrupt: incorrect header check"))
+
+isCorrupt(r: Result[Array[byte], CompressError]) -> bool = r match
+  Err(Corrupt(_)) -> true
+  _ -> false
+
+@test("gzip members decompress joined, an empty one among them; bytes after a stream are Corrupt")
+membersAndTrailing()
+  val a = "first member\n".utf8
+  val b = "second member\n".utf8
+  val two = joined(gzip(a), gzip(b))
+  assertEq(string.fromUtf8Lossy(gunzip(two).unwrap()), "first member\nsecond member\n")
+  val three = joined(joined(gzip(a), fixture("empty.gz")), gzip(b, 1))
+  assertEq(string.fromUtf8Lossy(gunzip(three).unwrap()), "first member\nsecond member\n")
+  for size in [1, 5, 4096]
+    assertEq(string.fromUtf8Lossy(drain(Decoder(Dribble(two, size)), size).unwrap()), "first member\nsecond member\n")
+  // A second member cut short is Truncated.
+  assertEq(gunzip(two.slice(0, two.length - 3)).map(x -> x.length), Err(Truncated))
+  // Junk, or zero padding, after a member is Corrupt.
+  assertEq(isCorrupt(gunzip(joined(gzip(a), "junk".utf8))), true)
+  assertEq(isCorrupt(gunzip(joined(gzip(a), Array.fill(8, byte(0))))), true)
+  // A zlib or raw stream has no members: anything after it is Corrupt.
+  assertEq(
+    decompress(joined(compress(a, Zlib), compress(b, Zlib)), Zlib).mapErr(e -> e.message),
+    Err("the compressed data is corrupt: bytes follow the end of the stream")
+  )
+  assertEq(isCorrupt(decompress(joined(compress(a, RawDeflate), [byte(1)]), RawDeflate)), true)
+
+@test("a decoder's failure is sticky, a failing reader's error is answered as it is, and a decoder ends for good")
+decoderStates()
+  val d = Decoder(Dribble(gzip("abc".utf8).slice(0, 5), 100))
+  assertEq(d.read(10).isErr, true)
+  assertEq(d.failure, Some(Truncated))
+  assertEq(d.read(10).mapErr(e -> e.message), Err("cannot decompress: the compressed data ends before its stream does"))
+  val broken = IoError(Other("the wire broke"), "read", "a socket")
+  val f = Decoder(Dribble(gzip(noise(100000)).slice(0, 2000), 500, Some(broken)))
+  assertEq(drain(f, 65536).map(b -> b.length), Err(broken))
+  assertEq(f.read(10), Err(broken))
+  assertEq(f.failure, None)
+  val e = Decoder(Dribble(gzip("x".utf8), 100))
+  assertEq(string.fromUtf8Lossy(e.read(10).unwrap()), "x")
+  assertEq(e.read(10).unwrap().length, 0)
+  assertEq(e.read(10).unwrap().length, 0)
+  assertEq(e.maxBytes, defaultMaxBytes)
+  assertEq(e.format, Gzip)
+
+@test(
+  "an encoder after its finish refuses writes, finishes again as nothing, and passes on its writer's failure for good"
+)
+encoderStates()
+  val sink = ByteSink()
+  val e = Encoder(sink, Zlib, 9)
+  assertEq(e.level, 9)
+  assertEq(e.format, Zlib)
+  e.write("abc".utf8).unwrap()
+  e.close().unwrap()
+  val written = sink.held.length
+  assertEq(e.finish(), Ok(()))
+  assertEq(sink.held.length, written)
+  assertEq(
+    e.write("more".utf8).mapErr(e -> e.message),
+    Err("cannot write a compressed stream: the compressed stream is finished")
+  )
+  assertEq(e.flush().isErr, true)
+  // An empty write before the stream has ended writes nothing and fails nothing.
+  val quiet = ByteSink()
+  val q = Encoder(quiet)
+  q.write(Array.empty[byte]()).unwrap()
+  assertEq(quiet.writes, 0)
+  // A writer that fails: the encoder answers its error, then the same for every call.
+  val full = ByteSink(Some(0))
+  val f = Encoder(full, Gzip, 0)
+  val first = f.write(noise(100000))
+  assertEq(first.mapErr(e -> e.message), Err("cannot write a sink: the sink is full"))
+  assertEq(f.write("x".utf8), first)
+  assertEq(f.flush(), first)
+  assertEq(f.finish(), first)
+  assertEq(defaultLevel, 6)
+
+@test("CompressError says what went wrong")
+compressErrorMessages()
+  assertEq(Corrupt("x").message, "the compressed data is corrupt: x")
+  assertEq(Truncated.message, "the compressed data ends before its stream does")
+  assertEq(TooLarge(5).message, "the decompressed data is longer than its limit of 5 bytes")

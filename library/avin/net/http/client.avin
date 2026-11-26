@@ -12,6 +12,7 @@ module avin.net.http
 // authorities and those the request's `TlsClient` adds.
 
 import avin.collections.mutable.{Map as MutableMap}
+import avin.compress.{Decoder, Format, Gzip, Zlib, defaultMaxBytes}
 import avin.io
 import avin.io.{IoError, Reader, TimedOut}
 import avin.net.{ByteStream, TcpStream, Url}
@@ -119,6 +120,13 @@ data ClientStats(opened: long, reused: long, idle: int, active: int)
 //
 // A response's status line and headers together may be at most `maxHeaderBytes` long, and the body
 // `send` reads whole at most `maxResponseBytes`; a reply over either fails with `TooLarge`.
+//
+// A request asks for a compressed response, unless its `decoding` is `None` or it sends its own
+// `Accept-Encoding`, and a body that comes as `gzip`, `x-gzip` or `deflate` is read decompressed,
+// within the request's `decoding` limit, by `send` and through `stream`'s body alike, without its
+// `Content-Encoding` and `Content-Length`; `maxResponseBytes` counts the decompressed bytes. A
+// redirect's body is dropped as it came, and a connection is kept only where its compressed body was
+// read to its end.
 // `keepAlive = false` keeps no connection: each request writes `Connection: close` and closes its own.
 // A `maxPerHost` or `maxHeaderBytes` less than one, a negative `maxRedirects` or
 // `maxResponseBytes`, or a negative timeout traps.
@@ -283,8 +291,15 @@ class Client(
     val framing = framingOf(head, request.method) match
       Ok(fr) -> fr
       Err(e) -> return Finished(Err(e))
-    val body = ResponseBodyReader(c, framing, maxHeaderBytes)
-    val answer = f(StreamedResponse(head.status, head.reason, head.headers, body))
+    val wire = BodyWire(c, framing, maxHeaderBytes)
+    val coding = if decodes(request) && !(framing is Sized(0)) then codingOf(head.headers) else None
+    val (headers, body) = coding match
+      Some(format) ->
+        val limit = request.decoding.getOrElse(defaultMaxBytes)
+        val plain = withoutHeader(withoutHeader(head.headers, "Content-Encoding"), "Content-Length")
+        (plain, ResponseBodyReader(wire, Some(Decoder(wire, format, limit))))
+      None -> (head.headers, ResponseBodyReader(wire))
+    val answer = f(StreamedResponse(head.status, head.reason, headers, body))
     keep = keepAlive && body.isComplete && !c.pending && reusable(head, request, framing)
     Finished(Ok(answer))
 
@@ -362,8 +377,46 @@ class StreamedResponse(
 // The body of a response as it arrives, a `Reader`: each `read` answers what has come of it, up to
 // what is asked for, and an empty array once it has ended, its end found by its `Content-Length`,
 // its last chunk, or the connection's close. A body that breaks off, or whose chunks are not
-// HTTP's, answers an `Err`, and so does every read after it.
-class ResponseBodyReader(private val conn: Conn, private val framing: Framing, private val headLimit: int): Reader
+// HTTP's, answers an `Err`, and so does every read after it. A body the client asked to have
+// compressed and the server sent as `gzip`, `x-gzip` or `deflate` is read decompressed, within the
+// request's `decoding` limit; one that is corrupt, ends early or passes the limit answers an `Err`,
+// `Decoding` from `readAll`.
+class ResponseBodyReader(private val wire: BodyWire, private val decoder: Option[Decoder] = None): Reader
+  // Whether the body has been read to its end, without an error.
+  isComplete -> bool = wire.isComplete && decoder.forall(d -> d.failure.isEmpty)
+
+  // Up to `max` bytes of the body, `max` being at least one, waiting for at least one where the body
+  // is still coming; an empty array once it has ended.
+  override read(max: int) -> Result[Array[byte], IoError] = decoder match
+    Some(d) -> d.read(max)
+    None -> wire.read(max)
+
+  // The rest of the body.
+  readAll() -> Result[Array[byte], IoError] = readAll(long.MaxValue).mapErr(e -> ioErrorOf(e))
+
+  // The rest of the body, `TooLarge` where it is longer than `limit` bytes, which is found before
+  // anything is read where its `Content-Length` says so and the body is not decompressed.
+  readAll(limit: long) -> Result[Array[byte], HttpError]
+    val d = decoder match
+      Some(d) -> d
+      None -> return wire.readAll(limit)
+    val out = Buffer[byte]()
+    while true
+      val part = d.read(65536) match
+        Ok(p) -> p
+        Err(e) -> return Err(d.failure.map(f -> Decoding(f)).orElse(wire.lastError).getOrElse(Io(e)))
+      if part.length == 0 then return Ok(out.toArray())
+      if long(out.length) + long(part.length) > limit then return Err(TooLarge(s"a body over $limit bytes"))
+      out.addAll(part)
+    Ok(out.toArray())
+
+  // Reads the rest of the body as it came, without decompressing it, and drops it, stopping once more
+  // than `limit` bytes have gone, and answers whether its end was reached; a body left unread keeps
+  // its connection from being used again.
+  discard(limit: long) -> bool = wire.discard(limit)
+
+// A response's body on its connection, as the server framed it.
+private class BodyWire(private val conn: Conn, private val framing: Framing, private val headLimit: int): Reader
   // What is left of the body, or of the chunk being read.
   private var left: long = framing match
     Sized(n) -> n
@@ -373,6 +426,9 @@ class ResponseBodyReader(private val conn: Conn, private val framing: Framing, p
 
   // Whether the body has been read to its end, without an error.
   isComplete -> bool = done && failure.isEmpty
+
+  // Why a read failed, where one did.
+  lastError -> Option[HttpError] = failure
 
   // Up to `max` bytes of the body, `max` being at least one, waiting for at least one where the body
   // is still coming; an empty array once it has ended.
@@ -472,6 +528,19 @@ class ResponseBodyReader(private val conn: Conn, private val framing: Framing, p
     if part.length == 0 then done = true
     Ok(part)
 
+// Whether the client asks for a compressed response to `request` and decompresses it: its `decoding`
+// is given and it sends no `Accept-Encoding` of its own.
+private decodes(request: Request) -> bool = request.decoding.isDefined && request.header("Accept-Encoding").isEmpty
+
+// The format a response's `Content-Encoding` says its body is in, where the client decompresses it:
+// `gzip` or `x-gzip`, and `deflate`, the zlib format.
+private codingOf(headers: Vector[(string, string)]) -> Option[Format] =
+  headerIn(headers, "Content-Encoding").map(c -> c.trim.toLower) match
+    Some("gzip") -> Some(Gzip)
+    Some("x-gzip") -> Some(Gzip)
+    Some("deflate") -> Some(Zlib)
+    _ -> None
+
 // The response `r` with its body read whole, at most `limit` bytes of it.
 private wholeOf(r: StreamedResponse, limit: long) -> Result[Response, HttpError]
   val body = r.body.readAll(limit)?
@@ -553,7 +622,8 @@ private redirectOf(request: Request, status: int, from: Url, to: Url) -> Request
     request.timeout,
     request.tls,
     request.connectTimeout,
-    request.totalTimeout
+    request.totalTimeout,
+    request.decoding
   )
 
 // `request` to `url` with the cookies `jar` holds for `url` in its `Cookie` header, after the cookies
@@ -574,7 +644,8 @@ private withCookies(request: Request, url: Url, jar: CookieJar) -> Request
     request.timeout,
     request.tls,
     request.connectTimeout,
-    request.totalTimeout
+    request.totalTimeout,
+    request.decoding
   )
 
 // Whether `a` and `b` have one origin: their scheme, host and port.
@@ -775,6 +846,7 @@ private requestHead(request: Request, url: Url, host: string, closing: bool, toP
   if sendsLength && headerIn(request.headers, "Content-Length").isEmpty
     out.write(s"Content-Length: ${request.body.length}\r\n")
   if closing && headerIn(request.headers, "Connection").isEmpty then out.write("Connection: close\r\n")
+  if decodes(request) then out.write("Accept-Encoding: gzip\r\n")
   for (name, value) in request.headers
     out.write(s"$name: $value\r\n")
   out.write("\r\n")

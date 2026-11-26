@@ -12132,6 +12132,87 @@ Settled on the user's delegation 2026-11-11 (built on branch `json-derive`): **J
   - **`unicodeHost` and `unicodeText` for display**, decoding each `xn--` label with
     `idna.toUnicode`; a name that does not decode to a valid one is shown in ASCII, so a person is
     never shown a name the URL does not reach. `display` stays ASCII, the form that round-trips.
+- Settled on the user's delegation 2026-11-24 (branch `compression`): **compression, and HTTP's
+  content codings** ([system library](/spec/system-library/#avincompress), and *Compression* under
+  [HTTP server](/spec/system-library/#http-server)).
+  - **The codec is the system's zlib, reached through a Sysl package the library carries**,
+    `library/sysl/zcodec` (module `avin.zcodec`), named in `library/library.hocon` by its path, so
+    only a program whose bindings reach it builds it and links `-lz`. Its C shim allocates the
+    `z_stream` and makes `deflateInit2`/`inflateInit2` (macros) callable; each step hands zlib two
+    slices and reports what it took and wrote. *Why*: zlib is on every machine Avin runs on (macOS
+    carries it; Debian's `zlib1g-dev`), has the streaming API this needs whole: a bounded output
+    per step, which is what makes the decompression limit exact; a sync flush, which a streamed
+    response needs to send each write at once; gzip, zlib and raw framings and multi-member reset.
+    *Alternatives*: `sysl:miniz` (vendored, nothing to install), which its `Decoder` appends a
+    chunk's whole output into a `Buf` (a few hundred bytes can stand for megabytes before the limit
+    is seen), its `Deflater` writes into one fixed slice and offers no sync flush, and it has no gzip
+    encoder: closing those would be changes to that package first; `@c` bindings to zlib from
+    `avin.compress` itself (the library has no `c-libraries`, and adding them to `library.hocon`
+    is a compiler change for one module). Review with the user: a Linux machine building a program
+    that uses `avin.net.http` now needs zlib's headers, beside OpenSSL's.
+  - **`avin.compress`'s surface**: `Format` (`Gzip`, `Zlib`, `RawDeflate`), `compress`/`decompress`
+    and `gzip`/`gunzip` on whole arrays, `Encoder` (a `ByteWriter` and `Close`, with `flush`,
+    `writeFlushed` and `finish`) and `Decoder` (a `Reader`), levels 0 to 9 with zlib's default 6,
+    `CompressError` (`Corrupt(text)`, `Truncated`, `TooLarge(limit)`). *Alternatives*: an
+    auto-detecting format for decoding (zlib can; left out, since every caller here knows its
+    format); levels as an enum (the numbers are what every tool and reader of zlib knows).
+  - **Every decompression has a limit, 100 MiB unless given** (`defaultMaxBytes`), and `TooLarge`
+    is answered before any byte past it: the codec is never given more room than the limit leaves
+    plus one byte. *Alternatives*: no default limit (unbounded by default, the decompression-bomb
+    hole); a ratio limit (a legitimate highly compressible body fails it, a bomb under it still
+    costs the ratio times its size). Review with the user: the 100 MiB default, shared with the
+    streamed request body's.
+  - **Members and trailing bytes**: a gzip stream of several members decompresses joined, as the
+    `gzip` tool and RFC 1952 read it; anything else after a stream's end (junk, zero padding, a
+    second zlib stream) is `Corrupt`. *Alternatives*: ignoring trailing bytes (hides a truncated or
+    spliced body).
+  - **`BodyWriter.through(writer)` is how a middleware wraps a streamed body**: a writer of the same
+    body, keeping its server's stopping, whose writes go to `writer`. *Why*: `StreamedBody.write`
+    takes a `BodyWriter`, a final class, so a transform needs a `BodyWriter` that does not write to
+    the connection; one method gives every middleware that, with no new type and no change to
+    `StreamedBody`. *Alternatives*: a `BodyWriter` trait (every stream's writer type changes, for one
+    use); a transform hook on `StreamedBody` (a second way to say the same thing).
+  - **A compressed stream sends each write at once**, by a zlib sync flush after it, as an
+    uncompressed stream does. *Why*: server-sent events and progress streams must arrive as they are
+    written. The cost is a few bytes per write and a little ratio. *Alternatives*: compressing with
+    no flush until the end (events held back); a flush every N bytes (latency a handler cannot see).
+  - **Negotiation**: q-values to the RFC 9110 grammar (malformed entries dropped), `*` for any coding
+    not named and for identity unless named, a coding used where its q-value is above zero and no
+    lower than identity's, gzip winning a tie; no `Accept-Encoding` means the response as it is.
+    *Alternatives*: compressing for a request with no header (RFC 9110 allows any coding then;
+    clients that send none rarely decode).
+  - **A request refusing identity and accepting neither coding is answered `406`, before the
+    handler**. *Why*: it is all that honours the header, and deciding before the handler wastes no
+    work. *Alternatives*: ignoring the refusal (RFC 9110 allows it; the header would then mean
+    nothing). Review with the user: some servers ignore it.
+  - **What is left alone**: `HEAD`, `101`, `204`, `206`, `304`, a `Content-Range`, a
+    `Content-Encoding` already set, `Cache-Control: no-transform`, already-compressed types (a
+    `compressible` predicate, default `compressibleType`), and bodies under `minBytes` (1024); a
+    request refusing identity overrides the last two. `Vary: Accept-Encoding` goes on exactly the
+    responses whose form depends on the header. A buffered body compressing larger is sent as it
+    was. A strong `ETag` is made weak, as the common servers do. *Alternatives*: an allow-list of
+    compressible types (misses every type a program invents); `HEAD` compressed like `GET` (the
+    server would have to compress a body it never sends, to report its length).
+  - **Request bodies are decompressed by the same middleware** (`decodesRequests = true`), a
+    buffered body whole within `maxDecodedBytes` (1 MiB, `serve`'s own `maxBodyBytes` default: the
+    middleware cannot see the server's), answering `400` or `413` itself; a streamed one through
+    `ServerRequest.withBodyDecoded(format)`, its reader's limit counting decompressed bytes and the
+    compressed bytes bounded by the limit plus a sixty-fourth and 64 KiB, a failure answered by the
+    server as an unreadable body is; any other coding `415` with `Accept-Encoding`. *Alternatives*:
+    a separate request middleware (one more thing to compose for the common case); decoding in
+    `serve` (the server would choose codings for every program).
+  - **The client asks for gzip and decompresses by default**, within `Request.decoding` (100 MiB),
+    stripping `Content-Encoding` and `Content-Length`; `withoutDecoding()` opts out, and a request
+    sending its own `Accept-Encoding` gets the body raw. A decompression failure is the new
+    `HttpError.Decoding`. In the pooled `Client` the decompression wraps the response's body reader,
+    so `stream` reads decompressed bytes as they arrive; `maxResponseBytes` counts decompressed bytes;
+    a redirect's body is drained as it came, never decompressed; a connection is kept only where the
+    compressed body was read to its end; and an empty body (`HEAD`, `204`, `304`, a length of zero)
+    is left with its headers. *Alternatives*: off by default (most callers want the bytes, and a
+    server that compresses unasked still works either way); `Malformed` for a failure (a body past a
+    limit is not malformed). Review with the user: `HttpError` gained a case.
+  - **brotli and zstd are follow-ups** (`sysl:brotli`, `sysl:zstd` exist), as further `Format`s and
+    codings in the same negotiation.
 
 - Settled on the user's delegation 2026-11-24 (branch `fs-content-type`): **`avin.fs` has
   `probeContentType(file) -> Result[Option[string], IoError]`, `contentTypeOfName(name) -> Option[string]`,

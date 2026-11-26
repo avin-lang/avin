@@ -5,6 +5,7 @@ module avin.net.http
 // beside this file, and the server, `serve`, in `server.avin`; a `Response` is what its handlers
 // answer.
 
+import avin.compress.{CompressError, defaultMaxBytes}
 import avin.encoding.toBase64
 import avin.html.Html
 import avin.io.IoError
@@ -33,6 +34,9 @@ data HttpError
   // The proxy an `https` URL goes by answered its `CONNECT` with `status`, not a `2xx`, opening no
   // tunnel: a `407` where it wants credentials it was not given or refuses those it was.
   ProxyRefused(status: int, reason: string)
+  // The response's body, compressed by the server, could not be decompressed: it is corrupt, ends
+  // early, or decompresses past the request's limit.
+  Decoding(error: CompressError)
 
 impl Error for HttpError
   // A sentence saying what went wrong, for a message to a person.
@@ -44,6 +48,7 @@ impl Error for HttpError
     Tls(e) -> e.message
     TooLarge(t) -> s"reply too large: $t"
     ProxyRefused(status, reason) -> s"the proxy refused the tunnel: $status $reason"
+    Decoding(e) -> s"the response body: ${e.message}"
 
 // A request: its method, its URL as text, the headers sent besides the ones the client writes, its
 // body, how long a read or write on its connection may wait, the TLS settings an `https` URL is
@@ -53,6 +58,14 @@ impl Error for HttpError
 // as `GET`, a header's name is a token and its value holds no line break; a request where one does
 // not hold, or whose `connectTimeout` or `totalTimeout` is negative, traps as it is made, its
 // headers given to the constructor as much as those added by `withHeader`.
+//
+// Unless `decoding` is `None`, the client asks for a compressed response, sending `Accept-Encoding:
+// gzip`, and decompresses a body the server sent as `gzip`, `x-gzip` or `deflate`, within `decoding`
+// bytes (100 MiB unless given), so the response's `body`, or the reader `Client.stream` hands over,
+// is the decompressed bytes and its headers carry no `Content-Encoding` or `Content-Length`; a body
+// that is corrupt, ends early or passes the limit fails the request with `Decoding`. A request that
+// sends its own `Accept-Encoding` gets the body as the server sent it, as one with `decoding` of
+// `None` does. A body of another coding is left as it came.
 class Request(
     val method: string,
     val url: string,
@@ -61,11 +74,13 @@ class Request(
     val timeout: Option[Duration] = None,
     val tls: TlsClient = TlsClient(),
     val connectTimeout: Duration = seconds(30),
-    val totalTimeout: Duration = Duration.Zero
+    val totalTimeout: Duration = Duration.Zero,
+    val decoding: Option[long] = Some(defaultMaxBytes)
 )
   if method.isEmpty || method.indexWhere(c -> !isTokenChar(c)) >= 0 then fail(s"`$method` is not an HTTP method")
   if connectTimeout.isNegative then fail(s"a connect timeout of $connectTimeout: it is at least zero")
   if totalTimeout.isNegative then fail(s"a total timeout of $totalTimeout: it is at least zero")
+  if decoding is Some(n) && n < 0 then fail(s"a decompression limit of $n bytes: it is at least zero")
   for (name, value) in headers
     checkHeader(name, value)
 
@@ -79,7 +94,8 @@ class Request(
     timeout,
     tls,
     connectTimeout,
-    totalTimeout
+    totalTimeout,
+    decoding
   )
 
   // The value of the first header of `name`, compared without regard to case.
@@ -109,24 +125,25 @@ class Request(
     timeout,
     tls,
     connectTimeout,
-    totalTimeout
+    totalTimeout,
+    decoding
   )
 
   // The request with the headers of `more` added after the ones it has, in order.
   withHeaders(more: Vector[(string, string)]) -> Request =
-    Request(method, url, headers ++ more, body, timeout, tls, connectTimeout, totalTimeout)
+    Request(method, url, headers ++ more, body, timeout, tls, connectTimeout, totalTimeout, decoding)
 
   // The request with the query parameter `name=value` added after any its URL has, each encoded by
   // `Url.encode`, and before the URL's fragment.
   withQueryParam(name: string, value: string) -> Request =
-    Request(method, withParam(url, name, value), headers, body, timeout, tls, connectTimeout, totalTimeout)
+    Request(method, withParam(url, name, value), headers, body, timeout, tls, connectTimeout, totalTimeout, decoding)
 
   // The request with `text`, as UTF-8, for its body.
   withBody(text: string) -> Request = withBody(utf8(text))
 
   // The request with `bytes` for its body.
   withBody(bytes: Array[byte]) -> Request =
-    Request(method, url, headers, bytes, timeout, tls, connectTimeout, totalTimeout)
+    Request(method, url, headers, bytes, timeout, tls, connectTimeout, totalTimeout, decoding)
 
   // The request with `pairs` for its body, written as `application/x-www-form-urlencoded` by
   // `Url.formEncode`, and that for its `Content-Type`, replacing any it has.
@@ -154,32 +171,41 @@ class Request(
     timeout,
     tls,
     connectTimeout,
-    totalTimeout
+    totalTimeout,
+    decoding
   )
 
   // The request with a read or write on its connection, the TLS handshake's included, failing with
   // `TimedOut` after waiting `d`.
   withTimeout(d: Duration) -> Request =
-    Request(method, url, headers, body, Some(d), tls, connectTimeout, totalTimeout)
+    Request(method, url, headers, body, Some(d), tls, connectTimeout, totalTimeout, decoding)
 
   // The request fetching an `https` URL with `client`'s settings: the machine's trusted
   // authorities and those `client` adds.
   withTls(client: TlsClient) -> Request =
-    Request(method, url, headers, body, timeout, client, connectTimeout, totalTimeout)
+    Request(method, url, headers, body, timeout, client, connectTimeout, totalTimeout, decoding)
 
   // The request with looking the host up, connecting and an `https` URL's TLS handshake together
   // failing with `TimedOut` once they have taken `d`, on each connection it makes; zero takes the
   // limit away, and a negative `d` traps. A `Client` waiting for a place among its connections to
   // the host waits within the same limit.
   withConnectTimeout(d: Duration) -> Request =
-    Request(method, url, headers, body, timeout, tls, d, totalTimeout)
+    Request(method, url, headers, body, timeout, tls, d, totalTimeout, decoding)
 
   // The request with the whole of it, from the call that sends it until its response is answered,
   // failing with `TimedOut` once it has taken `d`: getting a connection, writing the request, every
   // redirect followed, and reading the response, its body included, or, for `Client.stream`, the
   // function given the response. Zero, the default, takes the limit away; a negative `d` traps.
   withTotalTimeout(d: Duration) -> Request =
-    Request(method, url, headers, body, timeout, tls, connectTimeout, d)
+    Request(method, url, headers, body, timeout, tls, connectTimeout, d, decoding)
+
+  // The request asking for a compressed response and decompressing it within `maxBytes`; a limit
+  // below zero traps.
+  withDecoding(maxBytes: long) -> Request =
+    Request(method, url, headers, body, timeout, tls, connectTimeout, totalTimeout, Some(maxBytes))
+
+  // The request asking for no compressed response, and taking any body as the server sent it.
+  withoutDecoding() -> Request = Request(method, url, headers, body, timeout, tls, connectTimeout, totalTimeout, None)
 
 // A response: its status and reason, its headers as they came, name and value, and its body. A
 // response a server writes may instead be `streamed`, its body written as the handler makes it,

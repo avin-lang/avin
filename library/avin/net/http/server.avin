@@ -9,6 +9,7 @@ module avin.net.http
 // arrives once the server is stopping `503`. A handler that traps fails its connection alone, which
 // is answered `500` and closed.
 
+import avin.compress.Format
 import avin.io.{IoError, TimedOut}
 import avin.net.{ByteStream, KeepAlive, ListenOptions, TcpOptions, TcpServer, TcpStream, Url}
 import avin.net.tls.{TlsServer, TlsSource, TlsStream}
@@ -35,7 +36,8 @@ class ServerRequest(
     val route: Option[string] = None,
     private val server: Option[TcpServer] = None,
     private val values: Vector[Any] = Vector.empty[Any](),
-    private val source: Option[BodySource] = None
+    private val source: Option[BodySource] = None,
+    private val decoding: Option[BodyDecoding] = None
 )
   private val parts: Target = targetOf(target) match
     Some(t) -> t
@@ -74,9 +76,10 @@ class ServerRequest(
   bodyStreamed -> bool = source.isDefined
 
   // A reader of the body within `maxBytes` (100 MiB unless given), counted over the whole of it: of
-  // a streamed request, the body read as it arrives; of a buffered one, the body held. A limit less
+  // a streamed request, the body read as it arrives; of a buffered one, the body held. Of a request
+  // whose body is decoded (`withBodyDecoded`), the limit counts the decompressed bytes. A limit less
   // than zero traps.
-  bodyReader(maxBytes: long = streamedBodyLimit) -> BodyReader = BodyReader(source, body, maxBytes)
+  bodyReader(maxBytes: long = streamedBodyLimit) -> BodyReader = BodyReader(source, body, maxBytes, decoding)
 
   // The body read as `multipart/form-data` within `limits` a part at a time, as
   // `MultipartReader.over` reads it, through `bodyReader(limits.maxBytes)`. A `Content-Type` that is
@@ -134,7 +137,8 @@ class ServerRequest(
     route,
     server,
     values,
-    source
+    source,
+    decoding
   )
 
   // The request as the route of `pattern` takes it, binding `bound`.
@@ -149,7 +153,8 @@ class ServerRequest(
     Some(pattern),
     server,
     values,
-    source
+    source,
+    decoding
   )
 
   // The request with every header of `name`, compared without regard to case, replaced by one of
@@ -158,7 +163,76 @@ class ServerRequest(
   withHeaderReplaced(name: string, value: string) -> ServerRequest
     checkHeader(name, value)
     val kept = headers.filter(h -> !h.0.equalsIgnoreCase(name))
-    ServerRequest(method, target, kept :+ (name, value), body, version, params, remote, route, server, values, source)
+    ServerRequest(
+      method,
+      target,
+      kept :+ (name, value),
+      body,
+      version,
+      params,
+      remote,
+      route,
+      server,
+      values,
+      source,
+      decoding
+    )
+
+  // The request without its headers of `name`, compared without regard to case.
+  withoutHeader(name: string) -> ServerRequest = ServerRequest(
+    method,
+    target,
+    headers.filter(h -> !h.0.equalsIgnoreCase(name)),
+    body,
+    version,
+    params,
+    remote,
+    route,
+    server,
+    values,
+    source,
+    decoding
+  )
+
+  // The request with `bytes` for its body, held: what a middleware that rewrites the body hands
+  // on. A streamed request becomes a buffered one, its body no longer read from the connection, and
+  // a decoding `withBodyDecoded` asked for is dropped. The headers are as they were.
+  withBody(bytes: Array[byte]) -> ServerRequest = ServerRequest(
+    method,
+    target,
+    headers,
+    bytes,
+    version,
+    params,
+    remote,
+    route,
+    server,
+    values,
+    None,
+    None
+  )
+
+  // The request whose body `bodyReader` decompresses from `format` as it reads it, the reader's
+  // limit counting the decompressed bytes. The compressed bytes are read within that limit, a
+  // sixty-fourth of it and 64 KiB more, more than any compressor makes of data within the limit. A
+  // body that is corrupt, ends early or decompresses past the limit fails the read; of a streamed
+  // request, the server answers it `400`, `400` and `413`, as it answers a body it could not read.
+  // The readers `bodyReader` answers share one decompression, the first read's limit applying to it.
+  // `body`, of a buffered request, is left as it was; `Compression` decodes it whole instead.
+  withBodyDecoded(format: Format) -> ServerRequest = ServerRequest(
+    method,
+    target,
+    headers,
+    body,
+    version,
+    params,
+    remote,
+    route,
+    server,
+    values,
+    source,
+    Some(BodyDecoding(format))
+  )
 
   // The request with `address` as its client's address, `remote`.
   withRemote(address: Option[string]) -> ServerRequest =
@@ -207,7 +281,8 @@ class ServerRequest(
     route,
     server,
     values.filter(v -> v is not _: Carried[T]) :+ Carried(value),
-    source
+    source,
+    decoding
   )
 
   // The value the request carries as its `T`, handed on by `withValue`; `None` where it carries none.
@@ -948,7 +1023,7 @@ private streamedOut(
     stream.setTimeout(limit).isOk && stream.write(utf8(headOf(response, line, going, version, date))).isOk
   ) then return false
   if headOnly || bodiless then return going
-  val writer = BodyWriter(stream, Some(server), framing, limit)
+  val writer = BodyWriter(Wire(stream), Some(server), framing, limit)
   body.write(writer)
   writer.finish() && going
 

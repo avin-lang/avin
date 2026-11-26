@@ -21,10 +21,17 @@ private data Framing
   // The bytes as they are, the body ended by closing the connection.
   Closing
 
+// Where a body writer's framed bytes go.
+private data BodyOut
+  // The connection, each write waiting at most the writer's limit.
+  Wire(stream: ByteStream)
+  // Another writer, which frames and sends what it is given.
+  Into(writer: ByteWriter)
+
 // The writer of one streamed response's body, onto its connection, and a `ByteWriter` by its
 // `write(bytes)`. Its server, where it has one, says when it is stopping.
 class BodyWriter(
-    private val stream: ByteStream,
+    private val out: BodyOut,
     private val server: Option[TcpServer],
     private val framing: Framing,
     private val limit: Duration
@@ -45,7 +52,7 @@ class BodyWriter(
       stopped = true
       return Err(IoError(Other("the server is stopping"), "write to", "a client"))
     if bytes.length == 0 then return Ok(())
-    val out = framing match
+    val framed = framing match
       Chunked ->
         val all = Buffer[byte]()
         all.addAll(utf8(s"${hexOf(long(bytes.length))}\r\n"))
@@ -59,12 +66,28 @@ class BodyWriter(
         bytes
       Closing -> bytes
     sent += long(bytes.length)
-    val done = stream.setTimeout(limit).flatMap(_ -> stream.write(out))
+    val done = send(framed)
     if done.isErr then broken = true
     done
 
   // Sends `text` as UTF-8, as `write(bytes)` does.
   write(text: string) -> Result[unit, IoError] = write(utf8(text))
+
+  // A writer of the same body whose writes go to `writer`, as they are, rather than to the
+  // connection, and which says the server is stopping as this one does: what a middleware that
+  // transforms a streamed body hands the body's own `write`, `writer` transforming each write and
+  // writing the result to this writer. Once the body's `write` has returned, the middleware writes
+  // what its transform still holds to this writer.
+  //
+  //     StreamedBody(None, out ->
+  //       val upper = UpperCase(out)
+  //       body.write(out.through(upper)))
+  through(writer: ByteWriter) -> BodyWriter = BodyWriter(Into(writer), server, Closing, limit)
+
+  // Sends bytes already framed, nothing for none.
+  private send(framed: Array[byte]) -> Result[unit, IoError] = out match
+    Wire(stream) -> stream.setTimeout(limit).flatMap(_ -> stream.write(framed))
+    Into(writer) -> writer.write(framed)
 
   // Whether the server is stopping, so the code writing the stream should end it.
   isStopping() -> bool = stopped || server.exists(s -> s.isStopping())
@@ -84,7 +107,7 @@ class BodyWriter(
     if broken then return false
     framing match
       Chunked ->
-        if stream.setTimeout(limit).flatMap(_ -> stream.write(utf8("0\r\n\r\n"))).isErr then return false
+        if send(utf8("0\r\n\r\n")).isErr then return false
         !isStopping()
       Sized(length) -> sent == length && !isStopping()
       Closing -> false
