@@ -1,0 +1,527 @@
+// `avin.reactive`: atoms, derived values and effects; a diamond, a deep chain and dependencies that
+// switch, each derived value computed once per change and each effect run once per batch; batches,
+// nested; writes from inside an effect, queued; equality stopping a change; untracked reads; scopes,
+// cleanups, effects made by a run, and disposal while effects run; ports applied in one batch; a
+// state machine driven through the graph; and a randomized graph whose every observation is checked
+// against a computation from scratch.
+import avin.random.Random
+import avin.reactive.{Atom, Derived, Effect, Get, Graph, Readable, Step}
+
+@test("an effect runs when made and again only when what it read changes")
+rxEffectRuns()
+  val g = Graph()
+  val a = g.atom(1)
+  val seen = Buffer[int]()
+  val e = g.effect(get -> seen.append(get(a)))
+  assertEq(seen.toVector, [1])
+  a.set(2)
+  a.set(2)
+  a.update(x -> x + 3)
+  assertEq(seen.toVector, [1, 2, 5])
+  assertEq(e.runs(), 3)
+  assertEq(a.get(), 5)
+
+@test("a diamond is computed once per change and its effect never sees a mix of old and new")
+rxDiamond()
+  val g = Graph()
+  val a = g.atom(1)
+  val b = g.derived(get -> get(a) + 1)
+  val c = g.derived(get -> get(a) * 10)
+  val d = g.derived(get -> (get(b), get(c)))
+  val seen = Buffer[(int, int)]()
+  _ = g.effect(get -> seen.append(get(d)))
+  for n in 2 .. 6 do a.set(n)
+  assertEq(seen.toVector, [(2, 10), (3, 20), (4, 30), (5, 40), (6, 50), (7, 60)])
+  for p in seen do assertEq(p.1, (p.0 - 1) * 10)
+  assertEq(d.computed(), 6)
+  assertEq(b.computed(), 6)
+  assertEq(c.computed(), 6)
+
+@test("a chain a thousand deep is brought up to date by one write, each link once")
+rxDeepChain()
+  val g = Graph()
+  val a = g.atom(0)
+  val links = Buffer[Derived[int]]()
+  var last: Readable[int] = a
+  for i in 0 ..< 1000
+    val prev = last
+    val next = g.derived(get -> get(prev) + 1)
+    links.append(next)
+    last = next
+  val end = last
+  val seen = Buffer[int]()
+  _ = g.effect(get -> seen.append(get(end)))
+  a.set(5)
+  assertEq(seen.toVector, [1000, 1005])
+  for l in links do assertEq(l.computed(), 2)
+
+@test("a derived value that switches what it reads depends on exactly what it read last")
+rxDynamic()
+  val g = Graph()
+  val useX = g.atom(true)
+  val x = g.atom(1)
+  val y = g.atom(100)
+  val d = g.derived(get -> if get(useX) then get(x) else get(y))
+  val seen = Buffer[int]()
+  _ = g.effect(get -> seen.append(get(d)))
+  assertEq(x.observers(), 1)
+  assertEq(y.observers(), 0)
+  y.set(200)
+  assertEq(seen.toVector, [1])
+  useX.set(false)
+  assertEq(seen.toVector, [1, 200])
+  assertEq(x.observers(), 0)
+  assertEq(y.observers(), 1)
+  x.set(2)
+  assertEq(seen.toVector, [1, 200])
+  y.set(300)
+  assertEq(seen.toVector, [1, 200, 300])
+  assertEq(d.computed(), 3)
+
+@test("a switch that would read a broken branch never computes it")
+rxDynamicGuard()
+  val g = Graph()
+  val divisor = g.atom(2)
+  val safe = g.derived(get -> get(divisor) != 0)
+  val quotient = g.derived(get -> 100 / get(divisor))
+  val shown = g.derived(get -> if get(safe) then get(quotient) else -1)
+  val seen = Buffer[int]()
+  _ = g.effect(get -> seen.append(get(shown)))
+  divisor.set(0)
+  divisor.set(4)
+  assertEq(seen.toVector, [50, -1, 25])
+
+@test("a batch holds its effects back until it ends, and runs each once; batches nest")
+rxBatch()
+  val g = Graph()
+  val a = g.atom(1)
+  val b = g.atom(2)
+  val sum = g.derived(get -> get(a) + get(b))
+  val seen = Buffer[int]()
+  _ = g.effect(get -> seen.append(get(sum)))
+  val r = g.batch(() ->
+    a.set(10)
+    assertEq(seen.toVector, [3])
+    assertEq(sum.get(), 12)
+    g.batch(() -> b.set(20))
+    assertEq(seen.toVector, [3])
+    "done")
+  assertEq(r, "done")
+  assertEq(seen.toVector, [3, 30])
+  g.batch(() ->
+    a.set(11)
+    a.set(10))
+  assertEq(seen.toVector, [3, 30])
+
+@test("a write from an effect is queued: the effects it reaches run after the writer returns")
+rxWriteInEffect()
+  val g = Graph()
+  val a = g.atom(1)
+  val b = g.atom(0)
+  val order = Buffer[string]()
+  _ = g.effect(get ->
+    val v = get(a)
+    order.append(s"copy $v")
+    b.set(v * 2)
+    order.append(s"copied $v"))
+  _ = g.effect(get -> order.append(s"b ${get(b)}"))
+  a.set(5)
+  assertEq(order.toVector, ["copy 1", "copied 1", "b 2", "copy 5", "copied 5", "b 10"])
+  assertEq(g.isFlushing(), false)
+
+@test("an effect that writes and then reads sees its own write and is checked again after")
+rxReadOwnWrite()
+  val g = Graph()
+  val a = g.atom(1)
+  val b = g.atom(0)
+  val twice = g.derived(get -> get(b) * 2)
+  val seen = Buffer[(int, int)]()
+  val e = g.effect(get ->
+    val v = get(a)
+    b.set(v)
+    seen.append((v, get(twice))))
+  a.set(4)
+  assertEq(seen.toVector, [(1, 2), (4, 8)])
+  assertEq(e.runs(), 2)
+
+@test("an equal value stops a change: readers of a derived value that comes out the same are left alone")
+rxEqualStops()
+  val g = Graph()
+  val n = g.atom(2)
+  val parity = g.derived(get -> get(n) % 2)
+  val seen = Buffer[int]()
+  _ = g.effect(get -> seen.append(get(parity)))
+  n.set(4)
+  n.set(6)
+  n.set(7)
+  assertEq(seen.toVector, [0, 1])
+  assertEq(parity.computed(), 4)
+  val label = parity.map(p -> if p == 0 then "even" else "odd")
+  assertEq(label.get(), "odd")
+
+@test("a read with get() outside a Get is not tracked")
+rxUntracked()
+  val g = Graph()
+  val a = g.atom(1)
+  val b = g.atom(10)
+  val seen = Buffer[int]()
+  _ = g.effect(get -> seen.append(get(a) + b.get()))
+  b.set(20)
+  assertEq(seen.toVector, [11])
+  a.set(2)
+  assertEq(seen.toVector, [11, 22])
+  assertEq(b.observers(), 0)
+
+@test("a derived value nobody observes is computed on read and is observed by nothing")
+rxUnobserved()
+  val g = Graph()
+  val a = g.atom(3)
+  val sq = g.derived(get -> get(a) * get(a))
+  assertEq(sq.get(), 9)
+  assertEq(sq.get(), 9)
+  assertEq(sq.computed(), 1)
+  a.set(4)
+  assertEq(sq.computed(), 1)
+  assertEq(sq.get(), 16)
+  assertEq(a.observers(), 0)
+  val read = Buffer[int]()
+  val e = g.effect(get -> read.append(get(sq)))
+  assertEq(a.observers(), 1)
+  assertEq(sq.observers(), 1)
+  e.dispose()
+  assertEq(a.observers(), 0)
+  assertEq(sq.observers(), 0)
+
+@test("disposing a scope disposes what it made newest first, then runs its own cleanups; again does nothing")
+rxScopes()
+  val g = Graph()
+  val a = g.atom(0)
+  val log = Buffer[string]()
+  val s = g.scope()
+  val inner = s.scope()
+  _ = s.effect(get ->
+    val v = get(a)
+    log.append(s"outer $v")
+    get.onCleanup(() -> log.append(s"outer cleanup $v")))
+  _ = inner.effect(get ->
+    val v = get(a)
+    get.onCleanup(() -> log.append(s"inner cleanup $v")))
+  s.onDispose(() -> log.append("scope gone"))
+  a.set(1)
+  assertEq(log.toVector, ["outer 0", "outer cleanup 0", "outer 1", "inner cleanup 0"])
+  log.clear()
+  s.dispose()
+  assertEq(log.toVector, ["outer cleanup 1", "inner cleanup 1", "scope gone"])
+  assert(s.isDisposed() && inner.isDisposed())
+  log.clear()
+  s.dispose()
+  a.set(2)
+  assertEq(log.length, 0)
+  assertEq(a.observers(), 0)
+
+@test("an effect made by a run is disposed before the next run")
+rxRunOwns()
+  val g = Graph()
+  val rows = g.atom(2)
+  val tick = g.atom(0)
+  val made = Buffer[Effect]()
+  var innerRuns = 0
+  _ = g.effect(get ->
+    for i in 0 ..< get(rows) do made.append(get.effect(get2 -> innerRuns += get2(tick) * 0 + 1)))
+  assertEq(innerRuns, 2)
+  tick.set(1)
+  assertEq(innerRuns, 4)
+  rows.set(3)
+  assertEq(made.length, 5)
+  for i in 0 ..< 2 do assert(made(i).isDisposed())
+  for i in 2 ..< 5 do assert(!made(i).isDisposed())
+  tick.set(2)
+  assertEq(innerRuns, 4 + 3 + 3)
+  assertEq(tick.observers(), 3)
+
+@test("an effect that disposes a scope whose effect waits in the same flush stops it from running")
+rxDisposeWhilePropagating()
+  val g = Graph()
+  val a = g.atom(0)
+  val s = g.scope()
+  val log = Buffer[string]()
+  _ = g.effect(get -> if get(a) == 1 then s.dispose())
+  _ = s.effect(get ->
+    log.append(s"late ${get(a)}")
+    get.onCleanup(() -> log.append("late cleanup")))
+  a.set(1)
+  assertEq(log.toVector, ["late 0", "late cleanup"])
+  a.set(2)
+  assertEq(log.toVector, ["late 0", "late cleanup"])
+
+@test("an effect disposed inside its own body finishes that run, cleans up once and never runs again")
+rxSelfDispose()
+  val g = Graph()
+  val a = g.atom(0)
+  val log = Buffer[string]()
+  var me: Option[Effect] = None
+  val e = g.effect(get ->
+    val v = get(a)
+    get.onCleanup(() -> log.append(s"cleanup $v"))
+    if v == 1
+      me match
+        Some(m) -> m.dispose()
+        None -> ()
+    log.append(s"ran $v"))
+  me = Some(e)
+  a.set(1)
+  a.set(2)
+  assertEq(log.toVector, ["ran 0", "cleanup 0", "ran 1", "cleanup 1"])
+  assert(e.isDisposed())
+  assertEq(a.observers(), 0)
+
+@test("disposing the graph while effects wait runs none of them; its atoms still read")
+rxGraphDispose()
+  val g = Graph()
+  val a = g.atom(0)
+  val log = Buffer[int]()
+  _ = g.effect(get -> if get(a) == 1 then g.dispose())
+  _ = g.effect(get -> log.append(get(a)))
+  a.set(1)
+  assertEq(log.toVector, [0])
+  assertEq(a.get(), 1)
+  g.dispose()
+
+@test("ports hold each atom's latest value until the owner drains them, in one batch")
+rxPorts()
+  val g = Graph()
+  val a = g.atom(0)
+  val b = g.atom(0)
+  val sum = g.derived(get -> get(a) + get(b))
+  val seen = Buffer[int]()
+  _ = g.effect(get -> seen.append(get(sum)))
+  val pa = g.port(a)
+  val pb = g.port(b)
+  assert(pa.set(1) && pa.set(2) && pb.set(30))
+  assertEq(a.get(), 0)
+  assertEq(g.drain(), 2)
+  assertEq(seen.toVector, [0, 32])
+  assertEq(g.drain(), 0)
+  val s = g.scope()
+  val pc = s.port(a)
+  s.dispose()
+  assert(pc.isClosed())
+  assert(!pc.set(9))
+  assertEq(g.drain(), 0)
+  assertEq(a.get(), 2)
+
+data RxDoorEvent
+  Open
+  Close
+  Lock(code: int)
+  Unlock(code: int)
+
+machine RxDoor receives RxDoorEvent
+  var opened = 0
+
+  state Closed
+    Open ->
+      opened += 1
+      Opened
+    Close -> Closed
+    Lock(code) -> Locked(code)
+
+  state Opened
+    Close -> Closed
+
+  state Locked(code: int)
+    Unlock(c) if c == code -> Closed
+
+  receive
+    _ -> stay
+
+@test("a machine driven through the graph takes every step once, in order, and effects see state and step agree")
+rxMachine()
+  val g = Graph()
+  val door = RxDoor()
+  val m = g.machine(door.handle, door.state())
+  val steps = Buffer[Step[RxDoorEvent, RxDoor.State]]()
+  m.onStep(s -> steps.append(s))
+  val shown = Buffer[string]()
+  _ = g.effect(get ->
+    val st = get(m.state())
+    val last = get(m.lastStep())
+    last match
+      Some(s) -> assertEq(s.to, st)
+      None -> ()
+    shown.append(s"$st"))
+  val events: Vector[RxDoorEvent] = [Open, Open, Close, Close, Lock(7), Unlock(1), Unlock(7), Open]
+  for ev in events do m.fire(ev)
+  assertEq(m.steps(), 8)
+  assertEq(steps.length, 8)
+  for i in 0 ..< 8
+    assertEq(steps(i).number, long(i + 1))
+    assertEq(steps(i).event, events(i))
+  assertEq(steps(3).from, RxDoor.State.Closed)
+  assertEq(steps(3).to, RxDoor.State.Closed)
+  assertEq(steps(5).to, RxDoor.State.Locked(7))
+  assertEq(
+    shown.toVector,
+    ["Closed", "Opened", "Opened", "Closed", "Closed", "Locked(7)", "Locked(7)", "Closed", "Opened"]
+  )
+  assertEq(door.opened, 2)
+
+@test("an event fired while another is handled, from a step's listener or an effect, waits its turn")
+rxMachineReentrant()
+  val g = Graph()
+  val door = RxDoor()
+  val m = g.machine(door.handle, door.state())
+  val order = Buffer[string]()
+  m.onStep(s ->
+    order.append(s"step ${s.number} ${s.to}")
+    if s.number == 1 then m.fire(Close))
+  val trigger = g.atom(0)
+  _ = g.effect(get -> if get(trigger) == 1 then m.fire(Lock(3)))
+  m.fire(Open)
+  assertEq(order.toVector, ["step 1 Opened", "step 2 Closed"])
+  trigger.set(1)
+  assertEq(m.steps(), 3)
+  assertEq(m.state().get(), RxDoor.State.Locked(3))
+
+data RxHealth
+  RxUp
+  RxDegraded(down: Vector[string])
+
+data RxConfig(port: int, replicas: int)
+
+@test(
+  "a server's shape: a config reloaded through a port, and health aggregated over services, logged only as it changes"
+)
+rxServerShape()
+  val g = Graph()
+  val config = g.atom(RxConfig(8080, 2))
+  val reload = g.port(config)
+  val names = ["db", "cache", "queue"]
+  val up = names.map(n -> g.atom(true))
+  val health = g.derived(get ->
+    val down = Buffer[string]()
+    for i in 0 ..< names.length do if !get(up(i)) then down.append(names(i))
+    if down.isEmpty then RxUp else RxDegraded(down.toVector))
+  val log = Buffer[string]()
+  _ = g.effect(get -> log.append(s"health ${get(health)}"))
+  val listen = config.map(c -> c.port)
+  _ = g.effect(get -> log.append(s"listening on ${get(listen)}"))
+  up(1).set(false)
+  up(1).set(false)
+  up(2).set(false)
+  g.batch(() ->
+    up(1).set(true)
+    up(2).set(true))
+  assert(reload.set(RxConfig(8080, 3)))
+  _ = g.drain()
+  assert(reload.set(RxConfig(9090, 3)))
+  _ = g.drain()
+  assertEq(
+    log.toVector,
+    [
+      "health RxUp",
+      "listening on 8080",
+      "health RxDegraded([cache])",
+      "health RxDegraded([cache, queue])",
+      "health RxUp",
+      "listening on 9090"
+    ]
+  )
+
+// The randomized graph: atoms first, then derived values, each a sum of earlier nodes or a choice
+// between two by a third's parity, so dependencies switch as values change.
+private data RxFormula
+  RxSum(parts: Vector[int])
+  RxPick(cond: int, yes: int, no: int)
+
+private rxValue(formulas: Vector[RxFormula], atoms: Vector[int], memo: Array[int], i: int) -> int
+  if i < atoms.length then return atoms(i)
+  if memo(i) >= 0 then return memo(i)
+  val v = formulas(i - atoms.length) match
+    RxSum(parts) ->
+      var total = 0
+      for p in parts do total = (total + rxValue(formulas, atoms, memo, p)) % 1000
+      total
+    RxPick(cond, yes, no) -> if rxValue(
+      formulas,
+      atoms,
+      memo,
+      cond
+    ) % 2 == 0 then rxValue(formulas, atoms, memo, yes) else rxValue(formulas, atoms, memo, no)
+  memo(i) = v
+  v
+
+private rxScratch(formulas: Vector[RxFormula], atoms: Vector[int], i: int) -> int =
+  rxValue(formulas, atoms, Array.fill(atoms.length + formulas.length, -1), i)
+
+private rxCompute(formula: RxFormula, nodes: Buffer[Readable[int]], get: Get) -> int = formula match
+  RxSum(parts) ->
+    var total = 0
+    for p in parts do total = (total + get(nodes(p))) % 1000
+    total
+  RxPick(cond, yes, no) -> if get(nodes(cond)) % 2 == 0 then get(nodes(yes)) else get(nodes(no))
+
+private rxFormula(rng: Random, below: int) -> RxFormula =
+  if rng.nextInt(3) == 0 then RxPick(rng.nextInt(below), rng.nextInt(below), rng.nextInt(below))
+  else RxSum(Vector.fill(1 + rng.nextInt(3), rng.nextInt(below)))
+
+// One effect watching node `k`: it checks every value it sees against the graph computed from
+// scratch at that moment, that it runs at most once a round, and only when its value changed.
+private class RxWatcher(val k: int)
+  var last: int = -1
+  var round: int = -1
+  var effect: Option[Effect] = None
+
+private rxRun(seed: long)
+  val rng = Random(seed)
+  val atomCount = 5
+  val derivedCount = 30
+  val g = Graph()
+  val atoms = Buffer[Atom[int]]()
+  val nodes = Buffer[Readable[int]]()
+  for i in 0 ..< atomCount
+    val a = g.atom(rng.nextInt(10))
+    atoms.append(a)
+    nodes.append(a)
+  val formulas = Buffer[RxFormula]()
+  for i in 0 ..< derivedCount
+    val f = rxFormula(rng, atomCount + i)
+    formulas.append(f)
+    nodes.append(g.derived(get -> rxCompute(f, nodes, get)))
+  val fs = formulas.toVector
+  val values = () -> atoms.toVector.map(a -> a.get())
+  var round = 0
+  val watchers = Buffer[RxWatcher]()
+  val watch = (k: int) ->
+    val w = RxWatcher(k)
+    w.effect = Some(g.effect(get ->
+      val v = get(nodes(k))
+      assertEq(v, rxScratch(fs, values(), k))
+      assert(w.round != round, "an effect ran twice in one round")
+      assert(v != w.last, "an effect ran with its value unchanged")
+      w.round = round
+      w.last = v))
+    watchers.append(w)
+  for i in 0 ..< 8 do watch(atomCount + rng.nextInt(derivedCount))
+  for r in 1 .. 300
+    round = r
+    g.batch(() ->
+      for j in 0 ..< 1 + rng.nextInt(3) do atoms(rng.nextInt(atomCount)).set(rng.nextInt(10)))
+    for w in watchers do assertEq(w.last, rxScratch(fs, values(), w.k))
+    val probe = atomCount + rng.nextInt(derivedCount)
+    assertEq(nodes(probe).get(), rxScratch(fs, values(), probe))
+    if r % 20 == 0
+      val gone = watchers.remove(rng.nextInt(watchers.length))
+      gone.effect match
+        Some(e) -> e.dispose()
+        None -> ()
+      watch(atomCount + rng.nextInt(derivedCount))
+  for w in watchers
+    w.effect match
+      Some(e) -> e.dispose()
+      None -> ()
+  for n in nodes do assertEq(n.observers(), 0)
+
+@test("a randomized graph: every value every effect sees equals the graph computed from scratch")
+rxRandomized()
+  for seed in 1 .. 12 do rxRun(long(seed) * 7919)

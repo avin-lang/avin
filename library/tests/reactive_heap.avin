@@ -1,0 +1,98 @@
+// `avin.reactive` against the collector: thousands of scopes, effects and derived values made and
+// disposed leave the heap's live bytes where they were; derived values never observed, and a whole
+// graph let go of without being disposed, are collected; and a churn that keeps what it makes is seen
+// to grow the heap, so the measure can fail.
+import avin.reactive.{Atom, Derived, Graph, Scope}
+
+@sysl("avin.rt.live_bytes_after_collection")
+private rxLiveBytes() -> long
+
+// A scope with effects on a chain of three derived values reading the long-lived `a` and an atom of
+// its own, written to and disposed. Only the edges from `a` could keep it alive: an effect or a
+// derived value left observing `a` after the dispose is a leak the live heap shows.
+private rxChurnOnce(g: Graph, a: Atom[int], i: int, keep: Option[Buffer[Scope]])
+  val s = g.scope()
+  val own = g.atom(0)
+  val d1 = g.derived(get -> get(a) + get(own) + i)
+  val d2 = d1.map(x -> x * 2)
+  val d3 = g.derived(get -> get(d1) + get(d2))
+  var sink = 0
+  _ = s.effect(get ->
+    sink += get(d3)
+    get.onCleanup(() -> sink = 0))
+  _ = s.effect(get ->
+    val inner = get.effect(get2 -> sink += get2(d1))
+    assert(!inner.isDisposed()))
+  own.set(i + 1)
+  assert(sink >= 3 * (i + 1))
+  keep match
+    Some(kept) -> kept.append(s)
+    None -> s.dispose()
+
+private rxChurn(g: Graph, a: Atom[int], n: int, keep: Option[Buffer[Scope]])
+  for i in 0 ..< n do rxChurnOnce(g, a, i, keep)
+
+// Derived values read and dropped, never observed.
+private rxReadAndDrop(g: Graph, a: Atom[int], n: int)
+  for i in 0 ..< n
+    val d = g.derived(get -> get(a) * i)
+    assertEq(d.get(), a.get() * i)
+
+// A whole graph with live effects, let go of without being disposed.
+private rxAbandon(n: int)
+  for i in 0 ..< n
+    val g = Graph()
+    val a = g.atom(i)
+    val d = a.map(x -> x + 1)
+    var seen = 0
+    _ = g.effect(get -> seen = get(d))
+    a.set(i + 1)
+    assertEq(seen, i + 2)
+
+private val RxSlack: long = 64 * 1024
+
+@test("twenty thousand scopes of effects and derived values, made and disposed, leave the live heap where it was")
+rxNoLeakDisposed()
+  val g = Graph()
+  val a = g.atom(0)
+  rxChurn(g, a, 200, None)
+  val before = rxLiveBytes()
+  rxChurn(g, a, 20000, None)
+  val after = rxLiveBytes()
+  assert(after - before < RxSlack, s"the live heap grew by ${after - before} bytes")
+  assertEq(a.observers(), 0)
+
+@test("derived values nobody observes are collected once dropped")
+rxNoLeakUnobserved()
+  val g = Graph()
+  val a = g.atom(3)
+  rxReadAndDrop(g, a, 200)
+  val before = rxLiveBytes()
+  rxReadAndDrop(g, a, 20000)
+  val after = rxLiveBytes()
+  assert(after - before < RxSlack, s"the live heap grew by ${after - before} bytes")
+
+@test("a graph let go of without being disposed is collected, effects and all")
+rxNoLeakAbandoned()
+  rxAbandon(200)
+  val before = rxLiveBytes()
+  rxAbandon(5000)
+  val after = rxLiveBytes()
+  assert(after - before < RxSlack, s"the live heap grew by ${after - before} bytes")
+
+@test("the measure can fail: a churn that keeps its scopes grows the live heap")
+rxLeakIsSeen()
+  val g = Graph()
+  val a = g.atom(0)
+  val kept = Buffer[Scope]()
+  rxChurn(g, a, 200, None)
+  val before = rxLiveBytes()
+  rxChurn(g, a, 20000, Some(kept))
+  val after = rxLiveBytes()
+  assert(
+    after - before > long(20000 * 64),
+    s"keeping twenty thousand scopes grew the live heap by only ${after - before} bytes"
+  )
+  assertEq(kept.length, 20000)
+  for s in kept do s.dispose()
+  assertEq(a.observers(), 0)
