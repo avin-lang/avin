@@ -2313,6 +2313,84 @@ forge new ones. `seal` draws each nonce from `SecureRandom` and puts it in front
 its nonces (a record counter), which then answers for never repeating one. A key's text is its
 cipher, `AeadKey(AES-256-GCM)`, and nothing of the key.
 
+## `avin.crypto.password`
+
+Password hashing for a server: Argon2id (RFC 9106) in the PHC string format, which every Argon2
+implementation reads and writes, and bcrypt verification for hashes carried over from another
+system.
+
+```text run
+import avin.crypto.password.{hashPassword, verifyPassword, needsRehash}
+
+main()
+  val stored = hashPassword("correct horse battery staple")
+  println(stored.startsWith("$argon2id$v=19$m=19456,t=2,p=1$"))
+  println(verifyPassword("correct horse battery staple", stored))
+  println(verifyPassword("Tr0ub4dor&3", stored))
+  println(needsRehash(stored))
+  println(verifyPassword("U*U", "$2a$05$CCCCCCCCCCCCCCCCCCCCC.E5YPO9kmyuRGyh0XouQYb4YMJKvyOeW"))
+```
+
+```text output
+true
+Ok(true)
+Ok(false)
+Ok(false)
+Ok(true)
+```
+
+| Function | Meaning |
+| --- | --- |
+| `hashPassword(password, params = Argon2Params(), secret = [])` | The PHC string of `password` (a `string`, hashed as UTF-8, or a `Vector[byte]`) under `params`, with a new salt from `SecureRandom`: `$argon2id$v=19$m=19456,t=2,p=1$<salt>$<hash>`, salt and hash in base64 without padding. Parameters Argon2 cannot compute with trap. |
+| `verifyPassword(password, encoded, secret = [], limits = PasswordLimits()) -> Result[bool, PasswordHashError]` | Whether `password` is the one `encoded` was made from, the hash recomputed and compared in constant time. `encoded` is an Argon2 PHC string (`argon2id`, `argon2i`, `argon2d`; version 19, or 16 written `v=16` or left out) or a bcrypt hash (`$2b$`, `$2a$`, `$2y$`). `Ok(false)` is a wrong password; `Err` is a hash that could not be checked. |
+| `needsRehash(encoded, params = Argon2Params()) -> Result[bool, PasswordHashError]` | Whether `encoded` was made with anything other than `params` (variant, version, memory, passes, lanes, salt or hash length), or is bcrypt. |
+| `argon2(password, salt, params = Argon2Params(), secret = [], associatedData = []) -> Vector[byte]` | Raw Argon2 version 1.3: `params.hashLength` bytes, every input a `Vector[byte]`. Costs Argon2 cannot compute with and a salt shorter than 8 bytes trap. |
+| `parseArgon2Hash(encoded) -> Result[Argon2Hash, PasswordHashError]` | The parts of an Argon2 PHC string; `Argon2Hash.encode` writes them back. |
+
+**`Argon2Params(variant, memoryKiB, passes, lanes, hashLength, saltLength)`** defaults to OWASP's
+first recommendation: `Argon2id`, 19456 KiB (19 MiB), 2 passes, 1 lane, a 32-byte hash and a 16-byte
+salt. Memory is at least 8 KiB a lane, passes at least 1, lanes 1 to 16777215 (computed on up to 16
+threads), the hash at least 4 bytes and the salt at least 8. `Argon2d` and `Argon2i` are there for
+hashes other systems wrote; Argon2id is the one to use.
+
+**The parameters travel in the string**, so raising them leaves every stored hash valid. After a
+successful login, while the plaintext is at hand, a server hashes again whatever `needsRehash` names:
+
+```text
+if verifyPassword(attempt, user.hash)? && needsRehash(user.hash)?
+  user.hash = hashPassword(attempt)
+```
+
+**A stored string is not trusted to name its own cost.** `verifyPassword` refuses a hash asking for
+more than `PasswordLimits(maxMemoryKiB = 1048576, maxPasses = 32, maxLanes = 16, maxBcryptCost =
+16)` with `OverLimit` before computing anything, so a forged or corrupted row cannot hold a login for
+minutes or take gigabytes. The defaults admit every common setting; a server that stores heavier
+hashes passes its own limits.
+
+**`PasswordHashError`** says why a hash could not be checked: `Malformed(reason)` for text that is not
+a hash this module reads (fields out of order, a number with a sign or a leading zero, padded or
+non-canonical base64, a salt under 8 bytes, a bcrypt cost outside 04–31); `Unsupported(scheme)` for
+another scheme (`scrypt`, `pbkdf2-sha256`), bcrypt's `2x` or an Argon2 version other than 16 and 19;
+`OverLimit(parameter, value, limit)`, with `parameter` one of `m`, `t`, `p` and `cost`; and
+`Failed(reason)` where the computation itself failed, as when its memory cannot be allocated. Each
+has a `message`.
+
+**A `secret`** is Argon2's key input: a pepper the server keeps somewhere its database is not, so a
+stolen table is no use without it. It is not stored in the string, so the same secret is given to
+`verifyPassword`; bcrypt takes none and ignores it.
+
+**bcrypt is as bcrypt defines it**: a password is read up to its first zero byte and to 72 bytes at
+most, and only the 31 characters of hash are compared, so a salt written with nonzero unused bits
+still verifies. There is no bcrypt `hashPassword`: a hash is moved to Argon2id at the next login.
+
+**Hashing is blocking work.** The thread computing a hash is safe for the collector while it runs,
+and the scheduler moves other lightweight threads off its worker, so a login being hashed holds up
+no other request.
+
+The C is the Argon2 reference implementation (phc-winner-argon2, CC0) and Openwall's crypt_blowfish
+1.3 (public domain), carried in the library's `sysl/password` package and compiled, with nothing to
+install, into a program that imports this module and no other.
+
 ## `avin.uuid`
 
 Universally unique identifiers (RFC 9562), 128 bits written as 32 hexadecimal digits in groups of
