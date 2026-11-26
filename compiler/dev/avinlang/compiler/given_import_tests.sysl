@@ -1,0 +1,80 @@
+module dev.avinlang.compiler
+@tests
+
+import sh.sysl.parsing.source_of
+import sysl.buf.{Buf, buf}
+
+// Which givens of other modules a call sees: those its file imports by name, and those its module
+// exports; and the note the error of a call that finds none adds, naming the import to write, for each
+// fitting given of a module the file imports whole, public, and not imported already.
+
+/** A program of a main file and the modules `modules` holds as (name, text) pairs. */
+private program(main: string, modules: Buf[(string, string)]) -> Buf[ProgramFile]
+    var files: Buf[ProgramFile] = buf()
+    for (name, text) in modules
+        files.push(ProgramFile(source_of(s"/p/$name/$name.avin", text), Some(name), false, buf(), ""))
+    files.push(ProgramFile(source_of("/p/main.avin", main), None, false, buf(), ""))
+    files
+
+/** The diagnostics of a program, or "" when it compiles. */
+private diagnostics_of(files: Buf[ProgramFile]) -> string = lower_files(repository_toolchain(), files) match
+    Ok(_) -> ""
+    Err(d) -> d
+
+private const Db: string = "module db\n\ndata Tx(id: int)\n\ndata Audit(n: int)\n\ngiven current = Tx(1)\n\nprivate given audit = Audit(2)\n\ntxId(using tx: Tx) -> int = tx.id\n\nauditOf(using a: Audit) -> int = a.n\n"
+
+private const NoneFound: string = "`txId` needs a `Tx` for `tx`, and no given of that type is in scope: declare one (`given tx = …`), take one as `using`, import one, or pass `tx = …`"
+
+private one(name: string, text: string) -> Buf[(string, string)]
+    var out: Buf[(string, string)] = buf()
+    out.push((name, text))
+    out
+
+@test("a call whose file imports the module whole is told the import that brings its given in")
+whole_import_names_the_import()
+    val d = diagnostics_of(program("import db\n\nmain() = println(db.txId())\n", one("db", Db)))
+    assert(d.contains(NoneFound + "; `db` declares the given `current`, which this file does not import: `import db.{current}`\n"), d)
+
+@test("a private given is never offered, and a call needing it has the plain error")
+private_given_not_offered()
+    val d = diagnostics_of(program("import db\n\nmain() = println(db.auditOf())\n", one("db", Db)))
+    assert(d.contains("`auditOf` needs an `Audit` for `a`, and no given of that type is in scope: declare one (`given a = …`), take one as `using`, import one, or pass `a = …`\n"), d)
+    assert(!d.contains("does not import"), d)
+
+@test("a given of another type is not offered")
+other_type_not_offered()
+    val d = diagnostics_of(program("import db\n\ndata Other(n: int)\n\nneeds(using o: Other) -> int = o.n\n\nmain() = println(needs())\n", one("db", Db)))
+    assert(d.contains("`needs` needs an `Other` for `o`"), d)
+    assert(!d.contains("does not import"), d)
+
+@test("a call with no module imported whole has the plain error")
+no_whole_import_plain_error()
+    val d = diagnostics_of(program("import db.{txId}\n\nmain() = println(txId())\n", one("db", Db)))
+    assert(d.contains(NoneFound + "\n"), d)
+
+@test("a module imported whole that exports a given offers it under the name it exports")
+exported_given_offered()
+    var modules = one("db", Db)
+    modules.push(("kit", "module kit\n\nexport db.{current as kitTx}\n"))
+    val d = diagnostics_of(program("import kit\nimport db.{txId}\n\nmain() = println(txId())\n", modules))
+    assert(d.contains(NoneFound + "; `kit` declares the given `kitTx`, which this file does not import: `import kit.{kitTx}`\n"), d)
+
+@test("two modules imported whole that each declare a fitting given are both offered")
+two_modules_offered()
+    var modules = one("db", Db)
+    modules.push(("replica", "module replica\n\nimport db.Tx\n\ngiven spare = Tx(2)\n"))
+    val d = diagnostics_of(program("import db\nimport replica\n\nmain() = println(db.txId())\n", modules))
+    assert(d.contains("`import db.{current}`"), d)
+    assert(d.contains("; `replica` declares the given `spare`, which this file does not import: `import replica.{spare}`"), d)
+
+@test("an imported given fills the call, and the same given imported twice is one given")
+imported_twice_is_one()
+    var modules = one("db", Db)
+    modules.push(("kit", "module kit\n\nexport db.{current}\n"))
+    assert_eq(diagnostics_of(program("import db.{txId, current as tx}\nimport kit.{current}\n\nmain() = println(txId())\n", modules)), "")
+
+@test("a module exporting a given takes it as a given of its own files")
+exporting_module_fills()
+    var modules = one("db", Db)
+    modules.push(("kit", "module kit\n\nimport db.txId\n\nexport db.{current}\n\nviaKit() -> int = txId()\n"))
+    assert_eq(diagnostics_of(program("import kit.viaKit\n\nmain() = println(viaKit())\n", modules)), "")

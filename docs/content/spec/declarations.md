@@ -53,7 +53,9 @@ main()
   type, before type parameters and a type (`impl[A, B] (A, B)`), or before a function type with
   `for`. The words of actors and machines are keywords only where they [begin their
   forms](/spec/actors/#keywords), as
-  `select` is only where it ends its line to open a [select block](/spec/threads/#select).
+  `select` is only where it ends its line to open a [select block](/spec/threads/#select), and
+  `given` and `using` are keywords only where they [begin their
+  forms](/spec/contextual-parameters/).
 - **Capitalized** means the first character is an uppercase or titlecase letter (Unicode `Lu` or
   `Lt`): `Ärger`, `Δelta` and `ǅemal` are capitalized. A letter with no case, as in Chinese,
   Japanese or Arabic, is not, so such a name is written where a lowercase one is. Types and
@@ -520,7 +522,13 @@ data Option[+T]
 ```
 
 The single-line form declares a one-variant type whose variant has the type's name. Variants are
-constructors, not types: `Some(1)` has type `Option[int]`. A variant is a name of its module, and
+constructors, not types: `Some(1)` has type `Option[int]`. A variant without fields is a value
+(`None`); one with fields, named and not called, is its constructor as a function value, as a
+class's name is: a function of all its fields, in order, to its data type or a refined variant's
+declared instance, so `[1, 2].map(Some)` is `[Some(1), Some(2)]` and `val f = Circle` is a
+`(real) -> Shape`. A generic variant takes its instance from the function type expected there, whose
+result also decides between variants sharing a name, or from written type arguments, `Some[int]`;
+where a value of the variant's own type is expected, the variant is to be called. A variant is a name of its module, and
 several data types of one module, in one file or in several, may each have a variant of one name:
 
 ```text
@@ -1540,9 +1548,9 @@ the constructor's parameter type is the more specific.
   called by the object's name the same way.
 - **As a function value.** Where a function type is expected, the name of an object that declares
   `apply` is its companion class's constructor or the `apply` whose parameters accept that type's,
-  chosen as for any overloaded function used as a value: `[1, 2].map(Pair)`. A variant with fields
-  is not a value, so a data type's companion offers its `apply` methods alone. Elsewhere the bare
-  name is the object.
+  chosen as for any overloaded function used as a value: `[1, 2].map(Pair)`. For a data type's
+  companion, a variant of the object's name is one of those choices, as it is at a call. Elsewhere
+  the bare name is the object.
   An object that is itself of a function type stays that value.
 - `Name.apply(…)` is an ordinary member call, and chooses among the `apply` methods alone.
 
@@ -1818,6 +1826,40 @@ main() = println(s"${circleArea(Circle(2))}")
 - **Modules may import one another**, in a cycle if need be: the program is compiled whole. Its
   module-level values initialize before `main`, each after the values its initializer needs, across
   modules as within one.
+
+## Doc comments
+
+**The comment directly above a declaration documents it**: the run of `//` lines with no blank line
+between them and the declaration, any annotations between skipped. The comment above a file's
+`module` line documents the module. Nothing else marks a doc comment: the language server's hover
+shows it under the declaration's header, and [`avin doc`](/getting-started/#api-documentation)
+writes it into the program's pages.
+
+````avin
+// A shape in the plane; [area] measures one.
+//
+// ```
+// val s = Circle(1.0)
+// println(area(s))
+// ```
+data Shape
+  // A circle of the given radius.
+  Circle(radius: real)
+  Rect(width: real, height: real)
+````
+
+- **It is Markdown**, with GitHub's extensions. Each line loses its `//` and one space after it;
+  what is left keeps its indentation, so a code block indented in the comment stays one.
+- **A block with no language, or marked `avin`, is Avin code**, coloured as Avin; `avin doc --check`
+  fails on one that parses neither as declarations nor as the statements of a function's body. A
+  block of anything else names its language (`text`, `sh`).
+- **A link to a declaration** is written with its path as the destination, `[the map](Vector.map)`,
+  or as `[Name]` or `` [`Name`] `` alone. The path is found from the declaration the comment
+  documents: a member of its type, then a declaration of its module, then a full path such as
+  `avin.fs.File` or a module's name, then the prelude, then the one declaration of the program with
+  that name. `[Name]` that names nothing is left as the text it is; `` [`Name`] `` that names nothing,
+  and a destination that names neither a declaration nor a page of the documentation, are what
+  `avin doc --check` fails on.
 
 ## Literate source
 

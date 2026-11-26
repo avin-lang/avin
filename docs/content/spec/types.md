@@ -364,6 +364,7 @@ A `char` has these methods, classifying by the Unicode Character Database:
 | `isSpaceChar` | A character of category `Zs`, `Zl` or `Zp` |
 | `isUpper`, `isLower` | Cased and upper, cased and lower |
 | `isControl` | U+0000 to U+001F and U+007F to U+009F |
+| `displayWidth` | The columns of a terminal it takes drawn on its own: 2, 1, or 0 ([Display width](#display-width)) |
 | `toUpper`, `toLower` | The simple case mapping, one character for one: `'ß'.toUpper` is `'ß'` |
 | `asDigit` | The digit's value in radix 36: a decimal digit of any script gives its value, an ASCII or fullwidth letter, either case, gives 10 to 35; any other character gives -1 |
 
@@ -424,6 +425,9 @@ offset is inside.
 | `reverse` | The characters in the opposite order |
 | `padStart(w, c)`, `padEnd(w, c)` | At least `w` characters, `c` (default `' '`) repeated before, after; `w` counts characters, not bytes, and a string already that long is unchanged |
 | `padTo(n, c)` | As `padEnd(n, c)`, the name a sequence's padding has |
+| `displayWidth` | The columns of a terminal it takes, cluster by cluster ([Display width](#display-width)) |
+| `padStartWidth(w, c)`, `padEndWidth(w, c)` | At least `w` columns of a terminal wide, `c` (default `' '`) repeated before, after as often as it fits, and a space for a column a wide `c` leaves over; a string already that wide is unchanged, and a `c` that takes no column traps when padding is needed |
+| `truncateWidth(w, e)` | At most `w` columns wide: the string itself when it fits, or else as many whole clusters from the start as fit with the ellipsis `e` (default `"…"`) after them; an ellipsis wider than `w` is left off, and a `w` of 0 or less keeps nothing |
 | `equalsIgnoreCase(o)` | Whether the two are equal after each character's simple lower-case mapping |
 | `take(n)`, `drop(n)` | The first `n` characters, all but the first `n`; `n` counts characters, not bytes, and is clamped to the string, so 0 or less takes none |
 | `takeRight(n)`, `dropRight(n)` | The last `n` characters, all but the last `n` |
@@ -529,6 +533,41 @@ file 1
 true
 false
 ```
+
+### Display width
+
+`displayWidth` is the number of columns of a terminal, in a fixed-width font, a character or a
+string takes, which is what lines text up in a table or a help screen; `charCount` is not, since a CJK
+ideograph takes two columns and a combining accent none. A character on its own takes:
+
+- 2 when it is East Asian Wide or Fullwidth: CJK ideographs, kana, Hangul syllables, fullwidth forms,
+  and the emoji shown as pictures by default (`'😀'`);
+- 0 when it is a nonspacing or enclosing mark (a combining accent, a variation selector), a format
+  character (the zero-width space and joiner, the bidirectional marks), or a Hangul vowel or final
+  that joins the syllable before it; the soft hyphen and the marks written before a number are
+  shown, and take 1;
+- 0 when it is a control character, U+0000 to U+001F and U+007F to U+009F, tab and newline included:
+  where one moves the cursor is the terminal's business, not a width;
+- 1 otherwise, the East Asian Ambiguous characters and unassigned code points included.
+
+A string is measured cluster by cluster, as a modern terminal draws it. A cluster is a character with
+the zero-width characters after it, a skin-tone modifier after an emoji, and, when it is a
+pictograph, each pictograph a zero-width joiner joins to it. A cluster is as wide as its first
+character, except that a variation selector 16 after an emoji makes it 2 (`❤️`, the keycap `1️⃣`), a
+skin tone makes an emoji 2, and two regional indicators are one flag of 2. A control character is a
+cluster of its own. The table is the Unicode Character Database's, version 17.0.0.
+
+```text
+"hello".displayWidth          // 5
+"日本語".displayWidth          // 6
+"e\u{301}".displayWidth       // 1: an e and a combining acute
+"👩🏽‍💻".displayWidth            // 2: a skin tone and a joined pictograph
+"日本".padEndWidth(6) + "|"   // 日本  |
+"日本語テキスト".truncateWidth(7)  // 日本語…
+```
+
+A formatted field's width counts these columns too, so `f"${name}%-10s"` lines up whatever `name`
+is written in ([Strings and formatting](/spec/strings-and-formatting/)).
 
 ## unit
 
@@ -701,7 +740,8 @@ as it is written, `@sendable (int) -> int`.
 ### Placeholder lambdas
 
 A call's argument that holds `_` is a lambda: each `_` is a parameter of its own, in the order
-written, and the argument is the body. A `val` or `var` with a declared type takes one the same way.
+written, and the argument is the body. A `val` or `var` with a declared type takes one the same way,
+as does the body of a function with a declared result type, and each of its clauses' bodies.
 
 ```text
 xs.map(_ + 1)                 // xs.map(x -> x + 1)
@@ -712,7 +752,25 @@ people.sortBy(_.age)
 xs.map(scale(_, 2))           // xs.map(x -> scale(x, 2))
 orders.map(_.items.map(_ * 2))  // orders.map(o -> o.items.map(x -> x * 2))
 val inc: (int) -> int = _ + 1
+adder(n: int) -> (int) -> int = _ + n
 ```
+
+- **A branch is a place of its own.** Where an `if`, a `match` or a block stands in one of these
+  places, each branch of the `if`, each arm of the `match` and the block's last line is a place in
+  turn, with the same rules, so a choice of functions reads as one:
+
+  ```text
+  val key: (Request) -> string = by match
+    "method" -> _.method
+    "status" -> _.status.toString()
+    _ -> _.path
+  xs.map(if up then _ + 1 else _ - 1)
+  ```
+
+  The condition, the subject, a guard and a block's earlier lines keep their own `_`, and so do an
+  `if` or `match` anywhere else: `val f = if up then _ + 1 else 0`, with no declared type, is an
+  error, and so is a function's body with no declared result. A branch may be a written lambda or
+  any other value of the function type beside the placeholder ones.
 
 - **The lambda is the nearest argument holding the `_`.** A `_` is found through operators of every
   precedence, member access and method calls on it, tuple parts (`(_, 0)`), `is`, a range's bounds,
@@ -726,8 +784,9 @@ val inc: (int) -> int = _ + 1
   parameters in order, `xs.map(double(_))`, is that function: it is an error saying to pass
   `double`. A constructor's name is no function's, so `xs.map(Some(_))` is `x -> Some(x)`.
 - **A lambda, a block, an `if`, a `match`, a collection literal and an interpolation keep their
-  own `_`**: none of them is searched, so `xs.map(n -> n + _)` is an error, as is any `_` outside a
-  call's argument and a declared value, `val y = x + _`. A `_` alone as a whole argument of a call
+  own `_`**: none of them is searched from around it, so `xs.map(n -> n + _)` is an error, as is any
+  `_` outside the places above, `val y = x + _`; only an `if`'s branches, a `match`'s arms and a
+  block's last line pass a place on. A `_` alone as a whole argument of a call
   that is itself no argument, `scale(_, 2)` as a statement, is an error too.
 - **The parameters take their types from the function expected**, as any lambda's do, and their
   count must be its parameter count; a lambda of two `_`s where a function of one tuple is

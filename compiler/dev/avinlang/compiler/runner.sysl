@@ -75,9 +75,13 @@ cached_build(tc: Toolchain, program: string, files: Buf[ProgramFile], testing: b
             if read_record(text, key) is Some(tests)
                 _ = phase_done("cached", phase_start(), "built=0")
                 return Ok(Built(binary, tests, false))
-    val compiled = compile_program(tc, files, testing, sysl, c)
+    // A compiler the build was handed to has the compilation already (`link_handoff.sysl`).
+    val compiled = handed_compilation() match
+        Some(handed) -> handed
+        None -> compile_program(tc, files, testing, sysl, c)
     if compiled.diagnostics != "" then return Err(compiled.diagnostics)
     make_dir_all(cache).map_err(e -> s"avin: $cache: ${e.to_string()}")?
+    hand_off_link(compiled)
     link_compiled(tc, compiled, () -> compile_program(tc, files, testing, sysl, c), binary, optimization).map_err(message -> "avin: " + message)?
     write_text_atomic(record, write_record(key, compiled.tests)).map_err(e -> s"avin: $record: ${e.to_string()}")?
     Ok(Built(binary, compiled.tests, true))
@@ -162,16 +166,25 @@ private escaped(text: string) -> string = text.replace_all("\\", "\\\\").replace
 private unescaped(text: string) -> string
     var out = str_builder()
     var escaping = false
-    for b in text.bytes
+    // By character, not byte: a byte of a character past ASCII pushed as a character of its own
+    // would be written as two.
+    for c in text.chars
         if escaping
-            out.push_char(if b == u8('t') then '\t' elif b == u8('n') then '\n' else char(b))
+            out.push_char(if c == 't' then '\t' elif c == 'n' then '\n' else c)
             escaping = false
-        elif b == u8('\\') then escaping = true
-        else out.push_char(char(b))
+        elif c == '\\' then escaping = true
+        else out.push_char(c)
     out.finish()
 
 // The value of a field `optional` wrote.
 private read_optional(field: string) -> Option[string] = if field.starts_with("=") then Some(field[1..]) else None
+
+/** `tests` written as the record beside a cached executable writes them, under the key `key`. */
+tests_record(key: string, tests: Buf[TestEntry]) -> string = write_record(key, tests)
+
+/** The tests a text `tests_record` wrote under `key` holds, or `None` for another key or a damaged
+ * text. */
+tests_of_record(text: string, key: string) -> Option[Buf[TestEntry]] = read_record(text, key)
 
 // The tests a record holds, when its key is `key`.
 private read_record(text: string, key: string) -> Option[Buf[TestEntry]]

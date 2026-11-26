@@ -149,6 +149,18 @@ class Command(
   // capture.
   errorsToOutput() -> Command = Command(shape, dir, env, limit, sink, feed, ErrorsToOutput, grouped)
 
+  // The same command, its standard input a pipe the program writes into through the `stdin()` of the
+  // `Child` that `start()` answers; closing that ends the command's input.
+  pipeInput() -> Command = Command(shape, dir, env, limit, sink, PipedInput, errors, grouped)
+
+  // The same command, its standard output a pipe the program reads through the `stdout()` of the
+  // `Child` that `start()` answers. With `errorsToOutput()`, standard error goes into the same pipe.
+  pipeOutput() -> Command = Command(shape, dir, env, limit, PipedOutput, feed, errors, grouped)
+
+  // The same command, its standard error a pipe of its own, which the program reads through the
+  // `stderr()` of the `Child` that `start()` answers.
+  pipeErrors() -> Command = Command(shape, dir, env, limit, sink, feed, PipedErrors, grouped)
+
   // The same command, started in a process group of its own, which every program it starts joins:
   // the group `Child.signalGroup` signals, and with it every program those programs start that stays
   // in it.
@@ -170,6 +182,7 @@ class Command(
   // Runs the command with the program's own streams, waits for it, and answers how it ended. A
   // status other than success is a value; the `Err` is a command that could not be started.
   run() -> Result[ExitStatus, IoError]
+    unpipedFor("run")
     val job = launch(Context.outermost(Track()), Streams.own())?
     job.finish()
     job.outcome()
@@ -178,6 +191,7 @@ class Command(
   // and answers the output as text, bytes that are not UTF-8 each replaced with U+FFFD. Any status
   // but success is `Failed(status)`, and the output is then dropped.
   output() -> Result[string, CommandError]
+    unpipedFor("output")
     val dir = fs.createTempDir("avin-output").mapErr(e -> Io(e))?
     val file = dir + "/output"
     val opened = createFile(file)
@@ -202,6 +216,7 @@ class Command(
   // `\n` or `\r\n`, bytes that are not UTF-8 replaced with U+FFFD. Its status is not checked; once the
   // output has ended the command is waited for.
   lines() -> Result[Iterator[string], IoError]
+    unpipedFor("lines")
     val (from, into) = makePipe().mapErr(failed("create a pipe for", describe))?
     // A sequence starts its later parts as its earlier ones end, which has to happen while the
     // output is read, so a command holding one is started and driven on a thread of its own, which
@@ -238,10 +253,68 @@ class Command(
       return Err(ioError(descriptor.err.get, "read the output of", describe))
     Ok(OutputLines(from, fdReader(descriptor.ok.get), () -> job.finish()))
 
-  // Starts the command and answers at once, with the `Child` it is waited for and stopped by.
+  // Starts the command and answers at once, with the `Child` it is waited for and stopped by, and
+  // whose `stdin()`, `stdout()` and `stderr()` are the pipes the command asked for.
   start() -> Result[Child, IoError]
     val track = Track()
-    launch(Context.outermost(track), Streams.own()).map(job -> Child(job, newOwner(), track))
+    if !piped() then return launch(Context.outermost(track), Streams.own()).map(
+      job -> Child(job, newOwner(), track, Pipes.none)
+    )
+    // A read or write of a pipe waits no longer than the command may run, its deadline taken before
+    // the command's own, so never later.
+    val deadline = limit.map(d -> time.monotonic() + d)
+    var streams = Streams.own()
+    var input: Option[ChildInput] = None
+    var output: Option[ChildOutput] = None
+    var errs: Option[ChildOutput] = None
+    if feed is PipedInput
+      inputPipe(deadline, describe) match
+        Ok((from, p)) ->
+          streams = streams.withInput(from)
+          input = Some(p)
+        Err(e) -> return abandoned(streams, Pipes(input, output, errs), e)
+    if sink is PipedOutput
+      outputPipe(deadline, "standard output", describe) match
+        Ok((p, into)) ->
+          streams = streams.withOutput(into)
+          output = Some(p)
+        Err(e) -> return abandoned(streams, Pipes(input, output, errs), e)
+    if errors is PipedErrors
+      outputPipe(deadline, "standard error", describe) match
+        Ok((p, into)) ->
+          streams = streams.withErrors(into)
+          errs = Some(p)
+        Err(e) -> return abandoned(streams, Pipes(input, output, errs), e)
+    val pipes = Pipes(input, output, errs)
+    // The command's own streams are the pipes' other ends, which it closes once it has started.
+    unpiped().launch(Context.outermost(track), streams) match
+      Ok(job) -> Ok(Child(job, newOwner(), track, pipes))
+      Err(e) ->
+        pipes.close()
+        Err(e)
+
+  // Whether the command asks for a pipe to any of its streams.
+  private piped() -> bool = (feed is PipedInput) || (sink is PipedOutput) || (errors is PipedErrors)
+
+  // The same command with the streams it asked pipes for its program's own, which the pipes then
+  // replace.
+  private unpiped() -> Command = Command(
+    shape,
+    dir,
+    env,
+    limit,
+    if sink is PipedOutput then OwnOutput else sink,
+    if feed is PipedInput then OwnInput else feed,
+    if errors is PipedErrors then OwnErrors else errors,
+    grouped
+  )
+
+  // Stops the program where `method`, which hands no pipe over, runs a command that asks for one.
+  private unpipedFor(method: string)
+    if piped()
+      fail(
+        s"`$method()` hands over no pipe, and the command asks for one: start it with `start()`, whose `Child` answers its pipes"
+      )
 
   // The programs the command runs, for an error to name: `ls`, `ls | wc`, `make && ./app`.
   private describe -> string = shape match
@@ -312,6 +385,7 @@ class Command(
     var streams = given
     sink match
       OwnOutput -> ()
+      PipedOutput -> pipedPart()
       OutputTo(file, append) -> (if append then appendFile(file) else createFile(file)) match
         Ok(f) -> streams = streams.withOutput(f)
         Err(e) ->
@@ -319,6 +393,7 @@ class Command(
           return Err(ioError(e, "open", file))
     errors match
       OwnErrors -> ()
+      PipedErrors -> pipedPart()
       // The program's own output is reached through the name the platform gives it, opened to add to
       // its end, so what was written there is kept.
       ErrorsToOutput -> streams.output match
@@ -335,6 +410,7 @@ class Command(
           return Err(ioError(e, "open", file))
     val input = feed match
       OwnInput -> return Ok(streams)
+      PipedInput -> pipedPart()
       InputFrom(file) -> openFile(file).mapErr(failed("open", file))
       InputText(text) -> textFile(text)
     input match
@@ -385,11 +461,39 @@ impl string
 // body, it is the body's, which may wait for it, stop it and start its later parts, and every
 // operation first checks the child's owner, so the code that handed it over traps where it uses it
 // again while the body runs.
-@trusted_sendable("it belongs to one thread at a time: a send hands it over, and every operation first checks its owner, so the code that handed it over traps")
-class Child(private val job: Job, private val owner: Owner, private val track: Track): Sendable, io.Close
+@trusted_sendable(
+  "it belongs to one thread at a time: a send hands it over, and every operation first checks its owner, so the code that handed it over traps"
+)
+class Child(
+    private val job: Job,
+    private val owner: Owner,
+    private val track: Track,
+    private val pipes: Pipes
+): Sendable, io.Close
+  // The pipe the command reads its standard input from, for a command started with `pipeInput()`:
+  // the same `ChildInput` every time. A command that asked for none traps. Any thread may ask; the
+  // pipe itself belongs to the code that started the command until it is handed over.
+  stdin() -> ChildInput = pipes.input match
+    Some(p) -> p
+    None -> fail("the command's standard input is not a pipe: ask for one with `pipeInput()`")
+
+  // The pipe the command writes its standard output into, for a command started with `pipeOutput()`,
+  // its standard error too where it was also started `errorsToOutput()`. A command that asked for none
+  // traps.
+  stdout() -> ChildOutput = pipes.output match
+    Some(p) -> p
+    None -> fail("the command's standard output is not a pipe: ask for one with `pipeOutput()`")
+
+  // The pipe the command writes its standard error into, for a command started with `pipeErrors()`. A
+  // command that asked for none traps.
+  stderr() -> ChildOutput = pipes.errors match
+    Some(p) -> p
+    None -> fail("the command's standard error is not a pipe: ask for one with `pipeErrors()`")
+
   // Stops the command where it is still running, as `kill` does, and waits for it, so nothing it
   // started is left behind; `Err` where the wait failed. A child already waited for is only waited
-  // for again, which answers at once, and a detached one is let be: closing it does nothing.
+  // for again, which answers at once, and a detached one is let be: closing it does nothing. Its pipes
+  // are left to their own `close()`, each belonging to the code it was handed to.
   override close() -> Result[unit, IoError]
     owner.held()
     if track.detached.load() then return Ok(())
@@ -498,18 +602,27 @@ private data Joint
 private data Sink
   OwnOutput
   OutputTo(file: string, append: bool)
+  PipedOutput
 
 // Where a command's standard input comes from when the command says.
 private data Feed
   OwnInput
   InputFrom(file: string)
   InputText(text: string)
+  PipedInput
 
-// Where a command's standard error goes when the command says: to a file, or where its output goes.
+// Where a command's standard error goes when the command says: to a file, where its output goes, or
+// into a pipe of its own.
 private data Drain
   OwnErrors
   ErrorsTo(file: string, append: bool)
   ErrorsToOutput
+  PipedErrors
+
+// Stops the program where a part of a pipeline or a sequence asks for a pipe, which only the command
+// `start()` starts hands over.
+private pipedPart() -> Nothing =
+  fail("a pipe is asked of the command `start()` starts, not of a part of a pipeline or a sequence")
 
 // The settings a command's parts run with: the directory, the variables set for them, and when they
 // are stopped, a deadline being a reading of the monotonic clock; what the command's `Child` is told

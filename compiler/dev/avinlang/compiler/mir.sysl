@@ -2,6 +2,8 @@ module dev.avinlang.compiler
 
 import sh.sysl.parsing.Span
 import sysl.buf.{Buf, buf}
+import sysl.container.{Map, map}
+import sysl.text.{StrBuilder, parse_long, str_builder}
 
 // The mid-level representation: functions of basic blocks over numbered values, with explicit
 // control flow and machine-level types. `unit` has no representation here: a unit value is never
@@ -16,8 +18,9 @@ enum MirType
     MReal
     /** An address the collector does not follow: a slot, a field, a descriptor. */
     MPtr
-    /** A reference to an object on the collected heap, or to a constant object. Every reference a
-     * function holds is kept where the collector can find it. */
+    /** A reference to an object on the collected heap, to a constant object, or to an object in the
+     * stack frame of a function still running (`StackObject`). Every reference a function holds is
+     * kept where the collector can find it. */
     MRef
     /** A union with a scalar member as a parameter or the result of a function or a call, where
      * lowering hands it on as the reference to its cell; `refs` is whether a member is a reference.
@@ -44,9 +47,56 @@ struct MirSignature
 /** The signature of a function whose result is at most one word. */
 mir_signature(params: Buf[MirType], result: Option[MirType]) -> MirSignature = MirSignature(params, result, buf())
 
+/** One shared copy of each signature the calls of a program name, so that the many calls of one shape
+ * hold a reference each rather than a signature and its lists each. */
+struct MirSignatures
+    shared: Map[string, &MirSignature]
+
+    /** The shared copy of `s`, made the first time a signature like it is asked for. */
+    of(*self, s: MirSignature) -> &MirSignature
+        val key = signature_key(s)
+        if self.shared.get(key) is Some(found) then return found
+        val made: &MirSignature = s
+        self.shared.put(key, made)
+        made
+
+    /** The shared copy of the signature of `params` and a result of at most one word. */
+    plain(*self, params: Buf[MirType], result: Option[MirType]) -> &MirSignature = self.of(mir_signature(params, result))
+
+end MirSignatures
+
+/** No signature shared yet. */
+mir_signatures() -> MirSignatures = MirSignatures(map())
+
+/** Text that tells `s` from every other signature. */
+signature_key(s: MirSignature) -> string
+    var out = str_builder()
+    for p in s.params do type_letter(&out, p)
+    out.push("|")
+    if s.result is Some(r) then type_letter(&out, r)
+    out.push("|")
+    for p in s.rest do type_letter(&out, p)
+    out.finish()
+
+private type_letter(out: *StrBuilder, t: MirType)
+    t match
+        MInt(bits) ->
+            out.push("i")
+            out.push(bits.to_string())
+        MBool -> out.push("b")
+        MReal -> out.push("r")
+        MPtr -> out.push("p")
+        MRef -> out.push("R")
+        MCell(refs) -> out.push(if refs then "C" else "c")
+    out.push(",")
+
 enum Operand
     Value(id: usize)
-    ConstInt(bits: u32, digits: string)
+    /** An integer of `bits` bits, at most 64, written in decimal as `value` is. */
+    ConstInt(bits: u32, value: long)
+    /** An integer whose decimal spelling `digits` no `long` writes: one of more than 64 bits. Kept
+     * apart, behind a reference, so the common constants above keep every operand small. */
+    ConstWide(bits: u32, digits: &string)
     ConstBool(value: bool)
     ConstReal(value: real)
     /** A string literal, a constant object, by its index in the program's string table. */
@@ -88,15 +138,30 @@ enum Operand
      * convention for a function pointer a C binding passes. */
     TrampolineAddress(index: usize)
 
+/** The integer constant of `bits` bits spelled by `digits`, a decimal number with an optional minus
+ * sign: a `ConstInt` where a `long` writes it so, and a `ConstWide` otherwise. */
+const_int(bits: u32, digits: string) -> Operand
+    if bits <= 64
+        if parse_long(digits) is Ok(value)
+            if value.to_string() == digits then return ConstInt(bits, value)
+    ConstWide(bits, digits)
+
+/** The decimal spelling of an integer constant, `ConstInt` or `ConstWide`. */
+int_digits(o: Operand) -> string = o match
+    ConstInt(_, value) -> value.to_string()
+    ConstWide(_, digits) -> *digits
+    _ -> panic("avin: not an integer constant")
+
 enum Callee
     /** A function of this program, by its index in `MirProgram.functions`. */
     Direct(function: usize)
-    /** An entry point of the runtime library, called with the C calling convention. */
-    Runtime(symbol: string, signature: MirSignature)
+    /** An entry point of the runtime library, called with the C calling convention. The signature is
+     * shared: lowering makes one of each (`MirSignatures`), which every call of that shape names. */
+    Runtime(symbol: string, signature: &MirSignature)
     /** The code at an address: a method from a method table, a type record's entry, or what a
      * function value's `call` entry names, called with the object, then the arguments. Every such
-     * address is a function of this program. */
-    Indirect(target: Operand, signature: MirSignature)
+     * address is a function of this program. The signature is shared as `Runtime`'s is. */
+    Indirect(target: Operand, signature: &MirSignature)
     /** A C function a C binding calls, by its symbol, with the C calling convention and no context:
      * how each argument and the result cross, the result `None` where the call's answer is not
      * used. */
@@ -198,6 +263,17 @@ enum Inst
     /** A new object laid out by a descriptor, all zero, with the descriptor in the header the
      * collector keeps before it; allocating may collect. */
     Alloc(dest: usize, descriptor: usize)
+    /** A new object laid out by a descriptor in the function's own stack frame, with the descriptor
+     * in a header made as a constant object's is: a delayed argument's closure, which lives only as
+     * long as the call it is passed to (see `Keep`). Its contents are whatever was stored there
+     * last, so every field is stored before it is used; it never collects. The collector does not
+     * follow a reference to it, so the references stored in it are kept alive by a `Keep`. */
+    StackObject(dest: usize, descriptor: usize)
+    /** Uses `values` and makes no code: each reference among them stays live, and so a root, up to
+     * here. It follows a call that is passed a `StackObject`, keeping alive what the object holds
+     * for as long as the callee may read it, and it keeps that call from being a tail call, which
+     * would give the object's frame back before the callee runs. */
+    Keep(values: Buf[Operand])
     /** Makes every store before it visible to another thread no later than any store after it: it
      * ends the making of an object, so a thread that reads a reference to the object, however it
      * got it, sees the header and every field the object was made with. */

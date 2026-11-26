@@ -1,0 +1,70 @@
+// expect: exit 0
+// A `select` waits on a child's output beside a channel: whichever is ready first runs, a value sent
+// on the channel while the child is silent wakes it at once, and output arriving while the channel is
+// empty wakes it as well. A `writable()` arm waits for room in a child's input. An `else` runs while
+// neither is ready, and an `after` ends a wait on a child that writes nothing. A `Selector` waits on
+// two children's outputs at once and answers whichever has something.
+import avin.io.IoError
+import avin.process.Command
+import avin.threads.{Channel, Selector, sleep, spawn}
+import avin.time.{millis, seconds}
+
+ok[T](r: Result[T, IoError]) -> T = r match
+  Ok(v) -> v
+  Err(e) -> fail(e.message)
+
+main() -> int
+  val child = Command("cat").pipeInput().pipeOutput().start().ok.get
+  val input = child.stdin()
+  val output = child.stdout()
+  val messages = Channel[string](4)
+
+  // Nothing is ready: the `else` runs.
+  println(select
+    output.readable() -> "output"
+    messages.receive() as Some(m) -> m
+    else "nothing yet")
+
+  // The channel first, while the child is silent: a thread sends after the select has begun waiting.
+  val sender = spawn(() ->
+    sleep(millis(50))
+    messages.send("from the channel"))
+  println(select
+    output.readable() -> "output"
+    messages.receive() as Some(m) -> m)
+  sender.join()
+
+  // Then the child's output, while the channel is empty.
+  ok(input.writeText("from the child\n"))
+  println(select
+    output.readable() -> ok(output.readLine()).get
+    messages.receive() as Some(m) -> m)
+
+  // Room in the child's input.
+  println(select
+    input.writable() -> "room to write"
+    after seconds(5) -> "no room")
+
+  // A child that writes nothing: the `after` ends the wait.
+  println(select
+    output.readable() -> "output"
+    after millis(100) -> "timed out")
+
+  // A selector over two children's outputs.
+  val other = Command("cat").pipeInput().pipeOutput().start().ok.get
+  val selector = Selector[string]()
+  selector.readable(output, "first")
+  selector.readable(other.stdout(), "second")
+  ok(other.stdin().writeText("hi\n"))
+  println(s"selected: ${selector.wait()}")
+  println(s"read: ${ok(other.stdout().readLine()).get}")
+
+  // The output's end is readable, and a select runs its arm.
+  ok(input.close())
+  println(select
+    output.readable() -> s"ended: ${ok(output.readLine())}"
+    after seconds(5) -> "no end")
+  _ = child.waitFor()
+  ok(other.stdin().close())
+  _ = other.waitFor()
+  0

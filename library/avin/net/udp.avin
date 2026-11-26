@@ -1,0 +1,314 @@
+module avin.net
+
+// UDP: datagrams to and from a port. Each `sendTo` sends one datagram and each `receiveFrom` takes
+// one whole, with who sent it. A datagram is not a stream: one sent may never arrive, two may arrive
+// in either order, and one longer than the receive has room for loses the rest, which the `Datagram`
+// says. Every operation that can fail answers a `Result` with an `IoError`, and one that waits, to
+// receive or for room to send, is safe for the collector while it waits: a lightweight thread parks,
+// leaving its worker to run other threads, until the socket is ready, and a cancellation ends the
+// wait.
+//
+//     val server = UdpSocket.bind("127.0.0.1", 0)?
+//     val client = UdpSocket.bind("127.0.0.1", 0)?
+//     client.sendTo("ping".utf8, IpAddress.Localhost, server.port())?
+//     val d = server.receiveFrom(1500)?
+//     server.sendTo(d.bytes, d.sender, d.senderPort)?
+//
+// A socket belongs to one thread at a time, as a TCP connection does: handing it to a thread's or a
+// future's body hands it over, and every operation first checks its owner.
+
+import avin.io
+import avin.io.IoError
+import avin.threads.{Readiness, Writability}
+import avin.time.Duration
+
+// The datagram socket under a `UdpSocket`. Its descriptor is closed when its handle is closed or, for
+// one the program forgot, when the collector frees it. Its traps name the `UdpSocket`.
+@sysl("sysl.net.UdpSocket", named: "UdpSocket")
+private class Udp
+  bind(to: Address) -> Result[unit, SyslError]
+  connect(to: Address) -> Result[unit, SyslError]
+  local() -> Result[Address, SyslError]
+  setReusePort(on: bool) -> Result[unit, SyslError]
+  setSendBuffer(bytes: int) -> Result[unit, SyslError]
+  setRecvBuffer(bytes: int) -> Result[unit, SyslError]
+  sendBuffer() -> Result[int, SyslError]
+  recvBuffer() -> Result[int, SyslError]
+  // The descriptor, which a select's arms watch: calling it also checks the socket belongs to the
+  // code running.
+  @sysl("fd")
+  held() -> Result[int, SyslError]
+
+@sysl("sysl.net.udp_socket")
+private openUdp(forAddress: Address) -> Result[Udp, SyslError]
+
+@sysl("avin.rt.udp_non_blocking")
+private udpNonBlocking(s: Udp) -> Result[unit, SyslError]
+
+@sysl("avin.rt.udp_send_to")
+private udpSendTo(s: Udp, bytes: Array[byte], to: Address, limitMs: int) -> Result[unit, SyslError]
+
+@sysl("avin.rt.udp_send")
+private udpSend(s: Udp, bytes: Array[byte], limitMs: int) -> Result[unit, SyslError]
+
+// The next datagram and who sent it, at most `room` bytes of it.
+@sysl("avin.rt.udp_receive_from")
+private udpReceiveFrom(s: Udp, room: int, limitMs: int) -> Result[(Array[byte], Address), SyslError]
+
+@sysl("avin.rt.udp_readable")
+private udpReadable(s: Udp) -> bool
+
+@sysl("avin.rt.udp_writable")
+private udpWritable(s: Udp) -> bool
+
+// The most bytes a UDP datagram carries: its length field is sixteen bits. No receive needs room for
+// more, and one with room for this many never truncates.
+val DatagramMost = 65535
+
+// The send buffer a new socket is given at least, so that a datagram of any length the protocol
+// allows can be sent: a platform whose default is smaller refuses a longer datagram outright.
+private val SendBufferLeast = 65536 + 4096
+
+// The most bytes one datagram sends: what the sixteen-bit length leaves once the headers are counted,
+// 65507 over IPv4 (an 8-byte UDP header and a 20-byte IP one inside the length) and 65527 over IPv6
+// (the UDP header alone). A send of more fails at once, whatever the platform would make of it.
+val DatagramMostIpv4 = 65507
+val DatagramMostIpv6 = 65527
+
+// What a send of `n` bytes from a socket of version 6 where `v6` says answers where it is longer than
+// that version carries, or `None` where it is not.
+private tooLong(n: int, v6: bool, there: string) -> Option[IoError]
+  val most = if v6 then DatagramMostIpv6 else DatagramMostIpv4
+  if n <= most then return None
+  val version = if v6 then "IPv6" else "IPv4"
+  Some(IoError(io.Other(s"a datagram of $n bytes is longer than the $most $version carries"), "send to", there))
+
+// One datagram received: its bytes, the address and port it came from, and whether it was longer than
+// the receive had room for, the rest of it lost.
+data Datagram(bytes: Array[byte], sender: IpAddress, senderPort: int, truncated: bool)
+
+// `address` and `port` as a person writes them: `127.0.0.1:53`, `[::1]:53`.
+private endpointText(address: IpAddress, port: int) -> string =
+  if address.isIpv6 then s"[$address]:$port" else s"$address:$port"
+
+// Stops the program where `port` is not a port.
+private checkPort(port: int)
+  if port < 0 || port > 65535 then fail(s"port $port is outside 0 to 65535")
+
+// A socket sending and receiving datagrams, made by `UdpSocket.bind`. A receive, or a send that has
+// to wait for room, waits without a limit until `setTimeout` gives it one. A socket for one version of
+// the protocol sends only to addresses of that version.
+@trusted_sendable(
+  "it belongs to one thread at a time: a send hands it over, and every operation first checks its owner, so the code that handed it over traps"
+)
+class UdpSocket(
+    private val sock: Udp,
+    private val at: IpAddress,
+    private val boundPort: int,
+    private var closed: bool,
+    private var limitMs: int
+): Sendable, io.Close, Readiness, Writability
+  // Where `connect` pointed the socket.
+  private var peer: Option[(IpAddress, int)] = None
+
+  // The port it is bound to, the one the platform chose where `bind` was given port 0.
+  port() -> int
+    mine()
+    boundPort
+
+  // The address it is bound to.
+  localAddress() -> IpAddress
+    mine()
+    at
+
+  // The address and port `connect` pointed it at, if it has been.
+  connectedTo() -> Option[(IpAddress, int)]
+    mine()
+    peer
+
+  // Sends `bytes` as one datagram to `port` at `to`, an address of the socket's own version; an empty
+  // datagram is a datagram. One longer than the socket's version carries (`DatagramMostIpv4`,
+  // `DatagramMostIpv6`) fails without being sent; a port outside 0 to 65535 traps.
+  sendTo(bytes: Array[byte], to: IpAddress, port: int) -> Result[unit, IoError]
+    mine()
+    checkPort(port)
+    val there = endpointText(to, port)
+    if closed then return Err(closedError("send to", there))
+    if to.isIpv6 != at.isIpv6 then return Err(otherVersion(to, there, "send to"))
+    if tooLong(bytes.length, at.isIpv6, there) is Some(e) then return Err(e)
+    afterWait(udpSendTo(sock, bytes, socketAddress(to, port), limitMs)).mapErr(failed("send to", there))
+
+  // Sends `bytes` as one datagram to `port` at the first of `host`'s addresses of the socket's version.
+  sendTo(bytes: Array[byte], host: string, port: int) -> Result[unit, IoError]
+    mine()
+    sendTo(bytes, addressFor(host, port, "send to")?, port)
+
+  // Sends `bytes` as one datagram to where `connect` pointed the socket.
+  send(bytes: Array[byte]) -> Result[unit, IoError]
+    mine()
+    peer match
+      None -> Err(IoError(io.Other("the socket is not connected"), "send from", endpointText(at, boundPort)))
+      Some((to, port)) ->
+        val there = endpointText(to, port)
+        if closed then return Err(closedError("send to", there))
+        if tooLong(bytes.length, at.isIpv6, there) is Some(e) then return Err(e)
+        afterWait(udpSend(sock, bytes, limitMs)).mapErr(failed("send to", there))
+
+  // Waits for the next datagram and answers up to `max` of its bytes, with who sent it; `truncated`
+  // says it was longer, the rest of it lost. `max` is at least one; a `max` of `DatagramMost` or more
+  // never truncates. Once the socket is connected, only datagrams from where it points arrive, and a
+  // port there that nothing listens on may answer `ConnectionRefused`.
+  receiveFrom(max: int) -> Result[Datagram, IoError]
+    mine()
+    if max < 1 then fail(s"a receive of $max bytes: at least one is needed")
+    val here = endpointText(at, boundPort)
+    if closed then return Err(closedError("receive on", here))
+    val room = if max >= DatagramMost then DatagramMost + 1 else max + 1
+    afterWait(udpReceiveFrom(sock, room, limitMs)) match
+      Ok((got, from)) ->
+        val truncated = got.length > max
+        Ok(Datagram(if truncated then got.slice(0, max) else got, ipOf(from), from.port(), truncated))
+      Err(e) -> Err(failed("receive on", here)(e))
+
+  // Points the socket at `port` on `to`: `send` goes there without naming it, and only datagrams from
+  // there arrive. Connecting again points it elsewhere.
+  connect(to: IpAddress, port: int) -> Result[unit, IoError]
+    mine()
+    checkPort(port)
+    val there = endpointText(to, port)
+    if closed then return Err(closedError("connect to", there))
+    if to.isIpv6 != at.isIpv6 then return Err(otherVersion(to, there, "connect to"))
+    sock.connect(socketAddress(to, port)).mapErr(failed("connect to", there))?
+    peer = Some((to, port))
+    Ok(())
+
+  // Points the socket at `port` on the first of `host`'s addresses of the socket's version.
+  connect(host: string, port: int) -> Result[unit, IoError]
+    mine()
+    connect(addressFor(host, port, "connect to")?, port)
+
+  // A receive, or a send that waits for room, that waits longer than `d` fails with `TimedOut` from
+  // now on; a duration of zero or less takes the limit away. The limit is kept in whole milliseconds,
+  // a part of one counting as one.
+  setTimeout(d: Duration) -> Result[unit, IoError]
+    mine()
+    if closed then return Err(closedError("set the timeout of", endpointText(at, boundPort)))
+    limitMs = millisOf(d)
+    Ok(())
+
+  // The limit `setTimeout` set, in whole milliseconds; zero where there is none.
+  timeout -> Duration = Duration(long(limitMs) * 1000)
+
+  // Asks the platform for a receive buffer of `bytes`: datagrams that arrive faster than they are
+  // received are dropped once it is full, so a larger one drops fewer. The platform may give more or
+  // less; `receiveBufferSize` says what it gave.
+  setReceiveBufferSize(bytes: int) -> Result[unit, IoError]
+    mine()
+    val here = endpointText(at, boundPort)
+    if closed then return Err(closedError("size the buffer of", here))
+    sock.setRecvBuffer(bytes).mapErr(failed("size the buffer of", here))
+
+  // The receive buffer the platform gave the socket, in bytes.
+  receiveBufferSize() -> Result[int, IoError]
+    mine()
+    val here = endpointText(at, boundPort)
+    if closed then return Err(closedError("size the buffer of", here))
+    sock.recvBuffer().mapErr(failed("size the buffer of", here))
+
+  // Asks the platform for a send buffer of `bytes`, as `setReceiveBufferSize` does for receiving.
+  setSendBufferSize(bytes: int) -> Result[unit, IoError]
+    mine()
+    val here = endpointText(at, boundPort)
+    if closed then return Err(closedError("size the buffer of", here))
+    sock.setSendBuffer(bytes).mapErr(failed("size the buffer of", here))
+
+  // The send buffer the platform gave the socket, in bytes.
+  sendBufferSize() -> Result[int, IoError]
+    mine()
+    val here = endpointText(at, boundPort)
+    if closed then return Err(closedError("size the buffer of", here))
+    sock.sendBuffer().mapErr(failed("size the buffer of", here))
+
+  // Whether a receive would answer now, without waiting: a datagram has arrived, the socket has
+  // failed, or it is closed. Never waits.
+  override readable() -> bool
+    mine()
+    closed || udpReadable(sock)
+
+  // The socket's descriptor, which a select's `readable()` arm watches; -1 once closed.
+  override readinessDescriptor() -> int
+    mine()
+    if closed then return -1
+    sock.held() match
+      Ok(fd) -> fd
+      Err(_) -> -1
+
+  // Whether a send would go now, without waiting for room, or the socket has failed or is closed.
+  // Never waits.
+  override writable() -> bool
+    mine()
+    closed || udpWritable(sock)
+
+  // The socket's descriptor, which a select's `writable()` arm watches; -1 once closed.
+  override writabilityDescriptor() -> int = readinessDescriptor()
+
+  // Closes the socket; closing again does nothing. An operation afterwards answers an error.
+  override close() -> Result[unit, IoError]
+    mine()
+    if !closed
+      closed = true
+      sock.close()
+    Ok(())
+
+  // The first of `host`'s addresses of the socket's version, or the error `operation` fails with.
+  private addressFor(host: string, port: int, operation: string) -> Result[IpAddress, IoError]
+    checkPort(port)
+    val found = lookup(host)?
+    found.find(a -> a.isIpv6 == at.isIpv6) match
+      Some(a) -> Ok(a)
+      None ->
+        val version = if at.isIpv6 then "IPv6" else "IPv4"
+        Err(IoError(io.Other(s"no $version address found"), operation, s"$host:$port"))
+
+  // What `operation`, a send to or a connection with an address of the other version, answers.
+  private otherVersion(to: IpAddress, there: string, operation: string) -> IoError
+    val mineIs = if at.isIpv6 then "an IPv6" else "an IPv4"
+    val theirs = if to.isIpv6 then "IPv6" else "IPv4"
+    IoError(io.Other(s"$mineIs socket cannot reach an $theirs address"), operation, there)
+
+  // Stops the program where the socket belongs to another thread, as a connection's does.
+  private mine()
+    if closed then _ = sock.close() else _ = sock.held()
+
+object UdpSocket
+  // A socket bound to `port` on the first of `host`'s addresses: `127.0.0.1` or `::1` for this
+  // machine alone, `0.0.0.0` or `::` for every address it answers on. Port `0` lets the platform
+  // choose, and `port()` says which. With `reusePort`, several sockets may bind one port, each set so
+  // before binding, and the platform shares the datagrams that arrive among them.
+  bind(host: string, port: int, reusePort: bool = false) -> Result[UdpSocket, IoError]
+    checkPort(port)
+    val addresses = addressesOf(host, port, 0)?
+    bound(ipOf(addresses(0)), port, reusePort, s"$host:$port")
+
+  // A socket bound to `port` on `address`, as `bind` with a host's name binds.
+  bind(address: IpAddress, port: int, reusePort: bool = false) -> Result[UdpSocket, IoError]
+    checkPort(port)
+    bound(address, port, reusePort, endpointText(address, port))
+
+  private bound(address: IpAddress, port: int, reusePort: bool, here: string) -> Result[UdpSocket, IoError]
+    val a = socketAddress(address, port)
+    val s = openUdp(a).mapErr(failed("bind to", here))?
+    prepared(s, a, reusePort) match
+      Ok(at) -> Ok(UdpSocket(s, address, at.port(), false, 0))
+      Err(e) ->
+        s.close()
+        Err(failed("bind to", here)(e))
+
+  // Sets `s` up and binds it to `a`: shared where `reusePort` asks, with room to send any datagram,
+  // non-blocking. Answers where it is bound.
+  private prepared(s: Udp, a: Address, reusePort: bool) -> Result[Address, SyslError]
+    if reusePort then s.setReusePort(true)?
+    if s.sendBuffer()? < SendBufferLeast then s.setSendBuffer(SendBufferLeast)?
+    s.bind(a)?
+    udpNonBlocking(s)?
+    s.local()

@@ -1,0 +1,150 @@
+// expect: exit 0
+// Closing both halves of a split connection closes its socket then, whichever half closes first, not
+// when the collector frees the halves and the connection the split used up: the program holds one
+// descriptor fewer at once. Closing one half leaves the socket open for the other. It holds for TCP,
+// Unix and TLS connections, for halves closed on the thread that split them and on another, and
+// with the used-up connection and the closed halves still reachable.
+import avin.fs
+import avin.io.IoError
+import avin.net.{ByteStream, StreamReader, StreamWriter, TcpListener, TcpStream, UnixListener, UnixStream}
+import avin.net.tls.{TlsClient, TlsError, TlsServer, TlsStream}
+import avin.threads.{Thread, spawn}
+
+ok[T](r: Result[T, IoError]) -> T = r match
+  Ok(v) -> v
+  Err(e) -> fail(e.message)
+
+tls[T](r: Result[T, TlsError]) -> T = r match
+  Ok(v) -> v
+  Err(e) -> fail(e.message)
+
+fixture(name: string) -> string
+  val here = "tests/fixtures/tls/" + name
+  ok(fs.readText(if fs.exists(here) then here else "../" + here))
+
+descriptors() -> int = ok(fs.listDir("/dev/fd")).length
+
+// Splits `c`, whose other end `far` holds open, and closes its halves in the order `readerFirst`
+// says, printing how many more descriptors the program holds than `base` after each step. The used-up
+// connection and both halves stay reachable to the end, so nothing the collector does closes the
+// socket.
+closing(name: string, c: ByteStream, far: ByteStream, base: int, readerFirst: bool)
+  val (r, w) = c.split()
+  println(name, "split", descriptors() - base)
+  if readerFirst then ok(r.close()) else ok(w.close())
+  println(name, "one half closed", descriptors() - base)
+  if readerFirst then ok(w.close()) else ok(r.close())
+  println(name, "both closed", descriptors() - base)
+  ok(far.close())
+  println(name, "far end closed", descriptors() - base)
+  println(name, "still closed", c.close().isOk, r.close().isOk, w.close().isOk, descriptors() - base)
+
+// The same, each half closed by a thread of its own, the reader's first.
+closingElsewhere(name: string, c: ByteStream, far: ByteStream, base: int)
+  val (r, w) = c.split()
+  spawn(() -> ok(r.close())).join()
+  println(name, "reader closed elsewhere", descriptors() - base)
+  spawn(() -> ok(w.close())).join()
+  println(name, "writer closed elsewhere", descriptors() - base)
+  ok(far.close())
+  println(name, "far end closed", descriptors() - base, c.close().isOk)
+
+// A TCP connection and the far end a listener accepted for it.
+tcpPair() -> (TcpStream, TcpStream)
+  val l = ok(TcpListener.bind("127.0.0.1", 0))
+  val c = ok(TcpStream.connect("127.0.0.1", l.port()))
+  val s = ok(l.accept())
+  ok(l.close())
+  (c, s)
+
+// A Unix connection to a listener at `path` and the far end it accepted.
+unixPair(path: string) -> (UnixStream, UnixStream)
+  val l = ok(UnixListener.bind(path))
+  val c = ok(UnixStream.connect(path))
+  val s = ok(l.accept())
+  ok(l.close())
+  (c, s)
+
+// A TLS connection over TCP split on this thread, whose far end reads every line to its end and then
+// closes, answering the lines it read. The near end writes a line, closes its writer, reads the far
+// end's end, and closes its reader last, so it leaves nothing unread and the far end's close notice
+// goes out.
+tlsWriterFirst(server: TlsServer, trust: TlsClient)
+  val base = descriptors()
+  val l = ok(TcpListener.bind("127.0.0.1", 0))
+  val port = l.port()
+  val far = spawn(() ->
+    val s = tls(TlsStream.server(ok(l.accept()), server))
+    _ = l.close()
+    val lines = Buffer[string]()
+    while ok(s.readLine()) is Some(text)
+      lines.addOne(text)
+    ok(s.close())
+    lines.toVector.mkString("+"))
+  val c = tls(TlsStream.connect("localhost", port, trust))
+  val (r, w) = c.split()
+  ok(w.writeText("one\n"))
+  ok(w.close())
+  println("tls", "writer closed", ok(r.readLine()).isEmpty)
+  ok(r.close())
+  println("tls", "far end read", far.join())
+  println("tls", "both closed", descriptors() - base, c.close().isOk, r.close().isOk, w.close().isOk)
+
+// One TLS connection, closed whole, so that whatever the runtime opens once, on the first wait or the
+// first thread, is open before the counting begins.
+warmUp(server: TlsServer, trust: TlsClient)
+  val l = ok(TcpListener.bind("127.0.0.1", 0))
+  val port = l.port()
+  val far = spawn(() ->
+    val s = tls(TlsStream.server(ok(l.accept()), server))
+    _ = l.close()
+    _ = s.readAll()
+    _ = s.close())
+  val c = tls(TlsStream.connect("localhost", port, trust))
+  ok(c.writeText("warm\n"))
+  ok(c.close())
+  far.join()
+
+// The reader closed first: the writer's close closes the socket at once. The far end only reads, and
+// what it answers is not looked at, since a socket closed with the far end's session tickets unread
+// resets the connection.
+tlsReaderFirst(server: TlsServer, trust: TlsClient)
+  val base = descriptors()
+  val l = ok(TcpListener.bind("127.0.0.1", 0))
+  val port = l.port()
+  val far = spawn(() ->
+    val s = tls(TlsStream.server(ok(l.accept()), server))
+    _ = l.close()
+    _ = s.readAll()
+    _ = s.close())
+  val c = tls(TlsStream.connect("localhost", port, trust))
+  val (r, w) = c.split()
+  ok(r.close())
+  ok(w.writeText("one\n"))
+  ok(w.close())
+  far.join()
+  println("tls reader first", "both closed", descriptors() - base, c.close().isOk, r.close().isOk, w.close().isOk)
+
+main()
+  for readerFirst in [true, false]
+    val base = descriptors()
+    val (c, s) = tcpPair()
+    closing(s"tcp reader first $readerFirst", c, s, base, readerFirst)
+  val base = descriptors()
+  val (c, s) = tcpPair()
+  closingElsewhere("tcp", c, s, base)
+
+  val dir = ok(fs.createTempDir("avsplitfd"))
+  for readerFirst in [true, false]
+    val before = descriptors()
+    val (u, v) = unixPair(dir + s"/$readerFirst")
+    closing(s"unix reader first $readerFirst", u, v, before, readerFirst)
+  val before = descriptors()
+  val (u, v) = unixPair(dir + "/elsewhere")
+  closingElsewhere("unix", u, v, before)
+
+  val server = tls(TlsServer.of(fixture("localhost.pem"), fixture("localhost.key")))
+  val trust = TlsClient().trust(fixture("ca.pem"))
+  warmUp(server, trust)
+  tlsWriterFirst(server, trust)
+  tlsReaderFirst(server, trust)

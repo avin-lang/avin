@@ -1,0 +1,210 @@
+// expect: exit 0
+// Positioned reads and writes on an open file, `setLength`/`truncate`, the three syncs and
+// `deleteOnClose`: the position never moves under a positioned call, a read past the end is short,
+// a write past it leaves zeros, every misuse is an `Err`, many threads write disjoint ranges of one
+// file, and an offset past 4 GiB works on a sparse file.
+import avin.fs
+import avin.fs.File
+import avin.io.IoError
+import avin.threads.scope
+
+impl[T] Result[T, IoError]
+  get() -> T = self match
+    Ok(v) -> v
+    Err(e) -> fail(s"unexpected $e")
+
+show(r: Result[Array[byte], IoError]) -> string = r match
+  Ok(b) -> "[" + b.mkString(" ") + "]"
+  Err(e) -> s"Err($e)"
+
+ok(r: Result[unit, IoError]) -> string = r match
+  Ok(_) -> "ok"
+  Err(e) -> s"Err($e)"
+
+bytesOf(text: string) -> Array[byte] = Array.tabulate(text.byteLength, i -> text.byteAt(i))
+
+var root = ""
+
+say(line: Any)
+  println(if root == "" then s"$line" else s"$line".replace(root, "DIR"))
+
+main()
+  val dir = fs.createTempDir("avin-positioned").get()
+  root = dir
+  val path = dir + "/p"
+  // Positioned reads at the start, the middle, the end and past it; the position stays.
+  val f = fs.createUpdate(path).get()
+  say(ok(f.write(bytesOf("0123456789"))))
+  say(f.position())
+  say(show(f.readAt(0, 4)))
+  say(show(f.readAt(3, 4)))
+  say(show(f.readAt(6, 4)))
+  say(show(f.readAt(8, 10)))
+  say(show(f.readAt(10, 4)))
+  say(show(f.readAt(1000, 4)))
+  say(show(f.readAt(2, 0)))
+  say(f.position())
+  // A read of what this handle has just written, with no flush.
+  say(show(f.readAt(0, 10)))
+  // Positioned writes: start, middle, end, and past the end, which extends with zeros.
+  say(ok(f.writeAt(0, bytesOf("AB"))))
+  say(ok(f.writeAt(4, bytesOf("xy"))))
+  say(ok(f.writeAt(8, bytesOf("YZ!"))))
+  say(f.position())
+  say(text(f.readAt(0, 20).get()))
+  say(ok(f.writeAt(15, bytesOf("end"))))
+  say(f.size())
+  say(show(f.readAt(10, 8)))
+  say(ok(f.writeAt(2, Array.empty[byte]())))
+  say(f.position())
+  // The ordinary position is untouched: a seek, a positioned call, then a read goes on from the seek.
+  _ = f.seek(1)
+  _ = f.writeAt(0, bytesOf("Q"))
+  say(show(f.readAt(5, 2)))
+  say(f.position())
+  say(show(f.read(3)))
+  say(f.position())
+  // Reads made ahead are not stale after a positioned write over them.
+  _ = f.seek(0)
+  say(show(f.read(2)))
+  _ = f.writeAt(2, bytesOf("##"))
+  say(show(f.read(3)))
+  say(f.position())
+  // Misuse: negative offset, negative max, negative length.
+  say(show(f.readAt(-1, 2)))
+  say(show(f.readAt(0, -1)))
+  say(ok(f.writeAt(-1, bytesOf("a"))))
+  say(ok(f.setLength(-1)))
+  say(f.size())
+  // setLength: shrink, grow with zeros, to zero, to the same length; the position does not move.
+  _ = f.seek(4)
+  say(ok(f.setLength(6)))
+  say(s"${f.size()} ${f.position()}")
+  say(show(f.readAt(0, 10)))
+  say(ok(f.setLength(8)))
+  say(show(f.readAt(0, 10)))
+  say(ok(f.truncate(8)))
+  say(f.size())
+  _ = f.seek(20)
+  say(ok(f.setLength(2)))
+  say(s"${f.size()} ${f.position()}")
+  say(ok(f.write(bytesOf("z"))))
+  say(show(f.readAt(0, 30)))
+  say(ok(f.setLength(0)))
+  say(s"${f.size()} ${show(f.readAt(0, 5))}")
+  say(ok(f.truncate(3)))
+  say(show(f.readAt(0, 5)))
+  // The syncs succeed on a written file, and on one with nothing pending.
+  say(ok(f.writeAt(0, bytesOf("data"))))
+  say(ok(f.sync()))
+  say(ok(f.syncData()))
+  say(ok(f.fullSync()))
+  say(ok(f.sync()))
+  say(fs.readText(path).get())
+  say(f.close())
+  // Everything on a closed file is an Err; closing again is not.
+  say(ok(f.sync()))
+  say(ok(f.syncData()))
+  say(ok(f.fullSync()))
+  say(show(f.readAt(0, 1)))
+  say(ok(f.writeAt(0, bytesOf("a"))))
+  say(ok(f.setLength(0)))
+  say(ok(f.truncate(0)))
+  say(ok(f.deleteOnClose()))
+  say(f.close())
+  // A read-only handle reads at an offset, syncs, and refuses to write or change the length.
+  val r = fs.open(path).get()
+  say(show(r.readAt(1, 2)))
+  say(ok(r.sync()))
+  say(ok(r.syncData()))
+  say(ok(r.writeAt(0, bytesOf("a"))))
+  say(ok(r.setLength(0)))
+  say(fs.readText(path).get())
+  _ = r.close()
+  // A write-only handle refuses a positioned read, and writes at an offset.
+  val w = fs.create(dir + "/w").get()
+  say(show(w.readAt(0, 1)))
+  say(ok(w.writeAt(3, bytesOf("hi"))))
+  say(ok(w.setLength(7)))
+  _ = w.close()
+  say(show(fs.readBytes(dir + "/w")))
+  // A file opened to append can have its length set.
+  val a = fs.append(dir + "/w").get()
+  say(ok(a.setLength(2)))
+  _ = a.close()
+  say(show(fs.readBytes(dir + "/w")))
+  // Delete on close removes the name on close, not before; a plain file stays.
+  val d = fs.createUpdate(dir + "/scratch").get()
+  say(ok(d.deleteOnClose()))
+  _ = d.write(bytesOf("temporary"))
+  say(fs.exists(dir + "/scratch"))
+  say(show(d.readAt(0, 4)))
+  say(d.close())
+  say(fs.exists(dir + "/scratch"))
+  say(d.close())
+  val k = fs.createUpdate(dir + "/kept").get()
+  _ = k.close()
+  say(fs.exists(dir + "/kept"))
+  // Delete on close of a file already removed by name reports the failed removal once.
+  val gone = fs.createUpdate(dir + "/gone").get()
+  _ = gone.deleteOnClose()
+  _ = fs.remove(dir + "/gone")
+  say(gone.close())
+  // Many threads, each with its own handle, write disjoint 1 KiB ranges of one file; a reader
+  // handle with positional reads sees every block, and no position moved.
+  val big = dir + "/many"
+  _ = fs.writeBytes(big, Array.empty[byte]())
+  val blocks = 64
+  scope(s ->
+    val ts = (0 ..< blocks).map(i -> s.spawn(() ->
+      val h = fs.openUpdate(big).get()
+      val data = Array.fill(1024, byte(i))
+      _ = h.writeAt(long((blocks - 1 - i) * 1024), data)
+      _ = h.close()
+      i)).toVector
+    for t in ts
+      _ = t.join())
+  val rd = fs.open(big).get()
+  say(rd.size())
+  var wrong = 0
+  for i in 0 ..< blocks
+    val got = rd.readAt(long((blocks - 1 - i) * 1024), 1024).get()
+    if got.length != 1024 then wrong += 1
+    for j in 0 ..< got.length
+      if got(j) != byte(i) then wrong += 1
+  say(s"wrong=$wrong position=${rd.position()}")
+  _ = rd.close()
+  // Threads sharing nothing but the name also write at the same time through one handle each,
+  // interleaved by 8 bytes; the result is the interleaving.
+  val stripes = dir + "/stripes"
+  _ = fs.writeBytes(stripes, Array.empty[byte]())
+  scope(s ->
+    val ts = (0 ..< 8).map(i -> s.spawn(() ->
+      val h = fs.openUpdate(stripes).get()
+      for k in 0 ..< 100
+        _ = h.writeAt(long((k * 8 + i) * 8), Array.fill(8, byte(i + 1)))
+      _ = h.close()
+      i)).toVector
+    for t in ts
+      _ = t.join())
+  val sb = fs.readBytes(stripes).get()
+  var bad = 0
+  for n in 0 ..< sb.length
+    if sb(n) != byte((n / 8) % 8 + 1) then bad += 1
+  say(s"${sb.length} bad=$bad")
+  // Offsets above 4 GiB on a sparse file: write there, read there, the start is zeros.
+  val sparse = fs.createUpdate(dir + "/sparse").get()
+  val far: long = 5368709127
+  say(ok(sparse.writeAt(far, bytesOf("far"))))
+  say(sparse.size() == Ok(far + 3))
+  say(text(sparse.readAt(far, 10).get()))
+  say(show(sparse.readAt(0, 3)))
+  say(sparse.position())
+  say(ok(sparse.setLength(far + 1)))
+  say(text(sparse.readAt(far, 10).get()))
+  say(ok(sparse.setLength(0)))
+  say(sparse.size())
+  _ = sparse.close()
+  _ = fs.removeDirAll(dir)
+
+text(bytes: Array[byte]) -> string = string.fromUtf8Lossy(bytes)

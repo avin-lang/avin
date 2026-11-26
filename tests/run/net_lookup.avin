@@ -1,0 +1,128 @@
+// expect: exit 0
+// `lookup`: a name's addresses, each once; a numeric address answering itself without a helper
+// thread; names that could not be a host's refused with `HostNotFound` before anything is asked; a name
+// the resolver finds nothing for; a hundred lookups at once from lightweight threads; and a lookup's
+// wait ended by a cancellation and by a deadline, the runtime's test hook holding every helper as a
+// resolver that never answers would. Every name asked is `localhost` or under `.invalid`, which no
+// resolver answers for (RFC 6761).
+import avin.io
+import avin.io.IoError
+import avin.net.{HostNameMost, IpAddress, lookup}
+import avin.threads.{Atomic, scope, sleep, spawn, withTimeout}
+import avin.time.{Duration, millis, monotonic}
+
+@sysl("avin.rt.resolve_hold")
+resolveHold(on: bool)
+
+@sysl("avin.rt.resolve_helpers")
+helpers() -> long
+
+@sysl("avin.rt.resolve_in_flight")
+inFlight() -> long
+
+@sysl("avin.rt.resolve_helpers_started")
+helpersStarted() -> long
+
+ok[T](r: Result[T, IoError]) -> T = r match
+  Ok(v) -> v
+  Err(e) -> fail(e.message)
+
+// Waits until `ready` holds, stopping the program where it has not within a minute.
+within(what: string, ready: () -> bool)
+  val deadline = monotonic() + millis(60000)
+  while !ready()
+    if monotonic() > deadline then fail(s"$what did not happen within a minute")
+    sleep(millis(1))
+
+// Everything has been let go: no helper runs and no lookup holds a slot.
+settled() = within("the lookups settling", () -> helpers() == 0 && inFlight() == 0)
+
+// What looking `host` up answers: its addresses, or the error's kind and message.
+answer(host: string) -> string = lookup(host) match
+  Ok(found) -> found.map(a -> a.toString()).mkString(", ")
+  Err(e) -> s"${e.kind == io.HostNotFound}: ${e.message}"
+
+main()
+  // `localhost` answers the loopback of at least one version, each address once.
+  val local = ok(lookup("localhost"))
+  if local.isEmpty || !local.forall(a -> a.isLoopback) then fail(s"localhost is $local")
+  if local.toSet.size != local.length then fail(s"localhost answered an address twice: $local")
+  println(
+    s"localhost: loopback only, each once: ${local.contains(IpAddress.Localhost) || local.contains(IpAddress.LocalhostV6)}"
+  )
+  // A name is looked up whatever its case.
+  println(s"LOCALHOST: ${ok(lookup("LOCALHOST")).forall(a -> a.isLoopback)}")
+  settled()
+
+  // A numeric address is its own answer, asking nobody.
+  val before = helpersStarted()
+  for t in [
+    "127.0.0.1",
+    "::1",
+    "0.0.0.0",
+    "::",
+    "fe80::1%3",
+    "::ffff:10.1.2.3",
+    "2001:DB8::1"
+  ] do println(s"$t: ${answer(t)}")
+  if helpersStarted() != before then fail("a numeric address started a helper")
+
+  // Names that could not be a host's, refused before anything is asked.
+  val refusing = helpersStarted()
+  println(answer(""))
+  println(answer("local host"))
+  for host in [
+    " localhost",
+    "localhost\n",
+    "local\thost",
+    "local\u0000host",
+    "local\u007fhost",
+    "a".repeat(HostNameMost + 1)
+  ]
+    lookup(host) match
+      Ok(found) -> fail(s"a name that could not be a host's answered $found")
+      Err(e) -> println(s"refused as not found: ${e.kind == io.HostNotFound}, the name kept: ${e.subject == host}")
+  if helpersStarted() != refusing then fail("a refused name started a helper")
+  // The longest name allowed is asked about, and found nowhere.
+  println(answer("a".repeat(HostNameMost - 8) + ".invalid").startsWith("true"))
+  // A name nobody answers for.
+  println(answer("nothing-here.invalid"))
+  // Unicode is passed to the resolver as it is, and found nowhere.
+  println(answer("bücher.invalid"))
+  settled()
+
+  // A hundred lookups at once, from lightweight threads, each answered.
+  val answered = Atomic(0)
+  scope(s ->
+    for i in 0 ..< 100
+      s.spawn(() ->
+        lookup("localhost") match
+          Ok(found) if found.forall(a -> a.isLoopback) -> _ = answered.add(1)
+          _ -> ()))
+  println(s"${answered.load()} of 100 concurrent lookups answered")
+  settled()
+
+  // A cancellation ends a lookup's wait at once; so does a deadline.
+  resolveHold(true)
+  var cancelledAt = monotonic()
+  val ended = scope(s ->
+    val t = s.spawn(() -> lookup("localhost").isOk)
+    within("the lookup starting", () -> inFlight() == 1)
+    cancelledAt = monotonic()
+    s.cancel()
+    t)
+  val stoppedAfter = (monotonic() - cancelledAt).micros / 1000
+  if ended.result().nonEmpty then fail("a cancelled lookup gave a result")
+  if stoppedAfter > 2000 then fail(s"a cancelled lookup took $stoppedAfter ms to stop")
+  println("a cancelled lookup stops at once")
+  val start = monotonic()
+  val cut = withTimeout(millis(100), _ -> lookup("localhost").isOk)
+  val took = (monotonic() - start).micros / 1000
+  if cut.nonEmpty then fail("a lookup the deadline cut off answered")
+  if took < 100 || took > 2000 then fail(s"withTimeout took $took ms for a 100 ms deadline")
+  println("withTimeout ends a lookup at its deadline")
+  // A numeric address answers even while every helper is held.
+  println(s"held, a numeric address: ${answer("127.0.0.1")}")
+  resolveHold(false)
+  settled()
+  println("every helper and slot let go")

@@ -1,0 +1,128 @@
+// A concurrent web crawler. A fixed number of workers take URLs from a shared frontier, fetch each
+// page, and add the links they find on the same site; a set of the URLs already seen keeps each page
+// to one fetch, and a wait group counting the pages still to crawl tells the program when the
+// frontier will get no more, so it can be closed and the workers end.
+//
+//     avin run main.avin http://localhost:8080/ 8
+//
+// Given `--try`, it crawls a small site it serves itself on a port the system chooses: pages that
+// link to each other in cycles, a broken link, a link off the site and one deeper than the crawl
+// goes.
+//
+// args: --try
+// expect: exit 0
+import avin.collections.mutable.{Set as MutableSet}
+import avin.net.Url
+import avin.net.http
+import avin.net.http.{Response, Route, Router}
+import avin.regex.Regex
+import avin.threads.{Atomic, Channel, Mutex, WaitGroup, scope}
+
+data Page(url: Url, depth: int, outcome: Fetched)
+
+data Fetched
+  Fetched(status: int, title: string, links: int)
+  Failed(message: string)
+
+// What a worker looks for in a page. A compiled `Regex` cannot be shared between threads, so each
+// worker compiles its own.
+class Scanner()
+  val link = Regex("href=\"([^\"#]*)[^\"]*\"")
+  val title = Regex("<title>([^<]*)</title>")
+
+// The links of a page that stay on its site, resolved against the page and without fragments.
+linksOn(scan: Scanner, page: Url, html: string) -> Vector[Url] =
+  scan.link.findAllMatchIn(html).toVector
+    .flatMap(m -> m.group(1).flatMap(ref -> page.resolve(ref).ok))
+    .filter(u -> u.scheme == page.scheme && u.host == page.host && u.port == page.port)
+    .distinct
+
+// Crawls from `start` with `workers` fetching at once, following links at most `maxDepth` deep.
+crawl(start: Url, workers: int, maxDepth: int) -> Vector[Page]
+  val frontier = Channel[(Url, int)]()
+  val seen: Mutex[MutableSet[Url]] = Mutex({start})
+  val toCrawl = WaitGroup()
+  val pages = Channel[Page]()
+  val busy = Atomic(0)
+  val busiest = Atomic(0)
+  toCrawl.add(1)
+  frontier.send((start, 0))
+  scope(s ->
+    s.spawn(() ->
+      toCrawl.wait()
+      frontier.close())
+    for _ in 1 .. workers
+      s.spawn(() ->
+        val scan = Scanner()
+        for (url, depth) in frontier
+          val now = busy.add(1)
+          busiest.update(most -> max(most, now))
+          val outcome = http.get(url.toString()) match
+            Err(e) -> Failed(e.message)
+            Ok(r) ->
+              val links = if r.status == 200 then linksOn(scan, url, r.text) else []
+              if depth < maxDepth
+                // A page's new links are claimed together, before any is sent, so a page is crawled at
+                // the depth of the first page found that links to it, whichever worker is quicker.
+                val fresh = seen.with(set -> links.filter(set.add))
+                toCrawl.add(fresh.length)
+                for link in fresh do frontier.send((link, depth + 1))
+              Fetched(r.status, scan.title.findFirstMatchIn(r.text).flatMap(_.group(1)).getOrElse("-"), links.length)
+          busy.sub(1)
+          pages.send(Page(url, depth, outcome))
+          toCrawl.done()))
+  pages.close()
+  if busiest.load() > workers then eprintln(s"${busiest.load()} fetches at once, with $workers workers")
+  pages.toVector.sortBy(_.url.path)
+
+// The site `--try` crawls: each page's title and the links on it.
+val site: Map[string, (string, Vector[string])] = {
+  "index": ("Home", ["/about", "/blog", "docs", "https://elsewhere.example/", "/#top"]),
+  "about": ("About us", ["/", "/about#team", "/team"]),
+  "blog": ("Blog", ["/posts/1", "/posts/2", "/posts/3", "/"]),
+  "docs": ("Docs", ["/docs/start", "/blog"]),
+  "team": ("The team", ["/about"]),
+}
+
+render(title: string, links: Vector[string]) -> Response =
+  val anchors = links.map(l -> s"<a href=\"$l\">$l</a>").mkString("\n")
+  Response.html(200, s"<html><head><title>$title</title></head><body>\n$anchors\n</body></html>")
+
+page(name: string) -> Response = site.get(name) match
+  Some((title, links)) -> render(title, links)
+  None -> Response.text(404, "not found\n")
+
+post(n: int) -> Response = n match
+  1 | 2 -> render(s"Post $n", [s"/posts/${n + 1}", "/blog", "/posts/missing"])
+  3 -> render("Post 3", ["/posts/4"])
+  _ -> render(s"Post $n", [])
+
+testSite() -> Router = Router(
+  [
+    Route.get("/", _ -> page("index")),
+    Route.get("/:page", r -> page(r.param("page"))),
+    Route.get("/docs/start", _ -> render("Getting started", ["/docs", "../index"])),
+    Route.get("/posts/:n", r -> r.paramAs[int]("n").map(post).getOrElse(page("missing")))
+  ]
+)
+
+report(pages: Vector[Page])
+  for p in pages
+    p.outcome match
+      Fetched(status, title, links) -> println(f"${p.url.path}%-14s depth ${p.depth}  $status  $links%2d links  $title")
+      Failed(message) -> println(f"${p.url.path}%-14s depth ${p.depth}  failed: $message")
+  println(s"${pages.length} pages, ${pages.count(p -> p.outcome is Fetched(200, _, _))} fetched whole")
+
+main(args: Vector[string]) -> int
+  if args.contains("--try")
+    val server = http.serve("127.0.0.1", 0, testSite().handle).ok.get
+    report(crawl(Url(s"http://127.0.0.1:${server.port()}/"), workers = 4, maxDepth = 3))
+    server.shutdown()
+    return 0
+  val start = args.headOption.flatMap(a -> Url.parse(a).ok) match
+    Some(u) -> u
+    None ->
+      eprintln("usage: crawler URL [WORKERS]")
+      return 2
+  report(crawl(start, args.lift(1).flatMap(_.toIntOption()).getOrElse(8), maxDepth = 5))
+  0

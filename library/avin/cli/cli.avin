@@ -14,11 +14,27 @@ module avin.cli
 //         val opts = parser.parseOrExit(args)
 //         if opts.flag("lines") then …
 //
+// A program of several commands, each with options of its own, gives its parser a parser for each:
+//
+//     val parser = cli.Parser("todo", "Keep a to-do list.")
+//         .string("file", help = "the list", default = "todo.txt")
+//         .command(cli.Parser("add", "Add a task.").positionals("words", required = true))
+//         .command(cli.Parser("list", "List the tasks.").flag("all"))
+//
+//     val opts = parser.parseOrExit(args)
+//     opts.command match
+//       "add" -> add(opts.string("file"), opts.commandArgs.strings("words"))
+//       …
+//
 // A mistake in the declarations themselves, two options of one name or a default that is not one of
 // the choices, is the program's mistake and traps where it is declared. A mistake on the command line
 // is the user's, and `parse` answers it as an `ArgsError` saying what was wrong.
 
+import avin.fs
+import avin.io.NotFound
 import avin.process
+import avin.toml
+import avin.toml.Toml
 
 // The character an option without a one-letter form has for its `short`.
 private val noShort = '\u{0}'
@@ -48,21 +64,60 @@ private data Opt(
 // One positional argument as declared. A `many` one takes every argument left.
 private data Pos(name: string, help: string, required: bool, many: bool)
 
+// Where an option's value came from, as `Args.origin` answers: the command line, an environment
+// variable, a configuration file, or none of them, so it took its default.
+data Origin
+  CommandLine
+  Environment(variable: string)
+  ConfigFile(path: string)
+  Default
+
+impl Display for Origin
+  display(out: Writer, spec: FormatSpec) = out.writeField(originText(self), spec)
+
+private originText(origin: Origin) -> string
+originText(CommandLine) = "the command line"
+originText(Environment(variable)) = s"the environment variable `$variable`"
+originText(ConfigFile(path)) = path
+originText(Default) = "its default"
+
+// An option's values from the environment or a configuration file, and which: none, for a flag set
+// to false.
+private data Layered(values: Vector[string], source: Origin)
+
 // Why `parse` gave no `Args`: the user asked for the help or the version, which `text` holds, or the
 // arguments were not what the program takes. `reason` says what was wrong, `unknown option
-// `--x``, and `usage` is the program's usage line, to show with it. Its `message` is the text or
-// the reason.
+// `--x``; `usage` is the usage line of the parser that found it, `program` that parser's name,
+// `todo add` for a command's, and `hint` the line saying where its help is, empty where it has
+// none. Its `message` is the text or the reason; its `report` is all of it, as `parseOrExit`
+// writes it.
 data ArgsError
   HelpRequested(text: string)
   VersionRequested(text: string)
-  Invalid(reason: string, usage: string)
+  Invalid(reason: string, usage: string, program: string, hint: string)
 
 impl Error for ArgsError
   // The help or the version text, or what was wrong with the arguments.
   message -> string = self match
     HelpRequested(text) -> text
     VersionRequested(text) -> text
-    Invalid(reason, _) -> reason
+    Invalid(reason, _, _, _) -> reason
+
+impl ArgsError
+  // The whole text to show for this error, each line ending in a newline: the help, or the version;
+  // or the program's name and the reason, the usage line, and the hint where there is one. A
+  // program that reads command lines without ending, a shell or a script runner, writes it and
+  // carries on.
+  report -> string = self match
+    HelpRequested(text) -> if text.endsWith("\n") then text else text + "\n"
+    VersionRequested(text) -> text + "\n"
+    Invalid(reason, usage, program, hint) ->
+      val head = s"$program: $reason\n$usage\n"
+      if hint == "" then head else s"$head$hint\n"
+
+  // The status a program ending on this error exits with: 0 for the help or the version the user
+  // asked for, 2 for a mistake.
+  exitCode -> int = if self is Invalid(_, _, _, _) then 2 else 0
 
 // What a program takes on its command line. Each method that declares something answers a new parser
 // and leaves this one as it was. `name` is the program's name in the usage line and the messages,
@@ -74,7 +129,8 @@ class Parser(
     val about: string = "",
     val version: string = "",
     private val options: Vector[Opt] = [],
-    private val arguments: Vector[Pos] = []
+    private val arguments: Vector[Pos] = [],
+    private val commands: Vector[Parser] = []
 )
   // The same parser, with the flag `--name`, which is given or not. A flag may be given any number
   // of times, and `Args.count` says how many: `-vvv` is three.
@@ -147,14 +203,189 @@ class Parser(
   positionals(name: string, help: string = "", required: bool = false) -> Parser =
     withArgument(Pos(name, help, required, true))
 
+  // The same parser, taking the command `sub.name`, whose own options and arguments `sub` declares
+  // and whose line in the help is `sub.about`. A parser with commands takes no positional
+  // arguments: the first argument that is not an option, or one of its values, names the command,
+  // and every argument after it is the command's, read by `sub`, which may have commands of its own.
+  // Every parser with commands also has the command `help`, `prog help add`, unless the program
+  // declares one of that name itself.
+  command(sub: Parser) -> Parser
+    if sub.name == "" || sub.name.startsWith("-") || sub.name.contains(" ")
+      fail(s"cli: `${sub.name}` is not a command name; it is one word, not starting with `-`")
+    if commands.exists(_.name == sub.name) then fail(s"cli: the command `${sub.name}` is declared twice")
+    if arguments.nonEmpty
+      fail(s"cli: `$name` takes positional arguments, so it cannot take the command `${sub.name}`")
+    Parser(name, about, version, options, arguments, commands :+ sub)
+
   // The arguments read against the declarations: `Args` holding every value, or an `ArgsError`
   // when the user asked for `--help` or `--version`, or when the arguments are not what the program
   // takes. An argument starting with `-` is an option, except `-` alone; one starting with `--`
   // gives its value after `=` or as the next argument, and one with a single `-` is one or more
   // one-letter options, `-lw`, the last of which may take the rest of it or the next argument as
   // its value, `-n5` or `-n 5`. An option's value is the next argument whatever it starts with, so
-  // `--top -1` is -1. Every argument after `--` is positional.
-  parse(args: Vector[string]) -> Result[Args, ArgsError]
+  // `--top -1` is -1. Every argument after `--` is positional. Where the parser has commands, the
+  // first positional argument names one, and the arguments after it are that command's.
+  parse(args: Vector[string]) -> Result[Args, ArgsError] = parseOver(args, HashMap.empty[string, Layered]())
+
+  // As `parse`, with each option the command line does not give taken from the environment, else from
+  // the TOML file `file`, else its default: the command line wins over the environment, the
+  // environment over the file, and the file over the defaults. Only this parser's own options are
+  // layered; a command's options and the positional arguments come from the command line alone.
+  //
+  // - The file's keys are the options' names, `port = 8080`; an option named with dots, `db.host`, is
+  //   also the key `host` of the table `[db]`. A key that is no option is an error, so a misspelt
+  //   setting is not silently ignored. A flag's value is `true` or `false`, a repeated option's an
+  //   array or a single value, and every other value must be of the option's type: a string for a
+  //   string or a choice, an integer for an int, an integer or a float for a real.
+  // - The environment variable of an option is `envPrefix` and the option's name in upper case, each
+  //   `-` and `.` an `_`: `APP_MAX_CONNECTIONS` for `max-connections` with the prefix `APP_`. With an
+  //   empty prefix the environment is not read. A flag's variable is `true`, `false`, `1` or `0`; a
+  //   repeated option's gives one value.
+  // - `file` empty reads no file, and a file that does not exist is skipped unless `fileRequired`.
+  //
+  // A bad value is an `Invalid` error naming where it came from: `` `port` in app.toml needs an int,
+  // not a string ``, `` the environment variable `APP_PORT` needs an int, not `eighty` ``, or a TOML
+  // error with its line and column, `app.toml: '=' where a value was expected at line 2, column 8`.
+  // `--help` and `--version` are answered whatever the file and the environment hold.
+  parseLayered(
+      args: Vector[string],
+      file: string = "",
+      fileRequired: bool = false,
+      envPrefix: string = "",
+      env: Map[string, string] = process.environment()
+  ) -> Result[Args, ArgsError]
+    var config: Option[Toml] = None
+    if file != ""
+      fs.readBytes(file) match
+        Ok(bytes) ->
+          toml.parse(bytes) match
+            Ok(table) -> config = Some(table)
+            Err(e) -> return askedOr(args, wrong(s"$file: $e"))
+        Err(e) -> if !(e.kind == NotFound && !fileRequired) then return askedOr(args, wrong(s"$e"))
+    layeredOver(args, config, file, envPrefix, env)
+
+  // As `parseLayered`, with the configuration already read: `config`, a TOML table, named `source` in
+  // the messages.
+  parseWithConfig(
+      args: Vector[string],
+      config: Toml,
+      source: string,
+      envPrefix: string = "",
+      env: Map[string, string] = process.environment()
+  ) -> Result[Args, ArgsError] = layeredOver(args, Some(config), source, envPrefix, env)
+
+  // As `parseLayered`, ending the program where it gives no `Args`, as `parseOrExit` does.
+  parseLayeredOrExit(
+      args: Vector[string],
+      file: string = "",
+      fileRequired: bool = false,
+      envPrefix: string = "",
+      env: Map[string, string] = process.environment()
+  ) -> Args = exitOn(parseLayered(args, file, fileRequired, envPrefix, env))
+
+  private layeredOver(
+      args: Vector[string],
+      config: Option[Toml],
+      source: string,
+      envPrefix: string,
+      env: Map[string, string]
+  ) -> Result[Args, ArgsError]
+    var layered: Map[string, Layered] = HashMap.empty[string, Layered]()
+    if config is Some(table)
+      val members = table match
+        Toml.Table(m) -> m
+        _ -> return askedOr(args, wrong(s"$source is ${table.kind}, not a table of settings"))
+      layered = fromFile(members, "", source, layered) match
+        Ok(l) -> l
+        Err(e) -> return askedOr(args, e)
+    if envPrefix != ""
+      for o in options
+        val variable = envPrefix + o.name.toUpper.replace("-", "_").replace(".", "_")
+        if env.get(variable) is Some(text)
+          val values = fromEnvironment(o, variable, text) match
+            Ok(v) -> v
+            Err(e) -> return askedOr(args, e)
+          layered = layered.updated(o.name, Layered(values, Environment(variable)))
+    parseOver(args, layered)
+
+  // The help or the version where `args` asks for one, else `e`: a bad file or variable does not keep
+  // a user from asking how to fix it.
+  private askedOr(args: Vector[string], e: ArgsError) -> Result[Args, ArgsError] = parse(args) match
+    Err(HelpRequested(text)) -> Err(HelpRequested(text))
+    Err(VersionRequested(text)) -> Err(VersionRequested(text))
+    _ -> Err(e)
+
+  // The values of the options a configuration's `members` set, each key `prefix` and its name.
+  private fromFile(
+      members: Vector[(string, Toml)],
+      prefix: string,
+      source: string,
+      into: Map[string, Layered]
+  ) -> Result[Map[string, Layered], ArgsError]
+    var acc = into
+    for (k, v) in members
+      val key = if prefix == "" then k else s"$prefix.$k"
+      byName(key) match
+        Some(o) -> acc = acc.updated(key, Layered(fileValues(o, s"`$key` in $source", v)?, ConfigFile(source)))
+        None ->
+          val nested = v match
+            Toml.Table(inner) -> if options.exists(_.name.startsWith(key + ".")) then Some(inner) else None
+            _ -> None
+          acc = nested match
+            Some(inner) -> fromFile(inner, key, source, acc)?
+            None ->
+              val near = nearest(key, options.map(_.name)) match
+                Some(m) -> s"; did you mean `$m`?"
+                None -> ""
+              return Err(wrong(s"`$key` in $source is not an option of $name$near"))
+    Ok(acc)
+
+  // The values a configuration gives `o`, at `place`: each element of an array for a repeated option.
+  private fileValues(o: Opt, place: string, v: Toml) -> Result[Vector[string], ArgsError] = v match
+    Toml.Arr(items) ->
+      if !o.repeated || o.kind is Switch then return Err(wrong(s"$place takes one value, not an array"))
+      var out = Vector.empty[string]()
+      for item in items
+        out = out ++ fileValue(o, place, item)?
+      Ok(out)
+    _ -> fileValue(o, place, v)
+
+  private fileValue(o: Opt, place: string, v: Toml) -> Result[Vector[string], ArgsError] = o.kind match
+    Switch -> v match
+      Toml.Bool(b) -> Ok(if b then [""] else Vector.empty[string]())
+      _ -> Err(wrong(s"$place needs true or false, not ${v.kind}"))
+    Text -> v match
+      Toml.Str(s) -> Ok([s])
+      _ -> Err(wrong(s"$place needs a string, not ${v.kind}"))
+    Whole -> v match
+      Toml.Integer(n) -> if v.asInt.isDefined then Ok([s"$n"]) else Err(
+        wrong(s"$place needs an int, and $n does not fit one")
+      )
+      _ -> Err(wrong(s"$place needs an int, not ${v.kind}"))
+    Fraction -> v match
+      Toml.Integer(n) -> Ok([s"$n"])
+      Toml.Float(x) -> if x.isFinite then Ok([s"$x"]) else Err(wrong(s"$place needs a finite number, not $x"))
+      _ -> Err(wrong(s"$place needs a number, not ${v.kind}"))
+    OneOf(choices) -> v match
+      Toml.Str(s) ->
+        checked(o, place, s)?
+        Ok([s])
+      _ -> Err(wrong(s"$place must be one of ${listed(choices)}, not ${v.kind}"))
+
+  // The values the environment variable `variable`, holding `text`, gives `o`.
+  private fromEnvironment(o: Opt, variable: string, text: string) -> Result[Vector[string], ArgsError]
+    val place = s"the environment variable `$variable`"
+    if o.kind is Switch
+      return text match
+        "true" | "1" -> Ok([""])
+        "false" | "0" -> Ok(Vector.empty[string]())
+        _ -> Err(wrong(s"$place needs true, false, 1 or 0, not `$text`"))
+    checked(o, place, text)?
+    Ok([text])
+
+  // The arguments read against the declarations, each option the command line does not give taken
+  // from `layered` where it has it.
+  private parseOver(args: Vector[string], layered: Map[string, Layered]) -> Result[Args, ArgsError]
     var seen: Map[string, Vector[string]] = HashMap.empty[string, Vector[string]]()
     var loose = Vector.empty[string]()
     var ended = false
@@ -163,6 +394,7 @@ class Parser(
       val a = args(i)
       i += 1
       if ended || a == "-" || !a.startsWith("-")
+        if commands.nonEmpty then return dispatched(a, args.drop(i), seen, layered)
         loose = loose :+ a
       else if a == "--"
         ended = true
@@ -187,7 +419,7 @@ class Parser(
             args(i - 1)
           else
             return invalid(s"`$spelled` needs a value")
-          checked(opt, spelled, text)?
+          checked(opt, s"`$spelled`", text)?
           seen = recorded(seen, opt, text)
       else
         val letters = a.drop(1).chars
@@ -210,9 +442,10 @@ class Parser(
               args(i - 1)
             else
               return invalid(s"`$spelled` needs a value")
-            checked(opt, spelled, text)?
+            checked(opt, s"`$spelled`", text)?
             seen = recorded(seen, opt, text)
             j = letters.length
+    if commands.nonEmpty then return invalid(s"missing command; the commands are ${listed(commandNames)}")
     var k = 0
     for p in arguments
       if p.many
@@ -225,30 +458,42 @@ class Parser(
       else if p.required
         return invalid(s"missing argument `<${p.name}>`")
     if k < loose.length then return invalid(s"unexpected argument `${loose(k)}`")
-    for o in options
-      if o.required && !seen.contains(o.name) then return invalid(s"missing required option `--${o.name}`")
-    Ok(Args(options, arguments, seen))
+    val (values, sources) = merged(seen, layered)
+    if missingOption(values) is Some(o) then return invalid(s"missing required option `--$o`")
+    Ok(Args(options, arguments, values, sources = sources))
 
-  // As `parse`, ending the program where it gives no `Args`: the help or the version is written to
-  // standard output and the program exits with 0; a mistake is written to standard error as the
-  // program's name and the message, the usage line, and where to find the help, and the program
-  // exits with 2.
-  parseOrExit(args: Vector[string]) -> Args = parse(args) match
+  // As `parse`, ending the program where it gives no `Args`, with the error's `report`: the help or
+  // the version is written to standard output and the program exits with 0; a mistake is written to
+  // standard error as the program's name and the message, the usage line, and where to find the
+  // help, and the program exits with 2. A program that must go on after a mistake, reading command
+  // lines one after another, calls `parse` and writes the `report` itself.
+  parseOrExit(args: Vector[string]) -> Args = exitOn(parse(args))
+
+  private exitOn(result: Result[Args, ArgsError]) -> Args = result match
     Ok(a) -> a
-    Err(HelpRequested(text)) ->
-      print(text)
-      process.exit(0)
-    Err(VersionRequested(text)) ->
-      println(text)
-      process.exit(0)
-    Err(Invalid(reason, usage)) ->
-      eprintln(s"$name: $reason")
-      eprintln(usage)
-      if helpByName then eprintln(s"Run `$name --help` for the options.")
-      process.exit(2)
+    Err(e) ->
+      if e is Invalid(_, _, _, _) then eprint(e.report) else print(e.report)
+      process.exit(e.exitCode)
+
+  // The values the command line gave, `seen`, with each option it did not give taken from `layered`,
+  // and where each value came from.
+  private merged(
+      seen: Map[string, Vector[string]],
+      layered: Map[string, Layered]
+  ) -> (Map[string, Vector[string]], Map[string, Origin])
+    var values = seen
+    var sources: Map[string, Origin] = HashMap.empty[string, Origin]()
+    for (k, v) in seen
+      if v.nonEmpty then sources = sources.updated(k, CommandLine)
+    for (k, l) in layered
+      if !seen.contains(k)
+        if l.values.nonEmpty then values = values.updated(k, l.values)
+        sources = sources.updated(k, l.source)
+    (values, sources)
 
   // The usage line: the program's name, its required options, `[options]` where it has others, and
-  // its positional arguments, an optional one in brackets and one taking the rest with `...`.
+  // its positional arguments, an optional one in brackets and one taking the rest with `...`; or,
+  // where it has commands, `<command> ...`.
   usage -> string
     var line = s"Usage: $name"
     for o in options
@@ -257,16 +502,23 @@ class Parser(
     for p in arguments
       val shape = if p.many then s"<${p.name}>..." else s"<${p.name}>"
       line = if p.required then s"$line $shape" else s"$line [$shape]"
+    if commands.nonEmpty then line = s"$line <command> ..."
     line
 
-  // The help: the usage line, the `about` sentence, then each argument and option with its help,
-  // the option's default, and whether it is required or may be repeated, in the order declared.
+  // The help: the usage line, the `about` sentence, then each argument, each command with its
+  // `about`, and each option with its help, the option's default, and whether it is required or may
+  // be repeated, in the order declared. The help texts line up in one column of a terminal, the
+  // names before them measured by `displayWidth`, so wide and combining characters keep it straight.
   help -> string
     var rows = Vector.empty[(string, string)]()
     for p in arguments
       val shape = if p.many then s"<${p.name}>..." else s"<${p.name}>"
       rows = rows :+ (shape, p.help)
     val argumentRows = rows.length
+    for c in commands
+      rows = rows :+ (c.name, c.about)
+    if helpCommand then rows = rows :+ ("help <command>", "show the help of a command")
+    val commandRows = rows.length
     for o in options
       val letter = if o.short == noShort then "    " else s"-${o.short}, "
       rows = rows :+ (letter + spelling(o), described(o))
@@ -274,14 +526,15 @@ class Parser(
     if versionByName then rows = rows :+ ("    --version", "show the version and exit")
     var width = 0
     for (left, _) in rows
-      if left.charCount > width then width = left.charCount
+      if left.displayWidth > width then width = left.displayWidth
     var text = usage + "\n"
     if about != "" then text = s"$text\n$about\n"
     var n = 0
     for (left, right) in rows
       if n == 0 && argumentRows > 0 then text = text + "\nArguments:\n"
-      if n == argumentRows then text = text + "\nOptions:\n"
-      val line = if right == "" then s"  $left" else s"  ${left.padEnd(width)}  $right"
+      if n == argumentRows && commandRows > argumentRows then text = text + "\nCommands:\n"
+      if n == commandRows then text = text + "\nOptions:\n"
+      val line = if right == "" then s"  $left" else s"  ${left.padEndWidth(width)}  $right"
       text = s"$text$line\n"
       n += 1
     text
@@ -297,6 +550,66 @@ class Parser(
 
   private versionByName -> bool = version != "" && !options.exists(_.name == "version")
 
+  // Whether the parser has the command `help`, which it has where it has commands, unless the
+  // program declared one of that name.
+  private helpCommand -> bool = commands.nonEmpty && !commands.exists(_.name == "help")
+
+  // The commands the user may name, `help` last where it is the parser's own.
+  private commandNames -> Vector[string]
+    val names = commands.map(_.name)
+    if helpCommand then names :+ "help" else names
+
+  // The line after a mistake saying where the help is, or empty where the parser has no `--help`
+  // or `help` of its own.
+  private hint -> string
+    val what = if commands.nonEmpty then "commands" else "options"
+    if helpByName then s"Run `$name --help` for the $what."
+    else if helpCommand then s"Run `$name help` for the $what."
+    else ""
+
+  // The first required option the values `seen` lack, by name.
+  private missingOption(seen: Map[string, Vector[string]]) -> Option[string] =
+    options.find(o -> o.required && !seen.contains(o.name)).map(_.name)
+
+  // The parser of a command, as it reads that command's arguments: named after the program and the
+  // command, `todo add`, in its usage line, its help and its messages.
+  private within(program: string) -> Parser = Parser(s"$program $name", about, version, options, arguments, commands)
+
+  // The command `word` read from `rest`, the arguments after it, once the options before it were
+  // read into `seen`.
+  private dispatched(
+      word: string,
+      rest: Vector[string],
+      seen: Map[string, Vector[string]],
+      layered: Map[string, Layered]
+  ) -> Result[Args, ArgsError]
+    if word == "help" && helpCommand then return helpOf(rest)
+    val sub = commands.find(_.name == word) match
+      Some(c) -> c.within(name)
+      None -> return invalid(unknownCommand(word))
+    val inner = sub.parse(rest)?
+    val (values, sources) = merged(seen, layered)
+    if missingOption(values) is Some(o) then return invalid(s"missing required option `--$o`")
+    Ok(Args(options, arguments, values, word, Some(inner), sources))
+
+  // The help asked for by the command `help`: this parser's own where `words` is empty, else the
+  // help of the command they name, each word a command of the one before it: `git help remote add`.
+  private helpOf(words: Vector[string]) -> Result[Args, ArgsError]
+    var p = self
+    for w in words
+      if w == "help" && p.helpCommand then continue
+      if p.commands.isEmpty then return p.invalid(s"unexpected argument `$w`")
+      p = p.commands.find(_.name == w) match
+        Some(c) -> c.within(p.name)
+        None -> return p.invalid(p.unknownCommand(w))
+    Err(HelpRequested(p.help))
+
+  // The reason for naming `word`, which is no command: with the command it was most likely meant
+  // to be, else with every command.
+  private unknownCommand(word: string) -> string = nearest(word, commandNames) match
+    Some(c) -> s"unknown command `$word`; did you mean `$c`?"
+    None -> s"unknown command `$word`; the commands are ${listed(commandNames)}"
+
   private byName(key: string) -> Option[Opt] = options.find(_.name == key)
 
   private byLetter(c: char) -> Option[Opt] = options.find(_.short == c)
@@ -310,7 +623,7 @@ class Parser(
       fail(s"cli: `${o.name}` is declared twice")
     if o.short != noShort && options.exists(_.short == o.short)
       fail(s"cli: two options have the letter `-${o.short}`")
-    Parser(name, about, version, options :+ o, arguments)
+    Parser(name, about, version, options :+ o, arguments, commands)
 
   // The parser with `p` added, after checking it can follow the arguments before it.
   private withArgument(p: Pos) -> Parser
@@ -320,22 +633,24 @@ class Parser(
     if arguments.exists(_.many) then fail(s"cli: `<${p.name}>` follows an argument that takes the rest")
     if p.required && arguments.exists(!_.required)
       fail(s"cli: the required `<${p.name}>` follows an optional argument")
-    Parser(name, about, version, options, arguments :+ p)
+    if commands.nonEmpty then fail(s"cli: `$name` takes commands, so it cannot take the argument `<${p.name}>`")
+    Parser(name, about, version, options, arguments :+ p, commands)
 
-  // An `Invalid` error of `message`, with this parser's usage line.
-  private invalid(message: string) -> Result[Args, ArgsError] = Err(Invalid(message, usage))
+  // An `Invalid` error of `message`, from this parser.
+  private wrong(message: string) -> ArgsError = Invalid(message, usage, name, hint)
 
-  // `text` checked as a value of `o`, which the user spelled `spelled`.
-  private checked(o: Opt, spelled: string, text: string) -> Result[unit, ArgsError] = o.kind match
+  private invalid(message: string) -> Result[Args, ArgsError] = Err(wrong(message))
+
+  // `text` checked as a value of `o`, given at `place`: the option as the user spelled it, `` `--top`
+  // ``, or the variable or the file's key it came from.
+  private checked(o: Opt, place: string, text: string) -> Result[unit, ArgsError] = o.kind match
     Whole ->
-      if text.toIntOption() is Some(_) then Ok(()) else Err(Invalid(s"`$spelled` needs an int, not `$text`", usage))
+      if text.toIntOption() is Some(_) then Ok(()) else Err(wrong(s"$place needs an int, not `$text`"))
     Fraction ->
-      if text.toRealOption() is Some(_) then Ok(()) else Err(Invalid(s"`$spelled` needs a number, not `$text`", usage))
+      if text.toRealOption() is Some(_) then Ok(()) else Err(wrong(s"$place needs a number, not `$text`"))
     OneOf(choices) ->
       if choices.contains(text) then Ok(())
-      else
-        val listed = choices.map(c -> s"`$c`").mkString(", ")
-        Err(Invalid(s"`$spelled` must be one of $listed, not `$text`", usage))
+      else Err(wrong(s"$place must be one of ${listed(choices)}, not `$text`"))
     _ -> Ok(())
 
 // The values given so far with `text` added for `o`: kept beside the others where `o` is repeated,
@@ -343,6 +658,37 @@ class Parser(
 private recorded(seen: Map[string, Vector[string]], o: Opt, text: string) -> Map[string, Vector[string]] =
   if o.repeated then seen.updated(o.name, seen.getOrElse(o.name, Vector.empty[string]()) :+ text)
   else seen.updated(o.name, [text])
+
+// Each of `words` in backticks, separated by commas: `` `text`, `json` ``.
+private listed(words: Vector[string]) -> string = words.map(w -> s"`$w`").mkString(", ")
+
+// The one of `names` that `word` was most likely a slip for: the nearest within two edits, where
+// that is fewer edits than `word` has characters, the first declared of those as near; else the one
+// name `word` begins, where only one does. `None` where there is no such name.
+private nearest(word: string, names: Vector[string]) -> Option[string]
+  var best: Option[string] = None
+  var bestDistance = 3
+  for n in names
+    val d = edits(word, n)
+    if d < bestDistance && d < word.charCount
+      best = Some(n)
+      bestDistance = d
+  if best.nonEmpty || word == "" then return best
+  val begun = names.filter(_.startsWith(word))
+  if begun.length == 1 then Some(begun(0)) else None
+
+// How many characters must be put in, taken out or changed to make `a` into `b`.
+private edits(a: string, b: string) -> int
+  val x = a.chars
+  val y = b.chars
+  var row = Array.tabulate(y.length + 1, j -> j)
+  for i in 0 ..< x.length
+    val next = Array.fill(y.length + 1, i + 1)
+    for j in 0 ..< y.length
+      val change = row(j) + (if x(i) == y(j) then 0 else 1)
+      next(j + 1) = min(change, row(j + 1) + 1, next(j) + 1)
+    row = next
+  row(y.length)
 
 // The long form of `o` with its value's placeholder: `--top <N>`, or `--lines` for a flag.
 private spelling(o: Opt) -> string = o.kind match
@@ -371,7 +717,25 @@ kindName(OneOf(_)) = "a choice"
 // The arguments of one command line, as `Parser.parse` read them. Each value is asked for by the name
 // it was declared with, as the type it was declared with. Asking for a name that was never declared,
 // or as another type, is the program's mistake and traps.
-class Args(options: Vector[Opt], arguments: Vector[Pos], seen: Map[string, Vector[string]])
+class Args(
+    options: Vector[Opt],
+    arguments: Vector[Pos],
+    seen: Map[string, Vector[string]],
+    chosen: string = "",
+    inner: Option[Args] = None,
+    sources: Map[string, Origin] = HashMap.empty[string, Origin]()
+)
+  // The command given, `add` for `todo --file t.txt add milk`, where the parser has commands;
+  // empty where it has none.
+  command -> string = chosen
+
+  // The arguments after the command, read by the command's own parser: its options and arguments
+  // are asked for here, the program's own on these `Args`. Asking where the parser has no commands
+  // traps.
+  commandArgs -> Args = inner match
+    Some(a) -> a
+    None -> fail("cli: no command was read; the parser declares none")
+
   // Whether the flag `name` was given.
   flag(name: string) -> bool = count(name) > 0
 
@@ -380,11 +744,16 @@ class Args(options: Vector[Opt], arguments: Vector[Pos], seen: Map[string, Vecto
     expect(name, "a flag", k -> k is Switch)
     seen.getOrElse(name, Vector.empty[string]()).length
 
-  // Whether the option or argument `name` was given on the command line, rather than taking its
-  // default.
-  given(name: string) -> bool
+  // Whether the option or argument `name` was given, on the command line or, by `parseLayered`, in
+  // the environment or the configuration file, rather than taking its default. A flag a file or a
+  // variable sets to false is given.
+  given(name: string) -> bool = !(origin(name) is Default)
+
+  // Where the value of the option or argument `name` came from: `CommandLine`, `Environment(variable)`,
+  // `ConfigFile(path)`, or `Default` where none of them gave it.
+  origin(name: string) -> Origin
     if !declared(name) then fail(s"cli: nothing is declared as `$name`")
-    seen.getOrElse(name, Vector.empty[string]()).nonEmpty
+    sources.getOrElse(name, Default)
 
   // The text of the option `name`, of a choice, or of the positional argument `name`: the last
   // value given, else its default, which is empty where it has none. For a positional argument

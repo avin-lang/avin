@@ -2182,3 +2182,244 @@ lsp_completion_constructor_members()
     // A constructor parameter offered where a type is written shows its holes and bound.
     val typed = lsp_complete_in("t.avin", "f[F[_]: Monad](x: F) = 0\n\nmain() = ()\n", 0, 19, false)
     assert_eq(lsp_item(typed, "F").detail, "type parameter F[_]: Monad")
+
+// ---- contextual parameters ----
+
+// A module given, a block given hiding it, and a call passing the parameter by name.
+private lsp_givens_text() -> string =
+    "class Tx(val id: int)\n" +
+    "\n" +
+    "given current = Tx(1)\n" +
+    "\n" +
+    "insert(row: int, using tx: Tx) -> int = row + tx.id\n" +
+    "\n" +
+    "main()\n" +
+    "  print(insert(2))\n" +
+    "  given local = Tx(3)\n" +
+    "  print(insert(4))\n" +
+    "  print(insert(5, tx = current))\n"
+
+private lsp_givens() -> Opened
+    val dir = lsp_normal(make_temp_dir("avin-lsp").unwrap())
+    val uri = lsp_file_uri(dir + "/t.avin")
+    var server = lsp_ready()
+    assert_eq(lsp_one(&server, lsp_open(uri, lsp_givens_text())), lsp_publish_of(uri, ""))
+    Opened(dir, uri, server)
+
+// The markdown a hover answered with.
+private lsp_hover_value(answer: string) -> string = lsp_text_at(parse_json(answer).unwrap(), ["result", "contents", "value"]).unwrap_or("")
+
+@test("lsp: hover on a call shows each argument its `using` section was filled with and the given it came from")
+lsp_hover_filled_call()
+    var o = lsp_givens()
+    val uri = o.uri
+    val module_level = lsp_hover_value(lsp_one(&o.server, lsp_request(2, "textDocument/hover", lsp_test_at(uri, 7, 9))))
+    assert(module_level.starts_with("```avin\ninsert(row: int, using tx: Tx) -> int\n```"), module_level)
+    assert(module_level.ends_with("\n\nFilled from givens:\n\n```avin\ntx = current  // val current: Tx\n```"), module_level)
+    // The block's given is nearer than the module's.
+    val block = lsp_hover_value(lsp_one(&o.server, lsp_request(3, "textDocument/hover", lsp_test_at(uri, 9, 9))))
+    assert(block.ends_with("\n\nFilled from givens:\n\n```avin\ntx = local  // val local: Tx\n```"), block)
+    // A parameter passed by name is written, not filled: the hover is the signature alone.
+    assert_eq(lsp_one(&o.server, lsp_request(4, "textDocument/hover", lsp_test_at(uri, 10, 9))),
+        lsp_hover_of(4, "insert(row: int, using tx: Tx) -> int", "", 10, 8, 10, 14))
+    // The given's own name, and the parameter named at the call, hover as before.
+    assert_eq(lsp_one(&o.server, lsp_request(5, "textDocument/hover", lsp_test_at(uri, 10, 24))),
+        lsp_hover_of(5, "val current: Tx", "", 10, 23, 10, 30))
+    assert_eq(lsp_one(&o.server, lsp_request(6, "textDocument/hover", lsp_test_at(uri, 2, 8))),
+        lsp_hover_of(6, "val current: Tx", "", 2, 6, 2, 13))
+    remove_dir_all(o.dir).unwrap_or(())
+
+@test("lsp: definition from a filled call goes to the function, then to each given it was filled with")
+lsp_definition_filled_call()
+    var o = lsp_givens()
+    val uri = o.uri
+    assert_eq(lsp_one(&o.server, lsp_request(2, "textDocument/definition", lsp_test_at(uri, 7, 9))),
+        lsp_reply(2, s"[${lsp_location(uri, 4, 0, 4, 6)},${lsp_location(uri, 2, 6, 2, 13)}]"))
+    assert_eq(lsp_one(&o.server, lsp_request(3, "textDocument/definition", lsp_test_at(uri, 9, 9))),
+        lsp_reply(3, s"[${lsp_location(uri, 4, 0, 4, 6)},${lsp_location(uri, 8, 8, 8, 13)}]"))
+    // Passed by name, nothing is filled: the function alone.
+    assert_eq(lsp_one(&o.server, lsp_request(4, "textDocument/definition", lsp_test_at(uri, 10, 9))),
+        lsp_location_of(4, uri, 4, 0, 4, 6))
+    remove_dir_all(o.dir).unwrap_or(())
+
+@test("lsp: a given's references and highlights include the calls it filled; a rename of it edits only what is written")
+lsp_references_filled_call()
+    var o = lsp_givens()
+    val uri = o.uri
+    assert_eq(lsp_one(&o.server, lsp_request(2, "textDocument/references", lsp_references_at(uri, 2, 8, true))),
+        lsp_reply(2, s"[${lsp_location(uri, 2, 6, 2, 13)},${lsp_location(uri, 7, 8, 7, 14)},${lsp_location(uri, 10, 23, 10, 30)}]"))
+    assert_eq(lsp_one(&o.server, lsp_request(3, "textDocument/references", lsp_references_at(uri, 8, 9, false))),
+        lsp_reply(3, s"[${lsp_location(uri, 9, 8, 9, 14)}]"))
+    // The function's references are its calls, each once.
+    assert_eq(lsp_one(&o.server, lsp_request(4, "textDocument/references", lsp_references_at(uri, 4, 2, false))),
+        lsp_reply(4, s"[${lsp_location(uri, 7, 8, 7, 14)},${lsp_location(uri, 9, 8, 9, 14)},${lsp_location(uri, 10, 8, 10, 14)}]"))
+    assert_eq(lsp_one(&o.server, lsp_request(5, "textDocument/documentHighlight", lsp_test_at(uri, 2, 8))),
+        lsp_reply(5, s"[{\"range\":${lsp_test_range(2, 6, 2, 13)},\"kind\":3},{\"range\":${lsp_test_range(7, 8, 7, 14)},\"kind\":2},{\"range\":${lsp_test_range(10, 23, 10, 30)},\"kind\":2}]"))
+    // From the call, the highlights are the function's.
+    assert_eq(lsp_one(&o.server, lsp_request(6, "textDocument/documentHighlight", lsp_test_at(uri, 7, 9))),
+        lsp_reply(6, s"[{\"range\":${lsp_test_range(4, 0, 4, 6)},\"kind\":3},{\"range\":${lsp_test_range(7, 8, 7, 14)},\"kind\":2},{\"range\":${lsp_test_range(9, 8, 9, 14)},\"kind\":2},{\"range\":${lsp_test_range(10, 8, 10, 14)},\"kind\":2}]"))
+    // A rename of the given edits its declaration and its written use, never the call it filled.
+    val renamed = lsp_one(&o.server, lsp_request(7, "textDocument/rename", s"{\"textDocument\":{\"uri\":\"$uri\"},\"position\":{\"line\":2,\"character\":8},\"newName\":\"primary\"}"))
+    assert_eq(renamed, lsp_changes(7, uri, s"${lsp_edit(2, 6, 2, 13, "primary")},${lsp_edit(10, 23, 10, 30, "primary")}"))
+    // From the call, the name renamed is the function's.
+    val of_function = lsp_one(&o.server, lsp_request(8, "textDocument/rename", s"{\"textDocument\":{\"uri\":\"$uri\"},\"position\":{\"line\":7,\"character\":9},\"newName\":\"add\"}"))
+    assert_eq(of_function,lsp_changes(8, uri, s"${lsp_edit(4, 0, 4, 6, "add")},${lsp_edit(7, 8, 7, 14, "add")},${lsp_edit(9, 8, 9, 14, "add")},${lsp_edit(10, 8, 10, 14, "add")}"))
+    remove_dir_all(o.dir).unwrap_or(())
+
+@test("lsp: a filled call's name is one semantic token, the function's")
+lsp_semantic_tokens_filled_call()
+    var o = lsp_givens()
+    val tokens = lsp_decoded_tokens(lsp_one(&o.server, lsp_request(2, "textDocument/semanticTokens/full", s"{\"textDocument\":{\"uri\":\"${o.uri}\"}}")))
+    for line in [7, 9]
+        assert(tokens.contains(s" $line:8:6:function:-"), tokens)
+        assert(!tokens.contains(s" $line:8:6:variable"), tokens)
+    remove_dir_all(o.dir).unwrap_or(())
+
+// Each level a given is found at: a function's own `using` parameter, a class's contextual parameter,
+// an object's given, a lambda's `using` parameter, and an infix call.
+private lsp_given_levels_text() -> string =
+    "class Tx(val id: int)\n" +
+    "\n" +
+    "use(n: int, using tx: Tx) -> int = n + tx.id\n" +
+    "\n" +
+    "forward(using tx: Tx) -> int = use(1)\n" +
+    "\n" +
+    "class Service(using tx: Tx)\n" +
+    "  run() -> int = use(2)\n" +
+    "\n" +
+    "object Db\n" +
+    "  given conn = Tx(7)\n" +
+    "  query() -> int = use(3)\n" +
+    "\n" +
+    "around(f: (Tx) -> int) -> int = f(Tx(9))\n" +
+    "\n" +
+    "class Cell(val n: int)\n" +
+    "  plus(m: int, using tx: Tx) -> int = n + m + tx.id\n" +
+    "\n" +
+    "main()\n" +
+    "  print(forward(tx = Tx(1)))\n" +
+    "  print(Service(tx = Tx(2)).run())\n" +
+    "  print(Db.query())\n" +
+    "  print(around(using t -> use(4)))\n" +
+    "  given here = Tx(5)\n" +
+    "  print(Cell(1) plus 2)\n"
+
+@test("lsp: definition from a filled call reaches a `using` parameter, a class's, an object's given, a lambda's, and through an infix call")
+lsp_definition_given_levels()
+    val dir = lsp_normal(make_temp_dir("avin-lsp").unwrap())
+    val uri = lsp_file_uri(dir + "/t.avin")
+    var server = lsp_ready()
+    assert_eq(lsp_one(&server, lsp_open(uri, lsp_given_levels_text())), lsp_publish_of(uri, ""))
+    val used = lsp_location(uri, 2, 0, 2, 3)
+    assert_eq(lsp_one(&server, lsp_request(2, "textDocument/definition", lsp_test_at(uri, 4, 32))),
+        lsp_reply(2, s"[$used,${lsp_location(uri, 4, 14, 4, 16)}]"))
+    assert_eq(lsp_one(&server, lsp_request(3, "textDocument/definition", lsp_test_at(uri, 7, 18))),
+        lsp_reply(3, s"[$used,${lsp_location(uri, 6, 20, 6, 22)}]"))
+    assert_eq(lsp_one(&server, lsp_request(4, "textDocument/definition", lsp_test_at(uri, 11, 20))),
+        lsp_reply(4, s"[$used,${lsp_location(uri, 10, 8, 10, 12)}]"))
+    assert_eq(lsp_one(&server, lsp_request(5, "textDocument/definition", lsp_test_at(uri, 22, 27))),
+        lsp_reply(5, s"[$used,${lsp_location(uri, 22, 21, 22, 22)}]"))
+    assert_eq(lsp_one(&server, lsp_request(6, "textDocument/definition", lsp_test_at(uri, 24, 17))),
+        lsp_reply(6, s"[${lsp_location(uri, 16, 2, 16, 6)},${lsp_location(uri, 23, 8, 23, 12)}]"))
+    // The hover of each shows the given by its name.
+    val param = lsp_hover_value(lsp_one(&server, lsp_request(7, "textDocument/hover", lsp_test_at(uri, 4, 32))))
+    assert(param.ends_with("```avin\ntx = tx  // tx: Tx\n```"), param)
+    val in_object = lsp_hover_value(lsp_one(&server, lsp_request(8, "textDocument/hover", lsp_test_at(uri, 11, 20))))
+    assert(in_object.ends_with("```avin\ntx = conn  // val conn: Tx\n```"), in_object)
+    // A signature shows its section after `using`, written once: a method's, and a class's.
+    val infix = lsp_hover_value(lsp_one(&server, lsp_request(9, "textDocument/hover", lsp_test_at(uri, 24, 17))))
+    assert(infix.starts_with("```avin\nCell.plus(m: int, using tx: Tx) -> int\n```\n\nFilled from givens:"), infix)
+    assert_eq(lsp_one(&server, lsp_request(10, "textDocument/hover", lsp_test_at(uri, 20, 9))),
+        lsp_hover_of(10, "class Service(using tx: Tx)", "", 20, 8, 20, 15))
+    remove_dir_all(dir).unwrap_or(())
+
+@test("lsp: a signature writes `using` once, before its whole section, and a completed call leaves the section to the givens")
+lsp_signature_using_section()
+    val text = "class Tx(val id: int)\nclass Log(val n: int)\n\nclass Pool(size: int, using tx: Tx, log: Log)\n\nsend(n: int, using tx: Tx, log: Log) -> int = n\n\nonly(using tx: Tx) -> int = tx.id\n\nmain()\n  given t = Tx(1)\n  given l = Log(2)\n  print(send(1) + only())\n  val p = Pool(3)\n  "
+    val items = lsp_complete_in("t.avin", text + "se\n", 14, 4, true)
+    assert_eq(lsp_item(items, "send").detail, "send(n: int, using tx: Tx, log: Log) -> int")
+    assert_eq(lsp_item(items, "send").insert, "send(${1:n})")
+    assert_eq(lsp_item(items, "only").detail, "only(using tx: Tx) -> int")
+    assert_eq(lsp_item(items, "only").insert, "only")
+    assert_eq(lsp_item(items, "Pool").detail, "class Pool(size: int, using tx: Tx, log: Log)")
+    val dir = lsp_normal(make_temp_dir("avin-lsp").unwrap())
+    val uri = lsp_file_uri(dir + "/t.avin")
+    var server = lsp_ready()
+    val whole = text + "print(p)\n"
+    lsp_answer(&server, lsp_open(uri, whole))
+    // Both of a section's parameters are filled, in its order.
+    val both = lsp_hover_value(lsp_one(&server, lsp_request(2, "textDocument/hover", lsp_test_at(uri, 12, 9))))
+    assert(both.ends_with("```avin\ntx = t  // val t: Tx\nlog = l  // val l: Log\n```"), both)
+    val made = lsp_hover_value(lsp_one(&server, lsp_request(3, "textDocument/hover", lsp_test_at(uri, 13, 11))))
+    assert(made.ends_with("```avin\ntx = t  // val t: Tx\nlog = l  // val l: Log\n```"), made)
+    remove_dir_all(dir).unwrap_or(())
+
+@test("lsp: definition from a call filled by a given in another file of the module goes to that file")
+lsp_definition_given_other_file()
+    val dir = lsp_normal(make_temp_dir("avin-lsp").unwrap())
+    make_dir_all(dir + "/geo").unwrap()
+    write_text(dir + "/geo/one.avin", "module geo\n\nclass Tx(val id: int)\n\ngiven current = Tx(1)\n").unwrap()
+    val two = "module geo\n\nuse(using tx: Tx) -> int = tx.id\n\nrun() -> int = use()\n"
+    write_text(dir + "/geo/two.avin", two).unwrap()
+    write_text(dir + "/main.avin", "import geo\n\nmain()\n  print(geo.run())\n").unwrap()
+    val uri = lsp_file_uri(dir + "/geo/two.avin")
+    var server = lsp_ready()
+    lsp_answer(&server, lsp_open(uri, two))
+    assert_eq(lsp_one(&server, lsp_request(2, "textDocument/definition", lsp_test_at(uri, 4, 16))),
+        lsp_reply(2, s"[${lsp_location(uri, 2, 0, 2, 3)},${lsp_location(lsp_file_uri(dir + "/geo/one.avin"), 4, 6, 4, 13)}]"))
+    remove_dir_all(dir).unwrap_or(())
+
+@test("lsp: completion offers `given` and `using` where they may begin a form, and not where they may not")
+lsp_completion_given_using()
+    // A block's statement: both, among the other keywords.
+    val block = lsp_complete_in("t.avin", "main()\n  val n = 1\n  gi\n", 2, 4, false)
+    assert_eq(lsp_item(block, "given").kind, 14)
+    assert_eq(lsp_item(block, "given").sort, "5_given")
+    assert(lsp_offers(block, "using"))
+    // A call's argument may be a `using` lambda.
+    val argument = lsp_complete_in("t.avin", "run(f: (int) -> int) -> int = f(1)\n\nmain()\n  print(run(us))\n", 3, 14, false)
+    assert(lsp_offers(argument, "using"))
+    // A declaration at the module's top level and in an object's body.
+    val top = lsp_complete_in("t.avin", "class Tx(val id: int)\n\ngi\n", 2, 2, false)
+    assert(lsp_offers(top, "given"))
+    assert(!lsp_offers(top, "using"))
+    val in_object = lsp_complete_in("t.avin", "class Tx(val id: int)\n\nobject Db\n  gi\n", 3, 4, false)
+    assert(lsp_offers(in_object, "given"))
+    // A parameter list's item, on the line of the list or on one of its own.
+    val params = lsp_complete_in("t.avin", "class Tx(val id: int)\n\ninsert(row: int, us) = row\n", 2, 19, false)
+    assert(lsp_offers(params, "using"))
+    assert(!lsp_offers(params, "given"))
+    val lines = lsp_complete_in("t.avin", "class Tx(val id: int)\n\ninsert(\n  row: int,\n  us\n) = row\n", 4, 4, false)
+    assert(lsp_offers(lines, "using"))
+    val first = lsp_complete_in("t.avin", "class Tx(val id: int)\n\nclass Service(us\n", 2, 16, false)
+    assert(lsp_offers(first, "using"))
+    // A type, a member and an import take neither.
+    val ty = lsp_complete_in("t.avin", "class Tx(val id: int)\n\nf(x: T) = 1\n", 2, 6, false)
+    assert(!lsp_offers(ty, "given"))
+    assert(!lsp_offers(ty, "using"))
+    val member = lsp_complete_in("t.avin", "class Tx(val id: int)\n\nmain()\n  val t = Tx(1)\n  t.gi\n", 4, 6, false)
+    assert(!lsp_offers(member, "given"))
+    assert(!lsp_offers(member, "using"))
+    val imported = lsp_complete_in("t.avin", "import avin.gi\n\nmain() = ()\n", 0, 14, false)
+    assert(!lsp_offers(imported, "given"))
+    // Inside a string or a comment, nothing.
+    val quoted = lsp_complete_in("t.avin", "main()\n  print(\"gi\")\n", 1, 11, false)
+    assert(!lsp_offers(quoted, "given"))
+
+@test("lsp: the keywords a place takes, read off the text and the site the checker found")
+lsp_completion_keywords_of_sites()
+    val text = "f(a: int,\n  b\n"
+    val listed = completion_keywords(text, completion_word(text, 13), NoSite)
+    assert_eq(listed.len(), 1)
+    assert_eq(listed[0], "using")
+    val start = "x\n"
+    assert_eq(completion_keywords(start, completion_word(start, 1), NoSite)[0], "given")
+    val crlf = "a\r\nx\r\n"
+    assert_eq(completion_keywords(crlf, completion_word(crlf, 4), NoSite)[0], "given")
+    // After other words on its line, a place no site was found at takes nothing.
+    val after = "val x = 1 y\n"
+    assert_eq(completion_keywords(after, completion_word(after, 11), NoSite).len(), 0)
+    for site in [TypeSite, MemberSite, ImportSite]
+        assert_eq(completion_keywords(start, completion_word(start, 1), site).len(), 0)
+    val value = completion_keywords(start, completion_word(start, 1), ValueSite)
+    assert(value.len() > 2)

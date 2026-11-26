@@ -1,0 +1,632 @@
+module dev.avinlang.compiler
+@tests
+
+import sysl.buf.{Buf, buf}
+import sysl.fs.{make_dir_all, make_temp_dir, remove_dir_all, write_text}
+import sysl.path.parent
+import sysl.term.keys.Key
+import sysl.text.chars_of
+
+// `avin repl`: when an input is complete, what kind of input it is, and whole sessions fed a script as
+// standard input would feed them, checked against what they write.
+
+// ---- when an input is complete ----
+
+// Whether a session given `lines` one at a time, with no command among them, is still waiting after
+// the last.
+private waits(lines: []const string) -> bool
+    var s = ReplSession(repository_toolchain(), "", "", buf(), "", buf(), buf(), buf(), buf(), 1, 0, buf(), false)
+    for l in lines
+        s.pending.push(l)
+        if !repl_wants_more(&s)
+            s.pending.clear()
+            s.block = false
+            return false
+    true
+
+@test("a bracket left open waits for the line that closes it, and strings, characters and comments do not count")
+open_brackets_wait()
+    assert_eq(open_brackets("f(1, 2)"), 0)
+    assert_eq(open_brackets("f(1,"), 1)
+    assert_eq(open_brackets("[(1, {"), 3)
+    assert_eq(open_brackets("\"(\""), 0)
+    assert_eq(open_brackets("'('"), 0)
+    assert_eq(open_brackets("\"a\\\"(\""), 0)
+    assert_eq(open_brackets("x // ("), 0)
+    assert_eq(open_brackets(")"), -1)
+    assert_eq(open_brackets(""), 0)
+    assert_eq(open_brackets("\"é(\" + 世界("), 1)
+    assert(waits(["f(1,"]))
+    assert(!waits(["f(1,", "  2)"]))
+    assert(waits(["val xs = [", "  1,", "  2"]))
+    assert(!waits(["val xs = [", "  1,", "  2", "]"]))
+
+@test("a line ending with an operator, `=`, `->` or a comma goes on; one ending `++` or `--` does not")
+operator_continues()
+    for t in ["x +", "x -", "a *", "a /", "a %", "a &&", "a ||", "val x =", "f(a) =", "xs ::", "a <", "a >", "(a, b) ->", "a,", "x |>"]
+        assert(continues_line(t), t)
+    for t in ["x", "i++", "i--", "f(x)", "\"a\"", "", "x?", "a == b", "-1"]
+        assert(!continues_line(t), t)
+    assert(waits(["1 +"]))
+    assert(!waits(["1 +", "2"]))
+    assert(!waits(["count++"]))
+
+@test("a type's declaration opens a block that only an empty line ends; one line alone is a declaration too")
+types_open_blocks()
+    for t in ["class A", "trait T", "data P(x: int)", "object O", "impl Show for P", "actor A()", "machine M", "open class B", "abstract class C", "private data D", "sealed trait S"]
+        assert(declares_type(t), t)
+    for t in ["val classes = 1", "classify(x)", "dataOf(x)", "type Id = int", "impl", "x"]
+        assert(!declares_type(t), t)
+    assert(waits(["data P(x: int)"]))
+    assert(!waits(["data P(x: int)", ""]))
+    assert(waits(["class A", "  val n = 1"]))
+    assert(!waits(["class A", "  val n = 1", "   "]))
+
+@test("a line the parser finds unfinished opens a block, which an empty line ends; a finished one is entered at once")
+unfinished_opens_blocks()
+    assert(unfinished_at_end("if x > 0"))
+    assert(unfinished_at_end("for i in 0 ..< 3"))
+    assert(waits(["double(n: int) -> int"]))
+    assert(!waits(["double(n: int) -> int", "  n * 2", ""]))
+    assert(unfinished_at_end("while true"))
+    assert(!unfinished_at_end("1 + 2"))
+    assert(!unfinished_at_end("val x = 1"))
+    assert(!unfinished_at_end("double(n: int) = n * 2"))
+    assert(!unfinished_at_end("if x > 0 then 1 else 2"))
+    assert(waits(["if x > 0"]))
+    assert(waits(["if x > 0", "  1"]))
+    assert(waits(["if x > 0", "  1", "else"]))
+    assert(!waits(["if x > 0", "  1", "else", "  2", ""]))
+    assert(!waits(["1 + 2"]))
+    assert(!waits([""]))
+
+@test("a local function's header with parameters opens a block; a call, and a header of no parameters, do not")
+function_headers_open_blocks()
+    assert(heads_function("addTo(k: int)"))
+    assert(heads_function("pair[T](a: T, b: T)"))
+    assert(heads_function("log(m: string, level: int = 0)"))
+    assert(!heads_function("greet()"))
+    assert(!heads_function("id(\"g\")"))
+    assert(!heads_function("f(1)"))
+    assert(!heads_function("f(x)"))
+    assert(!heads_function("val x = f(k: int)"))
+    assert(!heads_function("addTo(k: int)\n  total += k"))
+    assert(waits(["addTo(k: int)"]))
+    assert(waits(["addTo(k: int)", "  total += k"]))
+    assert(!waits(["addTo(k: int)", "  total += k", ""]))
+    assert(!waits(["id(\"g\")"]))
+    // A function whose body is on its line is whole already.
+    assert(!heads_function("id[T](v: T) -> T = v"))
+    assert(!heads_function("double(n: int) = n * 2"))
+    assert(!heads_function("show(n: int) -> string = s\"$n\""))
+    assert(!waits(["id[T](v: T) -> T = v"]))
+
+// ---- whole sessions ----
+
+// A session started in `dir`, fed `script` a line at a time as standard input feeds it, and everything
+// it wrote. What the session built is removed after it.
+private transcript_in(dir: string, script: string) -> string
+    val tc = repository_toolchain()
+    var s = repl_session(tc, dir).unwrap()
+    var said = ""
+    val out: &Fn(string) -> unit = text -> said = said + text
+    var going = true
+    for line in script.lines()
+        if going then going = repl_line(&s, line, out)
+    if going then repl_finish(&s, out)
+    _ = remove_dir_all(s.scratch)
+    _ = remove_dir_all(build_cache(tc.builds, s.file))
+    _ = remove_dir_all(parent(parent(s.file).unwrap()).unwrap())
+    said
+
+// A session started in a directory of its own, holding no program.
+private transcript(script: string) -> string
+    val dir = make_temp_dir("avin-repl-test").unwrap()
+    val said = transcript_in(dir, script)
+    _ = remove_dir_all(dir)
+    said
+
+@test("an expression's value is shown with its type and kept as the next resN; a val by its name; a unit one shows nothing")
+session_values()
+    val said = transcript("1 + 2\nval x = 40\nx + res0\n\"hi\"\nprintln(\"out\")\n()\ndouble(n: int) = n * 2\ndouble(x)\n[1, 2, 3]\nSome(3)\n'é'\n\"世界\"\nvar v = -2147483648\nv\nres7.charCount\n")
+    assert_eq(said, "res0: int = 3\nx: int = 40\nres1: int = 43\nres2: string = \"hi\"\nout\ndouble(n: int) -> int\nres3: int = 80\nres4: Vector[int] = [1, 2, 3]\nres5: Option[int] = Some(3)\nres6: char = 'é'\nres7: string = \"世界\"\nv: int = -2147483648\nres8: int = -2147483648\nres9: int = 2\n")
+
+@test("a name entered again hides the earlier one from the inputs after it; a type declared again replaces the earlier declaration")
+session_redefinition()
+    val said = transcript("val x = 1\nval x = \"one\"\nx\nf(n: int) = n + 1\nval before = f(1)\nf(n: int) = n * 10\nf(1)\nbefore\ndata P(a: int)\n\nP(1)\ndata P(a: int, b: int)\n\ndata Q(a: int)\n\ndata Q(a: int, b: int)\n\nQ(1, 2)\nres3\nP(1, 2)\n")
+    assert_eq(said, "x: int = 1\nx: string = \"one\"\nres0: string = \"one\"\nf(n: int) -> int\nbefore: int = 2\nf(n: int) -> int\nres1: int = 10\nres2: int = 2\ndata P(a: int)\nres3: P = P(1)\ndata P(a: int, b: int)\ndata Q(a: int)\ndata Q(a: int, b: int)\nres4: Q = Q(1, 2)\nres5: P = P(1)\nres6: P = P(1, 2)\n")
+
+@test("a type declared again is refused where code of main entered before it no longer checks")
+session_type_breaking_code()
+    // `println(P(1))` is code of `main`, which sees the newest `P`.
+    val said = transcript("data P(a: int)\n\nprintln(P(1))\ndata P(a: int, b: int)\n\nP(5)\n")
+    assert_eq(said, "data P(a: int)\nP(1)\nerror: `P` takes 2 arguments, not 1 (in an earlier input, which this one breaks)\nres0: P = P(5)\n")
+
+// ---- declarations reaching earlier inputs ----
+
+@test("a class declared after a function and a val calls and reads them, and keeps them when they are entered again")
+session_hoisting()
+    val said = transcript("twice(n: int) = n * 2\nval base = 10\nclass Doubler\n  run(n: int) -> int = twice(n) + base\n\nDoubler().run(4)\ntwice(n: int) = n * 3\nval base = 100\nDoubler().run(4)\ntwice(4) + base\nclass Tripler\n  run(n: int) -> int = twice(n) + base\n\nTripler().run(1)\n")
+    assert_eq(said, "twice(n: int) -> int\nbase: int = 10\nclass Doubler\nres0: int = 18\ntwice(n: int) -> int\nbase: int = 100\nres1: int = 18\nres2: int = 112\nclass Tripler\nres3: int = 103\n")
+
+@test("functions, values and types reach one another across modules: generic, recursive, and through results")
+session_hoisting_shapes()
+    val said = transcript("id[T](v: T) -> T = v\nfact(n: int) -> int = if n == 0 then 1 else n * fact(n - 1)\nfact(5)\ndata Box[T](v: T)\n\nwrap[T](v: T) -> Box[T] = Box(id(v))\nclass Uses\n  all() -> string = s\"${fact(3)} ${wrap(\"s\").v} ${res0}\"\n\nUses().all()\nval (a, b) = (1, 2)\nclass Pair\n  sum() -> int = a + b\n\n")
+    // A destructured `val` stays code of `main`, which a class cannot reach.
+    assert(said.starts_with("id[T](v: T) -> T\nfact(n: int) -> int\nres0: int = 120\ndata Box(v: T)\nwrap[T](v: T) -> Box[T]\nclass Uses\nres1: string = \"6 s 120\"\nerror: `a` is not defined\n"), said)
+
+@test("a function or val that uses a local of main stays in main, where a class cannot reach it, and hides an earlier hoisted one there")
+session_capturing_stays_local()
+    val said = transcript("var count = 1\nbump() -> int = count + 1\nval doubled = count * 2\nclass K\n  get() -> int = bump()\n\nclass L\n  get() -> int = doubled\n\nshown() = \"hoisted\"\nval shown = count\nshown\nclass M\n  get() -> string = shown()\n\nM().get()\n")
+    assert(said.starts_with("count: int = 1\nbump() -> int\ndoubled: int = 2\nerror: `bump` is not defined\n"), said)
+    assert(said.contains("error: `doubled` is not defined\n"), said)
+    // The local `shown` hides the hoisted function in main, and a class still reaches the function only
+    // when no local is the newest of its name.
+    assert(said.contains("shown() -> string\nshown: int = 1\nres0: int = 1\nerror: "), said)
+
+@test("an impl of a type or trait the session declared joins its declaration, and an extension of a library type works")
+session_impls()
+    val said = transcript("data Pt(x: int, y: int)\n\nimpl Pt\n  sum() -> int = x + y\n\nPt(1, 2).sum()\ntrait Named\n  name() -> string\n\nimpl Named for Pt\n  name() -> string = \"pt\"\n\nPt(0, 0).name()\nimpl string\n  shout() -> string = self + \"!\"\n\n\"hey\".shout()\nclass Caller\n  go() -> string = \"a\".shout() + Pt(1, 1).name()\n\nCaller().go()\nlabel(n: int) = s\"#$n\"\nimpl Pt\n  tag() -> string = label(x)\n\nPt(7, 0).tag()\n")
+    // An impl joining an earlier declaration reaches what was entered before the impl.
+    assert_eq(said, "data Pt(x: int, y: int)\nres0: int = 3\ntrait Named\nres1: string = \"pt\"\nres2: string = \"hey!\"\nclass Caller\nres3: string = \"a!pt\"\nlabel(n: int) -> string\nres4: string = \"#7\"\n")
+
+@test("a diagnostic in a declaration is placed in it as typed; one in an earlier module breaks nothing it does not reach")
+session_declaration_diagnostics()
+    val said = transcript("data R(a: Missing)\n\ndata S(a: int)\n\nf(s: S) -> int = s.a\nf(S(4))\n")
+    assert(said.contains("error: unknown type `Missing`\n --> <input>:1:11\n"), said)
+    assert(said.ends_with("data S(a: int)\nf(s: S) -> int\nres0: int = 4\n"), said)
+
+@test("an import entered after a hoisted function of its name is left out of the modules, whose function is nearer")
+session_import_after_hoisting()
+    val said = transcript("max(a: int, b: int) -> int = if a > b then a else b\nimport avin.threads.spawn\nclass Big\n  of() -> int = spawn(() -> max(3, 9)).join()\n\nBig().of()\n:reset\nmax(1, 2)\n")
+    assert_eq(said, "max(a: int, b: int) -> int\nclass Big\nres0: int = 9\nthe session is empty\nres0: int = 2\n")
+
+@test("closures, local functions and generic values reach across inputs, and blocks run over several lines")
+session_closures_and_generics()
+    val said = transcript("var count = 0\nbump(by: int)\n  count += by\n\nbump(2)\nbump(3)\ncount\nval add = (a: int) -> a + count\nadd(1)\ncount = 10\nadd(1)\nid[T](v: T) -> T = v\nid(\"g\")\nid(7)\n(1, \"two\")\nif count > 3\n  \"big\"\nelse\n  \"small\"\n\nfor i in 0 ..< 3\n  print(i)\n\nprintln()\nval xs = [3, 1, 2].map(x -> x * count)\nxs\n")
+    assert_eq(said, "count: int = 0\nbump(by: int)\nres0: int = 5\nadd: (int) -> int = <function>\nres1: int = 6\nres2: int = 11\nid[T](v: T) -> T\nres3: string = \"g\"\nres4: int = 7\nres5: (int, string) = (1, \"two\")\nres6: string = \"big\"\n012\nxs: Vector[int] = [30, 10, 20]\nres7: Vector[int] = [30, 10, 20]\n")
+
+@test("a thread started in one input is joined in a later one; imports are kept and listed")
+session_threads_and_imports()
+    val said = transcript(":imports\nimport avin.threads.spawn\n:imports\nval t = spawn(() -> 21 * 2)\nprintln(\"between\")\nt.join()\nimport avin.threads.spawn\nimport avin.nothing.here\n:imports\n")
+    assert(said.starts_with("no imports\nimport avin.threads.spawn\nt: Thread[int] = Thread[int]\nbetween\nres0: int = 42\nerror: "), said)
+    assert(said.ends_with("import avin.threads.spawn\n"), said)
+    assert(said.contains("avin.nothing"), said)
+
+@test("an input that traps or ends the program is not kept, and the session goes on")
+session_traps()
+    val said = transcript("val xs = [1, 2]\nxs(5)\nxs.length\nval zero = 0\nprintln(\"before\")\n1 / zero\nimport avin.process.exit\nexit(3)\nexit(0)\nxs.length\n")
+    // A trap names its place in the input as typed, though the program wrote it after `val res0 = `.
+    assert(said.starts_with("xs: Vector[int] = [1, 2]\navin: trap: index out of range at <input>:1:1\nres0: int = 2\nzero: int = 0\nbefore\navin: trap: division by zero at <input>:1:3\n"), said)
+    assert(said.ends_with("the program exited with status 3, so the input is not kept\nthe input ended the program, so it is not kept\nres1: int = 2\n"), said)
+
+@test("a command misused says how it is used, and the session goes on; :reset forgets, :quit ends")
+session_commands()
+    val said = transcript(":foo\n:type\n:type 1 + 2\n:type [\"a\"].map(s -> s.charCount)\n:type undefined\n:load\n:load /nonexistent/x.avin\n:reset extra\n:quit extra\n:imports extra\n:type (1,\nval y = 1\n:reset\ny\n:help\n:quit\n1 + 1\n")
+    assert(said.starts_with("unknown command `:foo`: :help lists the commands\nusage: :type <expression>\nint\nVector[int]\nerror: `undefined` is not defined\n"), said)
+    assert(said.contains("\nusage: :load <file>\ncannot read /nonexistent/x.avin: "), said)
+    assert(said.contains("\n:reset takes nothing after it\n:quit takes nothing after it\n:imports takes nothing after it\nusage: :type <expression>, on one line\ny: int = 1\nthe session is empty\nerror: `y` is not defined\n"), said)
+    assert(said.ends_with(ReplHelp + "\n"), said)
+    // `:type` runs nothing and keeps nothing.
+    assert(!said.contains("res0: int = 3"), said)
+
+@test("a diagnostic is placed in the input as it was typed, on the line and column it names")
+session_diagnostics()
+    val said = transcript("val = 3\nif true\n  undefinedName\n\nval ok = 1\n")
+    assert(said.contains("--> <input>:1:"), said)
+    assert(said.contains("error: `undefinedName` is not defined\n --> <input>:2:3\n"), said)
+    assert(said.ends_with("ok: int = 1\n"), said)
+
+@test(":load enters a file's imports and declarations; its main becomes a function the session calls")
+session_load()
+    val dir = make_temp_dir("avin-repl-load").unwrap()
+    val file = dir + "/lib.avin"
+    write_text(file, "import avin.threads.spawn\n\n// twice\ntwice(n: int) = n * 2\n\ndata Box(v: int)\n\nmain()\n  println(twice(21))\n").unwrap()
+    val said = transcript(s":load $file\nmain()\nBox(twice(2))\nspawn(() -> twice(4)).join()\n")
+    _ = remove_dir_all(dir)
+    assert_eq(said, "twice(n: int) -> int\ndata Box(v: int)\nmain()\n42\nres0: Box = Box(4)\nres1: int = 8\n")
+
+@test("a session in a package imports the package's modules, its own main left out")
+session_in_a_package()
+    val dir = make_temp_dir("avin-repl-package").unwrap()
+    make_dir_all(dir + "/shapes").unwrap()
+    write_text(dir + "/avin.hocon", "package {\n  name = \"shapes\"\n  version = \"0.1.0\"\n}\n").unwrap()
+    write_text(dir + "/shapes/area.avin", "module shapes\n\nsquare(n: int) -> int = n * n\n").unwrap()
+    write_text(dir + "/main.avin", "main() = println(\"the package's main\")\n").unwrap()
+    val said = transcript_in(dir, "import shapes.square\nsquare(4)\n")
+    _ = remove_dir_all(dir)
+    assert_eq(said, "res0: int = 16\n")
+
+// ---- the pieces of a file `:load` enters ----
+
+@test("a file is entered as its imports and its declarations, each with the annotations and comments above it")
+pieces_of_a_file()
+    val text = "#!/usr/bin/env avin\nimport avin.threads.spawn\n\n// the answer\n@inline\nanswer() = 42\n\ndata P(x: int)\n  sum() -> int\n    x\n\nmain()\n  println(answer())\nend main\n"
+    val pieces = repl_pieces(text)
+    assert_eq(pieces.len(), 4)
+    assert_eq(pieces[0], "import avin.threads.spawn")
+    assert_eq(pieces[1], "// the answer\n@inline\nanswer() = 42")
+    assert_eq(pieces[2], "data P(x: int)\n  sum() -> int\n    x")
+    assert_eq(pieces[3], "main()\n  println(answer())\nend main")
+    assert_eq(repl_pieces("").len(), 0)
+    assert_eq(repl_pieces("\n\n// only a comment\n").len(), 0)
+    val brackets = repl_pieces("val xs = [\n  1,\n]\nval y = 2\n")
+    assert_eq(brackets.len(), 2)
+    assert_eq(brackets[0], "val xs = [\n  1,\n]")
+
+// ---- what the program writes ----
+
+@test("a string is written as an Avin literal, every quote, backslash and control character escaped")
+strings_as_literals()
+    assert_eq(avin_string("a"), "\"a\"")
+    assert_eq(avin_string(""), "\"\"")
+    assert_eq(avin_string("say \"hi\"\\"), "\"say \\\"hi\\\"\\\\\"")
+    assert_eq(avin_string("a\nb"), "\"a\\nb\"")
+    assert_eq(avin_string("\u{1E}x\u{1}"), "\"\\u{1e}x\\u{01}\"")
+    assert_eq(avin_string("$x é 世界"), "\"$x é 世界\"")
+
+// What `ReplOutput` passes on of `pieces` read in turn.
+private passed(pieces: []const string) -> (string, bool, bool)
+    var o = ReplOutput(false, false, "", 0, false, "", ReplPlace("", 1, 0, 0, 0))
+    var said = ""
+    val out: &Fn(string) -> unit = t -> said = said + t
+    for p in pieces
+        o.held = o.held + p
+        o.pass(out, false)
+    o.finish(out)
+    (said, o.started, o.ended)
+
+@test("only what the program writes between its two marks is passed on, however the marks are split across reads")
+output_between_marks()
+    val (a, started, ended) = passed(["old\n", ReplStart, "new\n", ReplEnd])
+    assert_eq(a, "new\n")
+    assert(started && ended)
+    val (b, _, e2) = passed(["old" + ReplStart[0..<3], ReplStart[3..] + "n", "ew" + ReplEnd[0..<4], ReplEnd[4..] + "late\n"])
+    assert_eq(b, "new" + "late\n")
+    assert(e2)
+    val (c, _, e3) = passed([ReplStart + "trap: oh\n"])
+    assert_eq(c, "trap: oh\n")
+    assert(!e3)
+    val (d, s4, _) = passed(["boom\n"])
+    assert_eq(d, "an earlier input failed when the session ran again:\nboom\n")
+    assert(!s4)
+    val (e, _, _) = passed([ReplStart + "é世" + ReplEnd])
+    assert_eq(e, "é世")
+    val (f, _, _) = passed([ReplStart, ReplEnd])
+    assert_eq(f, "")
+
+@test("a place in the session's file is shown as the place in the input, or as an earlier input outside it")
+places_relocated()
+    // The input is lines 10 and 11, moved 6 columns right, its first line 4 more.
+    val o = ReplOutput(false, false, "", 0, false, "repl.avin", ReplPlace("repl.avin", 10, 2, 6, 4))
+    assert_eq(o.relocated("trap: x at repl.avin:10:15\n"), "trap: x at <input>:1:5\n")
+    assert_eq(o.relocated("at repl.avin:11:7 and repl.avin:11:9"), "at <input>:2:1 and <input>:2:3")
+    assert_eq(o.relocated("at repl.avin:9:1"), "at an earlier input")
+    assert_eq(o.relocated("at repl.avin:12:1"), "at an earlier input")
+    assert_eq(o.relocated("at repl.avin:x and repl.avin:10 and repl.avin:"), "at repl.avin:x and repl.avin:10 and repl.avin:")
+    assert_eq(o.relocated("other.avin:10:15"), "other.avin:10:15")
+    assert_eq(o.relocated(""), "")
+    // A column before the input's margin is its first.
+    assert_eq(o.relocated("repl.avin:11:2"), "<input>:2:1")
+    assert(ReplPlace("", 10, 2, 0, 0).holds(10) && ReplPlace("", 10, 2, 0, 0).holds(11))
+    assert(!ReplPlace("", 10, 2, 0, 0).holds(9) && !ReplPlace("", 10, 2, 0, 0).holds(12) && !ReplPlace("", 10, 0, 0, 0).holds(10))
+    // A place in one of the session's modules is in an earlier input; a name like theirs is not one.
+    assert_eq(o.relocated("trap: x at repl-c3.avin:4:2\n"), "trap: x at an earlier input\n")
+    assert_eq(o.relocated("repl-c12.avin:1:1 and repl.avin:10:15"), "an earlier input and <input>:1:5")
+    assert_eq(o.relocated("repl-c.avin:1:1 repl-c3.avin:x repl-c3.txt"), "repl-c.avin:1:1 repl-c3.avin:x repl-c3.txt")
+
+// ---- the module of each declaration ----
+
+// A kept cell of `kind`, its newest text entered after `upto` cells.
+private cell_of(kind: u8, upto: usize) -> ReplCell
+    var texts: Buf[string] = buf()
+    texts.push("val v = 1")
+    ReplCell(kind, if kind == CellCode then 0usize else upto + 1, texts, "val v = avinReplC1.v", buf(), 0, upto)
+
+// The kinds the program writes `cells` as.
+private written_kinds(cells: Buf[ReplCell]) -> string
+    var out = ""
+    for c in written_cells(cells)
+        out = out + s"${c.kind}"
+    out
+
+@test("a hoisted function or val is written as a module only when a declaration of types reaches it, and as code of main before")
+hoisted_written_when_reached()
+    var cells: Buf[ReplCell] = buf()
+    cells.push(cell_of(CellFunction, 0))
+    cells.push(cell_of(CellValue, 1))
+    assert_eq(written_kinds(cells), "00")
+    // The code a hoisted `val` is written as is what was entered, not the read of its module.
+    assert_eq(written_cells(cells)[1].main, "val v = 1")
+    cells.push(cell_of(CellTypes, 2))
+    cells.push(cell_of(CellValue, 3))
+    cells.push(cell_of(CellCode, 4))
+    assert_eq(written_kinds(cells), "23100")
+    // An impl joining the declaration later reaches the cells entered before the impl.
+    cells[2] = cell_of(CellTypes, 5)
+    assert_eq(written_kinds(cells), "23130")
+    var none: Buf[ReplCell] = buf()
+    assert_eq(written_kinds(none), "")
+
+@test("an import line keeps what no module gives, written out again only when a name is left out")
+imports_without_given_names()
+    var given: Buf[string] = buf()
+    given.push("max")
+    var none: Buf[string] = buf()
+    assert_eq(import_without("import avin.threads.spawn", given, none), "import avin.threads.spawn")
+    assert_eq(import_without("import avin.math.max", given, none), "")
+    assert_eq(import_without("import avin.math.{max, min}", given, none), "import avin.math.min")
+    assert_eq(import_without("import avin.math.{max, min as least}", given, none), "import avin.math.min as least")
+    assert_eq(import_without("import avin.math.{min as max}", given, none), "")
+    assert_eq(import_without("import avin.threads", none, given), "import avin.threads")
+
+// ---- the editor ----
+
+// Each character of `text` typed into `ed`.
+private type_text(ed: *ReplEditor, text: string)
+    for c in chars_of(text.bytes)
+        _ = ed.key(Key.Char(c))
+
+// A key pressed in `ed`, Enter decided as the terminal decides it.
+private press(ed: *ReplEditor, k: Key) -> EditStep
+    var step = ed.key(k)
+    if step is Entering then step = ed.enter(!input_wants_more(ed.lines))
+    step
+
+// What an `Accepted` step entered, or "" for any other.
+private accepted(step: EditStep) -> string = step match
+    Accepted(text) -> text
+    _ -> ""
+
+@test("an input whose lines are complete is entered whole, whatever line the cursor is on; whether lines are complete is the session's rule")
+input_completeness()
+    for text in ["if x > 0", "if x > 0\n  1", "if x > 0\n  1\nelse", "data P(x: int)", "class A\n  val n = 1", "1 +", "f(1,", "addTo(k: int)", "val xs = [\n  1,"]
+        assert(input_wants_more(editor_lines(text)), text)
+    for text in ["1 + 2", "if x > 0\n  1\n", "if x > 0\n  1\n   ", "data P(x: int)\n", "f(1,\n  2)", "val xs = [\n  1,\n]", "", "greet()", "double(n: int) = n * 2"]
+        assert(!input_wants_more(editor_lines(text)), text)
+    // The lines are the text's, an empty last one kept.
+    assert_eq(editor_lines("a\n").len(), 2)
+    assert_eq(editor_lines("").len(), 1)
+    assert_eq(editor_joined(editor_lines("a\n\nb")), "a\n\nb")
+
+@test("Enter on an unfinished input begins a line indented as the one before, two more after a line opening a block")
+editor_lines_go_on()
+    var ed = repl_editor()
+    type_text(&ed, "if x > 0")
+    assert(press(&ed, Key.Enter) is Edited)
+    assert_eq(ed.text(), "if x > 0\n  ")
+    assert_eq(ed.row, 1)
+    assert_eq(ed.col, 2)
+    type_text(&ed, "1")
+    _ = press(&ed, Key.Enter)
+    assert_eq(ed.text(), "if x > 0\n  1\n  ")
+    // Backspace over an indentation takes back a step of two.
+    assert(press(&ed, Key.Backspace) is Edited)
+    assert_eq(ed.text(), "if x > 0\n  1\n")
+    type_text(&ed, "else")
+    _ = press(&ed, Key.Enter)
+    assert_eq(ed.text(), "if x > 0\n  1\nelse\n  ")
+    type_text(&ed, "2")
+    _ = press(&ed, Key.Enter)
+    assert_eq(accepted(press(&ed, Key.Enter)), "if x > 0\n  1\nelse\n  2\n  ")
+    // A bracket left open goes on, its items at one indentation; the closing line ends it.
+    var list = repl_editor()
+    type_text(&list, "val xs = [")
+    _ = press(&list, Key.Enter)
+    type_text(&list, "1,")
+    _ = press(&list, Key.Enter)
+    assert_eq(list.text(), "val xs = [\n  1,\n  ")
+    type_text(&list, "]")
+    assert_eq(accepted(press(&list, Key.Enter)), "val xs = [\n  1,\n  ]")
+    // A complete line is entered at once; Enter in the middle of it does not break it.
+    var one = repl_editor()
+    type_text(&one, "1 + 2")
+    _ = press(&one, Key.Left)
+    assert_eq(accepted(press(&one, Key.Enter)), "1 + 2")
+    // Enter in the middle of an unfinished line breaks it there, the rest moved to the new line.
+    var split = repl_editor()
+    type_text(&split, "f(1, 2")
+    _ = press(&split, Key.Left)
+    _ = press(&split, Key.Enter)
+    assert_eq(split.text(), "f(1,\n  2")
+
+@test("the arrows move through an input's lines, and past its first and last through the inputs entered before")
+editor_arrows_and_history()
+    var ed = repl_editor()
+    ed.remember("first")
+    ed.remember("a(1,\n  2)")
+    ed.remember("a(1,\n  2)")
+    ed.remember("   ")
+    assert_eq(ed.history.len(), 2)
+    ed.clear()
+    type_text(&ed, "dra")
+    assert(press(&ed, Key.Up) is Edited)
+    assert_eq(ed.text(), "a(1,\n  2)")
+    assert_eq(ed.row, 1)
+    assert_eq(ed.col, 4)
+    _ = press(&ed, Key.Up)
+    assert_eq(ed.row, 0)
+    assert_eq(ed.col, 4)
+    _ = press(&ed, Key.Up)
+    assert_eq(ed.text(), "first")
+    assert(press(&ed, Key.Up) is Ignored)
+    _ = press(&ed, Key.Down)
+    assert_eq(ed.text(), "a(1,\n  2)")
+    _ = press(&ed, Key.Down)
+    assert_eq(ed.text(), "dra")
+    assert(press(&ed, Key.Down) is Ignored)
+    // Left and Right cross the lines' ends.
+    var lines = repl_editor()
+    lines.show("ab\ncd")
+    _ = press(&lines, Key.Home)
+    _ = press(&lines, Key.Left)
+    assert_eq(lines.row, 0)
+    assert_eq(lines.col, 2)
+    _ = press(&lines, Key.Right)
+    assert_eq(lines.row, 1)
+    assert_eq(lines.col, 0)
+    // Up keeps the column where the line above is long enough, and goes to its end where not.
+    var cols = repl_editor()
+    cols.show("x\nlonger")
+    _ = press(&cols, Key.Up)
+    assert_eq(cols.col, 1)
+
+@test("the editing keys: characters of many bytes taken back whole, lines joined, the line killed either side, Ctrl-C and Ctrl-D")
+editor_keys()
+    var ed = repl_editor()
+    type_text(&ed, "aé世")
+    _ = press(&ed, Key.Backspace)
+    assert_eq(ed.text(), "aé")
+    _ = press(&ed, Key.Left)
+    assert_eq(ed.col, 1)
+    _ = press(&ed, Key.Delete)
+    assert_eq(ed.text(), "a")
+    type_text(&ed, "bc")
+    _ = press(&ed, Key.Ctrl('a'))
+    assert_eq(ed.col, 0)
+    _ = press(&ed, Key.Right)
+    _ = press(&ed, Key.Ctrl('k'))
+    assert_eq(ed.text(), "a")
+    type_text(&ed, "xyz")
+    _ = press(&ed, Key.Left)
+    _ = press(&ed, Key.Ctrl('u'))
+    assert_eq(ed.text(), "z")
+    assert_eq(ed.col, 0)
+    _ = press(&ed, Key.Ctrl('e'))
+    assert_eq(ed.col, 1)
+    // Backspace at a line's start joins it to the line above; Delete at a line's end, the next to it.
+    var two = repl_editor()
+    two.show("ab\ncd")
+    _ = press(&two, Key.Home)
+    _ = press(&two, Key.Backspace)
+    assert_eq(two.text(), "abcd")
+    assert_eq(two.col, 2)
+    two.show("ab\ncd")
+    _ = press(&two, Key.Up)
+    _ = press(&two, Key.End)
+    _ = press(&two, Key.Delete)
+    assert_eq(two.text(), "abcd")
+    assert(press(&two, Key.Ctrl('c')) is Cancelled)
+    assert(press(&two, Key.Ctrl('d')) is Edited)
+    var empty = repl_editor()
+    assert(press(&empty, Key.Ctrl('d')) is Ended)
+    assert(press(&empty, Key.Backspace) is Ignored)
+    assert(press(&empty, Key.F(1)) is Ignored)
+    // Tab indents at a line's start and asks for completion after a word.
+    assert(press(&empty, Key.Tab) is Edited)
+    assert_eq(empty.text(), "  ")
+    type_text(&empty, "al")
+    assert(press(&empty, Key.Tab) is Completing)
+
+@test("a completion writes what every name found begins with; when that is nothing more, the names are listed")
+editor_completes()
+    var ed = repl_editor()
+    type_text(&ed, "x + al")
+    var labels: Buf[string] = buf()
+    labels.push("alpha")
+    labels.push("alps")
+    assert_eq(ed.complete_with(4, labels).len(), 0)
+    assert_eq(ed.text(), "x + alp")
+    val listed = ed.complete_with(4, labels)
+    assert_eq(listed.len(), 2)
+    assert_eq(ed.text(), "x + alp")
+    var one: Buf[string] = buf()
+    one.push("alphabet")
+    assert_eq(ed.complete_with(4, one).len(), 0)
+    assert_eq(ed.text(), "x + alphabet")
+    var none: Buf[string] = buf()
+    assert_eq(ed.complete_with(4, none).len(), 0)
+    assert_eq(common_prefix(labels), "alp")
+    var accented: Buf[string] = buf()
+    accented.push("éa")
+    accented.push("éb")
+    assert_eq(common_prefix(accented), "é")
+    var split: Buf[string] = buf()
+    split.push("é")
+    split.push("è")
+    assert_eq(common_prefix(split), "")
+    assert_eq(common_prefix(none), "")
+    var three: Buf[string] = buf()
+    three.push("a")
+    three.push("bb")
+    three.push("ccc")
+    assert_eq(completion_listing(three, 12, "\n"), "a    bb\nccc\n")
+    assert_eq(completion_listing(three, 3, "\r\n"), "a\r\nbb\r\nccc\r\n")
+
+@test("the input is drawn over what was drawn of it, the cursor put back where it is, over lines and rows wrapped")
+editor_draws()
+    var ed = repl_editor()
+    type_text(&ed, "ab")
+    _ = press(&ed, Key.Left)
+    assert_eq(ed.render(80), "\r\u{1b}[Javin> ab\r\u{1b}[7C")
+    assert_eq(ed.drawn, 0)
+    ed.show("if x\n  y")
+    ed.row = 0
+    ed.col = 0
+    assert_eq(ed.render(80), "\r\u{1b}[Javin> if x\r\n    |   y\r\u{1b}[1A\u{1b}[6C")
+    assert_eq(ed.drawn, 0)
+    assert_eq(ed.bottom, 1)
+    // The cursor on the second line: the next drawing first goes up to the input's first row.
+    _ = press(&ed, Key.Down)
+    _ = ed.render(80)
+    assert_eq(ed.drawn, 1)
+    assert(ed.render(80).starts_with("\u{1b}[1A\r\u{1b}[J"))
+    assert_eq(ed.leave(), "\r\n")
+    // A line wider than the terminal takes two rows.
+    var wide = repl_editor()
+    type_text(&wide, "abcdefgh")
+    assert_eq(wide.render(10), "\r\u{1b}[Javin> abcdefgh\r\u{1b}[4C")
+    assert_eq(wide.drawn, 1)
+    // A line filling its row exactly is followed by a new row, which the cursor is on.
+    var exact = repl_editor()
+    type_text(&exact, "abcd")
+    assert_eq(exact.render(10), "\r\u{1b}[Javin> abcd\r\n\r")
+    assert_eq(exact.drawn, 1)
+    // Wide characters take two columns each.
+    var cjk = repl_editor()
+    type_text(&cjk, "世界")
+    assert_eq(cjk.render(80), "\r\u{1b}[Javin> 世界\r\u{1b}[10C")
+
+// ---- completion ----
+
+@test("Tab completes the names in scope, a receiver's members after a dot, a module after import, and inside a declaration what it may reach")
+completion_in_a_session()
+    val dir = make_temp_dir("avin-repl-complete").unwrap()
+    val tc = repository_toolchain()
+    var s = repl_session(tc, dir).unwrap()
+    var said = ""
+    val out: &Fn(string) -> unit = t -> said = said + t
+    for line in ["val alpha = 1", "val alps = 2", "var count = 3", "twice(n: int) = n * 2", "import avin.threads.spawn"]
+        _ = repl_line(&s, line, out)
+    val names = repl_complete(&s, "al", 2)
+    assert_eq(names.start, 0)
+    assert(names.labels.len() >= 2 && names.labels[0] == "alpha" && names.labels[1] == "alps", said)
+    assert(!has_name(names.labels, "count"))
+    val called = repl_complete(&s, "1 + tw", 6)
+    assert_eq(called.start, 4)
+    assert(has_name(called.labels, "twice"))
+    val member = repl_complete(&s, "\"hi\".charC", 10)
+    assert_eq(member.start, 5)
+    assert(has_name(member.labels, "charCount"))
+    val module_name = repl_complete(&s, "import avin.thr", 15)
+    assert(has_name(module_name.labels, "threads"))
+    assert(has_name(repl_complete(&s, "sp", 2).labels, "spawn"))
+    assert_eq(repl_complete(&s, ":ty", 3).labels.len(), 0)
+    assert_eq(repl_complete(&s, "zzzq", 4).labels.len(), 0)
+    assert(has_name(repl_complete(&s, "whi", 3).labels, "while"))
+    // Inside an input of several lines, and the cursor before its end.
+    val nested = repl_complete(&s, "if true\n  cou", 13)
+    assert_eq(nested.start, 10)
+    assert(has_name(nested.labels, "count"))
+    assert(has_name(repl_complete(&s, "cou + 1", 3).labels, "count"))
+    // A class reaches the hoisted val and function, not the local `var`.
+    val body = "class K\n  get() -> int = alp"
+    assert(has_name(repl_complete(&s, body, body.bytes.len).labels, "alpha"))
+    val local = "class K\n  get() -> int = cou"
+    assert(!has_name(repl_complete(&s, local, local.bytes.len).labels, "count"))
+    // The session's own names are never offered.
+    assert(!has_name(repl_complete(&s, "avin", 4).labels, "avinReplShow"))
+    _ = remove_dir_all(s.scratch)
+    _ = remove_dir_all(build_cache(tc.builds, s.file))
+    _ = remove_dir_all(parent(parent(s.file).unwrap()).unwrap())
+    _ = remove_dir_all(dir)

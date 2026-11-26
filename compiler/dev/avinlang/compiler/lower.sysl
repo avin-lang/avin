@@ -335,6 +335,8 @@ private struct Lowering
     pack_choice: Buf[PackChoice]
     /** Whether a pack was made since the instances that read packs were last looked at. */
     new_packs: bool
+    /** The one shared copy of each signature a call names. */
+    signatures: MirSignatures
 
 /** One pack of a variant with hidden type parameters at one instance of its type: the hidden types,
  * the layout of its fields at them, and its descriptor's index in `layout_made`'s order. */
@@ -486,7 +488,7 @@ lower_program_cached(program: TProgram, cached: Map[string, string], caching: bo
     val ordinals = local_ordinals(program)
     var constant_globals: Buf[bool] = buf()
     val keyer = key_maker(program, ordinals, constant_globals, world)
-    var l = Lowering(program, buf(), map(), buf(), map(), buf(), buf(), map(), buf(), buf(), map(), map(), map(), map(), buf(), map(), buf(), 0, buf(), buf(), buf(), buf(), buf(), buf(), buf(), buf(), 0, buf(), buf(), 0, map(), false, global_types, generic_base, buf(), map(), buf(), buf(), buf(), false, false, Span(0, 0), buf(), false, buf(), false, 0, buf(), plan, map(), buf(), map(), buf(), buf(), false, buf(), false, None, buf(), false, buf(), buf(), map(), conformance_memo(), map(), buf(), local, ordinals, map(), "", map(), false, buf(), keyer, buf(), cached, caching, buf(), buf(), false, 0, entry_writer(), 0, false, type_names(program), map(), map(), map(), map(), 0, map(), 0, map(), 0, map(), 0, global_names(program), buf(), buf(), debug, false, buf(), 0, buf(), false, false, map(), buf(), buf(), false)
+    var l = Lowering(program, buf(), map(), buf(), map(), buf(), buf(), map(), buf(), buf(), map(), map(), map(), map(), buf(), map(), buf(), 0, buf(), buf(), buf(), buf(), buf(), buf(), buf(), buf(), 0, buf(), buf(), 0, map(), false, global_types, generic_base, buf(), map(), buf(), buf(), buf(), false, false, Span(0, 0), buf(), false, buf(), false, 0, buf(), plan, map(), buf(), map(), buf(), buf(), false, buf(), false, None, buf(), false, buf(), buf(), map(), conformance_memo(), map(), buf(), local, ordinals, map(), "", map(), false, buf(), keyer, buf(), cached, caching, buf(), buf(), false, 0, entry_writer(), 0, false, type_names(program), map(), map(), map(), map(), 0, map(), 0, map(), 0, map(), 0, global_names(program), buf(), buf(), debug, false, buf(), 0, buf(), false, false, map(), buf(), buf(), false, mir_signatures())
     // Record 0 is for the objects no value of the program's types is: the boxes of captured
     // variables. A closure's record is its function type's.
     l.records.push(TypeRecord("a captured variable", buf(), None, None, None, None, false, buf(), 0))
@@ -1449,8 +1451,8 @@ private load_at(l: *Lowering, address: Operand, t: MirType) -> Operand
     // element not yet filled is all zero. A tag saying the union holds a reference is believed only
     // beside a reference, and otherwise is the first scalar member's, so every union read from
     // storage is one some member's value, never a null reference.
-    val zero = compare(l, CmpEq, Value(tag), ConstInt(32, "0"))
-    var fixed = select(l, MInt(32), zero, ConstInt(32, "1"), Value(tag))
+    val zero = compare(l, CmpEq, Value(tag), ConstInt(32, 0))
+    var fixed = select(l, MInt(32), zero, ConstInt(32, 1), Value(tag))
     if refs
         val r = fresh(l, MRef)
         l.insts.push(Load(r, addresses[2]))
@@ -1585,9 +1587,9 @@ private global_names(program: TProgram) -> Buf[string]
 private constant_of(l: *Lowering, e: &TExpr) -> Option[Constant] = e.kind match
     IntConst(digits) ->
         val bits = int_bits(e.ty)
-        if bits > 64 then None else Some(Constant(Some(ConstInt(bits, digits))))
+        if bits > 64 then None else Some(Constant(Some(const_int(bits, digits))))
     BoolConst(value) -> Some(Constant(Some(ConstBool(value))))
-    CharConst(code) -> Some(Constant(Some(ConstInt(32, code.to_string()))))
+    CharConst(code) -> Some(Constant(Some(ConstInt(32, long(code)))))
     RealConst(value) -> Some(Constant(Some(ConstReal(value))))
     StrConst(value) -> Some(Constant(Some(string_constant(l, value))))
     UnitConst -> Some(Constant(None))
@@ -1645,7 +1647,7 @@ private constant_vector(l: *Lowering, e: &TExpr, elements: Buf[&TExpr]) -> Optio
     if is_scalar_union(args[0]) then return None
     val size = element_size(Some(element))
     var cells: Buf[ConstantField] = buf()
-    cells.push(ConstantField(0, MInt(64), ConstInt(64, elements.len().to_string())))
+    cells.push(ConstantField(0, MInt(64), ConstInt(64, long(elements.len()))))
     for i in 0..<values.len()
         val v = values[i] match
             Some(v) -> v
@@ -1722,7 +1724,8 @@ private constant_object_made(l: *Lowering, descriptor: usize, size: usize, field
 
 /** A constant operand as text that tells it from every other. */
 private constant_key(o: Operand) -> string = o match
-    ConstInt(bits, digits) -> s"i$bits:$digits"
+    ConstInt(bits, value) -> s"i$bits:$value"
+    ConstWide(bits, digits) -> s"i$bits:${*digits}"
     ConstBool(value) -> if value then "t" else "f"
     ConstReal(value) -> s"r${value.bits()}"
     ConstStr(index) -> s"s$index"
@@ -1998,13 +2001,17 @@ private keeps_owners(l: *Lowering, t: &Type) -> bool
 // a behaviour does; a function value, whose captures its type does not show; and `Any`, a trait or
 // an open or abstract class, which may hold anything. A class marked `@keeps_owners` stops the walk, so it holds none, and the scalars and
 // strings hold none. `seen` holds the types being decided, which a recursive type reaches again.
-private holds_handles(l: *Lowering, t: &Type, seen: *Buf[string]) -> bool
+// Where `hidden` is false, only a handle the type shows counts: a function value, `Any`, a trait, an
+// open or abstract class, a union, a type variable and a variant hiding types hold none, and neither
+// does a function a generic type of the standard library keeps — the threads' rule, for a channel's
+// values and a lock's, so a lock of callbacks or of a trait's objects costs no walk.
+private holds_handles(l: *Lowering, t: &Type, seen: *Buf[string], hidden: bool = true) -> bool
     *t match
         Tuple(items) ->
             for item in items
-                if holds_handles(l, item, seen) then return true
+                if holds_handles(l, item, seen, hidden) then return true
             false
-        Opaque(_, _, _, repr) -> holds_handles(l, repr, seen)
+        Opaque(_, _, _, repr) -> holds_handles(l, repr, seen, hidden)
         Data(id, _, args) ->
             val key = type_key(t)
             for s in *seen
@@ -2013,9 +2020,11 @@ private holds_handles(l: *Lowering, t: &Type, seen: *Buf[string]) -> bool
             val d = l.program.data[id]
             for v in 0..<d.variants.len()
                 // A variant hiding types may hold anything its packs do.
-                if hides(l, id, v) then return true
+                if hides(l, id, v) then
+                    if hidden then return true
+                    continue
                 for field in variant_fields_at(d, id, v, args).unwrap_or(buf())
-                    if holds_handles(l, field, seen) then return true
+                    if holds_handles(l, field, seen, hidden) then return true
             false
         Class(id, _, args) ->
             val k = l.program.classes[id]
@@ -2030,20 +2039,21 @@ private holds_handles(l: *Lowering, t: &Type, seen: *Buf[string]) -> bool
             // structure, such as a vector's nodes.
             if (k.module_name == CoreModule || k.module_name.starts_with("avin.")) && args.len() > 0
                 for a in args
-                    if holds_handles(l, a, seen) then return true
-                for f in k.fields
-                    if f.ty is Some(ft)
-                        if *ft is Function(_, _, _) || *ft is ByName(_) then return true
+                    if holds_handles(l, a, seen, hidden) then return true
+                if hidden
+                    for f in k.fields
+                        if f.ty is Some(ft)
+                            if *ft is Function(_, _, _) || *ft is ByName(_) then return true
                 return false
-            if k.decl.modifier == "trait" || k.decl.modifier == "open" || k.decl.modifier == "abstract" then return true
+            if k.decl.modifier == "trait" || k.decl.modifier == "open" || k.decl.modifier == "abstract" then return hidden
             for f in k.fields
-                if holds_handles(l, substitute(f.ty.unwrap_or(ErrorType), class_owner(id), args), seen) then return true
+                if holds_handles(l, substitute(f.ty.unwrap_or(ErrorType), class_owner(id), args), seen, hidden) then return true
             false
-        Function(_, _, _) -> true
-        ByName(_) -> true
-        AnyType -> true
-        Union(_) -> true
-        TypeVar(_, _, _) -> true
+        Function(_, _, _) -> hidden
+        ByName(_) -> hidden
+        AnyType -> hidden
+        Union(_) -> hidden
+        TypeVar(_, _, _) -> hidden
         _ -> false
 
 /** The classes and traits `t` conforms to besides itself and `Any`, each once. A tuple's other
@@ -2183,7 +2193,7 @@ private member_tag(t: &Type, m: &Type) -> Option[u32]
         if same_type(scalars[i], m) then return Some(u32(i + 1))
     None
 
-private tag_constant(tag: u32) -> Operand = ConstInt(32, tag.to_string())
+private tag_constant(tag: u32) -> Operand = ConstInt(32, long(tag))
 
 /** A new cell of the union `t` holding `tag` and, where given, `bits` and `reference`. */
 private make_cell(l: *Lowering, t: &Type, tag: Operand, bits: Option[Operand], reference: Option[Operand]) -> Operand
@@ -2201,22 +2211,22 @@ private make_cell(l: *Lowering, t: &Type, tag: Operand, bits: Option[Operand], r
 private scalar_bits(l: *Lowering, m: &Type, value: Option[Operand]) -> Operand
     val v = value match
         Some(v) -> v
-        None -> return ConstInt(64, "0")
+        None -> return ConstInt(64, 0)
     // An opaque member is kept as its representation is.
     *representation(m) match
         Int(bits) -> resize(l, v, bits, 64, true)
         Byte -> resize(l, v, 8, 64, false)
         Char -> resize(l, v, 32, 64, false)
-        Bool -> select(l, MInt(64), v, ConstInt(64, "1"), ConstInt(64, "0"))
+        Bool -> select(l, MInt(64), v, ConstInt(64, 1), ConstInt(64, 0))
         Real -> convert_op(l, Bitcast, MInt(64), v)
-        _ -> ConstInt(64, "0")
+        _ -> ConstInt(64, 0)
 
 /** The value of the scalar type `m` that the bits `bits` of a union's cell keep. */
 private scalar_of_bits(l: *Lowering, m: &Type, bits: Operand) -> Option[Operand] = *representation(m) match
     Int(width) -> Some(resize(l, bits, 64, width, true))
     Byte -> Some(resize(l, bits, 64, 8, false))
     Char -> Some(resize(l, bits, 64, 32, false))
-    Bool -> Some(compare(l, CmpNe, bits, ConstInt(64, "0")))
+    Bool -> Some(compare(l, CmpNe, bits, ConstInt(64, 0)))
     Real -> Some(convert_op(l, Bitcast, MReal, bits))
     _ -> None
 
@@ -2403,7 +2413,7 @@ private type_test(l: *Lowering, object: Operand, t: &Type) -> Operand
     if exact(l, t) then return compare(l, CmpEq, record, target)
     note_tested(l, index)
     val found = runtime_call(l, "avin_rt_conforms", [MPtr, MPtr], MInt(32), [record, target])
-    compare(l, CmpNe, found, ConstInt(32, "0"))
+    compare(l, CmpNe, found, ConstInt(32, 0))
 
 /** The address of the type record of the object `object`, read from its descriptor. */
 private record_at(l: *Lowering, object: Operand) -> Operand
@@ -2563,7 +2573,7 @@ private option_pointer(l: *Lowering, t: &Type, object: Operand) -> Operand
     val absent = new_block(l)
     val present = new_block(l)
     val join = new_block(l)
-    val some = ConstInt(64, some_variant(l).to_string())
+    val some = ConstInt(64, long(some_variant(l)))
     finish_into(l, Branch(compare(l, CmpEq, variant_tag(l, object), some), present, absent), absent)
     store(l, slot, Some(NullAddress))
     finish_into(l, Jump(join), present)
@@ -2705,19 +2715,70 @@ private function_value(l: *Lowering, function: usize, type_args: Buf[&Type]) -> 
     val entry = entry_instance(l, function, concrete_args)
     val shape = closure_shape(l, function, concrete_args, entry)
     if shape.fields.len() == 0 then return ConstClosure(constant_closure(l, function, concrete_args, shape.descriptor, entry))
-    var values: Buf[Operand] = buf()
-    for x in symbol.captured_locals
-        if machine(l, l.locals[x].ty) is Some(_)
-            val place = if l.boxed[x] then l.local_slots[x] else local_place(l, x)
-            values.push(load(l, place).unwrap())
-    for x in symbol.captured_params
-        if param_operand(l, x) is Some(v) then values.push(v)
+    val values = captured_values(l, symbol)
     val object = fresh(l, MRef)
     l.insts.push(Alloc(object, shape.descriptor))
     for i in 0..<values.len()
         store_field(l, Value(object), shape.fields[i], values[i])
     l.insts.push(Publish)
     Value(object)
+
+// What a closure of `symbol` holds, read where it is made: each captured local's value, or its box,
+// then each captured top-level parameter's. A captured delayed argument may be a closure in the
+// frame of a call still running (`delayed_on_stack`), which this closure could outlive, so it is
+// first kept on the heap: no closure ever holds one in a frame, and a closure that is itself in a
+// frame can be copied to the heap whole.
+private captured_values(l: *Lowering, symbol: FunctionSymbol) -> Buf[Operand]
+    var values: Buf[Operand] = buf()
+    for x in symbol.captured_locals
+        if machine(l, l.locals[x].ty) is Some(_)
+            val place = if l.boxed[x] then l.local_slots[x] else local_place(l, x)
+            val v = load(l, place).unwrap()
+            values.push(if !l.boxed[x] && *l.locals[x].ty is ByName(_) then kept_delayed(l, v) else v)
+    val root = symbol.root.unwrap_or(0)
+    for x in symbol.captured_params
+        if param_operand(l, x) is Some(v)
+            values.push(if *l.program.symbols[root].params[x] is ByName(_) then kept_delayed(l, v) else v)
+    values
+
+/** The delayed argument `v`, which may be a closure in a frame, as one on the heap: the same object
+ * where it is already there or captures nothing, otherwise a copy (see `avin_rt_keep_delayed`). */
+private kept_delayed(l: *Lowering, v: Operand) -> Operand
+    if v is ConstClosure(_) then return v
+    runtime_call(l, "avin_rt_keep_delayed", [MRef], MRef, [v])
+
+// A delayed argument passed straight to the call being lowered, made in the caller's own frame
+// rather than on the heap. A delayed argument cannot escape the call it is passed to: a parameter
+// that is only read or forwarded leaves it where it is, and the one way to keep it past the call, a
+// closure capturing the parameter, copies it to the heap first (`captured_values`). So the closure
+// lives exactly as long as the call. The collector does not follow a reference into a frame, so
+// the values the closure holds are pushed on `kept`, which the call's lowering keeps alive across
+// the call with a `Keep`. A closure that captures nothing is the constant one.
+private delayed_on_stack(l: *Lowering, function: usize, type_args: Buf[&Type], kept: *Buf[Operand]) -> Operand
+    val symbol = l.program.symbols[function]
+    val concrete_args = instance_args(l, function, symbol, type_args)
+    val entry = entry_instance(l, function, concrete_args)
+    val shape = closure_shape(l, function, concrete_args, entry)
+    if shape.fields.len() == 0 then return ConstClosure(constant_closure(l, function, concrete_args, shape.descriptor, entry))
+    val values = captured_values(l, symbol)
+    val object = fresh(l, MRef)
+    l.insts.push(StackObject(object, shape.descriptor))
+    for i in 0..<values.len()
+        store_field(l, Value(object), shape.fields[i], values[i])
+        kept.push(values[i])
+    Value(object)
+
+/** The function a delayed argument `a` is the closure of, where `a` is one written at the call. */
+private written_delayed(l: *Lowering, a: &TExpr) -> Option[(usize, Buf[&Type])]
+    if !(*a.ty is ByName(_)) then return None
+    a.kind match
+        FunctionValue(function, type_args) -> if l.program.symbols[function].delayed then Some((function, type_args)) else None
+        _ -> None
+
+/** Ends the life of the delayed arguments a call was passed in its caller's frame: what they hold
+ * stays alive up to here, after the call, and the call is no tail call. */
+private keep_after(l: *Lowering, kept: Buf[Operand])
+    if kept.len() > 0 then l.insts.push(Keep(kept))
 
 /** The constant closure of `function`'s copy at `type_args`, which captures nothing, laid out by
  * `descriptor` and entered at instance `entry`: made when first asked for. */
@@ -2757,6 +2818,14 @@ private note_calls_values(l: *Lowering)
 // slot in the object's class, it takes the parameters `function` takes and yields its result, as
 // machine types, so the call is spelled from `function`'s signature.
 private dispatch(l: *Lowering, function: usize, slot: usize, args: Buf[&TExpr], type_args: Buf[&Type]) -> Option[Operand]
+    var kept: Buf[Operand] = buf()
+    val result = dispatch_keeping(l, function, slot, args, type_args, &kept)
+    keep_after(l, kept)
+    result
+
+// A delayed argument written at the call is made in the caller's frame (`delayed_on_stack`), what it
+// holds pushed on `kept`: every override takes it as a by-name parameter.
+private dispatch_keeping(l: *Lowering, function: usize, slot: usize, args: Buf[&TExpr], type_args: Buf[&Type], kept: *Buf[Operand]) -> Option[Operand]
     // A union with a scalar member has no method table: a member call on one, seen as a trait every
     // member has, goes to the member's own implementation by its tag where it renders the value, and
     // otherwise through the table of the value as an `Any`.
@@ -2768,7 +2837,9 @@ private dispatch(l: *Lowering, function: usize, slot: usize, args: Buf[&TExpr], 
     var operands: Buf[Operand] = buf()
     for i in 0..<args.len()
         val a = if i == 0 then receiver_expr else args[i]
-        val op = lower_expr(l, a)
+        var op: Option[Operand] = None
+        if i > 0 && written_delayed(l, a) is Some((delayed, delayed_args)) then op = Some(delayed_on_stack(l, delayed, delayed_args, kept))
+        else op = lower_expr(l, a)
         // An argument that never finishes ends the code here: the call is never made.
         if *a.ty is Nothing then return None
         // A value of a type parameter that is `Nothing` in this copy, as the value of a `Some` in an
@@ -2815,7 +2886,7 @@ private dispatch(l: *Lowering, function: usize, slot: usize, args: Buf[&TExpr], 
     val dest = result match
         Some(t) -> Some(fresh(l, value_machine(t)))
         None -> None
-    push_call(l, dest, Indirect(Value(code), mir_signature(params, result)), operands)
+    push_call(l, dest, Indirect(Value(code), l.signatures.plain(params, result)), operands)
     dest match
         Some(id) -> Some(Value(id))
         None -> None
@@ -2988,16 +3059,22 @@ private struct DispatchAnswer
 // A direct call of `function`, the receiver first for a method. A static member's receiver is a
 // type, which is not passed.
 private direct_call(l: *Lowering, e: &TExpr, function: usize, args: Buf[&TExpr], type_args: Buf[&Type]) -> Option[Operand]
+    var kept: Buf[Operand] = buf()
+    val result = direct_call_keeping(l, e, function, args, type_args, &kept)
+    keep_after(l, kept)
+    result
+
+private direct_call_keeping(l: *Lowering, e: &TExpr, function: usize, args: Buf[&TExpr], type_args: Buf[&Type], kept: *Buf[Operand]) -> Option[Operand]
     val callee = l.program.symbols[function]
     // A constructor trait's method is compiled for each constructor implementing it, which follows
     // its type arguments, so its `Self` is the value's own type.
     if constructor_trait_method(l, callee) && args.len() > 0
-        val operands = call_operands(l, callee, args, false)?
+        val operands = call_operands(l, callee, args, false, kept)?
         return call_resolved(l, e, function, callee, args, operands, with_constructor(l, function, args[0].ty, type_args))
     // A trait's default body is compiled once for every conforming type, its `Self` an object: an
     // option kept as a pointer goes in as the object it stands for, and comes out as a pointer again.
     val default_body = is_trait_method(l, callee)
-    val operands = call_operands(l, callee, args, default_body)?
+    val operands = call_operands(l, callee, args, default_body, kept)?
     if default_body && is_self_type(callee.result.unwrap_or(Unit)) && pointer_option(l, e.ty)
         val object = call_resolved(l, e, function, callee, args, operands, type_args)?
         return Some(option_pointer(l, e.ty, object))
@@ -3016,12 +3093,18 @@ private constructor_trait_method(l: *Lowering, symbol: FunctionSymbol) -> bool =
 // member's type receiver left out; `None` where one never finishes, which ends the code there, since
 // the call is never made. In a trait's default body an option kept as a pointer goes in where `Self`
 // is taken as the object it stands for.
-private call_operands(l: *Lowering, callee: FunctionSymbol, args: Buf[&TExpr], default_body: bool) -> Option[Buf[Operand]]
+// A delayed argument written at the call is made in the caller's frame (`delayed_on_stack`), what
+// it holds pushed on `kept`, for a callee that is a function of the program rather than an operation
+// lowered in place.
+private call_operands(l: *Lowering, callee: FunctionSymbol, args: Buf[&TExpr], default_body: bool, kept: *Buf[Operand]) -> Option[Buf[Operand]]
     var operands: Buf[Operand] = buf()
     for i in 0..<args.len()
         val a = args[i]
         if a.kind is TypeReceiver then continue
-        val op = lower_expr(l, a)
+        var op: Option[Operand] = None
+        if callee.intrinsic is None && written_delayed(l, a) is Some((function, type_args))
+            op = Some(delayed_on_stack(l, function, type_args, kept))
+        else op = lower_expr(l, a)
         if *a.ty is Nothing then return None
         if machine(l, a.ty) is Some(_)
             op match
@@ -3055,7 +3138,8 @@ private words_result(l: *Lowering, e: &TExpr, function: usize) -> Buf[FieldSlot]
  * values, read as the words `words` of the call's result. `None` where an argument never finishes. */
 private words_call(l: *Lowering, e: &TExpr, function: usize, args: Buf[&TExpr], type_args: Buf[&Type], words: Buf[FieldSlot]) -> Option[Buf[Operand]]
     val callee = l.program.symbols[function]
-    var operands = call_operands(l, callee, args, false)?
+    var kept: Buf[Operand] = buf()
+    var operands = call_operands(l, callee, args, false, &kept)?
     push_captures(l, callee, &operands)
     val concrete_args = instance_args(l, function, callee, type_args)
     val index = words_instance(l, function, concrete_args)
@@ -3067,6 +3151,7 @@ private words_call(l: *Lowering, e: &TExpr, function: usize, args: Buf[&TExpr], 
         val dest = fresh(l, words[k].ty)
         l.insts.push(CallWord(dest, first, k))
         out.push(Value(dest))
+    keep_after(l, kept)
     Some(out)
 
 /** Whether a function is a method a trait declares, compiled once for every conforming type. */
@@ -3102,7 +3187,7 @@ private call_resolved(l: *Lowering, e: &TExpr, function: usize, callee: Function
             var values: Buf[Operand] = buf()
             values.push(TrapSiteAddress(site))
             values.push(operands[0])
-            l.insts.push(Call(None, Runtime(entry, mir_signature(types, None)), values))
+            l.insts.push(Call(None, Runtime(entry, l.signatures.plain(types, None)), values))
             leave(l, Unreachable)
             return None
         if name.starts_with("array_")
@@ -3111,9 +3196,9 @@ private call_resolved(l: *Lowering, e: &TExpr, function: usize, callee: Function
             return array_operation(l, name, array, operands, e.span)
         if name.starts_with("string_") then return intrinsic_operation(l, name, operands, e.span)
         if name.starts_with("atomic_") then return atomic_operation(l, name, concrete(l, args[0].ty), operands)
-        if name == "holds_handles"
+        if name == "holds_handles" || name == "shows_handles"
             var seen: Buf[string] = buf()
-            return Some(ConstBool(holds_handles(l, concrete(l, args[0].ty), &seen)))
+            return Some(ConstBool(holds_handles(l, concrete(l, args[0].ty), &seen, name == "holds_handles")))
         // A field's initializer is the only place `field_unset` means anything (the checker leaves
         // the field unstored); anywhere else there is no value to give.
         if name == "field_unset"
@@ -3221,12 +3306,22 @@ private conformance_member(l: *Lowering, receiver: &Type, function: usize, table
 // Calls a function value, a closure or an object of a class or data type that is a function: its
 // descriptor's `call` takes the object before the arguments.
 private call_value(l: *Lowering, callee: &TExpr, args: Buf[&TExpr]) -> Option[Operand]
+    var kept: Buf[Operand] = buf()
+    val result = call_value_keeping(l, callee, args, &kept)
+    keep_after(l, kept)
+    result
+
+// A delayed argument written at the call is made in the caller's frame (`delayed_on_stack`), what it
+// holds pushed on `kept`: whatever function the value is takes it as a by-name parameter.
+private call_value_keeping(l: *Lowering, callee: &TExpr, args: Buf[&TExpr], kept: *Buf[Operand]) -> Option[Operand]
     note_calls_values(l)
     val target = lower_expr(l, callee)?
     var operands: Buf[Operand] = buf()
     operands.push(target)
     for a in args
-        val op = lower_expr(l, a)
+        var op: Option[Operand] = None
+        if written_delayed(l, a) is Some((delayed, delayed_args)) then op = Some(delayed_on_stack(l, delayed, delayed_args, kept))
+        else op = lower_expr(l, a)
         // An argument that never finishes ends the code here: the call is never made.
         if *a.ty is Nothing then return None
         if machine(l, a.ty) is Some(_)
@@ -3248,7 +3343,7 @@ private call_value(l: *Lowering, callee: &TExpr, args: Buf[&TExpr]) -> Option[Op
     val dest = result match
         Some(t) -> Some(fresh(l, value_machine(t)))
         None -> None
-    push_call(l, dest, Indirect(Value(code), mir_signature(params, result)), operands)
+    push_call(l, dest, Indirect(Value(code), l.signatures.plain(params, result)), operands)
     dest match
         Some(id) -> Some(Value(id))
         None -> None
@@ -3937,7 +4032,7 @@ private binding_body(l: *Lowering, symbol: FunctionSymbol, shim: string)
     val dest = result match
         Some(t) -> Some(fresh(l, t))
         None -> None
-    l.insts.push(Call(dest, Runtime(shim, mir_signature(params, result)), args))
+    l.insts.push(Call(dest, Runtime(shim, l.signatures.plain(params, result)), args))
     finish(l, Return(dest match
         Some(d) -> Some(Value(d))
         None -> None))
@@ -4174,7 +4269,7 @@ private c_binding_body(l: *Lowering, symbol: FunctionSymbol, n: usize, p: CProto
     var length_slots: Buf[usize] = buf()
     for _ in array_outs
         val place = machine_slot(l, MInt(64))
-        store(l, place, Some(ConstInt(64, "0")))
+        store(l, place, Some(ConstInt(64, 0)))
         length_slots.push(slot_of(place))
         scalars.push(CAddress)
         passed.push(SlotAddress(slot_of(place)))
@@ -4185,7 +4280,7 @@ private c_binding_body(l: *Lowering, symbol: FunctionSymbol, n: usize, p: CProto
     // the C result, where the binding keeps it, and the out values.
     if errno
         val code_place = machine_slot(l, MInt(32))
-        store(l, code_place, Some(ConstInt(32, "0")))
+        store(l, code_place, Some(ConstInt(32, 0)))
         scalars.push(CAddress)
         passed.push(SlotAddress(slot_of(code_place)))
         val s = c_scalar_of(p.result, if *answered is Unit then Int(64) else answered, l.program.c_measures)
@@ -4230,7 +4325,7 @@ private c_binding_body(l: *Lowering, symbol: FunctionSymbol, n: usize, p: CProto
         c_call(l, Call(Some(answer), CFunction(callee, scalars, Some(CAddress)), passed), blocking, arrays, objects)
         val handle = c_handle_out(l, symbol, calls, Value(answer), ok_type, h, s"`${p.symbol}` answered", at)
         val code = machine_slot(l, MInt(64))
-        store(l, code, Some(ConstInt(64, "0")))
+        store(l, code, Some(ConstInt(64, 0)))
         val slot = machine_slot(l, MRef)
         val failed = new_block(l)
         val join = new_block(l)
@@ -4315,7 +4410,7 @@ private c_binding_body(l: *Lowering, symbol: FunctionSymbol, n: usize, p: CProto
         made_optional = h.optional
     elif c_struct_of(answered, l.program.data) is Some(d)
         // The glue writes the struct C answered into memory passed first.
-        val memory = c_struct_memory(l, ConstInt(64, c_struct_size(l, d).to_string()))
+        val memory = c_struct_memory(l, ConstInt(64, long(c_struct_size(l, d))))
         structs.push(CHeld(memory, None))
         c_call(l, Call(None, CFunction(callee, c_first_scalar(scalars), None), c_first_operand(memory, passed)), blocking, arrays, objects)
         first = Some(c_struct_read(l, d, memory, s"`${p.symbol}` answered", at))
@@ -4412,7 +4507,7 @@ private c_arrays_in(l: *Lowering, symbol: FunctionSymbol, p: CPrototype, blockin
         var check_args: Buf[Operand] = buf()
         check_args.push(a)
         check_args.push(TrapSiteAddress(trap_site(l, "", symbol.decl.name_span)))
-        l.insts.push(Call(None, Runtime("avin_rt_array_check", mir_signature(check_types, None)), check_args))
+        l.insts.push(Call(None, Runtime("avin_rt_array_check", l.signatures.plain(check_types, None)), check_args))
         val write = q.ty match
             CText(constant) -> !constant
             _ -> !(" " + q.pointee_text + " ").contains(" const ")
@@ -4422,8 +4517,8 @@ private c_arrays_in(l: *Lowering, symbol: FunctionSymbol, p: CPrototype, blockin
         // hold for an array of `long` or `real`; a length C writes back through it is in bytes too. A
         // pointer to a typedef the C unit measured as `void *` points at memory of no type as well.
         if c_points_at_no_type(q, l.program.c_measures)
-            length = runtime_call(l, "avin_rt_c_array_bytes", [MRef, MInt(64)], MInt(64), [a, ConstInt(64, size.to_string())])
-            limit = runtime_call(l, "avin_rt_c_array_byte_limit", [MRef, MInt(64)], MInt(64), [a, ConstInt(64, size.to_string())])
+            length = runtime_call(l, "avin_rt_c_array_bytes", [MRef, MInt(64)], MInt(64), [a, ConstInt(64, long(size))])
+            limit = runtime_call(l, "avin_rt_c_array_byte_limit", [MRef, MInt(64)], MInt(64), [a, ConstInt(64, long(size))])
         elif form.optional
             length = runtime_call(l, "avin_rt_c_array_length", [MRef], MInt(32), [a])
             limit = runtime_call(l, "avin_rt_c_array_limit", [MRef], MInt(64), [a])
@@ -4435,7 +4530,7 @@ private c_arrays_in(l: *Lowering, symbol: FunctionSymbol, p: CPrototype, blockin
             of.push(Some(CArrayIn(a, memory, length, limit, c_struct_size(l, d), false, Some(d), false)))
             continue
         var pointer = a
-        if blocking then pointer = runtime_call(l, "avin_rt_c_array_copy", [MRef, MInt(64)], MPtr, [a, ConstInt(64, size.to_string())])
+        if blocking then pointer = runtime_call(l, "avin_rt_c_array_copy", [MRef, MInt(64)], MPtr, [a, ConstInt(64, long(size))])
         elif form.optional then pointer = runtime_call(l, "avin_rt_c_array_elements", [MRef], MPtr, [a])
         else
             val elements = fresh(l, MPtr)
@@ -4453,7 +4548,7 @@ private c_block_in(l: *Lowering, x: Operand, at: Span) -> CArrayIn
     var args: Buf[Operand] = buf()
     args.push(x)
     args.push(TrapSiteAddress(trap_site(l, "", at)))
-    l.insts.push(Call(None, Runtime("avin_rt_c_memory_check", mir_signature(types, None)), args))
+    l.insts.push(Call(None, Runtime("avin_rt_c_memory_check", l.signatures.plain(types, None)), args))
     val pointer = load_field(l, x, FieldSlot(0, MPtr))
     val limit = load_field(l, x, FieldSlot(CMemoryLength, MInt(64)))
     val length = resize(l, limit, 64, 32, true)
@@ -4473,9 +4568,9 @@ private c_call(l: *Lowering, call: Inst, blocking: bool, arrays: CArraysIn, obje
     if !blocking
         l.insts.push(call)
         return
-    l.insts.push(Call(None, Runtime("avin_rt_enter_safe", mir_signature(buf(), None)), buf()))
+    l.insts.push(Call(None, Runtime("avin_rt_enter_safe", l.signatures.plain(buf(), None)), buf()))
     l.insts.push(call)
-    l.insts.push(Call(None, Runtime("avin_rt_leave_safe", mir_signature(buf(), None)), buf()))
+    l.insts.push(Call(None, Runtime("avin_rt_leave_safe", l.signatures.plain(buf(), None)), buf()))
     for x in arrays.of
         if x is Some(a)
             if a.converted is Some(_) || a.block then continue
@@ -4487,9 +4582,9 @@ private c_call(l: *Lowering, call: Inst, blocking: bool, arrays: CArraysIn, obje
             var operands: Buf[Operand] = buf()
             operands.push(a.array)
             operands.push(a.pointer)
-            operands.push(ConstInt(64, a.size.to_string()))
-            operands.push(ConstInt(32, if a.write then "1" else "0"))
-            l.insts.push(Call(None, Runtime("avin_rt_c_array_back", mir_signature(types, None)), operands))
+            operands.push(ConstInt(64, long(a.size)))
+            operands.push(ConstInt(32, if a.write then 1 else 0))
+            l.insts.push(Call(None, Runtime("avin_rt_c_array_back", l.signatures.plain(types, None)), operands))
     for o in objects
         if o is Some(object)
             val keep = machine_slot(l, MRef)
@@ -4497,9 +4592,9 @@ private c_call(l: *Lowering, call: Inst, blocking: bool, arrays: CArraysIn, obje
 
 // The zero of the C integer crossing as `s`.
 private c_zero(s: CScalar) -> Operand = s match
-    CSigned(bits) -> ConstInt(bits, "0")
-    CUnsigned(bits) -> ConstInt(bits, "0")
-    _ -> ConstInt(32, "0")
+    CSigned(bits) -> ConstInt(bits, 0)
+    CUnsigned(bits) -> ConstInt(bits, 0)
+    _ -> ConstInt(32, 0)
 
 // The copy of the string `x` of type `t`, perhaps an `Option` of one, passed to parameter `i` of a
 // binding: NUL-terminated memory off the heap, null for `None`, which stops the program on a held NUL.
@@ -4531,7 +4626,7 @@ private struct COutSlot
 private c_out_slot(l: *Lowering, symbol: FunctionSymbol, q: CParam, t: &Type, given: Option[Operand], given_type: &Type, copies: *Buf[Operand], at: Span) -> COutSlot
     // A struct mirror C fills is C memory, holding the value given for an `inout` one.
     if c_struct_of(t, l.program.data) is Some(d)
-        val memory = c_struct_memory(l, ConstInt(64, c_struct_size(l, d).to_string()))
+        val memory = c_struct_memory(l, ConstInt(64, long(c_struct_size(l, d))))
         if given is Some(x) then c_struct_write(l, symbol, d, x, memory, 0, copies, at)
         return COutSlot(q, t, 0, CAddress, None, Some(memory), None)
     val pointer = c_handle_form(t, l.program.data, l.program.classes) is Some(_) || !(c_text_form(t, l.program.data, l.program.classes) is NoText) || c_array_form(t, l.program.data, l.program.classes) is Some(_) || c_memory_form(t, l.program.data, l.program.classes) is Some(_)
@@ -4551,10 +4646,10 @@ private c_out_slot(l: *Lowering, symbol: FunctionSymbol, q: CParam, t: &Type, gi
     val m = if s is CBinary32 then MInt(32) else c_machine(s)
     val place = machine_slot(l, m)
     var start: Operand = s match
-        CSigned(bits) -> ConstInt(bits, "0")
-        CUnsigned(bits) -> ConstInt(bits, "0")
+        CSigned(bits) -> ConstInt(bits, 0)
+        CUnsigned(bits) -> ConstInt(bits, 0)
         CBoolean -> ConstBool(false)
-        CBinary32 -> ConstInt(32, "0")
+        CBinary32 -> ConstInt(32, 0)
         _ -> ConstReal(0.0)
     if given is Some(x)
         if c_mirror_of(given_type, l.program.data) is Some(d) then start = c_mirror_argument(l, x, d, s)
@@ -4686,7 +4781,7 @@ private c_struct_field_avin(l: *Lowering, d: usize, j: usize) -> string = l.prog
 // laid out as C's struct, or null for an `Option`'s `None`. Its strings are copies, freed with it.
 private c_struct_in(l: *Lowering, symbol: FunctionSymbol, m: CHandleForm, t: &Type, x: Operand, at: Span) -> Operand
     val d = m.class_index
-    val size = ConstInt(64, c_struct_size(l, d).to_string())
+    val size = ConstInt(64, long(c_struct_size(l, d)))
     // The copies of strings are found again in the memory to be freed.
     var copies: Buf[Operand] = buf()
     if !m.optional
@@ -4757,7 +4852,7 @@ private c_struct_free_strings(l: *Lowering, d: usize, base: Operand, offset: usi
         types_in.push(MPtr)
         var args: Buf[Operand] = buf()
         args.push(Value(p))
-        l.insts.push(Call(None, Runtime("avin_rt_c_string_free", mir_signature(types_in, None)), args))
+        l.insts.push(Call(None, Runtime("avin_rt_c_string_free", l.signatures.plain(types_in, None)), args))
 
 // Whether the struct mirror `d` holds a string, in a field of its own or of a mirror it holds.
 private c_struct_has_strings(l: *Lowering, d: usize) -> bool
@@ -4821,7 +4916,7 @@ private struct CLoop
 // Starts a loop over the indices below `count`, leaving the code in its body.
 private c_loop_start(l: *Lowering, count: Operand) -> CLoop
     val slot = machine_slot(l, MInt(64))
-    store(l, slot, Some(ConstInt(64, "0")))
+    store(l, slot, Some(ConstInt(64, 0)))
     val head = new_block(l)
     val body = new_block(l)
     val exit = new_block(l)
@@ -4832,12 +4927,12 @@ private c_loop_start(l: *Lowering, count: Operand) -> CLoop
 
 // Ends the body of `loop`, leaving the code after it.
 private c_loop_end(l: *Lowering, each: CLoop)
-    store(l, each.slot, Some(binary(l, MInt(64), OpAdd, each.index, ConstInt(64, "1"))))
+    store(l, each.slot, Some(binary(l, MInt(64), OpAdd, each.index, ConstInt(64, 1))))
     finish_into(l, Jump(each.head), each.exit)
 
 // The address `index` elements of `size` bytes past `base`.
 private c_element_address(l: *Lowering, base: Operand, index: Operand, size: usize) -> Operand
-    val offset = if size == 1 then index else binary(l, MInt(64), OpMul, index, ConstInt(64, size.to_string()))
+    val offset = if size == 1 then index else binary(l, MInt(64), OpMul, index, ConstInt(64, long(size)))
     val address = fresh(l, MPtr)
     l.insts.push(Index(address, base, offset))
     Value(address)
@@ -4849,7 +4944,7 @@ private c_struct_array_in(l: *Lowering, symbol: FunctionSymbol, d: usize, a: Ope
     val stride = c_struct_size(l, d)
     val elements = runtime_call(l, "avin_rt_c_array_elements", [MRef], MPtr, [a])
     val count = convert_op(l, SignExtend, MInt(64), length)
-    val memory = c_struct_memory(l, binary(l, MInt(64), OpMul, count, ConstInt(64, stride.to_string())))
+    val memory = c_struct_memory(l, binary(l, MInt(64), OpMul, count, ConstInt(64, long(stride))))
     var copies: Buf[Operand] = buf()
     val each = c_loop_start(l, count)
     val element = fresh(l, MRef)
@@ -4888,7 +4983,7 @@ private c_free_struct_memory(l: *Lowering, memory: Operand)
     types.push(MPtr)
     var args: Buf[Operand] = buf()
     args.push(memory)
-    l.insts.push(Call(None, Runtime("avin_rt_c_struct_free", mir_signature(types, None)), args))
+    l.insts.push(Call(None, Runtime("avin_rt_c_struct_free", l.signatures.plain(types, None)), args))
 
 // Frees the string C answered at `pointer` through the out slot `o`, where `free:` names it, through
 // the glue of the binding numbered `n`, which is passed the receiver's object for a method and frees
@@ -4947,7 +5042,7 @@ private c_array_answer(l: *Lowering, symbol: usize, j: usize, t: &Type, pointer:
     val absent = compare(l, CmpEq, pointer, NullAddress)
     if !form.optional
         c_array_length_traps(l, length, who, at)
-        val counted = compare(l, CmpNe, length, ConstInt(64, "0"))
+        val counted = compare(l, CmpNe, length, ConstInt(64, 0))
         val both = fresh(l, MBool)
         l.insts.push(Select(both, absent, counted, ConstBool(false)))
         trap_if(l, Value(both), s"$who null", at)
@@ -4967,8 +5062,8 @@ private c_array_answer(l: *Lowering, symbol: usize, j: usize, t: &Type, pointer:
 
 // Stops the program where the length of an array C answers is negative or longer than an array holds.
 private c_array_length_traps(l: *Lowering, length: Operand, who: string, at: Span)
-    trap_if(l, compare(l, CmpLt, length, ConstInt(64, "0")), s"$who a negative length", at)
-    trap_if(l, compare(l, CmpGt, length, ConstInt(64, "2147483647")), s"$who more elements than an array holds", at)
+    trap_if(l, compare(l, CmpLt, length, ConstInt(64, 0)), s"$who a negative length", at)
+    trap_if(l, compare(l, CmpGt, length, ConstInt(64, 2147483647)), s"$who more elements than an array holds", at)
 
 private c_array_copy_out(l: *Lowering, symbol: usize, j: usize, array: &Type, element: &Type, pointer: Operand, length: Operand, who: string, at: Span) -> Operand
     c_array_length_traps(l, length, who, at)
@@ -5018,7 +5113,7 @@ private struct CViewLender
 private c_view_lent(l: *Lowering, lender: CViewLender, t: &Type, m: CMemoryForm, pointer: Operand, length: Operand, who: string, at: Span, raw: Option[Place]) -> Operand
     val absent = compare(l, CmpEq, pointer, NullAddress)
     if !m.optional
-        val counted = compare(l, CmpNe, length, ConstInt(64, "0"))
+        val counted = compare(l, CmpNe, length, ConstInt(64, 0))
         val both = fresh(l, MBool)
         l.insts.push(Select(both, absent, counted, ConstBool(false)))
         trap_if(l, Value(both), s"$who null", at)
@@ -5041,8 +5136,8 @@ private c_view_lent(l: *Lowering, lender: CViewLender, t: &Type, m: CMemoryForm,
 // A new view of the memory at `pointer`, of class `m.class_index`, owned by the code running and, where
 // a handle lends it, kept by that handle as the view it lent last, to close it at its next use.
 private c_view_made(l: *Lowering, lent: CViewLender, m: CMemoryForm, pointer: Operand, length: Operand, who: string, at: Span) -> Operand
-    trap_if(l, compare(l, CmpLt, length, ConstInt(64, "0")), s"$who a negative length", at)
-    trap_if(l, compare(l, CmpGt, length, ConstInt(64, "2147483647")), s"$who more bytes than a view holds", at)
+    trap_if(l, compare(l, CmpLt, length, ConstInt(64, 0)), s"$who a negative length", at)
+    trap_if(l, compare(l, CmpGt, length, ConstInt(64, 2147483647)), s"$who more bytes than a view holds", at)
     val name = l.program.classes[m.class_index].name
     val t: &Type = Class(m.class_index, name, buf())
     val object = fresh(l, MRef)
@@ -5068,7 +5163,7 @@ private c_close_view(l: *Lowering, view: Operand)
     val open = new_block(l)
     val join = new_block(l)
     finish_into(l, Branch(compare(l, CmpEq, view, NullAddress), join, open), open)
-    l.insts.push(Store(field_address(l, view, FieldSlot(CMemoryClosed, MInt(64))), ConstInt(64, "1")))
+    l.insts.push(Store(field_address(l, view, FieldSlot(CMemoryClosed, MInt(64))), ConstInt(64, 1)))
     finish_into(l, Jump(join), join)
 
 // Closes the view the handle `object` lent last, if it is open: the handle is being used, and the
@@ -5080,7 +5175,7 @@ private c_close_lent(l: *Lowering, object: Operand)
     val open = new_block(l)
     val join = new_block(l)
     finish_into(l, Branch(compare(l, CmpEq, Value(lent), NullAddress), join, open), open)
-    l.insts.push(Store(field_address(l, Value(lent), FieldSlot(CMemoryClosed, MInt(64))), ConstInt(64, "1")))
+    l.insts.push(Store(field_address(l, Value(lent), FieldSlot(CMemoryClosed, MInt(64))), ConstInt(64, 1)))
     l.insts.push(Store(field_address(l, object, FieldSlot(CHandleLent, MRef)), NullAddress))
     finish_into(l, Jump(join), join)
 
@@ -5139,12 +5234,12 @@ private c_integer_constant(value: i64, s: CScalar) -> Operand
         CSigned(b) -> b
         CUnsigned(b) -> b
         _ -> 32u32
-    if bits >= 64u32 then return ConstInt(64, value.to_string())
+    if bits >= 64u32 then return ConstInt(64, value)
     val span = 1i64 << i64(bits)
     var low = value % span
     if low < 0i64 then low = low + span
     if low >= span / 2i64 then low = low - span
-    ConstInt(bits, low.to_string())
+    ConstInt(bits, low)
 
 // The C value of the enum mirror `d`'s value `x`: its variant's enumerator, at the width of `s`.
 private c_mirror_argument(l: *Lowering, x: Operand, d: usize, s: CScalar) -> Operand
@@ -5154,7 +5249,7 @@ private c_mirror_argument(l: *Lowering, x: Operand, d: usize, s: CScalar) -> Ope
     val tag = variant_tag(l, x)
     for v in 1..<values.len()
         val dest = fresh(l, c_machine(s))
-        l.insts.push(Select(dest, compare(l, CmpEq, tag, ConstInt(64, v.to_string())), c_integer_constant(values[v], s), result))
+        l.insts.push(Select(dest, compare(l, CmpEq, tag, ConstInt(64, long(v))), c_integer_constant(values[v], s), result))
         result = Value(dest)
     result
 
@@ -5329,7 +5424,7 @@ private c_field_body(l: *Lowering, symbol: FunctionSymbol, n: usize, field: CFie
         val bound = fresh(l, MInt(64))
         l.insts.push(Call(Some(bound), CFunction(c_field_glue(n, "bound" + b.to_string()), c_field_params(indices.len()), Some(CSigned(64))), c_field_args(pointer, indices)))
         val reason = s"index `${c_parameter_name(symbol.decl, b)}` of `${symbol.name}` out of range"
-        trap_if(l, compare(l, CmpLt, indices[b], ConstInt(64, "0")), reason, at)
+        trap_if(l, compare(l, CmpLt, indices[b], ConstInt(64, 0)), reason, at)
         trap_if(l, compare(l, CmpGe, indices[b], Value(bound)), reason, at)
     val field_type = CTypedef(c_field_type_name(n))
     if writer
@@ -5337,7 +5432,7 @@ private c_field_body(l: *Lowering, symbol: FunctionSymbol, n: usize, field: CFie
         // A struct mirror is written whole: laid out as C's struct in memory of its own, which the
         // glue assigns to the field, then freed. A mirror holding a string is never written.
         if c_struct_of(t, l.program.data) is Some(d)
-            val memory = c_struct_memory(l, ConstInt(64, c_struct_size(l, d).to_string()))
+            val memory = c_struct_memory(l, ConstInt(64, long(c_struct_size(l, d))))
             var copies: Buf[Operand] = buf()
             c_struct_write(l, symbol, d, Value(l.param_values[last].unwrap()), memory, 0, &copies, at)
             var params = c_field_params(indices.len())
@@ -5383,7 +5478,7 @@ private c_field_body(l: *Lowering, symbol: FunctionSymbol, n: usize, field: CFie
     // A struct mirror is read whole: the glue copies the field into memory of its own, read into a
     // new value of the mirror, then freed.
     if c_struct_of(result_type, l.program.data) is Some(d)
-        val memory = c_struct_memory(l, ConstInt(64, c_struct_size(l, d).to_string()))
+        val memory = c_struct_memory(l, ConstInt(64, long(c_struct_size(l, d))))
         var params = c_field_params(indices.len())
         params.push(CAddress)
         var args = c_field_args(pointer, indices)
@@ -5640,9 +5735,9 @@ private c_attach(l: *Lowering, holder: Operand, k: usize, binding: string, at: S
     store(l, record, Some(Value(known)))
     val make = new_block(l)
     val join = new_block(l)
-    finish_into(l, Branch(compare(l, CmpEq, Value(known), ConstInt(64, "0")), make, join), make)
+    finish_into(l, Branch(compare(l, CmpEq, Value(known), ConstInt(64, 0)), make, join), make)
     val fresh_record = fresh(l, MInt(64))
-    l.insts.push(Call(Some(fresh_record), Runtime("avin_rt_c_attach_new", mir_signature(buf(), Some(MInt(64)))), buf()))
+    l.insts.push(Call(Some(fresh_record), Runtime("avin_rt_c_attach_new", l.signatures.plain(buf(), Some(MInt(64)))), buf()))
     val made = Value(fresh_record)
     var params: Buf[CScalar] = buf()
     params.push(CAddress)
@@ -5654,12 +5749,12 @@ private c_attach(l: *Lowering, holder: Operand, k: usize, binding: string, at: S
     l.insts.push(Call(Some(answer), CFunction(s"avin_c_attach_$k", params, Some(CSigned(64))), args))
     val failed = new_block(l)
     val attached = new_block(l)
-    finish_into(l, Branch(compare(l, CmpNe, Value(answer), ConstInt(64, "0")), failed, attached), failed)
+    finish_into(l, Branch(compare(l, CmpNe, Value(answer), ConstInt(64, 0)), failed, attached), failed)
     var undo: Buf[MirType] = buf()
     undo.push(MInt(64))
     var undone: Buf[Operand] = buf()
     undone.push(made)
-    l.insts.push(Call(None, Runtime("avin_rt_c_attach_failed", mir_signature(undo, None)), undone))
+    l.insts.push(Call(None, Runtime("avin_rt_c_attach_failed", l.signatures.plain(undo, None)), undone))
     fail match
         Some(f) ->
             l.insts.push(Store(SlotAddress(f.code), Value(answer)))
@@ -5678,7 +5773,7 @@ private c_attach(l: *Lowering, holder: Operand, k: usize, binding: string, at: S
     var values: Buf[Operand] = buf()
     values.push(load(l, record).unwrap())
     values.push(Value(list))
-    l.insts.push(Call(None, Runtime("avin_rt_c_attach_set", mir_signature(types, None)), values))
+    l.insts.push(Call(None, Runtime("avin_rt_c_attach_set", l.signatures.plain(types, None)), values))
 
 // Frees the record of each function the call passed C that no handle keeps, once the call has
 // returned: C calls it no more.
@@ -5687,7 +5782,7 @@ private c_free_records(l: *Lowering, slots: Buf[Option[Place]])
         if slot is None then continue
         var args: Buf[Operand] = buf()
         args.push(load(l, slot).unwrap())
-        l.insts.push(Call(None, Runtime("avin_rt_c_callback_free", mir_signature(single(MPtr), None)), args))
+        l.insts.push(Call(None, Runtime("avin_rt_c_callback_free", l.signatures.plain(single(MPtr), None)), args))
 
 /** What the function a trampoline runs converts for: the binding's name, the unit and span that
  * place it, the prototype of the function C calls, the Avin function's type, the trampoline's
@@ -5798,7 +5893,7 @@ private c_callback_body(l: *Lowering, k: usize) -> MirFunction
     val dest = answer match
         Some(m) -> Some(fresh(l, m))
         None -> None
-    push_call(l, dest, Indirect(Value(code), mir_signature(types, answer)), operands)
+    push_call(l, dest, Indirect(Value(code), l.signatures.plain(types, answer)), operands)
     // The memory was lent for the call, so each view is closed once the function returns.
     for raw in lent
         c_close_view(l, load(l, raw).unwrap())
@@ -5931,7 +6026,7 @@ private c_release_copies(l: *Lowering, copies: Buf[Operand])
         types.push(MPtr)
         var args: Buf[Operand] = buf()
         args.push(c)
-        l.insts.push(Call(None, Runtime("avin_rt_c_string_free", mir_signature(types, None)), args))
+        l.insts.push(Call(None, Runtime("avin_rt_c_string_free", l.signatures.plain(types, None)), args))
 
 // Calls the C function `free` on the string C answered at `answer`.
 private c_free_answer(l: *Lowering, free: string, answer: Operand)
@@ -5990,7 +6085,7 @@ private c_text_copy(l: *Lowering, answer: Operand, t: &Type, form: CTextForm, fr
 // The C constant `name` as a constant of its Avin type `t`, an integer type, `real` or `string`, as
 // the C unit measured it; the driver has checked that it fits.
 private c_constant(l: *Lowering, t: &Type, name: string) -> Operand = *t match
-    Int(bits) -> ConstInt(bits, c_value(l, c_value_key(CConstInteger, name)).integer.to_string())
+    Int(bits) -> const_int(bits, c_value(l, c_value_key(CConstInteger, name)).integer.to_string())
     Real -> ConstReal(c_value(l, c_value_key(CConstReal, name)).real)
     _ -> string_constant(l, c_value(l, c_value_key(CConstString, name)).text.unwrap_or(""))
 
@@ -6020,10 +6115,10 @@ private c_argument(l: *Lowering, x: Operand, t: &Type, s: CScalar, name: string,
             narrow
         CUnsigned(bits) ->
             if bits >= width
-                trap_if(l, compare(l, CmpLt, x, ConstInt(width, "0")), s"value out of range for $name", at)
+                trap_if(l, compare(l, CmpLt, x, ConstInt(width, 0)), s"value out of range for $name", at)
                 return resize(l, x, width, bits, false)
             // A negative value compares as huge, so one unsigned test covers both ends.
-            trap_if(l, compare(l, CmpUgt, x, ConstInt(width, ((1u64 << u64(bits)) - 1u64).to_string())), s"value out of range for $name", at)
+            trap_if(l, compare(l, CmpUgt, x, const_int(width, ((1u64 << u64(bits)) - 1u64).to_string())), s"value out of range for $name", at)
             resize(l, x, width, bits, false)
         _ -> x
     // A `bool` passed to an integer used as a truth value is 0 or 1.
@@ -6035,7 +6130,7 @@ private c_argument(l: *Lowering, x: Operand, t: &Type, s: CScalar, name: string,
 
 private c_truth(l: *Lowering, x: Operand, bits: u32) -> Operand
     val dest = fresh(l, MInt(bits))
-    l.insts.push(Select(dest, x, ConstInt(bits, "1"), ConstInt(bits, "0")))
+    l.insts.push(Select(dest, x, ConstInt(bits, 1), ConstInt(bits, 0)))
     Value(dest)
 
 // What C answered, crossing as `s`, as the Avin type `t`: an integer traps where `t` cannot hold it,
@@ -6046,8 +6141,8 @@ private c_answer(l: *Lowering, x: Operand, s: CScalar, t: &Type, at: Span) -> Op
         CUnsigned(bits) -> narrow_unsigned(l, x, bits, width, t, at)
         _ -> x
     Bool -> s match
-        CSigned(bits) -> compare(l, CmpNe, x, ConstInt(bits, "0"))
-        CUnsigned(bits) -> compare(l, CmpNe, x, ConstInt(bits, "0"))
+        CSigned(bits) -> compare(l, CmpNe, x, ConstInt(bits, 0))
+        CUnsigned(bits) -> compare(l, CmpNe, x, ConstInt(bits, 0))
         _ -> x
     _ -> x
 
@@ -6292,9 +6387,9 @@ private intrinsic_body(l: *Lowering, symbol: FunctionSymbol)
             if l.param_values[i] is Some(v) then operands.push(Value(v))
         finish(l, Return(atomic_operation(l, name, concrete(l, symbol.params[0]), operands)))
         return
-    if name == "holds_handles"
+    if name == "holds_handles" || name == "shows_handles"
         var seen: Buf[string] = buf()
-        finish(l, Return(Some(ConstBool(holds_handles(l, concrete(l, symbol.params[0]), &seen)))))
+        finish(l, Return(Some(ConstBool(holds_handles(l, concrete(l, symbol.params[0]), &seen, name == "holds_handles")))))
         return
     // An operation of a view or a block calls the runtime's entry point of its name with its receiver
     // and arguments, the descriptor of an array or block it makes, and a site for its traps, which
@@ -6317,7 +6412,7 @@ private intrinsic_body(l: *Lowering, symbol: FunctionSymbol)
         val dest = result match
             Some(t) -> Some(fresh(l, t))
             None -> None
-        l.insts.push(Call(dest, Runtime("avin_rt_" + name, mir_signature(types, result)), args))
+        l.insts.push(Call(dest, Runtime("avin_rt_" + name, l.signatures.plain(types, result)), args))
         finish(l, Return(dest match
             Some(id) -> Some(Value(id))
             None -> None))
@@ -6345,7 +6440,7 @@ private intrinsic_body(l: *Lowering, symbol: FunctionSymbol)
     val dest = result match
         Some(t) -> Some(fresh(l, t))
         None -> None
-    l.insts.push(Call(dest, Runtime(found.0, mir_signature(params, result)), args))
+    l.insts.push(Call(dest, Runtime(found.0, l.signatures.plain(params, result)), args))
     // An entry point that never returns, such as ending the process, leaves nothing to return.
     if *found.2 is Nothing
         finish(l, Unreachable)
@@ -6384,7 +6479,7 @@ private intrinsic_operation(l: *Lowering, name: string, args: Buf[Operand], at: 
     if name == "string_parse_real"
         return Some(runtime_call(l, "avin_rt_string_parse_real", [MRef], MReal, [s]))
     if name == "string_repeat"
-        trap_if(l, compare(l, CmpLt, args[1], ConstInt(32, "0")), "negative repeat count", at)
+        trap_if(l, compare(l, CmpLt, args[1], ConstInt(32, 0)), "negative repeat count", at)
         return Some(runtime_call(l, "avin_rt_string_repeat", [MRef, MInt(32)], MRef, [s, args[1]]))
     None
 
@@ -6418,16 +6513,16 @@ private trap_unless_owner(l: *Lowering, a: Operand, at: Span)
 // Marks the block being lowered as one the program rarely reaches, by a call to a runtime function
 // declared cold that does nothing: the optimizer lays such a block out of the hot path and weighs
 // the branch to it as almost never taken, as it does a trap's.
-private mark_cold(l: *Lowering) = l.insts.push(Call(None, Runtime("avin_rt_array_slow", mir_signature(buf(), None)), buf()))
+private mark_cold(l: *Lowering) = l.insts.push(Call(None, Runtime("avin_rt_array_slow", l.signatures.plain(buf(), None)), buf()))
 
 // The length a moved array's length word `word` holds, in its bits 32 to 62, as an `int`.
 private moved_length(l: *Lowering, word: Operand) -> Operand
-    val high = binary(l, MInt(64), OpLShr, word, ConstInt(64, "32"))
-    binary(l, MInt(32), OpAnd, convert_op(l, Truncate, MInt(32), high), ConstInt(32, "2147483647"))
+    val high = binary(l, MInt(64), OpLShr, word, ConstInt(64, 32))
+    binary(l, MInt(32), OpAnd, convert_op(l, Truncate, MInt(32), high), ConstInt(32, 2147483647))
 
 // The length of the array `a`, whose length word is `word`, moved or not, as an `int`.
 private decoded_length(l: *Lowering, word: Operand) -> Operand
-    val moved = compare(l, CmpLt, word, ConstInt(64, "0"))
+    val moved = compare(l, CmpLt, word, ConstInt(64, 0))
     val length = fresh(l, MInt(32))
     l.insts.push(Select(length, moved, moved_length(l, word), convert_op(l, Truncate, MInt(32), word)))
     Value(length)
@@ -6443,7 +6538,7 @@ private element_in_bounds(l: *Lowering, a: Operand, index: Operand, at: Span)
     val next = new_block(l)
     finish_into(l, Branch(outside, slow, next), slow)
     mark_cold(l)
-    trap_if(l, compare(l, CmpGe, word, ConstInt(64, "0")), "index out of range", at)
+    trap_if(l, compare(l, CmpGe, word, ConstInt(64, 0)), "index out of range", at)
     trap_unless_owner(l, a, at)
     trap_if(l, compare(l, CmpUge, index, moved_length(l, word)), "index out of range", at)
     finish_into(l, Jump(next), next)
@@ -6456,7 +6551,7 @@ private checked_length(l: *Lowering, a: Operand, at: Span) -> Operand
     val word = array_word(l, a)
     val slot = machine_slot(l, MInt(32))
     store(l, slot, Some(convert_op(l, Truncate, MInt(32), word)))
-    val moved = compare(l, CmpLt, word, ConstInt(64, "0"))
+    val moved = compare(l, CmpLt, word, ConstInt(64, 0))
     val slow = new_block(l)
     val next = new_block(l)
     finish_into(l, Branch(moved, slow, next), slow)
@@ -6488,7 +6583,7 @@ private array_operation(l: *Lowering, name: string, array: &Type, args: Buf[Oper
     val m = storage_type(element)
     val size = element_size(m)
     if name == "array_new"
-        trap_if(l, compare(l, CmpLt, args[0], ConstInt(32, "0")), "negative array length", at)
+        trap_if(l, compare(l, CmpLt, args[0], ConstInt(32, 0)), "negative array length", at)
         val descriptor = layout(l, array).variants[0].descriptor
         val length = convert_op(l, SignExtend, MInt(64), args[0])
         return Some(runtime_call(l, "avin_rt_new_array", [MPtr, MInt(64)], MRef, [DescriptorAddress(descriptor), length]))
@@ -6516,7 +6611,7 @@ private array_operation(l: *Lowering, name: string, array: &Type, args: Buf[Oper
         types.push(MRef)
         types.push(MInt(32))
         types.push(MInt(32))
-        l.insts.push(Call(None, Runtime("avin_rt_array_clear", mir_signature(types, None)), args))
+        l.insts.push(Call(None, Runtime("avin_rt_array_clear", l.signatures.plain(types, None)), args))
         return None
     // A move of a run of elements from one array into another of the same element type, or within
     // one, whose ranges the library has checked.
@@ -6527,7 +6622,7 @@ private array_operation(l: *Lowering, name: string, array: &Type, args: Buf[Oper
         types.push(MRef)
         types.push(MInt(32))
         types.push(MInt(32))
-        l.insts.push(Call(None, Runtime("avin_rt_array_copy", mir_signature(types, None)), args))
+        l.insts.push(Call(None, Runtime("avin_rt_array_copy", l.signatures.plain(types, None)), args))
         return None
     if name == "array_slice"
         trap_if(l, compare(l, CmpUgt, args[2], if movable then checked_length(l, a, at) else byte_length(l, a)), "slice out of range", at)
@@ -6542,7 +6637,7 @@ private array_operation(l: *Lowering, name: string, array: &Type, args: Buf[Oper
     val elements = fresh(l, MPtr)
     l.insts.push(Offset(elements, a, ArrayHeader))
     val index = convert_op(l, SignExtend, MInt(64), args[1])
-    val offset = if size == 1 then index else binary(l, MInt(64), OpMul, index, ConstInt(64, s"$size"))
+    val offset = if size == 1 then index else binary(l, MInt(64), OpMul, index, ConstInt(64, long(size)))
     val address = fresh(l, MPtr)
     l.insts.push(Index(address, Value(elements), offset))
     if name == "array_update"
@@ -6649,14 +6744,14 @@ private lazy_state(l: *Lowering, g: usize) -> usize
 private lazy_read(l: *Lowering, at: Span, name: string, p: LazyPlace, initialize: &TExpr) -> Option[Operand]
     val word = fresh(l, MInt(64))
     l.insts.push(AtomicLoad(word, lazy_state_address(l, p)))
-    val ready = compare(l, CmpEq, Value(word), ConstInt(64, "1"))
+    val ready = compare(l, CmpEq, Value(word), ConstInt(64, 1))
     val slow = new_block(l)
     val run = new_block(l)
     val done = new_block(l)
     finish_into(l, Branch(ready, done, slow), slow)
     val site = trap_site(l, s"`$name` is read while it is being initialized", at)
     val first = runtime_call(l, "avin_rt_lazy_begin", [MPtr, MPtr], MInt(32), [lazy_state_address(l, p), TrapSiteAddress(site)])
-    finish_into(l, Branch(compare(l, CmpNe, first, ConstInt(32, "0")), run, done), run)
+    finish_into(l, Branch(compare(l, CmpNe, first, ConstInt(32, 0)), run, done), run)
     val value = lower_expr(l, initialize)
     // An initializer that never returns traps or ends the program.
     if value is None && machine(l, initialize.ty) is Some(_) then finish_into(l, Unreachable, done)
@@ -6666,7 +6761,7 @@ private lazy_read(l: *Lowering, at: Span, name: string, p: LazyPlace, initialize
         types.push(MPtr)
         var args: Buf[Operand] = buf()
         args.push(lazy_state_address(l, p))
-        l.insts.push(Call(None, Runtime("avin_rt_lazy_end", mir_signature(types, None)), args))
+        l.insts.push(Call(None, Runtime("avin_rt_lazy_end", l.signatures.plain(types, None)), args))
         finish_into(l, Jump(done), done)
     load(l, lazy_value_place(l, p))
 
@@ -6935,12 +7030,12 @@ private located(l: *Lowering) -> Buf[Inst]
     out
 
 private lower_kind(l: *Lowering, e: &TExpr, tail: bool) -> Option[Operand] = e.kind match
-    IntConst(digits) -> Some(ConstInt(int_bits(e.ty), digits))
+    IntConst(digits) -> Some(const_int(int_bits(e.ty), digits))
     IntLimit(greatest) ->
         val bits = int_bits(concrete(l, e.ty))
-        Some(ConstInt(bits, if greatest then max_digits(bits) else min_digits(bits)))
+        Some(const_int(bits, if greatest then max_digits(bits) else min_digits(bits)))
     BoolConst(value) -> Some(ConstBool(value))
-    CharConst(code) -> Some(ConstInt(32, code.to_string()))
+    CharConst(code) -> Some(ConstInt(32, long(code)))
     RealConst(value) -> Some(ConstReal(value))
     StrConst(value) -> Some(string_constant(l, value))
     UnitConst -> None
@@ -7043,7 +7138,7 @@ private lower_kind(l: *Lowering, e: &TExpr, tail: bool) -> Option[Operand] = e.k
             var args: Buf[Operand] = buf()
             args.push(x)
             args.push(ClosureRunner)
-            l.insts.push(Call(None, Runtime("avin_rt_defer_push", mir_signature(types, None)), args))
+            l.insts.push(Call(None, Runtime("avin_rt_defer_push", l.signatures.plain(types, None)), args))
         l.defers.push(closure)
         None
     Let(local, value) ->
@@ -7089,7 +7184,7 @@ private lower_kind(l: *Lowering, e: &TExpr, tail: bool) -> Option[Operand] = e.k
     Complement(operand) ->
         val x = lower_expr(l, operand)?
         val bits = int_bits(e.ty)
-        Some(binary(l, MInt(bits), OpXor, x, ConstInt(bits, "-1")))
+        Some(binary(l, MInt(bits), OpXor, x, ConstInt(bits, -1)))
     Arith(op, left, right, op_span) ->
         val a = lower_expr(l, left)?
         val b = lower_expr(l, right)?
@@ -7183,14 +7278,14 @@ private run_defers(l: *Lowering, from: usize)
     var types: Buf[MirType] = buf()
     types.push(MInt(64))
     var args: Buf[Operand] = buf()
-    args.push(ConstInt(64, (l.defers.len() - from).to_string()))
-    l.insts.push(Call(None, Runtime("avin_rt_defers_run", mir_signature(types, None)), args))
+    args.push(ConstInt(64, long(l.defers.len() - from)))
+    l.insts.push(Call(None, Runtime("avin_rt_defers_run", l.signatures.plain(types, None)), args))
 
 private step(l: *Lowering, e: &TExpr, local: usize, increment: bool, postfix: bool, op_span: Span) -> Option[Operand]
     val slot = local_place(l, local)
     val old = load(l, slot)?
     val bits = int_bits(e.ty)
-    val updated = checked(l, bits, if increment then CheckedAdd else CheckedSub, old, ConstInt(bits, "1"), op_span)
+    val updated = checked(l, bits, if increment then CheckedAdd else CheckedSub, old, ConstInt(bits, 1), op_span)
     store(l, slot, Some(updated))
     Some(if postfix then old else updated)
 
@@ -7213,21 +7308,21 @@ private arith(l: *Lowering, bits: u32, op: BinaryOp, a: Operand, b: Operand, at:
         BitOr -> binary(l, t, OpOr, a, b)
         BitXor -> binary(l, t, OpXor, a, b)
         Divide ->
-            trap_if(l, compare(l, CmpEq, b, ConstInt(bits, "0")), "division by zero", at)
-            val minimum = compare(l, CmpEq, a, ConstInt(bits, min_digits(bits)))
-            val minus_one = compare(l, CmpEq, b, ConstInt(bits, "-1"))
+            trap_if(l, compare(l, CmpEq, b, ConstInt(bits, 0)), "division by zero", at)
+            val minimum = compare(l, CmpEq, a, const_int(bits, min_digits(bits)))
+            val minus_one = compare(l, CmpEq, b, ConstInt(bits, -1))
             trap_if(l, binary(l, MBool, OpAnd, minimum, minus_one), "integer overflow", at)
             binary(l, t, OpDiv, a, b)
         Remainder ->
-            trap_if(l, compare(l, CmpEq, b, ConstInt(bits, "0")), "remainder by zero", at)
-            val minus_one = compare(l, CmpEq, b, ConstInt(bits, "-1"))
-            binary(l, t, OpRem, a, select(l, t, minus_one, ConstInt(bits, "1"), b))
+            trap_if(l, compare(l, CmpEq, b, ConstInt(bits, 0)), "remainder by zero", at)
+            val minus_one = compare(l, CmpEq, b, ConstInt(bits, -1))
+            binary(l, t, OpRem, a, select(l, t, minus_one, ConstInt(bits, 1), b))
         ShiftLeft ->
-            val out = compare(l, CmpUge, b, ConstInt(bits, bits.to_string()))
-            select(l, t, out, ConstInt(bits, "0"), binary(l, t, OpShl, a, b))
+            val out = compare(l, CmpUge, b, ConstInt(bits, long(bits)))
+            select(l, t, out, ConstInt(bits, 0), binary(l, t, OpShl, a, b))
         ShiftRight ->
-            val out = compare(l, CmpUge, b, ConstInt(bits, bits.to_string()))
-            binary(l, t, OpAShr, a, select(l, t, out, ConstInt(bits, (bits - 1).to_string()), b))
+            val out = compare(l, CmpUge, b, ConstInt(bits, long(bits)))
+            binary(l, t, OpAShr, a, select(l, t, out, ConstInt(bits, long(bits - 1)), b))
         _ -> a
 
 /** An arithmetic, bitwise or shift operation on two values of the built-in type `t`, or `+` joining
@@ -7242,7 +7337,7 @@ private scalar_arith(l: *Lowering, t: &Type, op: BinaryOp, a: Operand, b: Operan
 private negate_value(l: *Lowering, t: &Type, x: Operand, at: Span) -> Operand
     if *t is Real then return binary(l, MReal, OpFNeg, x, ConstReal(0.0))
     val bits = int_bits(t)
-    checked(l, bits, CheckedSub, ConstInt(bits, "0"), x, at)
+    checked(l, bits, CheckedSub, ConstInt(bits, 0), x, at)
 
 private real_arith(l: *Lowering, op: BinaryOp, a: Operand, b: Operand) -> Operand
     val machine = op match
@@ -7261,11 +7356,11 @@ private byte_arith(l: *Lowering, op: BinaryOp, a: Operand, b: Operand) -> Operan
         BitOr -> binary(l, t, OpOr, a, b)
         BitXor -> binary(l, t, OpXor, a, b)
         ShiftLeft ->
-            val out = compare(l, CmpUge, b, ConstInt(8, "8"))
-            select(l, t, out, ConstInt(8, "0"), binary(l, t, OpShl, a, b))
+            val out = compare(l, CmpUge, b, ConstInt(8, 8))
+            select(l, t, out, ConstInt(8, 0), binary(l, t, OpShl, a, b))
         _ ->
-            val out = compare(l, CmpUge, b, ConstInt(8, "8"))
-            select(l, t, out, ConstInt(8, "0"), binary(l, t, OpLShr, a, b))
+            val out = compare(l, CmpUge, b, ConstInt(8, 8))
+            select(l, t, out, ConstInt(8, 0), binary(l, t, OpLShr, a, b))
 
 private convert_op(l: *Lowering, conv: MirConv, t: MirType, x: Operand) -> Operand
     val dest = fresh(l, t)
@@ -7310,15 +7405,15 @@ private narrow_signed(l: *Lowering, x: Operand, from: u32, to: u32, target: &Typ
 // above the greatest the width holds.
 private narrow_unsigned(l: *Lowering, x: Operand, from: u32, to: u32, target: &Type, at: Span) -> Operand
     if from < to then return resize(l, x, from, to, false)
-    trap_if(l, compare(l, CmpUgt, x, ConstInt(from, max_digits(to))), s"value out of range for ${type_name(target)}", at)
+    trap_if(l, compare(l, CmpUgt, x, const_int(from, max_digits(to))), s"value out of range for ${type_name(target)}", at)
     resize(l, x, from, to, false)
 
 // An integer becomes a byte only when it is 0 to 255; anything else traps.
 private to_byte(l: *Lowering, x: Operand, width: u32, at: Span) -> Operand
     if width <= 8
-        trap_if(l, compare(l, CmpLt, x, ConstInt(width, "0")), "value out of range for byte", at)
+        trap_if(l, compare(l, CmpLt, x, ConstInt(width, 0)), "value out of range for byte", at)
         return resize(l, x, width, 8, false)
-    trap_if(l, compare(l, CmpUgt, x, ConstInt(width, "255")), "value out of range for byte", at)
+    trap_if(l, compare(l, CmpUgt, x, ConstInt(width, 255)), "value out of range for byte", at)
     resize(l, x, width, 8, false)
 
 // An integer becomes a char only when it is a Unicode scalar value: 0 to 0x10FFFF, outside the
@@ -7327,9 +7422,9 @@ private to_byte(l: *Lowering, x: Operand, width: u32, at: Span) -> Operand
 private to_char(l: *Lowering, x: Operand, width: u32, at: Span) -> Operand
     val w = if width < 32 then 32u32 else width
     val wide = resize(l, x, width, w, true)
-    trap_if(l, compare(l, CmpUgt, wide, ConstInt(w, "1114111")), "value out of range for char", at)
-    val offset = binary(l, MInt(w), OpSub, wide, ConstInt(w, "55296"))
-    trap_if(l, compare(l, CmpUlt, offset, ConstInt(w, "2048")), "surrogate code point is not a char", at)
+    trap_if(l, compare(l, CmpUgt, wide, ConstInt(w, 1114111)), "value out of range for char", at)
+    val offset = binary(l, MInt(w), OpSub, wide, ConstInt(w, 55296))
+    trap_if(l, compare(l, CmpUlt, offset, ConstInt(w, 2048)), "surrogate code point is not a char", at)
     resize(l, wide, w, 32, false)
 
 /** The most negative value of a width, in decimal. */
@@ -7426,7 +7521,7 @@ private intern(l: *Lowering, text: string) -> usize
 private compare_values(l: *Lowering, op: CompareOp, t: &Type, a: Operand, b: Operand) -> Operand
     if *t is Str
         val order = runtime_call(l, "avin_rt_string_compare", [MRef, MRef], MInt(32), [a, b])
-        return compare(l, compare_op(op, Int(32)), order, ConstInt(32, "0"))
+        return compare(l, compare_op(op, Int(32)), order, ConstInt(32, 0))
     compare(l, compare_op(op, t), a, b)
 
 /** An operand of a comparison: its value, a placeholder for a unit value, which has none and is equal
@@ -7485,7 +7580,7 @@ private runtime_call(l: *Lowering, symbol: string, params: []MirType, result: Mi
     var operands: Buf[Operand] = buf()
     for a in args do operands.push(a)
     val dest = fresh(l, result)
-    l.insts.push(Call(Some(dest), Runtime(symbol, mir_signature(types, Some(result))), operands))
+    l.insts.push(Call(Some(dest), Runtime(symbol, l.signatures.plain(types, Some(result))), operands))
     Value(dest)
 
 // A chain evaluates each operand when its link is reached, and the first false link decides.
@@ -8021,7 +8116,7 @@ private test_pattern(l: *Lowering, p: &TPattern, value: Option[Operand], fail: u
                     l.insts.push(Offset(tag_address, Value(descriptor), DescriptorTag))
                     val tag = fresh(l, MInt(64))
                     l.insts.push(Load(tag, Value(tag_address)))
-                    continue_if(l, compare(l, CmpEq, Value(tag), ConstInt(64, variant.to_string())), fail)
+                    continue_if(l, compare(l, CmpEq, Value(tag), ConstInt(64, long(variant))), fail)
                 val places = shape.variants[variant].fields
                 for i in 0..<fields.len()
                     val sub = fields[i]
@@ -8277,7 +8372,7 @@ private dispatch_operands(l: *Lowering, position: usize, name: string, operands:
     val dest = result match
         Some(t) -> Some(fresh(l, t))
         None -> None
-    push_call(l, dest, Indirect(Value(code), mir_signature(params, result)), operands)
+    push_call(l, dest, Indirect(Value(code), l.signatures.plain(params, result)), operands)
     dest match
         Some(id) -> Some(Value(id))
         None -> None
@@ -8285,6 +8380,7 @@ private dispatch_operands(l: *Lowering, position: usize, name: string, operands:
 private operand_type(l: *Lowering, o: Operand) -> MirType = o match
     Value(id) -> l.values[id]
     ConstInt(bits, _) -> MInt(bits)
+    ConstWide(bits, _) -> MInt(bits)
     ConstBool(_) -> MBool
     ConstReal(_) -> MReal
     ConstStr(_) -> MRef
@@ -8337,8 +8433,8 @@ private own_equals(l: *Lowering, t: &Type, a: Operand, b: Operand) -> Operand
 
 /** The hash of a value of type `t`, a `long`; equal values hash alike. */
 private hash_value(l: *Lowering, t: &Type, a: Operand) -> Operand = *t match
-    Unit -> ConstInt(64, "0")
-    Bool -> select(l, MInt(64), a, ConstInt(64, "1"), ConstInt(64, "0"))
+    Unit -> ConstInt(64, 0)
+    Bool -> select(l, MInt(64), a, ConstInt(64, 1), ConstInt(64, 0))
     Int(bits) -> resize(l, a, bits, 64, true)
     Byte -> resize(l, a, 8, 64, false)
     Char -> resize(l, a, 32, 64, false)
@@ -8402,7 +8498,7 @@ private union_hash(l: *Lowering, t: &Type, a: Operand) -> Operand
     for i in 0..<scalars.len()
         l.current = arms.scalars[i]
         val x = scalar_of_bits(l, scalars[i], load_field(l, a, cell_bits()))
-        store(l, slot, Some(if x is Some(v) then hash_value(l, scalars[i], v) else ConstInt(64, "0")))
+        store(l, slot, Some(if x is Some(v) then hash_value(l, scalars[i], v) else ConstInt(64, 0)))
         finish(l, Jump(arms.join))
     if arms.reference is Some(r)
         l.current = r
@@ -8497,7 +8593,7 @@ private any_rendering(l: *Lowering, name: string, entry: usize) -> MirFunction
     for m in params
         operands.push(Value(fresh(l, m)))
     val code = record_entry(l, object_record(l, operands[0]), entry)
-    push_call(l, None, Indirect(code, mir_signature(params, None)), operands)
+    push_call(l, None, Indirect(code, l.signatures.plain(params, None)), operands)
     finish(l, Return(None))
     MirFunction(s"avin.any.$name", mir_signature(params, None), l.values, l.slots, l.blocks)
 
@@ -8727,7 +8823,7 @@ private structural_equals(l: *Lowering, t: &Type, a: Operand, b: Operand)
         if !has_field_data(fields) then continue
         val body = new_block(l)
         val other = new_block(l)
-        finish_into(l, Branch(compare(l, CmpEq, tag, ConstInt(64, v.to_string())), body, other), body)
+        finish_into(l, Branch(compare(l, CmpEq, tag, ConstInt(64, long(v))), body, other), body)
         equal_fields(l, field_types(l, t, v), fields, a, b, unequal)
         finish(l, Return(Some(ConstBool(true))))
         l.current = other
@@ -8747,9 +8843,9 @@ private structural_hash(l: *Lowering, t: &Type, a: Operand)
         val none = new_block(l)
         val some = new_block(l)
         finish_into(l, Branch(compare(l, CmpEq, a, NullAddress), none, some), none)
-        finish_into(l, Return(Some(ConstInt(64, none_variant(l).to_string()))), some)
+        finish_into(l, Return(Some(ConstInt(64, long(none_variant(l))))), some)
         val inner = field_types(l, t, some_variant(l))[0]
-        val start = binary(l, MInt(64), OpMul, ConstInt(64, some_variant(l).to_string()), ConstInt(64, "31"))
+        val start = binary(l, MInt(64), OpMul, ConstInt(64, long(some_variant(l))), ConstInt(64, 31))
         finish(l, Return(Some(binary(l, MInt(64), OpAdd, start, hash_value(l, inner, a)))))
         return
     val shape = layout(l, t)
@@ -8764,11 +8860,11 @@ private structural_hash(l: *Lowering, t: &Type, a: Operand)
                     val body = new_block(l)
                     val other = new_block(l)
                     finish_into(l, Branch(compare(l, CmpEq, Value(da), DescriptorAddress(pack.shape.descriptor)), body, other), body)
-                    val start = ConstInt(64, (v * 1000003 + pack_number(l, pack.types)).to_string())
+                    val start = ConstInt(64, long(v * 1000003 + pack_number(l, pack.types)))
                     finish(l, Return(Some(hash_fields(l, packed_fields_at(l.program.data[id], id, v, type_args_of(t), pack.types).unwrap(), pack.shape.fields, a, start))))
                     l.current = other
     elif shape.variants.len() == 1
-        finish(l, Return(Some(hash_fields(l, field_types(l, t, 0), shape.variants[0].fields, a, ConstInt(64, "0")))))
+        finish(l, Return(Some(hash_fields(l, field_types(l, t, 0), shape.variants[0].fields, a, ConstInt(64, 0)))))
         return
     val tag = variant_tag(l, a)
     for v in 0..<shape.variants.len()
@@ -8776,7 +8872,7 @@ private structural_hash(l: *Lowering, t: &Type, a: Operand)
         if !has_field_data(fields) then continue
         val body = new_block(l)
         val other = new_block(l)
-        finish_into(l, Branch(compare(l, CmpEq, tag, ConstInt(64, v.to_string())), body, other), body)
+        finish_into(l, Branch(compare(l, CmpEq, tag, ConstInt(64, long(v))), body, other), body)
         finish(l, Return(Some(hash_fields(l, field_types(l, t, v), fields, a, tag))))
         l.current = other
     finish(l, Return(Some(tag)))
@@ -8786,7 +8882,7 @@ private hash_fields(l: *Lowering, types: Buf[&Type], fields: Buf[Option[FieldSlo
     for i in 0..<fields.len()
         if fields[i] is Some(slot)
             val part = hash_value(l, types[i], load_field(l, a, slot))
-            h = binary(l, MInt(64), OpAdd, binary(l, MInt(64), OpMul, h, ConstInt(64, "31")), part)
+            h = binary(l, MInt(64), OpAdd, binary(l, MInt(64), OpMul, h, ConstInt(64, 31)), part)
     h
 
 /** The type record of an object, from its descriptor; null for a string. */
@@ -8826,7 +8922,7 @@ private any_equals(l: *Lowering, a: Operand, b: Operand)
     l.current = others
     val code = record_entry(l, record, RecordEqualsEntry)
     val dest = fresh(l, MBool)
-    push_call(l, Some(dest), Indirect(code, mir_signature(pair(MRef), Some(MBool))), two(a, b))
+    push_call(l, Some(dest), Indirect(code, l.signatures.plain(pair(MRef), Some(MBool))), two(a, b))
     finish(l, Return(Some(Value(dest))))
 
 private any_hash(l: *Lowering, a: Operand)
@@ -8838,7 +8934,7 @@ private any_hash(l: *Lowering, a: Operand)
     l.current = others
     val code = record_entry(l, record, RecordHashEntry)
     val dest = fresh(l, MInt(64))
-    push_call(l, Some(dest), Indirect(code, mir_signature(single(MRef), Some(MInt(64)))), one(a))
+    push_call(l, Some(dest), Indirect(code, l.signatures.plain(single(MRef), Some(MInt(64)))), one(a))
     finish(l, Return(Some(Value(dest))))
 
 // --- the instance cache ----------------------------------------------------------------------------
@@ -9139,10 +9235,14 @@ private write_operand(l: *Lowering, w: *EntryWriter, o: Operand) -> bool
         Value(id) ->
             w.word("v")
             w.num(id)
-        ConstInt(bits, digits) ->
+        ConstInt(bits, value) ->
             w.word("i")
             w.num(usize(bits))
-            w.text(digits)
+            w.text(value.to_string())
+        ConstWide(bits, digits) ->
+            w.word("i")
+            w.num(usize(bits))
+            w.text(*digits)
         ConstBool(value) ->
             w.word("b")
             w.flag(value)
@@ -9195,7 +9295,7 @@ private read_operand(l: *Lowering, r: *EntryReader, resolve: bool) -> Option[Ope
     if tag == "v" then return Some(Value(r.num()))
     if tag == "i"
         val bits = u32(r.num())
-        return Some(ConstInt(bits, r.text()))
+        return Some(const_int(bits, r.text()))
     if tag == "b" then return Some(ConstBool(r.flag()))
     if tag == "r" then return Some(ConstReal(real.from_bits(u64(r.num()))))
     if tag == "a" then return Some(SlotAddress(r.num()))
@@ -9299,11 +9399,11 @@ private write_inst(l: *Lowering, w: *EntryWriter, inst: Inst) -> bool
                 Runtime(symbol, signature) ->
                     w.word("r")
                     w.text(symbol)
-                    write_signature(w, signature)
+                    write_signature(w, *signature)
                     true
                 Indirect(target, signature) ->
                     w.word("i")
-                    write_signature(w, signature)
+                    write_signature(w, *signature)
                     write_operand(l, w, target)
                 CFunction(symbol, params, result) ->
                     w.word("f")
@@ -9354,6 +9454,13 @@ private write_inst(l: *Lowering, w: *EntryWriter, inst: Inst) -> bool
             w.word("al")
             w.num(dest)
             w.text(l.descriptors[d].name)
+        StackObject(dest, d) ->
+            w.word("so")
+            w.num(dest)
+            w.text(l.descriptors[d].name)
+        Keep(values) ->
+            w.word("kp")
+            return write_operands(l, w, values)
         Publish -> w.word("pu")
         Locate(at, _, _) ->
             // Kept counted from the start of the declaration the instance belongs to, as a trap
@@ -9426,9 +9533,9 @@ private read_inst(l: *Lowering, r: *EntryReader) -> Option[Inst]
         if kind == "d" then callee = Some(Direct(read_instance(l, r)?))
         elif kind == "r"
             val symbol = r.text()
-            callee = Some(Runtime(symbol, read_signature(r)?))
+            callee = Some(Runtime(symbol, l.signatures.of(read_signature(r)?)))
         elif kind == "i"
-            val signature = read_signature(r)?
+            val signature = l.signatures.of(read_signature(r)?)
             callee = Some(Indirect(read_operand(l, r, true)?, signature))
         elif kind == "f"
             val symbol = r.text()
@@ -9441,6 +9548,7 @@ private read_inst(l: *Lowering, r: *EntryReader) -> Option[Inst]
             callee = Some(CFunction(symbol, params, result))
         return Some(Call(dest, callee?, read_operands(l, r)?))
     if tag == "pu" then return Some(Publish)
+    if tag == "kp" then return Some(Keep(read_operands(l, r)?))
     if tag == "lo"
         val inside = r.flag()
         val offset = r.num()
@@ -9475,6 +9583,7 @@ private read_inst(l: *Lowering, r: *EntryReader) -> Option[Inst]
         return Some(Convert(dest, conv, read_operand(l, r, true)?))
     if tag == "ld" then return Some(Load(dest, read_operand(l, r, true)?))
     if tag == "al" then return Some(Alloc(dest, descriptor_named(l, r.text())?))
+    if tag == "so" then return Some(StackObject(dest, descriptor_named(l, r.text())?))
     if tag == "aL" then return Some(AtomicLoad(dest, read_operand(l, r, true)?))
     if tag == "aW"
         val address = read_operand(l, r, true)?

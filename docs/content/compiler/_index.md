@@ -310,8 +310,12 @@ those.
 **The build log.** A build reports what it did when `AVIN_BUILD_LOG` names a file, or `-` for the
 error channel. The file is emptied when the build starts, so it holds that build alone; a file that
 cannot be written is an error before any work is done. Unset or empty, nothing is written and no
-clock is read. Each phase writes one line, `phase=<name> ms=<n>` followed by its counts as
-`key=<n>` words, in this order:
+clock is read. Each phase writes one line, `phase=<name> ms=<n> rss=<n> inuse=<n> maxrss=<n>`
+followed by its counts as `key=<n>` words, in this order. The three memory fields are bytes of the
+compiler process as the phase ends: `rss` is its resident size, `inuse` what the allocator holds
+for live blocks (zero where the platform does not say; macOS does), and `maxrss` the most resident
+bytes it has held. The allocator keeps freed small blocks for the life of the process, so `rss`
+stays high after `inuse` falls.
 
 | Phase | Counts |
 |---|---|
@@ -324,11 +328,23 @@ clock is read. Each phase writes one line, `phase=<name> ms=<n>` followed by its
 | `shims` | `bindings`, `handles`: the Sysl shims built |
 | `emit` | `bytes`, `reused`: the size of the LLVM text, and the functions whose text came from the cache |
 | `store` | with the instance cache only: `written`, `kept`, `trimmed`: module files written, those left as they were, and those trimmed |
+| `handoff` | `bytes`: the LLVM text written for the compiler that links |
+| `restore` | `bytes`: the LLVM text that compiler read back |
 | `split` | `units`: the codegen units the module was cut into |
 | `units` | `units`, `compiled`, `reused`: units clang compiled, and units taken from its cache |
 | `link` | none |
 
 A run that finds its executable already built writes the one line `phase=cached ms=0 built=0`.
+
+**The link runs in a compiler that never compiled.** Compiling leaves gigabytes of freed small
+allocations that the allocator keeps for the life of the process, so the executable `avin build`,
+`avin run` and `avin test` compile with does not link: it writes the compilation to a temporary
+directory and replaces itself (`exec`) with `avin --linking-handed <dir>` and the same command,
+which takes the compilation in place of compiling and splits, compiles the units and links. The
+process, its streams and its exit status are the same throughout, and the log goes on in the same
+file with `handoff` and `restore` between the compile's phases and the link's. Building marshal at
+`-O2` with a cold cache, the processes together peaked at 8.2 GB before and 5.5 GB after. A
+compiler run in memory, as its tests run it, links in place.
 The keys and phase names are stable; later phases add lines and keys, never rename them.
 
 **Testing it.** A build reports what it did through that log: each phase's time,
@@ -608,6 +624,15 @@ grows with what is live, is spread over that much allocation. `AVIN_GC_PERCENT` 
 proportion: 200 lets the heap allocate twice what survived between collections, halving what
 marking costs per byte allocated for a heap that much larger; 0 collects at every 8 MiB whatever is
 live. It is a whole number in decimal digits, at most 100000; any other value is ignored.
+
+A collection gives free pages back to the operating system, so a program that drops a burst of
+data falls back from its peak resident size rather than keeping it: the whole pages of every free
+run of 64 KiB or more are released, and a free run at the top of the heap shrinks it. It does so
+only when the heap reaches more than twice the allocation allowed between collections past what
+the last one left live, and at most once a second, so a program allocating steadily does not hand
+pages back that it takes again at once. A released page reads as zero when it is next used. On
+macOS the range is mapped afresh, on Linux `MADV_DONTNEED` drops it. `AVIN_GC_RELEASE=0` turns
+the release off and keeps every page the heap has touched.
 
 The collector owns each object's header, which sits just before the object: the word 16 bytes
 before an object's address holds its **kind**, the collector's record of how to trace it, and the
@@ -1204,7 +1229,12 @@ by a function of its own, which is the program's.
 an actor's start, its messages and its `stopping` blocks through `avin_rt_actor_guarded`, which
 records in the context a return point (`_setjmp`), the shadow stack's top, the caller site, the
 owner and the count of regions in doubt, and calls the closure through the closure runner. Every
-trap entry point first offers the trap there: with a return point recorded and no region in doubt
+trap entry point first drops the frames of the code that trapped from the shadow stack, before
+anything that may wait: the thread goes on from the recorded top where the trap is contained and
+from no frame where it stops the program, and the context keeps the reason, a root of every
+collection, in their place (a trap is no collection point, so those frames may hold slots not yet
+stored to, which a collection made while the trap is reported or the exit hooks run must not read).
+Then it offers the trap to the return point: with a return point recorded and no region in doubt
 entered since, the runtime flushes standard output, reports `avin: trap in Counter#3: <reason> at
 <place>`, puts the recorded words back and returns to the turn (`_longjmp`), the reason, an Avin
 string, stored in the array the library passed before anything is allocated. The regions in doubt
@@ -1247,7 +1277,9 @@ the slot's last occupant ended. A value is stored to its slot where it is made, 
 that needs a slot lives in it. The frame is not cleared on entry: only a slot the collector could read
 before the function has stored to it on some path is set to null, and a slot whose reference has died
 still holds a valid reference, since its object has been kept alive by that same slot at every
-collection since. A function with no reference live across a collection point has **no frame** at
+collection since. A trap is not a collection point, though the runtime waits as it reports one:
+the frames of the trapping code are dropped first (above), so no collection reads them. A function
+with no reference live across a collection point has **no frame** at
 all, so a leaf that only reads fields, or one whose branches only read fields and trap, pushes
 nothing.
 
@@ -1423,8 +1455,8 @@ An intrinsic that is not a string operation is lowered to a function whose body 
 checker's `intrinsic_entry` table with its parameters and result. The formatting library
 (`format.avin`) reaches the runtime this way: `write_out` and `write_int` write to standard output,
 an integer's digits rendered on the stack; `render_int`, `render_real` and `render_char` make a
-value's text; `quote_text` and `quote_char` its quoted, escaped literal; `text_size` and
-`text_width` count a string's bytes and characters; `text_append` and `text_take` keep a
+value's text; `quote_text` and `quote_char` its quoted, escaped literal; `text_size` counts a
+string's bytes; `text_append` and `text_take` keep a
 `StringWriter`'s text in a string object of its own whose length is its capacity, filled in place
 and doubled when full, and copy the written part out.
 

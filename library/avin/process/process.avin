@@ -57,6 +57,50 @@ currentDir() -> Result[string, IoError] = workingDir().mapErr(failed("read the w
 @sysl("sysl.fs.home_dir")
 homeDir() -> Option[string]
 
+@sysl("sysl.fs.set_current_dir")
+private changeDir(dir: string) -> Result[unit, SyslError]
+
+// Makes `dir` the directory relative paths are read from, for the whole program: every thread sees
+// the change at once, and a program started afterwards starts there. `NotFound` when `dir` is not
+// there, `NotADirectory` when it is a file, `PermissionDenied` when it may not be entered. The
+// current directory is the one piece of shared state a library cannot own, so a library never calls
+// this; a program that needs it calls it once, before it starts threads.
+setCurrentDir(dir: string) -> Result[unit, IoError] = changeDir(dir).mapErr(failed("change directory to", dir))
+
+@sysl("sysl.path.join")
+private joinPath(a: string, b: string) -> string
+
+// A variable read as a directory: unset, empty and relative all answer `None`.
+private absoluteEnv(name: string) -> Option[string] = env(name).filter(v -> v.startsWith("/"))
+
+private underHome(leaf: string) -> Option[string] = homeDir().map(h -> joinPath(h, leaf))
+
+// The directory for temporary files: `TMPDIR` when it names an absolute path, else `/tmp`. It is a
+// path and nothing is made; `fs.createTempDir` makes a directory of its own in it.
+tempRoot() -> string = absoluteEnv("TMPDIR").getOrElse("/tmp")
+
+// Where the machine keeps what a program can make again, such as downloads and compiled output:
+// `~/Library/Caches` on macOS; elsewhere `$XDG_CACHE_HOME`, and `~/.cache` when that is unset, empty
+// or not an absolute path (the freedesktop rule). `None` when there is no home to put it under. The
+// program adds its own name: `cacheDir().map(d -> fs.join(d, "myprogram"))`. A path only: nothing is
+// made.
+cacheDir() -> Option[string] = os() match
+  MacOS -> underHome("Library/Caches")
+  _ -> absoluteEnv("XDG_CACHE_HOME").orElse(underHome(".cache"))
+
+// Where a program's settings belong: `~/Library/Application Support` on macOS; elsewhere
+// `$XDG_CONFIG_HOME`, else `~/.config`, by the rule of `cacheDir`. macOS keeps configuration and data
+// in the one directory, so there `configDir()` and `dataDir()` agree.
+configDir() -> Option[string] = os() match
+  MacOS -> underHome("Library/Application Support")
+  _ -> absoluteEnv("XDG_CONFIG_HOME").orElse(underHome(".config"))
+
+// Where a program keeps what it wrote and cannot make again: `~/Library/Application Support` on
+// macOS; elsewhere `$XDG_DATA_HOME`, else `~/.local/share`, by the rule of `cacheDir`.
+dataDir() -> Option[string] = os() match
+  MacOS -> underHome("Library/Application Support")
+  _ -> absoluteEnv("XDG_DATA_HOME").orElse(underHome(".local/share"))
+
 // The absolute path of the running program's file, `None` where the platform cannot tell.
 @sysl("sysl.env.current_exe")
 executable() -> Option[string]
@@ -73,6 +117,30 @@ private processId() -> int
 
 // The process's identifier, which no other process running beside it has.
 pid() -> long = long(processId())
+
+@sysl("sysl.process.user")
+private effectiveUser() -> long
+
+@sysl("sysl.process.group")
+private effectiveGroup() -> long
+
+@sysl("sysl.process.user_name")
+private userNameOf(id: long) -> Result[string, SyslError]
+
+// The user id the program acts as: the one the file system checks a permission against, and the one
+// `fs.Metadata.owner` of a file the program creates holds. `0` is the superuser.
+userId() -> long = effectiveUser()
+
+// The group id the program acts as, which `fs.Metadata.group` is compared with.
+groupId() -> long = effectiveGroup()
+
+// The name the system's user database gives user `id`: `userName(0)` is `"root"`, and
+// `userName(userId())` is the program's own login name. An id with no entry is `Err(NotFound)`, and
+// so is one outside `0` to `0xffffffff`, which no user can have.
+userName(id: long) -> Result[string, IoError]
+  val subject = s"user $id"
+  if !(0 <= id <= (0xffff_ffff: long)) then return Err(IoError(io.NotFound, "look up the name of", subject))
+  userNameOf(id).mapErr(failed("look up the name of", subject))
 
 @sysl("sysl.process.total_memory")
 private machineMemory() -> Result[long, SyslError]

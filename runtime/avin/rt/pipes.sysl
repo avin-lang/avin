@@ -1,0 +1,133 @@
+module avin.rt
+
+import sysl.fs.{File, IoError, from_errno}
+import sysl.io.wait.{Readable, Writable, ready}
+import sysl.slices.{as_mut_ptr, as_ptr, copy}
+import sysl.time.micros
+
+// The program's ends of the pipes to a child program's standard streams, for `avin.process`'s
+// `ChildInput` and `ChildOutput`. Each end is non-blocking, and an operation on one that would have
+// to wait waits for its descriptor as a socket's does (`sockets.sysl`): a lightweight thread parks on
+// the runtime's poller, leaving its worker to the others, and any other thread waits on the
+// descriptor alone, safe for the collector. The reads and writes themselves are in
+// `__posix__/child_pipes.c`, which keeps a write to a pipe whose reader has gone from raising SIGPIPE.
+//
+// The pipes are made by `sysl.process.pipe`, whose two ends are both closed on exec, so a child
+// started by any thread gets an end only as the standard stream it was handed.
+//
+// An operation that may wait takes its end by pointer, never a copy: a copy of a `File` is a share
+// counted without atomics, which a lightweight thread holding it across a wait would give back on
+// whichever worker it resumed on. The end's handle keeps its own share meanwhile; only the thread
+// owning the handle uses or closes it, and that thread is the one waiting.
+
+private extern "avin_rt_pipe_non_blocking" c_pipe_non_blocking(fd: i32) -> i32
+private extern "avin_rt_pipe_read" c_pipe_read(fd: i32, p: *u8, n: i64) -> i64
+private extern "avin_rt_pipe_write" c_pipe_write(fd: i32, p: *u8, n: i64) -> i64
+private extern "fcntl" c_pipe_fcntl(fd: int, command: int, ...) -> int
+
+#if bsd
+private const PipeAgainCode: i64 = 35
+private const PipeTimedOutCode: int = 60
+#else
+private const PipeAgainCode: i64 = 11
+private const PipeTimedOutCode: int = 110
+#endif
+
+/** `F_GETFD` and `FD_CLOEXEC`, the same on macOS and Linux. */
+private const PipeGetDescriptorFlags: int = 1
+private const PipeCloseOnExec: int = 1
+
+/** Makes the program's end `f` of a pipe to a child non-blocking, and on macOS never to raise
+ * SIGPIPE. */
+pipe_non_blocking(f: File) -> Result[unit, IoError]
+    val fd = f.fd()?
+    val e = c_pipe_non_blocking(i32(fd))
+    if e != 0 then return Err(from_errno(int(-e)))
+    Ok(())
+
+/** Up to `max` bytes from the pipe `f`, `max` being at least one, waiting for at least one, or none
+ * once every writer has gone; a wait longer than `limit_ms` milliseconds, where it is positive, fails
+ * as timed out. Exactly as long as what arrived, read as `socket_receive` reads, into the carrier's
+ * buffer and copied out at its length. */
+pipe_receive(f: *File, max: int, limit_ms: int) -> Result[[]u8, IoError]
+    val want = usize(if max > ReceiveLimit then ReceiveLimit elif max < 1 then 1 else max)
+    val fd = f.fd()?
+    loop
+        pipe_read_now(fd, want)? match
+            Some(out) -> return Ok(out)
+            None -> if !wait_for_fd_as(fd, Readable, limit_ms, WaitsOnPipe)? then return Err(from_errno(PipeTimedOutCode))
+
+/** Up to `max` bytes from the pipe `f` without waiting: `Some` of what has arrived, of none once every
+ * writer has gone, or `None` where nothing has arrived yet. */
+pipe_receive_available(f: File, max: int) -> Result[Option[[]u8], IoError]
+    val want = usize(if max > ReceiveLimit then ReceiveLimit elif max < 1 then 1 else max)
+    pipe_read_now(f.fd()?, want)
+
+/** One try at reading up to `want` bytes from `fd` without waiting, as `receive_now` tries a socket:
+ * the carrier's buffer is lent only for the read, never across a wait. */
+private pipe_read_now(fd: int, want: usize) -> Result[Option[[]u8], IoError]
+    val ctx = current_context
+    val k = if ctx == null then null else ctx.carrier
+    var own: []u8 = []
+    if k == null
+        own = [0; want]
+    elif k.receiving.len < want
+        k.receiving = [0; want]
+    val room: []u8 = if k == null then own[0..<want] else k.receiving[0..<want]
+    val got = c_pipe_read(i32(fd), as_mut_ptr(room), i64(want))
+    if got == -PipeAgainCode then return Ok(None)
+    if got < 0 then return Err(from_errno(int(-got)))
+    var out: []u8 = [0; usize(got)]
+    copy(out, room[0..<usize(got)])
+    Ok(Some(out))
+
+/** As many bytes of `bytes` as the pipe `f` takes without waiting, after waiting for room for the
+ * first where there is none; a wait longer than `limit_ms` milliseconds, where it is positive, fails
+ * as timed out. Answers how many were written: at least one, unless `bytes` is empty. */
+pipe_send_some(f: *File, bytes: []const u8, limit_ms: int) -> Result[usize, IoError]
+    if bytes.len == 0 then return Ok(0)
+    val fd = f.fd()?
+    loop
+        val got = c_pipe_write(i32(fd), as_ptr(bytes), i64(bytes.len))
+        if got >= 0 then return Ok(usize(got))
+        if got != -PipeAgainCode then return Err(from_errno(int(-got)))
+        if !wait_for_fd_as(fd, Writable, limit_ms, WaitsOnPipe)? then return Err(from_errno(PipeTimedOutCode))
+
+/** Every byte of `bytes` into the pipe `f`, waiting for room as often as it takes; a wait longer than
+ * `limit_ms` milliseconds, where it is positive, fails as timed out. */
+pipe_send_all(f: *File, bytes: []const u8, limit_ms: int) -> Result[unit, IoError]
+    val fd = f.fd()?
+    var at: usize = 0
+    while at < bytes.len
+        val rest = bytes[at..<bytes.len]
+        val got = c_pipe_write(i32(fd), as_ptr(rest), i64(rest.len))
+        if got >= 0
+            at += usize(got)
+        elif got == -PipeAgainCode
+            if !wait_for_fd_as(fd, Writable, limit_ms, WaitsOnPipe)? then return Err(from_errno(PipeTimedOutCode))
+        else
+            return Err(from_errno(int(-got)))
+    Ok(())
+
+/** Whether a read of the pipe `f` would answer without waiting: bytes have arrived, every writer has
+ * gone, or the pipe has failed or been closed, which the read then reports. Never waits. */
+pipe_readable(f: File) -> bool
+    val fd = f.fd() match
+        Ok(d) -> d
+        Err(_) -> return true
+    ready(fd, Readable, micros(0)) match
+        Ok(b) -> b
+        Err(_) -> true
+
+/** Whether a write to the pipe `f` would write at least one byte without waiting, or fail at once:
+ * there is room, or the reader has gone. Never waits. */
+pipe_writable(f: File) -> bool
+    val fd = f.fd() match
+        Ok(d) -> d
+        Err(_) -> return true
+    ready(fd, Writable, micros(0)) match
+        Ok(b) -> b
+        Err(_) -> true
+
+/** For tests: whether the descriptor `fd` is closed on exec, read back with `F_GETFD`. */
+pipe_closes_on_exec(fd: int) -> bool = (c_pipe_fcntl(fd, PipeGetDescriptorFlags, 0) & PipeCloseOnExec) != 0

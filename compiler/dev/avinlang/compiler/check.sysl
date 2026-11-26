@@ -162,6 +162,8 @@ struct GlobalSymbol
     object: Option[usize]
     /** A `lazy val`: `init` runs on the value's first read instead of before `main`. */
     lazy: bool
+    /** `given name = value` at the top level: a value that is also a given of its module. */
+    given: bool
 
 /** A field of a class; `ty` is `None` until the constructor's check infers it from the field's
  * initializer, when the declaration has no type. */
@@ -415,8 +417,19 @@ struct BodyState
     /** Set while the lambda a deferred statement is checked as is begun: its body is a deferred
      * statement's, which no jump may leave. */
     deferring: bool
+    /** The locals that are givens, `given name = value` in a block, each with its declaration: a
+     * call fills a contextual parameter from those of them in scope. */
+    givens: Buf[GivenLocal]
 
-fresh_body(root: usize) -> BodyState = BodyState(root, buf(), buf(), buf(), buf(), 0, buf(), 0, buf(), buf(), buf(), buf(), buf(), buf(), buf(), buf(), None, 0, buf(), false)
+fresh_body(root: usize) -> BodyState = BodyState(root, buf(), buf(), buf(), buf(), 0, buf(), 0, buf(), buf(), buf(), buf(), buf(), buf(), buf(), buf(), None, 0, buf(), false, buf())
+
+/** A given declared in a block, or a contextual parameter of a local function or a lambda: its local,
+ * where it is declared, and its scope, the position in `visible` where its block, or the function's
+ * parameters, begin. */
+struct GivenLocal
+    local: usize
+    span: Span
+    scope: usize
 
 /** A local type equality: type parameter `index` of `owner` is `ty` wherever local `marker`, which a
  * refining pattern declares beside the names it binds, is in scope. */
@@ -1393,10 +1406,11 @@ check_program(units: Buf[SourceUnit], root_module: string, testing: bool, indexi
     check_expansion(&c)
     check_tailrec(&c)
     val direct = direct_uses(&c)
-    check_module_state_in_threads(&c, direct)
+    check_module_state_in_threads(&c)
     check_lazy_cycles(&c, direct)
     check_lazy_field_cycles(&c)
     check_local_lazy_cycles(&c)
+    check_givens(&c)
     val init = initializer(&c, initialization_order(&c, direct), testing)
     // A program without `main` is told so in its last file.
     var main_unit = given - 1
@@ -1420,7 +1434,9 @@ check_program(units: Buf[SourceUnit], root_module: string, testing: bool, indexi
                 takes_arguments = *main.params[0] match
                     Class(k, _, args) -> is_vector_class(c.classes[k]) && args.len() == 1 && *args[0] is Str
                     _ -> false
-            if main.params.len() > 1 || (main.params.len() == 1 && !takes_arguments && !(*main.params[0] is ErrorType))
+            if takes_using(main.decl)
+                c.note(main_unit, main.decl.name_span, "`main` takes no `using` section: nothing calls it to fill one, so it declares the givens it needs in its body")
+            elif main.params.len() > 1 || (main.params.len() == 1 && !takes_arguments && !(*main.params[0] is ErrorType))
                 c.note(main_unit, main.decl.name_span, "`main` is `main()` or `main(args: Vector[string])`")
             elif takes_arguments && declares_variadic(main.decl)
                 c.note(main_unit, main.decl.name_span, "`main`'s `args` is not a repeated parameter; `main` is `main()` or `main(args: Vector[string])`")
@@ -1498,7 +1514,8 @@ private check_tests(c: *Checker) -> Buf[TestCase]
                 break
             var test = TestCase(id, f.name, f.module_name, None, None, None, None, None, None, None, None)
             read_test_arguments(c, f.unit, a, f.name, &test)
-            if f.params.len() > 0
+            // A `using` section is reported where the signature is read.
+            if f.params.len() > 0 && !takes_using(f.decl)
                 c.note(f.unit, f.decl.name_span, s"a `@test` function takes no parameters, and `${f.name}` takes ${count(f.params.len(), "parameter")}: `avin test` calls it with nothing")
             if f.decl.type_params.len() > 0
                 c.note(f.unit, f.decl.name_span, s"a `@test` function has no type parameters, and `${f.name}` declares `${f.decl.type_params[0].name}`: the runner supplies no type arguments")
@@ -1631,7 +1648,7 @@ private check_hooks(c: *Checker) -> Map[string, TestHooks]
                 c.note(f.unit, a.span, s"`@${a.name}` marks a top-level function, which `avin test` can call by itself")
                 break
             if a.args.len() > 0 then c.note(f.unit, a.span, s"`@${a.name}` takes no arguments")
-            if f.params.len() > 0
+            if f.params.len() > 0 && !takes_using(f.decl)
                 c.note(f.unit, f.decl.name_span, s"a `@${a.name}` function takes no parameters, and `${f.name}` takes ${count(f.params.len(), "parameter")}: `avin test` calls it with nothing")
             if f.decl.type_params.len() > 0
                 c.note(f.unit, f.decl.name_span, s"a `@${a.name}` function has no type parameters, and `${f.name}` declares `${f.decl.type_params[0].name}`: the runner supplies no type arguments")
@@ -2157,7 +2174,9 @@ private resolve_impl(c: *Checker, unit: usize, module_name: string, written_decl
         if tp.lower is Some(l) then c.note(unit, l.span, s"a lower bound is written on a function's or a method's own type parameter, not on `${tp.name}`")
     for m in d.members
         m match
-            FieldMember(f) -> c.note(unit, f.span, s"an impl adds methods, not state, so it cannot declare the field `${f.name}`")
+            FieldMember(f) ->
+                if f.given then c.note(unit, f.span, s"an impl adds methods, so it declares no given; declare `${f.name}` at the module's top level or in an object")
+                else c.note(unit, f.span, s"an impl adds methods, not state, so it cannot declare the field `${f.name}`")
             AbstractFieldMember(f) -> c.note(unit, f.span, s"an impl adds methods, not state, so it cannot declare the field `${f.name}`")
             StatementMember(s) -> c.note(unit, s.span, "an impl's body declares only methods")
             MethodMember(_, _, _, _) -> ()
@@ -2746,15 +2765,21 @@ private declare_trait_method(c: *Checker, i: usize, f: &Function, public: bool, 
     // one overloads. Impls adding to different types built from one, as `Option[Option[T]]` and
     // `Option[List[T]]`, are told apart by the receiver at a call; extensions of two modules, by
     // which of the modules a file imports.
+    // An impl adding to a built-in type may add a binary operator whose operand is of a type the
+    // program declares, `impl real` adding `*(v: Vec)` for `k * v`; between two built-in values the
+    // operator stays the machine's.
+    val scalar_left = !block.on_trait && block.instance is None && scalar_left_operator(c, f.name, symbol.params, target)
     // The bitwise and shift operators of the integers and bytes are the machine's, which no method
     // replaces.
-    if bitwise_method_name(f.name) && (*target is Int(_) || *target is Byte)
-        c.note(unit, f.name_span, s"`${f.name}` is the language's operator on ${type_name(target)}, and no method can redefine it")
+    if bitwise_method_name(f.name) && (*target is Int(_) || *target is Byte) && !scalar_left
+        val message = if !block.on_trait && block.instance is None && f.params.len() == 1 then scalar_left_message(f.name, target) else s"`${f.name}` is the language's operator on ${type_name(target)}, and no method can redefine it"
+        c.note(unit, f.name_span, message)
         return
     // So are the arithmetic and orderings of every built-in type: only a data type, a class or a trait
     // has methods of those names, and an impl for every type would reach the built-in ones.
-    if (arithmetic_method_name(f.name) || prefix_method_name(f.name, f.params.len())) && !(*target is Data(_, _, _) || *target is Class(_, _, _) || *target is Applied(_, _))
+    if (arithmetic_method_name(f.name) || prefix_method_name(f.name, f.params.len())) && !(*target is Data(_, _, _) || *target is Class(_, _, _) || *target is Applied(_, _)) && !scalar_left
         if *target is TypeVar(_, _, _) then c.note(unit, f.name_span, s"`${f.name}` names a method only of a data type, a class or a trait, and an impl for every type would redefine the built-in types' operator")
+        elif !block.on_trait && block.instance is None && f.params.len() == 1 && scalar_builtin(target) && arithmetic_method_name(f.name) then c.note(unit, f.name_span, scalar_left_message(f.name, target))
         else c.note(unit, f.name_span, builtin_operator_message(f.name, f.params.len(), target))
         return
     var same_name: Buf[usize] = buf()
@@ -3931,6 +3956,7 @@ private declare_fields(c: *Checker, unit: usize)
                 _ -> "_"
             if field_named(fields, name) is Some(_) then c.note(unit, cp.param.pattern.span, s"the field `$name` is declared more than once")
             val written = resolve_type(c, unit, cp.param.ty)
+            if cp.param.contextual then check_contextual_param(c, unit, cp.param, written)
             val field_type = if cp.param.variadic then vector_of(c, written) else written
             fields.push(FieldSymbol(name, cp.param.pattern.span, Some(field_type), cp.mutable, cp.public, true, id, false, false))
         var state: Buf[TraitState] = buf()
@@ -4858,7 +4884,7 @@ private declare_methods(c: *Checker, unit: usize)
             made_from.push(None)
             if f.mutable
                 var value_params: Buf[Param] = buf()
-                value_params.push(Param(f.span, Pattern(f.span, Name("value")), declared_type, None, false, false, buf()))
+                value_params.push(Param(f.span, Pattern(f.span, Name("value")), declared_type, None, false, false, buf(), false))
                 val unit_type = TypeExpr(f.span, Named("unit", buf()))
                 val setter = Function(buf(), f.span, f.span, f.name + "=", buf(), value_params, Some(unit_type), None, buf(), false)
                 declared.push(MethodDecl(setter, true, false, unit, module_name, d.type_params, false, false, false, 1, j))
@@ -5090,8 +5116,10 @@ private declare_impl_method(c: *Checker, i: usize, f: &Function, public: bool, o
                 c.note(unit, f.name_span, "annotations on methods are not implemented")
                 break
     // A built-in type's arithmetic and orderings are the machine's, which no method replaces, in a
-    // trait's implementation either.
-    if (arithmetic_method_name(f.name) || prefix_method_name(f.name, f.params.len())) && !(*target is Data(_, _, _))
+    // trait's implementation either. A binary one an impl of no trait adds to a scalar built-in type
+    // is judged by its operand's type once the signature is known.
+    val maybe_scalar_left = trait_id is None && scalar_builtin(target) && f.params.len() == 1 && arithmetic_method_name(f.name)
+    if (arithmetic_method_name(f.name) || prefix_method_name(f.name, f.params.len())) && !(*target is Data(_, _, _)) && !maybe_scalar_left
         c.note(unit, f.name_span, builtin_operator_message(f.name, f.params.len(), target))
         return
     if trait_id is Some(_) || overrides then refuse_override_defaults(c, unit, f)
@@ -5171,6 +5199,9 @@ private declare_impl_method(c: *Checker, i: usize, f: &Function, public: bool, o
     symbol.name = type_name_of + "." + f.name
     symbol.public = public
     symbol.receiver = Some(target)
+    if maybe_scalar_left && !scalar_left_operator(c, f.name, symbol.params, target)
+        c.note(unit, f.name_span, scalar_left_message(f.name, target))
+        return
     symbol.static_member = static_member
     var method_defaults: Buf[Option[usize]] = buf()
     for _ in receiver_types
@@ -5607,7 +5638,7 @@ private declare_globals(c: *Checker, unit: usize)
                 c.locals.push(buf())
                 if file.private_items[i] then c.private_names.put(key, true)
                 c.global_names.put(key, c.globals.len())
-                c.globals.push(GlobalSymbol(unit, file.module_name, v.name, v.span, v.mutable, init, None, v.lazy))
+                c.globals.push(GlobalSymbol(unit, file.module_name, v.name, v.span, v.mutable, init, None, v.lazy, v.given))
             ClassItem(d) ->
                 if !d.object then continue
                 // A second object of one name has no class, and was reported.
@@ -5617,7 +5648,7 @@ private declare_globals(c: *Checker, unit: usize)
                         if global_name_taken(c, unit, d.name, d.name_span, true) then break
                         c.classes[k].global = Some(c.globals.len())
                         c.global_names.put(key, c.globals.len())
-                        c.globals.push(GlobalSymbol(unit, file.module_name, d.name, d.name_span, false, cls.constructor, Some(k), false))
+                        c.globals.push(GlobalSymbol(unit, file.module_name, d.name, d.name_span, false, cls.constructor, Some(k), false, false))
             _ -> ()
 
 // A companion's `apply` overloads the constructor its name has in call position, so it cannot take
@@ -7483,6 +7514,17 @@ private param_mismatch(c: *Checker, self_type: &Type, m: usize, base: usize) -> 
                 val w = seen_from(c, self_type, base, u)
                 if !same_type(h, w) then return Some(s"whose type parameter `$name` is bounded by ${type_name(w)}, not ${type_name(h)}")
             None -> return Some(s"whose type parameter `$name` is bounded by no type parameter")
+    // A call through either method fills the same `using` section, passing its parameters by the same
+    // names.
+    val wanted = c.symbols[base].decl.params
+    val written = c.symbols[m].decl.params
+    if wanted.len() + 1 == want.len() && written.len() + 1 == have.len()
+        for i in 0..<wanted.len()
+            val name = c.symbols[base].param_names[i + 1]
+            if wanted[i].contextual != written[i].contextual
+                return Some(if wanted[i].contextual then s"whose parameter `$name` is contextual, after `using`" else s"whose parameter `$name` is not contextual")
+            if wanted[i].contextual && c.symbols[m].param_names[i + 1] != name
+                return Some(s"whose contextual parameter is named `$name`, not `${c.symbols[m].param_names[i + 1]}`: a call passes it by that name")
     // A call through either method passes the same arguments, so both repeat their last parameter or
     // neither does.
     val repeats = declares_variadic(c.symbols[base].decl)
@@ -7745,7 +7787,7 @@ private check_conformance_members(c: *Checker, self_type: &Type, t: &Type, unit:
                 val want = c.symbols[tm].params
                 for i in 1..<want.len()
                     if i > 1 then shown = shown + ", "
-                    shown = shown + s"${c.symbols[tm].param_names[i]}: ${param_type_text(seen_from(c, self_type, tm, want[i]), declares_variadic(c.symbols[tm].decl) && i + 1 == want.len())}"
+                    shown = shown + s"${c.symbols[tm].param_names[i]}: ${param_type_text(seen_from(c, self_type, tm, want[i]), repeated_at(c.symbols[tm].decl) == Some(i - 1))}"
                 c.note(unit, at, s"`${type_name(self_type)}` implements `${type_name(t)}` without `static $name($shown)`")
     c.seen_instance = None
 
@@ -7845,8 +7887,10 @@ private signature(c: *Checker, unit: usize, module_name: string, f: &Function, o
         if p.by_name && f.clauses.len() > 0
             c.note(unit, p.pattern.span, s"`${f.name}` is defined by clauses, which match its arguments, so its parameters cannot be by-name")
         val written = resolve_type(c, unit, p.ty)
+        if p.contextual then check_contextual_param(c, unit, p, written)
         val ty = if p.variadic then vector_of(c, written) else written
         if p.by_name && f.clauses.len() == 0 then params.push(ByName(ty)) else params.push(ty)
+    if takes_using(f) then refuse_using_section(c, unit, f)
     var result: Option[&Type] = None
     if f.result is Some(r) then result = Some(resolve_type(c, unit, r))
     elif f.body is None && f.clauses.len() == 0 then result = Some(Unit)
@@ -7877,6 +7921,11 @@ private signature(c: *Checker, unit: usize, module_name: string, f: &Function, o
         elif name == "holds_handles"
             if module_name != "avin.actors" then c.note(unit, f.name_span, s"`$name` is an intrinsic of `avin.actors`")
             elif params.len() != 1 || !(*result.unwrap_or(Unit) is Bool) then c.note(unit, f.name_span, s"intrinsic `$name` takes one value and answers a `bool`")
+        // The same, counting only the handles a type shows, not what a function, `Any` or a trait may
+        // hide: the threads', for a channel's values and a lock's.
+        elif name == "shows_handles"
+            if module_name != "avin.threads" then c.note(unit, f.name_span, s"`$name` is an intrinsic of `avin.threads`")
+            elif params.len() != 1 || !(*result.unwrap_or(Unit) is Bool) then c.note(unit, f.name_span, s"intrinsic `$name` takes one value and answers a `bool`")
         // A field's initializer that leaves the field zero, `[T]() -> T`, the core library's.
         elif name == "field_unset"
             if module_name != CoreModule then c.note(unit, f.name_span, s"`$name` is an intrinsic of the core library")
@@ -7901,8 +7950,28 @@ private signature(c: *Checker, unit: usize, module_name: string, f: &Function, o
     c.generic = outer_generic
     FunctionSymbol(unit, module_name, f.name, f, params, names, result, intrinsic, None, buf(), buf(), buf(), false, false, false, buf(), None, owner, type_params, None, false, true, "", None, false)
 
+/** The parameters of `f` (its receiver, if it has one, before the `first`) that the default of its
+ * parameter `i` takes, in order: the receiver; then, for an ordinary parameter, those before it and
+ * the whole `using` section, which a call fills first; for a parameter of the section, the section's
+ * parameters before it. */
+default_inputs(f: FunctionSymbol, first: usize, i: usize) -> Buf[usize]
+    var out: Buf[usize] = buf()
+    val start = f.params.len() - section_size(f.decl)
+    for k in 0..<first
+        out.push(k)
+    if i >= start
+        for k in start..<i
+            out.push(k)
+        return out
+    for k in first..<i
+        out.push(k)
+    for k in start..<f.params.len()
+        out.push(k)
+    out
+
 // Each default argument becomes a function of its own, declared beside the function whose parameter
-// it belongs to: it takes the parameters before that one, so the default may use them, and yields
+// it belongs to: it takes the parameters before that one (`default_inputs`), so the default may use
+// them, and the contextual parameters, which are givens in it, and yields
 // the default. It is checked in the declaring function's scope, never the caller's, and a call that
 // omits the argument calls it. A generic function's defaults are generic over the same parameters.
 // The default of a by-name parameter is its delayed expression: the function yields it unevaluated.
@@ -7947,7 +8016,7 @@ private declare_defaults(c: *Checker, id: usize)
         var params: Buf[&Type] = buf()
         var names: Buf[string] = buf()
         var decls: Buf[Param] = buf()
-        for k in 0..<i
+        for k in default_inputs(f, first, i)
             params.push(if shared then f.params[k] else substitute(f.params[k], id, own))
             names.push(f.param_names[k])
             if k >= first then decls.push(f.decl.params[k - first])
@@ -8084,10 +8153,6 @@ intrinsic_entry(name: string) -> Option[(string, Buf[&Type], &Type)]
         result = Str
     elif name == "text_size"
         entry = "avin_rt_text_size"
-        params.push(Str)
-        result = Int(64)
-    elif name == "text_width"
-        entry = "avin_rt_text_width"
         params.push(Str)
         result = Int(64)
     elif name == "text_append"
@@ -9490,6 +9555,28 @@ private made_sendable(c: *Checker, root: usize, e: &TExpr) -> bool
                 _ -> false
         _ -> false
 
+// Whether `e` is a method value whose receiver is held in a local of no name before the closure
+// capturing it.
+private is_method_value(c: *Checker, root: usize, e: &TExpr) -> bool
+    e.kind match
+        Block(items) ->
+            if items.len() != 2 || !(items[1].kind is FunctionValue(_, _)) then return false
+            items[0].kind match
+                Let(x, _) -> x < c.locals[root].len() && c.locals[root][x].name == ""
+                _ -> false
+        _ -> false
+
+// What of `e` goes with it to another thread: a method value's closure without the receiver
+// expression, which runs where the value is made, and anything else whole. A receiver that is a
+// local or a parameter is kept, so an error names it; its value is what the closure carries.
+private sent_part(c: *Checker, root: usize, e: &TExpr) -> &TExpr
+    if is_method_value(c, root, e)
+        if e.kind is Block(items)
+            if items[0].kind is Let(_, value)
+                if value.kind is Local(_) || value.kind is Param(_) then return e
+            return items[1]
+    e
+
 /** `e`, or the argument it stands for where it is a local holding one evaluated before the call. */
 private held_value(e: &TExpr, held: *Buf[HeldArgument]) -> &TExpr
     if e.kind is Local(x)
@@ -9572,7 +9659,10 @@ private is_match_function_literal(c: *Checker, e: &TExpr) -> bool
 private first_send_problem(c: *Checker, root: usize, e: &TExpr, mark: int, k: usize, held: *Buf[HeldArgument]) -> Option[string]
     var uses: Buf[SendUse] = buf()
     var bound: Buf[usize] = buf()
-    collect_send_uses(c, e, &uses, &bound, held)
+    // A method value's receiver is evaluated where the value is made, so what the receiver expression
+    // uses stays here; what the closure carries is the receiver's value, held in a local of no name
+    // and checked by its type.
+    collect_send_uses(c, sent_part(c, root, e), &uses, &bound, held)
     for u in uses
         if !u.param && contains_index(bound, u.index) then continue
         var seen: Buf[usize] = buf()
@@ -9634,6 +9724,8 @@ private send_use_problem(c: *Checker, root: usize, u: SendUse, mark: int, k: usi
                     // `val` to make it sendable.
                     if has_states(c.classes[id]) then return Some(s"it uses the state of the actor `${held[ActorClassPrefix.bytes.len..]}`, which only the actor's own code reaches; copy what it needs into a `val` first")
                     return Some(s"it uses the state of the actor `${held[ActorClassPrefix.bytes.len..]}`, ${nested_reason(why)}")
+            // The local of no name holds a method value's receiver.
+            if name == "" then return Some(s"it carries its receiver, ${quoted_type(ty)}, ${nested_reason(why)}")
             Some(s"it uses `$name`, ${quoted_type(ty)}, ${nested_reason(why)}")
         _ -> None
 
@@ -9803,10 +9895,12 @@ private push_all(out: *Buf[&TExpr], items: Buf[&TExpr])
 // to it too: it runs at once, but what it makes leaves isolated, as an `Isolated`'s objects do, and a
 // module-level value it stored one in would let code outside reach it. What is passed for an
 // `@isolated` parameter runs at once on the calling thread, and is not held to this.
-private check_module_state_in_threads(c: *Checker, direct: Buf[Option[Uses]])
+private check_module_state_in_threads(c: *Checker)
     val k = c.core.trait_named("Sendable") match
         Some(k) -> k
         None -> return
+    var graph = reach_graph(c)
+    val g = &graph
     for id in 0..<c.symbols.len()
         if id >= c.bodies.len() then break
         val body = c.bodies[id] match
@@ -9814,15 +9908,15 @@ private check_module_state_in_threads(c: *Checker, direct: Buf[Option[Uses]])
             None -> continue
         val root = c.symbols[id].root.unwrap_or(id)
         var held: Buf[HeldArgument] = buf()
-        scan_thread_bodies(c, id, root, body, k, direct, &held)
+        scan_thread_bodies(c, id, root, body, k, g, &held)
 
-private scan_thread_bodies(c: *Checker, id: usize, root: usize, e: &TExpr, k: usize, direct: Buf[Option[Uses]], held: *Buf[HeldArgument])
+private scan_thread_bodies(c: *Checker, id: usize, root: usize, e: &TExpr, k: usize, direct: *ReachGraph, held: *Buf[HeldArgument])
     if sendable_match_attempt(c, e) is Some(attempt)
         if module_state_path(c, attempt, k, direct) is Some(why)
             c.note(c.symbols[id].unit, e.span, s"a `match` function passed for a type argument bounded by `Sendable` may run on another thread, which shares the program's module-level state, but $why")
         return
     if made_sendable(c, root, e)
-        if module_state_path(c, e, k, direct) is Some(why)
+        if module_state_path(c, sent_part(c, root, e), k, direct) is Some(why)
             c.note(c.symbols[id].unit, e.span, s"${sendable_made(c, c.symbols[id].unit, e)} may run on another thread, which shares the program's module-level state, but $why")
         if e.kind is Block(items)
             if items.len() == 2 then scan_thread_bodies(c, id, root, items[0], k, direct, held)
@@ -9843,14 +9937,14 @@ private struct StateReached
     global: usize
     via: Buf[usize]
 
-private thread_body_arguments(c: *Checker, id: usize, root: usize, f: usize, args: Buf[&TExpr], k: usize, direct: Buf[Option[Uses]], held: *Buf[HeldArgument])
+private thread_body_arguments(c: *Checker, id: usize, root: usize, f: usize, args: Buf[&TExpr], k: usize, direct: *ReachGraph, held: *Buf[HeldArgument])
     for i in 0..<args.len()
         val mark = param_mark(c, f, i)
         if mark < IsolatingMark then continue
         val arg = held_value(args[i], held)
         // A function made as a `@sendable` one is checked where it is made.
         if made_sendable(c, root, arg) then continue
-        if module_state_path(c, arg, k, direct) is Some(why)
+        if module_state_path(c, sent_part(c, root, arg), k, direct) is Some(why)
             val what = s"what is passed for `${c.symbols[f].param_names[i]}` of `${c.symbols[f].name}`"
             // What an `@isolating` argument makes leaves isolated, so code outside must not reach it
             // through module-level state.
@@ -9859,9 +9953,8 @@ private thread_body_arguments(c: *Checker, id: usize, root: usize, f: usize, arg
 
 // Where the code `arg` runs reaches module-level state a thread's body may not: the functions it is
 // reached through and what it is.
-private module_state_path(c: *Checker, arg: &TExpr, k: usize, direct: Buf[Option[Uses]]) -> Option[string]
-    val start = with_implementations(c, uses_of(arg))
-    val r = module_state_reached(c, direct, start, k)?
+private module_state_path(c: *Checker, arg: &TExpr, k: usize, g: *ReachGraph) -> Option[string]
+    val r = module_state_reached(c, g, uses_of(arg), k)?
     var through = ""
     for step in r.via
         val s = c.symbols[step]
@@ -9896,45 +9989,329 @@ private lazy_field_named(c: *Checker, f: usize) -> Option[string]
     None
 
 // The first module-level value the uses `start` reach that a thread's body may not, found breadth
-// first so that the path to it is a shortest one.
-private module_state_reached(c: *Checker, direct: Buf[Option[Uses]], start: Uses, k: usize) -> Option[StateReached]
-    if forbidden_global(c, start, k) is Some(g) then return Some(StateReached(g, buf()))
-    val none = c.symbols.len()
+// first so that the path to it is a shortest one. The code is followed instance by instance: a generic
+// function called at known type arguments reaches only what those types implement.
+private module_state_reached(c: *Checker, g: *ReachGraph, start: Uses, k: usize) -> Option[StateReached]
+    if forbidden_global(c, start, k) is Some(global) then return Some(StateReached(global, buf()))
+    val none = NoReach
     var parent: Buf[usize] = buf()
     var seen: Buf[bool] = buf()
-    for _ in 0..<direct.len()
-        parent.push(none)
-        seen.push(false)
     var pending: Buf[usize] = buf()
-    for f in start.functions
-        if f < direct.len() && !seen[f]
-            seen[f] = true
-            pending.push(f)
+    for n in reach_successors(c, g, start, no_reach_env())
+        grow_marks(&parent, &seen, g.nodes.len(), none)
+        if !seen[n]
+            seen[n] = true
+            pending.push(n)
     var next = 0usize
     while next < pending.len()
-        val f = pending[next]
+        val n = pending[next]
         next += 1
-        val u = direct[f] match
+        val u = g.raw[g.nodes[n].function] match
             Some(u) -> u
             None -> continue
-        if forbidden_global(c, u, k) is Some(g)
+        if forbidden_global(c, u, k) is Some(global)
             var chain: Buf[usize] = buf()
-            var at = f
+            var at = n
             while at != none
-                chain.push(at)
+                chain.push(g.nodes[at].function)
                 at = parent[at]
             var via: Buf[usize] = buf()
             var j = chain.len()
             while j > 0
                 j -= 1
                 via.push(chain[j])
-            return Some(StateReached(g, via))
-        for callee in u.functions
-            if callee < direct.len() && !seen[callee]
+            return Some(StateReached(global, via))
+        for callee in node_successors(c, g, n)
+            grow_marks(&parent, &seen, g.nodes.len(), none)
+            if !seen[callee]
                 seen[callee] = true
-                parent[callee] = f
+                parent[callee] = n
                 pending.push(callee)
     None
+
+private grow_marks(parent: *Buf[usize], seen: *Buf[bool], len: usize, none: usize)
+    while seen.len() < len
+        parent.push(none)
+        seen.push(false)
+
+/** One instance of a function as a thread's body reaches it: `args` instantiate the type parameters
+ * `owner` owns. An instance whose arguments are not known (`known` false) stands for every instance:
+ * its calls on its type parameters reach every implementation the program has. */
+private struct ReachNode
+    function: usize
+    owner: usize
+    args: Buf[&Type]
+    known: bool
+
+/** The instances of functions the thread-state check has met, each once, and what each reaches. */
+private struct ReachGraph
+    raw: Buf[Option[Uses]]
+    nodes: Buf[ReachNode]
+    index: Map[string, usize]
+    next: Buf[Option[Buf[usize]]]
+    /** The traits each class and each data type conforms to. */
+    class_traits: Buf[Buf[usize]]
+    data_traits: Buf[Buf[usize]]
+
+/** The type arguments in force where code runs: `owner`'s parameters are `args` when `known`. */
+private struct ReachEnv
+    owner: usize
+    args: Buf[&Type]
+    known: bool
+
+/** No node and no owner. */
+private const NoReach: usize = 0xffffffffffffffff
+
+private no_reach_env() -> ReachEnv = ReachEnv(NoReach, buf(), false)
+
+// The instances a search keeps apart before it treats the rest as every instance, and the longest
+// type argument it keeps, so a function that calls itself at ever larger types ends.
+private const ReachInstanceLimit: usize = 20000
+private const ReachTypeKeyLimit: usize = 200
+
+private reach_graph(c: *Checker) -> ReachGraph
+    var raw: Buf[Option[Uses]] = buf()
+    for b in c.bodies
+        raw.push(b match
+            Some(body) -> Some(uses_of(body))
+            None -> None)
+    var class_traits: Buf[Buf[usize]] = buf()
+    for k in 0..<c.classes.len()
+        class_traits.push(if is_trait(c, k) then buf() else conformed_traits(c, k))
+    var data_traits_of: Buf[Buf[usize]] = buf()
+    for d in 0..<c.data.len()
+        data_traits_of.push(data_traits(c, d))
+    ReachGraph(raw, buf(), map(), buf(), class_traits, data_traits_of)
+
+/** The traits every type a value of type `t` may have conforms to: a type parameter's bounds, or the
+ * trait whose `Self` it is. Empty where nothing is known of it. */
+private required_traits(c: *Checker, t: &Type) -> Buf[usize]
+    var ids: Buf[usize] = buf()
+    val (owner, index) = *t match
+        TypeVar(o, i, _) -> (o, i)
+        // A value of a trait's type is of a type conforming to the trait.
+        Class(k, _, _) ->
+            if is_trait(c, k) then ids.push(k)
+            return ids
+        _ -> return ids
+    if owner >= self_owner(0)
+        val k = owner - self_owner(0)
+        if k < c.classes.len() && is_trait(c, k) then ids.push(k)
+        return ids
+    val params: Buf[TypeParam] = if owner < c.symbols.len() then c.symbols[owner].type_params else buf()
+    for b in scope_bounds(conformances(c), owner, params, index)
+        if *b is Class(k, _, _)
+            if is_trait(c, k) && !contains_id(ids, k) then ids.push(k)
+    ids
+
+private meets_traits(have: Buf[usize], need: Buf[usize]) -> bool
+    for n in need
+        if !contains_id(have, n) then return false
+    true
+
+/** The node of `f` at `env`, made the first time it is met. */
+private reach_node(c: *Checker, g: *ReachGraph, f: usize, env: ReachEnv) -> usize
+    var known = env.known
+    if g.nodes.len() >= ReachInstanceLimit then known = false
+    var key = s"$f"
+    if known
+        key = key + s"@${env.owner}"
+        for a in env.args
+            val ak = type_key(a)
+            if ak.bytes.len > ReachTypeKeyLimit then known = false
+            key = key + "," + ak
+    // With no arguments to substitute, every instance reaches the same code.
+    if !known || env.args.len() == 0
+        known = false
+        key = s"$f"
+    if g.index.get(key) is Some(n) then return n
+    val n = g.nodes.len()
+    g.nodes.push(ReachNode(f, env.owner, if known then env.args else buf(), known))
+    g.next.push(None)
+    g.index.put(key, n)
+    n
+
+private node_env(node: ReachNode) -> ReachEnv = ReachEnv(node.owner, node.args, node.known)
+
+/** What node `n` reaches, worked out once. */
+private node_successors(c: *Checker, g: *ReachGraph, n: usize) -> Buf[usize]
+    if g.next[n] is Some(out) then return out
+    val node = g.nodes[n]
+    val out = g.raw[node.function] match
+        Some(u) -> reach_successors(c, g, u, node_env(node))
+        None -> buf()
+    g.next[n] = Some(out)
+    out
+
+/** `t` as it is in the instance `env`. */
+private in_env(c: *Checker, t: &Type, env: ReachEnv) -> &Type
+    val solved = zonk(c, t)
+    if env.known then substitute(solved, env.owner, env.args) else solved
+
+/** The instances the code with uses `u` reaches, running at `env`: each function it calls or makes,
+ * and each implementation its calls through a method table or a bound and its operators may reach. */
+private reach_successors(c: *Checker, g: *ReachGraph, u: Uses, env: ReachEnv) -> Buf[usize]
+    var out: Buf[usize] = buf()
+    for site in u.sites
+        add_node(&out, reach_node(c, g, site.function, site_env(c, site, env)))
+    for i in 0..<u.dispatched.len()
+        val receiver = u.dispatched_receivers[i] match
+            Some(t) -> Some(in_env(c, t, env))
+            None -> None
+        dispatch_targets(c, g, &out, u.dispatched[i], u.dispatched_slots[i], receiver)
+    for i in 0..<u.operators.len()
+        operator_targets(c, g, &out, u.operators[i], in_env(c, u.operator_types[i], env))
+    // A `lazy val` field's read runs the initializer its class made: where the object's class is not
+    // known, every field of that name.
+    for read in u.lazy_fields
+        val declaring: Option[usize] = *in_env(c, read.object, env) match
+            Class(id, _, _) -> if read.index < c.classes[id].fields.len() then Some(c.classes[id].fields[read.index].owner) else None
+            _ -> None
+        for init in c.lazy_initializers
+            val same = declaring match
+                Some(owner) -> init.owner == owner && init.index == read.index
+                None -> c.classes[init.owner].fields[init.index].name == read.name
+            if same then add_node(&out, reach_node(c, g, init.function, no_reach_env()))
+    out
+
+private add_node(out: *Buf[usize], n: usize)
+    for x in *out
+        if x == n then return
+    out.push(n)
+
+// The instance a call or a closure reaches. Type arguments written at the call instantiate the function;
+// a local function or a lambda runs in the instance of the code that makes it; a method of a generic
+// type is instantiated by its receiver's type arguments. Anything else stands for every instance.
+private site_env(c: *Checker, site: CallSite, env: ReachEnv) -> ReachEnv
+    val s = c.symbols[site.function]
+    if site.type_args.len() > 0
+        if site.type_args.len() != s.type_params.len() then return no_reach_env()
+        var args: Buf[&Type] = buf()
+        for t in site.type_args
+            args.push(in_env(c, t, env))
+        return ReachEnv(s.type_owner, args, true)
+    if s.root is Some(_) || s.lambda then return env
+    if s.type_params.len() == 0 then return ReachEnv(s.type_owner, buf(), true)
+    site.receiver match
+        Some(t) -> receiver_env(c, site.function, in_env(c, t, env))
+        None -> no_reach_env()
+
+/** The instance method `m` runs in, called on a receiver of type `t`: the type's arguments, where `m`
+ * belongs to that type and takes no type parameters of its own. */
+private receiver_env(c: *Checker, m: usize, t: &Type) -> ReachEnv
+    val s = c.symbols[m]
+    val (owner, args) = *t match
+        Data(d, _, xs) -> (data_owner(d), xs)
+        Class(k, _, xs) -> (class_owner(k), xs)
+        _ -> return no_reach_env()
+    if s.type_owner == owner && s.type_params.len() == args.len() then ReachEnv(owner, args, true) else no_reach_env()
+
+/** Whether values of type `t` are built-in scalars, whose operators and methods are the machine's own
+ * or the standard library's, never a method of a class or a data type. */
+private builtin_scalar(t: &Type) -> bool = *t match
+    Int(_) -> true
+    Real -> true
+    Byte -> true
+    Char -> true
+    Bool -> true
+    Unit -> true
+    Str -> true
+    _ -> false
+
+// A call through a method table or a bound reaches the method in `slot` of the table of the receiver's
+// type: a data type's own table, or that of the class or of any class descending from it. Where the
+// receiver's type is not known (a trait, a type parameter, `Any`), it reaches the method of that name
+// in that slot of the table of any class, or of a class descending from the method's own, and of any
+// data type, among those that conform to the trait or to the type parameter's bounds.
+private dispatch_targets(c: *Checker, g: *ReachGraph, out: *Buf[usize], f: usize, slot: usize, receiver: Option[&Type])
+    val name = c.symbols[f].decl.name
+    if receiver is Some(t)
+        if builtin_scalar(t) then return
+        *t match
+            Data(d, _, _) ->
+                if slot < c.data[d].table.len()
+                    if c.data[d].table[slot] is Some(m)
+                        if c.symbols[m].decl.name == name then add_node(out, reach_node(c, g, m, receiver_env(c, m, t)))
+                return
+            Class(k, _, _) ->
+                if !is_trait(c, k)
+                    for kk in 0..<c.classes.len()
+                        if !descends(c, kk, k) then continue
+                        if slot < c.classes[kk].table.len()
+                            if c.classes[kk].table[slot] is Some(m)
+                                if c.symbols[m].decl.name == name then add_node(out, reach_node(c, g, m, receiver_env(c, m, t)))
+                    return
+            _ -> ()
+    var declared: Option[usize] = None
+    if c.symbols[f].owner_class is Some(o)
+        if !is_trait(c, o) then declared = Some(o)
+    val need = required_of(c, receiver)
+    for kk in 0..<c.classes.len()
+        if declared is Some(o)
+            if !descends(c, kk, o) then continue
+        if !candidate_class(c, g, kk, need) then continue
+        if slot < c.classes[kk].table.len()
+            if c.classes[kk].table[slot] is Some(m)
+                if c.symbols[m].decl.name == name then add_node(out, reach_node(c, g, m, no_reach_env()))
+    if declared is Some(_) then return
+    for d in 0..<c.data.len()
+        if !meets_traits(g.data_traits[d], need) then continue
+        if slot < c.data[d].table.len()
+            if c.data[d].table[slot] is Some(m)
+                if c.symbols[m].decl.name == name then add_node(out, reach_node(c, g, m, no_reach_env()))
+
+/** The traits a receiver of type `receiver` is known to conform to. */
+private required_of(c: *Checker, receiver: Option[&Type]) -> Buf[usize] = receiver match
+    Some(t) -> required_traits(c, t)
+    None -> buf()
+
+/** Whether a value known to conform to the traits `need` may be an object of class `k`: a trait's own
+ * table, which holds what its implementers inherit, is always kept. */
+private candidate_class(c: *Checker, g: *ReachGraph, k: usize, need: Buf[usize]) -> bool
+    is_trait(c, k) || meets_traits(g.class_traits[k], need)
+
+// An operator calls the core trait method `name` of its operand's type: nothing on a built-in scalar, a
+// data type's own method, or that of the class or of a class descending from it. Where the type is not
+// known (a trait, a type parameter, `Any`), it reaches the method of that name of every type that may
+// be the operand's: one conforming to the type parameter's bounds or to the trait. An equality on a
+// type with no `equals` of its own compares fields and elements by their own methods, so it reaches
+// every `equals`.
+private operator_targets(c: *Checker, g: *ReachGraph, out: *Buf[usize], name: string, t: &Type)
+    if builtin_scalar(t) then return
+    var found = false
+    var known = false
+    *t match
+        Data(d, _, _) ->
+            known = true
+            found = named_targets(c, g, out, c.data[d].table, name, Some(t))
+        Class(k, _, _) ->
+            if !is_trait(c, k)
+                known = true
+                for kk in 0..<c.classes.len()
+                    if descends(c, kk, k)
+                        if named_targets(c, g, out, c.classes[kk].table, name, Some(t)) then found = true
+        _ -> ()
+    if known && (found || name != "equals") then return
+    // A type parameter's value conforms to its bounds, so only the types that do are candidates; an
+    // equality is not narrowed, since it compares fields and elements by their own methods.
+    val need: Buf[usize] = if name == "equals" then buf() else required_traits(c, t)
+    for kk in 0..<c.classes.len()
+        if candidate_class(c, g, kk, need) then named_targets(c, g, out, c.classes[kk].table, name, None)
+    for d in 0..<c.data.len()
+        if meets_traits(g.data_traits[d], need) then named_targets(c, g, out, c.data[d].table, name, None)
+
+/** Adds each method of `table` named `name`, answering whether there is one. */
+private named_targets(c: *Checker, g: *ReachGraph, out: *Buf[usize], table: Buf[Option[usize]], name: string, receiver: Option[&Type]) -> bool
+    var found = false
+    for entry in table
+        if entry is Some(m)
+            if c.symbols[m].decl.name == name
+                val env = receiver match
+                    Some(t) -> receiver_env(c, m, t)
+                    None -> no_reach_env()
+                add_node(out, reach_node(c, g, m, env))
+                found = true
+    found
 
 private forbidden_global(c: *Checker, u: Uses, k: usize) -> Option[usize]
     for g in u.globals
@@ -13154,7 +13531,7 @@ private opaque_wrap(c: *Checker, at: Span, name_span: Span, id: usize, args: Buf
     names.push("repr")
     var defaults: Buf[Option[usize]] = buf()
     defaults.push(None)
-    val signature = Signature(d.name, true, d.type_params, alias_owner(id), params, names, defaults, opaque_own_type(c, id), buf(), None, false, buf(), buf())
+    val signature = Signature(d.name, true, d.type_params, alias_owner(id), params, names, defaults, opaque_own_type(c, id), buf(), None, false, buf(), buf(), 0)
     val applied = apply(c, at, name_span, signature, args, explicit, expected, buf())
     if applied.cut || applied.args.len() != 1 then return applied.wrap(at, UnitConst)
     applied.wrap(at, Reveal(applied.args[0]))
@@ -13858,9 +14235,13 @@ private check_clauses(c: *Checker, id: usize, subjects: Buf[&TExpr])
     // A method's clauses match its arguments, not its receiver: that of a class's, a trait's or an
     // impl's method, which only a static member lacks.
     val skip = if symbol.params.len() > decl.params.len() then symbol.params.len() - decl.params.len() else 0usize
+    // Nor its `using` section, which the clauses' bodies have as givens.
+    var contextual = 0usize
+    for p in decl.params
+        if p.contextual then contextual += 1
     var params: Buf[&Type] = buf()
     var matched: Buf[&TExpr] = buf()
-    for i in skip..<symbol.params.len()
+    for i in skip..<symbol.params.len() - contextual
         params.push(symbol.params[i])
         matched.push(subjects[i])
     var typed: Buf[TClause] = buf()
@@ -13871,7 +14252,8 @@ private check_clauses(c: *Checker, id: usize, subjects: Buf[&TExpr])
     var refined_clauses: Buf[RefinedArm] = buf()
     for clause in decl.clauses
         if clause.patterns.len() != params.len()
-            c.note(unit, clause.span, s"`${decl.name}` takes ${count(params.len(), "argument")}, but this clause matches ${clause.patterns.len()}")
+            val section = if contextual > 0 then s" besides its `using` section" else ""
+            c.note(unit, clause.span, s"`${decl.name}` takes ${count(params.len(), "argument")}$section, but this clause matches ${clause.patterns.len()}")
             continue
         val mark = c.body.visible.len()
         val outer_start = c.body.block_start
@@ -14177,7 +14559,7 @@ private super_initialization(c: *Checker, receiver: &TExpr, sup: &Type, parent: 
         name_span = callee.span
     val s = c.classes[sid]
     val constructor = c.symbols[s.constructor]
-    val signature = Signature(s.name, true, constructor.type_params, class_owner(sid), constructor.params, constructor.param_names, constructor.defaults, Unit, sargs, None, declares_variadic(constructor.decl), function_sites(c, s.constructor, 0), buf())
+    val signature = Signature(s.name, true, constructor.type_params, class_owner(sid), constructor.params, constructor.param_names, constructor.defaults, Unit, sargs, None, declares_variadic(constructor.decl), function_sites(c, s.constructor, 0), buf(), section_size(constructor.decl))
     val outer = c.super_args
     c.super_args = true
     val applied = apply(c, parent.span, name_span, signature, args, None, None, buf())
@@ -14547,6 +14929,10 @@ private check_local_symbol(c: *Checker, id: usize)
     for i in 0..<symbol.params.len()
         param_locals.push(add_local(c, decl.span, symbol.param_names[i], symbol.params[i], false))
     c.symbols[id].param_locals = param_locals
+    // Its contextual parameters are givens in its body, a level of their own outside it.
+    val offset = symbol.params.len() - decl.params.len()
+    for k in 0..<decl.params.len()
+        if decl.params[k].contextual then c.body.givens.push(GivenLocal(param_locals[k + offset], decl.params[k].span, mark))
     note_refined_function(c, id)
     var subjects: Buf[&TExpr] = buf()
     for i in 0..<param_locals.len()
@@ -14948,14 +15334,18 @@ private results_as(c: *Checker, typed: &TExpr, want: &Type) -> &TExpr
     TExpr(at, lambda.ty, Block(items))
 
 /** A lambda of `arity` parameters, checked against `want`, that passes them on to a call of `callee`. */
-private calling_lambda(c: *Checker, at: Span, callee: string, arity: usize, want: &Type) -> &TExpr
+private calling_lambda(c: *Checker, at: Span, callee: string, arity: usize, want: &Type) -> &TExpr = calling_lambda_of(c, at, name_at(at, callee), arity, want)
+
+/** A lambda of `arity` parameters, checked against `want`, that passes them on to a call of the
+ * expression `callee`, a name as written, qualified or with type arguments. */
+private calling_lambda_of(c: *Checker, at: Span, callee: &Expr, arity: usize, want: &Type) -> &TExpr
     var params: Buf[LambdaParam] = buf()
     var args: Buf[Argument] = buf()
     for i in 0..<arity
         val param = s"adapted $i"
-        params.push(LambdaParam(at, param, None))
+        params.push(LambdaParam(at, param, None, false))
         args.push(Argument(at, None, name_at(at, param), false))
-    val body = Expr(at, Call(name_at(at, callee), args))
+    val body = Expr(at, Call(callee, args))
     lambda_expr(c, Expr(at, Lambda(params, body)), params, body, Some(want), false)
 
 private function_arity(t: &Type) -> usize = *t match
@@ -15095,18 +15485,19 @@ private check_kind(c: *Checker, e: &Expr, expected: Option[&Type], used: bool) -
     Member(target, name) ->
         // The rewritten use is judged as this one is, by the caller, so it is checked as used.
         if module_use(c, e) is Some(q) then check_form(c, q, expected, true)
-        elif variant_use(c, e.span, target, name) is Some((found, explicit)) then qualified_variant_value(c, e.span, found, explicit, expected)
+        elif variant_use(c, e.span, target, name) is Some((found, explicit)) then qualified_variant_value(c, e, found, explicit, expected)
         elif limit_constant(c, e.span, target, name) is Some(k) then k
         elif static_value(c, e.span, target, name, expected) is Some(v) then v
         else member_expr(c, e, target, name, expected)
     Call(callee, args) ->
         if bare_placeholder(args) is Some(blank)
-            c.note(unit_of(c), blank, "`_` alone as an argument makes the call around it a lambda, which stands only as another call's argument or a declared `val`'s value; write the lambda out, as in `x -> body`")
+            c.note(unit_of(c), blank, "`_` alone as an argument makes the call around it a lambda, which stands only as another call's argument, a declared `val`'s value or the body of a function with a declared result, or a branch of one of these; write the lambda out, as in `x -> body`")
             TExpr(e.span, ErrorType, UnitConst)
         else call_expr(c, e.span, callee, args, expected)
     InfixCall(target, name, name_span, arg) -> infix_call(c, e.span, target, name, name_span, arg, expected)
     Block(items, discard) -> block_expr(c, e, items, discard, expected, used)
     Binding(name, declared, value, mutable) -> binding_expr(c, e, name, declared, value, mutable)
+    GivenBinding(name, declared, value) -> given_binding_expr(c, e, name, declared, value)
     Destructure(pattern, declared, value, mutable) -> destructure_expr(c, e, pattern, declared, value, mutable)
     LazyBinding(name, declared, value) -> lazy_binding_expr(c, e, name, declared, value)
     Assign(target, op, value, yields, op_span) -> assign_expr(c, e, target, op, value, yields, op_span)
@@ -15246,7 +15637,7 @@ private adapted_function(c: *Checker, at: Span, name: string, id: usize, expecte
 
 private name_expr(c: *Checker, at: Span, name: string, expected: Option[&Type]) -> &TExpr
     if name == "_"
-        c.note(unit_of(c), at, "`_` is not a value here: it stands for a lambda's parameter only within a call's argument, as in `xs.map(_ + 1)`, or a declared `val`'s value, and elsewhere for a binding that is never read")
+        c.note(unit_of(c), at, "`_` is not a value here: it stands for a lambda's parameter only within a call's argument, as in `xs.map(_ + 1)`, a declared `val`'s value or the body of a function with a declared result, or a branch of one of these, and elsewhere for a binding that is never read")
         return TExpr(at, ErrorType, UnitConst)
     if c.super_args && name == "self"
         c.note(unit_of(c), at, "`self` cannot be used in a superclass's arguments, which run before the object is initialized")
@@ -15295,10 +15686,10 @@ private name_expr(c: *Checker, at: Span, name: string, expected: Option[&Type]) 
         if abstract_constructor(c, id, at) then return TExpr(at, ErrorType, UnitConst)
         if adapted_function(c, at, name, id, expected) is Some(lambda) then return lambda
         return named_function_value(c, at, name, None, expected)
-    val (chosen, is_variant) = choose_variant(c, at, name, expected)
+    val (chosen, is_variant) = choose_variant(c, at, name, made_type(c, expected))
     if chosen is Some(v)
         if c.data[v.data].variants[v.index].fields.len() == 0 then return construct(c, at, at, v, buf(), None, expected)
-        c.note(symbol.unit, at, s"`$name` has fields; call it, as in `$name(arguments)`")
+        return variant_function(c, at, name_at(at, name), name, v, None, expected)
     elif is_variant then ()
     elif tested_named(c, name) then c.note(symbol.unit, at, s"`$name` is bound by an `is` test, and is in scope only where that test is known to hold")
     elif alias_not_value(c, unit_of(c), name) is Some(message) then c.note(symbol.unit, at, message)
@@ -15502,7 +15893,7 @@ private overloaded_method_value(c: *Checker, at: Span, receiver: &TExpr, name: s
             // With an overload of no parameters among them, the likelier slip is a call missing its
             // parentheses, so the error names the call.
             for m in ms
-                if c.symbols[m].params.len() == 1 && !is_parameterless(c, m)
+                if c.symbols[m].params.len() - section_size(c.symbols[m].decl) == 1 && !is_parameterless(c, m)
                     empty_list_without_call(c, at, receiver, name)
                     return TExpr(at, ErrorType, UnitConst)
             c.note(unit, at, s"`$name` is overloaded, so as a value with no expected function type it is ambiguous: ${overload_list(c, ms)} could each be meant")
@@ -15511,7 +15902,7 @@ private overloaded_method_value(c: *Checker, at: Span, receiver: &TExpr, name: s
     var compared: Buf[Buf[&Type]] = buf()
     for m in ms
         val s = method_signature(c, receiver, m, ErrorType)
-        val view = substitute_all(s.params, s.owner, s.known)
+        val view = before_section(substitute_all(s.params, s.owner, s.known), s.section)
         if accepts(c, view, s.owner, s.type_params.len(), params)
             fitting.push(m)
             compared.push(view)
@@ -15625,7 +16016,8 @@ private method_value(c: *Checker, at: Span, receiver: &TExpr, m: usize, explicit
         return method_call(c, at, at, receiver, m, buf(), explicit, expected, false, buf())
     if refuse_unmet_conformance(c, at, receiver.ty, m) then return TExpr(at, ErrorType, UnitConst)
     if refuse_static_on_value(c, at, receiver, m) then return TExpr(at, ErrorType, UnitConst)
-    if c.symbols[m].params.len() == 1 && !function_expected(c, expected)
+    val section = section_size(c.symbols[m].decl)
+    if c.symbols[m].params.len() - section == 1 && !function_expected(c, expected)
         empty_list_without_call(c, at, receiver, c.symbols[m].decl.name)
         return TExpr(at, ErrorType, UnitConst)
     val target = c.symbols[m]
@@ -15649,7 +16041,8 @@ private method_value(c: *Checker, at: Span, receiver: &TExpr, m: usize, explicit
                 unify(c, type_args[known.len() + i], written[i])
     var params: Buf[&Type] = buf()
     var names: Buf[string] = buf()
-    for i in 1..<target.params.len()
+    // A `using` section is filled where the value is made, so the value takes the parameters before it.
+    for i in 1..<target.params.len() - section
         params.push(with_self(c, m, receiver.ty, target.params[i]))
         names.push(target.param_names[i])
     val declared: &Type = Function(substitute_all(marked_value_params(c, m, 1, params, expected), target.type_owner, type_args), substitute(with_self(c, m, receiver.ty, result), target.type_owner, type_args), sendable_wanted(c, expected))
@@ -15668,39 +16061,82 @@ private method_value(c: *Checker, at: Span, receiver: &TExpr, m: usize, explicit
     // the receiver gives were held where its type was made.
     hold_to_bounds(c, unit, at, s"`$name`", target.type_owner, type_params, solved, known.len())
     val ty = zonk(c, declared)
-    var lambda_params: Buf[&Type] = buf()
-    var lambda_result: &Type = ErrorType
-    if *ty is Function(ps, r, _)
-        lambda_params = ps
-        lambda_result = r
     // The receiver is held in a local of the code making the value, which the closure captures; a
     // static member's receiver is its type, which has no value to hold.
     val on_type = receiver.kind is TypeReceiver
     val held = if on_type then 0usize else hidden_local(c, receiver.ty)
-    val enclosing = c.symbols[c.current]
-    val decl = Function(buf(), at, at, "lambda", buf(), buf(), None, None, buf(), false)
-    val id = c.symbols.len()
-    c.symbols.push(FunctionSymbol(enclosing.unit, enclosing.module_name, "lambda", decl, lambda_params, names, Some(lambda_result), None, Some(c.body.root), buf(), buf(), buf(), true, false, true, buf(), None, id, buf(), None, false, true, "", None, false))
-    c.states.push(2)
-    c.bodies.push(None)
-    c.locals.push(buf())
-    var args: Buf[&TExpr] = buf()
-    args.push(if on_type then receiver else TExpr(at, receiver.ty, Local(held)))
-    var param_locals: Buf[usize] = buf()
-    for i in 0..<lambda_params.len()
-        val index = c.body.locals.len()
-        c.body.locals.push(TLocal(names[i], lambda_params[i], false, id))
-        param_locals.push(index)
-        args.push(TExpr(at, lambda_params[i], Local(index)))
-    c.symbols[id].param_locals = param_locals
+    val closure = value_closure(c, at, ty, names)
+    val id = closure.id
+    val held_receiver: &TExpr = if on_type then receiver else TExpr(at, receiver.ty, Local(held))
     if !on_type then c.body.uses.push(CaptureUse(id, held, false))
     c.body.calls.push(LocalCall(c.current, id))
-    val call = method_call_kind(c, receiver.ty, m, args, solved, false)
-    c.bodies[id] = Some(TExpr(at, lambda_result, call))
+    if section > 0
+        // The closure calls the method as a call written here would, so its section is filled from
+        // the givens in scope here, which the closure captures, or from the section's defaults.
+        val passed = passed_on(at, closure, names, repeated_at(target.decl))
+        val outer = c.current
+        c.current = id
+        val call = method_call(c, at, at, held_receiver, m, passed.args, None, Some(closure.result), false, passed.checked)
+        c.current = outer
+        c.bodies[id] = Some(call)
+    else
+        var args: Buf[&TExpr] = buf()
+        args.push(held_receiver)
+        for i in 0..<closure.params.len()
+            args.push(TExpr(at, closure.params[i], Local(closure.locals[i])))
+        c.bodies[id] = Some(TExpr(at, closure.result, method_call_kind(c, receiver.ty, m, args, solved, false)))
     var items: Buf[&TExpr] = buf()
     if !on_type then items.push(TExpr(receiver.span, Unit, Let(held, receiver)))
     items.push(TExpr(at, ty, FunctionValue(id, buf())))
     TExpr(at, ty, Block(items))
+
+/** The closure a function value is made as: its symbol, the parameter types and result of its function
+ * type, and the local each parameter is held in. */
+private struct ValueClosure
+    id: usize
+    params: Buf[&Type]
+    result: &Type
+    locals: Buf[usize]
+
+// A closure, of function type `ty` with parameters named `names`, declared in the code being checked,
+// whose body the caller gives it.
+private value_closure(c: *Checker, at: Span, ty: &Type, names: Buf[string]) -> ValueClosure
+    var params: Buf[&Type] = buf()
+    var result: &Type = ErrorType
+    if *ty is Function(ps, r, _)
+        params = ps
+        result = r
+    val enclosing = c.symbols[c.current]
+    val decl = Function(buf(), at, at, "lambda", buf(), buf(), None, None, buf(), false)
+    val id = c.symbols.len()
+    c.symbols.push(FunctionSymbol(enclosing.unit, enclosing.module_name, "lambda", decl, params, names, Some(result), None, Some(c.body.root), buf(), buf(), buf(), true, false, true, buf(), None, id, buf(), None, false, true, "", None, false))
+    c.states.push(2)
+    c.bodies.push(None)
+    c.locals.push(buf())
+    var locals: Buf[usize] = buf()
+    for i in 0..<params.len()
+        val index = c.body.locals.len()
+        c.body.locals.push(TLocal(if i < names.len() then names[i] else "", params[i], false, id))
+        locals.push(index)
+    c.symbols[id].param_locals = locals
+    ValueClosure(id, params, result, locals)
+
+/** The arguments a closure passes on to the function it calls, already checked: each of its
+ * parameters by position, a repeated parameter's vector spliced in. */
+private struct PassedOn
+    args: Buf[Argument]
+    checked: Buf[Option[&TExpr]]
+
+private passed_on(at: Span, closure: ValueClosure, names: Buf[string], repeated: Option[usize]) -> PassedOn
+    var args: Buf[Argument] = buf()
+    var checked: Buf[Option[&TExpr]] = buf()
+    for i in 0..<closure.params.len()
+        val name = if i < names.len() then names[i] else "_"
+        val read: &Expr = Expr(at, Name(name))
+        val value: &Expr = if repeated == Some(i) then Expr(at, Splice(read)) else read
+        args.push(Argument(at, None, value, false))
+        checked.push(Some(TExpr(at, closure.params[i], Local(closure.locals[i]))))
+    PassedOn(args, checked)
 
 // Whether the expected type is a function type: the one place a method declared with an empty
 // parameter list may be named without a call.
@@ -15818,11 +16254,11 @@ private type_apply(c: *Checker, e: &Expr, target: &Expr, types: Buf[&TypeExpr], 
             if abstract_constructor(c, id, target.span) then return TExpr(e.span, ErrorType, UnitConst)
             return named_function_value(c, e.span, name, Some(types), expected)
         if lookup_local(c, name) is None && param_index(c, name) is None
-            val (chosen, is_variant) = choose_variant(c, target.span, name, expected)
+            val (chosen, is_variant) = choose_variant(c, target.span, name, made_type(c, expected))
             if chosen is Some(v)
                 if c.data[v.data].variants[v.index].fields.len() == 0
                     return construct(c, e.span, target.span, v, buf(), Some(types), expected)
-                return variant_needs_call(c, e.span, name)
+                return variant_function(c, e.span, e, name, v, Some(types), expected)
             elif is_variant then return TExpr(e.span, ErrorType, UnitConst)
     if target.kind is Member(inner, name)
         // A variant reached through its type with the type arguments on the variant, `T.V[A]`.
@@ -15833,7 +16269,7 @@ private type_apply(c: *Checker, e: &Expr, target: &Expr, types: Buf[&TypeExpr], 
             if on_type is Some(_)
                 c.note(unit_of(c), target.span, "a variant's type arguments are written once, on its type or on the variant")
                 return TExpr(e.span, ErrorType, UnitConst)
-            return qualified_variant_value(c, e.span, Some(v), Some(types), expected)
+            return qualified_variant_value(c, e, Some(v), Some(types), expected)
     // A method named without a call, with its own type arguments, as in `box.convert[int]`.
     if target.kind is Member(inner, name)
         val object = check_expr(c, inner, None)
@@ -16730,18 +17166,20 @@ private joined_types(types: Buf[&Type]) -> string
 private takes_params(c: *Checker, t: &Type, ms: Buf[usize], wanted: Buf[&Type]) -> bool
     for m in ms
         val s = c.symbols[m]
-        val total = s.params.len() - 1
+        // A `using` section is filled where the call is made, so it takes no part.
+        val total = s.params.len() - 1 - section_size(s.decl)
         var required = total
-        for i in 1..<s.defaults.len()
-            if s.defaults[i] is Some(_) && required > 0 then required -= 1
-        val variadic = s.decl.params.len() > 0 && s.decl.params[s.decl.params.len() - 1].variadic
+        for i in 1..<total + 1
+            if i < s.defaults.len() && s.defaults[i] is Some(_) && required > 0 then required -= 1
+        val repeated = repeated_at(s.decl)
+        val variadic = repeated is Some(_)
         if variadic && required > 0 then required -= 1
         if wanted.len() < required || (wanted.len() > total && !variadic) then continue
         if s.decl.type_params.len() > 0 then return true
         var all = true
         for i in 0..<wanted.len()
-            if i + 1 >= s.params.len() then break
-            if variadic && i + 2 == s.params.len() then break
+            if i >= total then break
+            if repeated == Some(i) then break
             if !fits(c, wanted[i], seen_from(c, t, m, s.params[i + 1])) then all = false
         if all then return true
     false
@@ -16772,7 +17210,10 @@ private forwarder(c: *Checker, f: usize, k: usize, tm: usize, several: bool) -> 
         overload = overload + type_name(ty)
         val read = Expr(at, Name(base.param_names[i]))
         val variadic = i - 1 < base.decl.params.len() && base.decl.params[i - 1].variadic
-        args.push(Argument(at, None, if variadic then Expr(at, Splice(read)) else read, false))
+        // A contextual parameter is passed on by name, the one way an argument reaches one.
+        val contextual = i - 1 < base.decl.params.len() && base.decl.params[i - 1].contextual
+        val named: Option[string] = if contextual then Some(base.param_names[i]) else None
+        args.push(Argument(at, named, if variadic then Expr(at, Splice(read)) else read, false))
     val via = Expr(at, Member(Expr(at, Name("self")), fw.decl.via))
     val member = Expr(at, Member(via, item.name))
     val body = if base.decl.parameterless then member else Expr(at, Call(member, args))
@@ -17098,6 +17539,177 @@ private binding_expr(c: *Checker, e: &Expr, name: string, declared: Option[&Type
     val index = declare_local(c, e.span, name, ty, mutable)
     // A binding whose value never finishes does not finish either.
     TExpr(e.span, if *typed.ty is Nothing then Nothing else Unit, Let(index, typed))
+
+/** The givens of modules and objects, once every value's type is known: each of a type a given may
+ * have, and at most one of each type at a module's top level (all its files together) and in an
+ * object's body. A class, trait or actor body declares none: its context comes as `using` parameters
+ * of its constructor. */
+private check_givens(c: *Checker)
+    for i in 0..<c.globals.len()
+        val g = c.globals[i]
+        if !g.given then continue
+        val ty = zonk(c, c.symbols[g.init].result.unwrap_or(ErrorType))
+        val problem = given_type_problem(c, ty, "a given")
+        if problem != ""
+            c.note(g.unit, g.span, problem)
+            continue
+        for j in 0..<i
+            val h = c.globals[j]
+            if !h.given || h.module_name != g.module_name then continue
+            if same_type(zonk(c, c.symbols[h.init].result.unwrap_or(ErrorType)), ty)
+                c.note(g.unit, g.span, s"`${g.name}` is a second given of type `${type_name(ty)}` at this module's top level, beside `${h.name}` (${place_of(c, h.unit, g.unit, h.span)})")
+                break
+    for k in 0..<c.classes.len()
+        val cls = c.classes[k]
+        var names: Buf[string] = buf()
+        var types: Buf[&Type] = buf()
+        var spans: Buf[Span] = buf()
+        for m in cls.decl.members
+            m match
+                FieldMember(f) ->
+                    if !f.given then continue
+                    if cls.decl.modifier == "trait"
+                        c.note(cls.unit, f.span, "a trait declares no givens: a given is a value, and a trait's state is each implementing type's; declare it at the module's top level or in an object")
+                        continue
+                    if !cls.decl.object
+                        c.note(cls.unit, f.span, "a class or an actor declares no givens in its body: it takes its context as `using` parameters of its constructor, which are givens in its body")
+                        continue
+                    var ty: &Type = ErrorType
+                    for field in cls.fields
+                        if field.owner == k && field.name == f.name
+                            ty = zonk(c, field.ty.unwrap_or(ErrorType))
+                            break
+                    val problem = given_type_problem(c, ty, "a given")
+                    if problem != ""
+                        c.note(cls.unit, f.span, problem)
+                        continue
+                    for j in 0..<names.len()
+                        if same_type(types[j], ty)
+                            c.note(cls.unit, f.span, s"`${f.name}` is a second given of type `${type_name(ty)}` in `${cls.name}`, beside `${names[j]}` (line ${c.units[cls.unit].src.locate(spans[j].start).line})")
+                            break
+                    names.push(f.name)
+                    types.push(ty)
+                    spans.push(f.span)
+                _ -> ()
+
+/** Where `span` of `unit` is, said from `from`: its line, and its file's name where that is another. */
+private place_of(c: *Checker, unit: usize, from: usize, span: Span) -> string
+    val line = c.units[unit].src.locate(span.start).line
+    if unit == from then s"line $line" else s"${c.units[unit].src.name}, line $line"
+
+/** A contextual parameter's type, `written`: a type a given may have, naming no type parameter, of the
+ * function or of an enclosing class, trait or impl, since every call resolves it the same way. */
+private check_contextual_param(c: *Checker, unit: usize, p: Param, written: &Type)
+    val name = p.pattern.kind match
+        Name(n) -> n
+        _ -> "_"
+    val t = zonk(c, written)
+    if type_parameter_named(t) is Some(tp)
+        var bound = ""
+        *t match
+            Class(_, head, _) -> bound = s": `[$tp: $head]`"
+            Data(_, head, _) -> bound = s": `[$tp: $head]`"
+            _ -> ()
+        c.note(unit, p.span, s"`$name: ${type_name(t)}` names the type parameter `$tp`; a contextual parameter's type is fixed where its function is declared, and what `$tp` needs is a bound$bound")
+        return
+    val problem = given_type_problem(c, t, "a contextual parameter")
+    if problem != "" then c.note(unit, p.span, problem)
+
+/** Whether `f` declares a `using` section. */
+takes_using(f: &Function) -> bool
+    for p in f.params
+        if p.contextual then return true
+    false
+
+/** Reports a `using` section on a function nothing calls with one: a binding to foreign code, a
+ * `@test` function or a test hook. `main` is reported where the entry point is checked. */
+private refuse_using_section(c: *Checker, unit: usize, f: &Function)
+    for a in f.annotations
+        if a.name == "sysl" || a.name == "c"
+            c.note(unit, f.name_span, s"a `@${a.name}` binding takes no `using` section: its parameters are the foreign function's")
+            return
+        if a.name == "test" || is_hook_annotation(a.name)
+            c.note(unit, f.name_span, s"a `@${a.name}` function takes no `using` section: the runner calls it with nothing, so it declares the givens it needs in its body")
+            return
+
+/** `given name = value` in a block: a `val`, held to the types a given may have, and recorded as a
+ * given of the block, which holds at most one of each type. */
+private given_binding_expr(c: *Checker, e: &Expr, name: string, declared: Option[&TypeExpr], value: &Expr) -> &TExpr
+    val unit = unit_of(c)
+    var want: Option[&Type] = None
+    if declared is Some(d) then want = Some(resolve_type(c, unit, d))
+    val typed = check_expr(c, value, want)
+    var ty = typed.ty
+    if want is Some(w)
+        if !fits(c, typed.ty, w) then c.note(unit, value.span, expected_found(c, w, typed.ty))
+        ty = w
+    ty = zonk(c, ty)
+    val problem = given_type_problem(c, ty, "a given")
+    if problem != "" then c.note(unit, e.span, problem)
+    else
+        for g in c.body.givens
+            if !local_in_block(c, g.local) then continue
+            val other = c.body.locals[g.local]
+            if same_type(zonk(c, other.ty), ty)
+                c.note(unit, e.span, s"`$name` is a second given of type `${type_name(ty)}` in this block, beside `${other.name}` (line ${c.units[unit].src.locate(g.span.start).line})")
+                break
+    val index = declare_local(c, e.span, name, ty, false)
+    c.body.givens.push(GivenLocal(index, e.span, c.body.block_start))
+    TExpr(e.span, if *typed.ty is Nothing then Nothing else Unit, Let(index, typed))
+
+/** Whether local `index` is declared in the innermost block, and in scope there. */
+private local_in_block(c: *Checker, index: usize) -> bool
+    for i in c.body.block_start..<c.body.visible.len()
+        if c.body.visible[i] == index then return true
+    false
+
+/** Why a value of type `ty` cannot be `what` (a given, or a contextual parameter), or "" where it can:
+ * its type is a class, an object's type, a trait used as a type, a data type or an opaque type, and
+ * names no type parameter. A type of any other kind would be given wherever any value of it is asked
+ * for. */
+given_type_problem(c: *Checker, ty: &Type, what: string) -> string
+    val t = zonk(c, ty)
+    val shown = type_name(t)
+    var nominal = false
+    *t match
+        ErrorType -> return ""
+        Class(k, name, _) ->
+            if is_trait(c, k) && mentions_self(c, k, 0) then return s"`$name` is only a bound, since a method of it names `Self` or is static, so it is no type of $what"
+            nominal = true
+        Data(_, _, _) -> nominal = true
+        Opaque(_, _, _, _) -> nominal = true
+        _ -> ()
+    if !nominal
+        if type_parameter_named(t) is Some(p)
+            return s"`$p` is a type parameter, and $what's type is fixed where it is declared: what `$p` needs is a bound"
+        return s"$what is of a class, object, trait or data type: `$shown` would be given wherever ${article(shown)} `$shown` is asked for; give it a type of its own (`data Retries(count: int)`)"
+    if type_parameter_named(t) is Some(p)
+        return s"`$shown` names the type parameter `$p`, and $what's type is fixed where it is declared: what `$p` needs is a bound"
+    ""
+
+/** The first type parameter `t` names, if any: a bare one, or one among its arguments or parts. */
+type_parameter_named(t: &Type) -> Option[string]
+    *t match
+        TypeVar(owner, _, name) -> return if owner == hole_owner() then None else Some(name)
+        Class(_, _, args) -> return type_parameter_among(args)
+        Data(_, _, args) -> return type_parameter_among(args)
+        Opaque(_, _, args, _) -> return type_parameter_among(args)
+        Tuple(items) -> return type_parameter_among(items)
+        Union(members) -> return type_parameter_among(members)
+        Function(params, result, _) ->
+            if type_parameter_among(params) is Some(p) then return Some(p)
+            return type_parameter_named(result)
+        ByName(inner) -> return type_parameter_named(inner)
+        Applied(head, args) ->
+            if type_parameter_named(head) is Some(p) then return Some(p)
+            return type_parameter_among(args)
+        Constructor(body, _) -> return type_parameter_named(body)
+        _ -> return None
+
+private type_parameter_among(types: Buf[&Type]) -> Option[string]
+    for t in types
+        if type_parameter_named(t) is Some(p) then return Some(p)
+    None
 
 /** Whether `name` is a variant of `ty`, a data type with refined variants. */
 private names_refined_variant(c: *Checker, ty: &Type, name: string) -> bool
@@ -17662,8 +18274,10 @@ private variant_use(c: *Checker, at: Span, target: &Expr, name: string) -> Optio
     if no_such_variant(c, at, path) then return Some((None, None))
     None
 
-// `T.V` not called: a variant without fields, made; one with fields is reported, as its bare name is.
-private qualified_variant_value(c: *Checker, at: Span, found: Option[VariantRef], explicit: Option[Buf[&TypeExpr]], expected: Option[&Type]) -> &TExpr
+// `T.V` not called, `e`: a variant without fields, made; one with fields is its function value, as
+// its bare name is.
+private qualified_variant_value(c: *Checker, e: &Expr, found: Option[VariantRef], explicit: Option[Buf[&TypeExpr]], expected: Option[&Type]) -> &TExpr
+    val at = e.span
     val v = found match
         Some(v) -> v
         None -> return TExpr(at, ErrorType, UnitConst)
@@ -17672,14 +18286,96 @@ private qualified_variant_value(c: *Checker, at: Span, found: Option[VariantRef]
             if c.data[v.data].variants[v.index].result is Some(_) then return construct(c, at, at, v, buf(), None, Some(written_instance(c, v, types)))
         return construct(c, at, at, v, buf(), explicit, expected)
     val written = c.data[v.data].name + "." + c.data[v.data].variants[v.index].name
-    c.note(unit_of(c), at, s"`$written` has fields; call it, as in `$written(arguments)`")
-    TExpr(at, ErrorType, UnitConst)
+    variant_function(c, at, e, written, v, explicit, expected)
 
-// A variant with fields named with type arguments and not called, as in `Some[int]`: reported, since
-// a variant with fields is not a value.
-private variant_needs_call(c: *Checker, at: Span, name: string) -> &TExpr
-    c.note(unit_of(c), at, s"`$name` has fields; call it, as in `$name(arguments)`")
-    TExpr(at, ErrorType, UnitConst)
+/** Whether a value of type `got` may be given where `want` is expected, or either is still open. */
+private fits_settled(c: *Checker, got: &Type, want: &Type) -> bool
+    val g = zonk(c, got)
+    val w = zonk(c, want)
+    has_unknowns(g) || has_unknowns(w) || *g is ErrorType || *w is ErrorType || fits(c, g, w)
+
+/** The type a value made where `expected` is wanted has: the result of an expected function type,
+ * which decides among variants sharing a name as the type itself would. */
+private made_type(c: *Checker, expected: Option[&Type]) -> Option[&Type]
+    val t = expected?
+    *zonk(c, t) match
+        Function(_, r, _) -> Some(r)
+        _ -> Some(t)
+
+// A variant with fields named and not called, `callee` as written (`Heard`, `Event.Heard`,
+// `Some[int]`): its constructor as a function value, as a class's name is its constructor. The value
+// is a lambda taking the variant's fields, in order, and making the variant from them, so the
+// variant's own rules hold at the call it makes: a generic variant's type arguments come from the
+// expected function type, or from written ones; the result is the data type, or a refined variant's
+// declared instance. Where a function type of as many parameters is expected, its parameters stand
+// in for the fields' and its result is the one the variant is made at; elsewhere the value's type is
+// the variant's own, `(text: string) -> Msg` taken as `(string) -> Msg`.
+private variant_function(c: *Checker, at: Span, callee: &Expr, written: string, v: VariantRef, explicit: Option[Buf[&TypeExpr]], expected: Option[&Type]) -> &TExpr
+    val unit = unit_of(c)
+    // Where a value of the variant's own type is expected, the call was meant.
+    if expected is Some(t)
+        if *zonk(c, t) is Data(id, _, _) && id == v.data
+            c.note(unit, at, s"`$written` has fields; call it, as in `$written(arguments)`")
+            return TExpr(at, ErrorType, UnitConst)
+    val s = variant_signature(c, v)
+    val first = c.vars.len()
+    var type_args: Buf[&Type] = buf()
+    var writable: Buf[usize] = buf()
+    for i in 0..<s.type_params.len()
+        var preset: Option[&Type] = None
+        if i < s.fixed.len()
+            if s.fixed[i] is Some(t) then preset = Some(t)
+        preset match
+            Some(t) -> type_args.push(t)
+            None ->
+                type_args.push(fresh_var(c))
+                writable.push(i)
+    // Written type arguments fix the instance; too many are reported by the call the value makes.
+    if explicit is Some(types)
+        val fitting = if types.len() > writable.len() then writable.len() else types.len()
+        for i in 0..<fitting
+            unify(c, type_args[writable[i]], resolve_type_arg(c, unit, types[i], s.type_params, writable[i]))
+    val fields = substitute_all(s.params, s.owner, type_args)
+    val made = substitute(s.result, s.owner, type_args)
+    var params: Buf[&Type] = buf()
+    var result = made
+    var sendable = false
+    var matched = false
+    if expected is Some(t)
+        if *zonk(c, t) is Function(ps, r, m)
+            if ps.len() == fields.len()
+                matched = true
+                sendable = m
+                result = r
+                for i in 0..<ps.len()
+                    val want = zonk(c, ps[i])
+                    if has_unknowns(want) then unify(c, want, fields[i])
+                    params.push(zonk(c, ps[i]))
+                // An expected type the variant does not fit is reported as the value's own type
+                // against it, as any function value's is, rather than inside the call it makes.
+                for i in 0..<ps.len()
+                    if !fits_settled(c, params[i], fields[i]) then matched = false
+                if !fits_settled(c, made, r) then matched = false
+                if !matched
+                    params.clear()
+                    result = made
+                    sendable = false
+    if !matched
+        for f in fields
+            params.push(zonk(c, f))
+    // A parameter neither the expected type nor written type arguments decide leaves the value's type
+    // open, as a generic function's name leaves it.
+    for p in params
+        if *p is Var(x)
+            var named = "a type argument"
+            var sample = "int"
+            for i in 0..<type_args.len()
+                if *zonk(c, type_args[i]) is Var(y) && x == y && y >= first
+                    named = s"`${s.type_params[i].name}`"
+                    sample = sample_type_arg(s.type_params[i])
+            c.note(unit, at, s"cannot infer $named for `$written` used as a value; write it, as in `$written[$sample]`")
+            return TExpr(at, ErrorType, UnitConst)
+    calling_lambda_of(c, at, callee, params.len(), Function(params, result, sendable))
 
 // `T.V(args)`: the variant made from the arguments. Type arguments are written once, on the type,
 // `T[A].V(…)`, or on the variant, `T.V[A](…)`.
@@ -17836,32 +18532,50 @@ private struct InitOrder
 // keep their declaration order. A value that needs itself is a cycle, reported with the values it
 // passes through.
 // A call through a method table reaches the method the call names or any override of it: the method
-// of that name in the same slot of any class's table. Every one counts as called.
+// of that name in the same slot of the table of a class its receiver may have. A class's method is
+// overridden only in the classes descending from it; a trait's is implemented by any class or data
+// type. Every one counts as called.
 private with_implementations(c: *Checker, uses: Uses) -> Uses
     var u = uses
     for i in 0..<u.dispatched.len()
         val name = c.symbols[u.dispatched[i]].decl.name
         val slot = u.dispatched_slots[i]
-        for k in c.classes
+        var declared: Option[usize] = None
+        if c.symbols[u.dispatched[i]].owner_class is Some(o)
+            if !is_trait(c, o) then declared = Some(o)
+        for kk in 0..<c.classes.len()
+            val k = c.classes[kk]
+            if declared is Some(o)
+                if !descends(c, kk, o) then continue
             if slot < k.table.len()
                 if k.table[slot] is Some(m)
                     if c.symbols[m].decl.name == name then add_function(&u, m)
+        // A class's method is never in a data type's table.
+        if declared is Some(_) then continue
         // A method table of a data type is called through a bound as well.
         for d in c.data
             if slot < d.table.len()
                 if d.table[slot] is Some(m)
                     if c.symbols[m].decl.name == name then add_function(&u, m)
     // An operator on a data type or a class calls the core trait method in the type's table. A data
-    // type's own operator is found in its table; the rest, which may be a class with subclasses, a
+    // type's own operator is found in its table, and a class's in the table of that class or of a
+    // class descending from it, the classes its values may have. The rest, which may be a trait, a
     // type parameter, `Any`, or an equality that compares fields and elements by their own methods,
     // reaches every method of that name.
     for i in 0..<u.operators.len()
         val name = u.operators[i]
         var own: Option[usize] = None
+        var class_of: Option[usize] = None
         if name != "equals"
-            if *u.operator_types[i] is Data(id, _, _) then own = Some(id)
+            *zonk(c, u.operator_types[i]) match
+                Data(id, _, _) -> own = Some(id)
+                Class(id, _, _) -> if !is_trait(c, id) then class_of = Some(id)
+                _ -> ()
         if own is Some(d)
             add_named(c, &u, c.data[d].table, name)
+        elif class_of is Some(declared)
+            for kk in 0..<c.classes.len()
+                if descends(c, kk, declared) then add_named(c, &u, c.classes[kk].table, name)
         else
             for k in c.classes
                 add_named(c, &u, k.table, name)
@@ -19086,6 +19800,87 @@ private builtin_operator_message(name: string, arity: usize, target: &Type) -> s
         return s"`$name` is the language's operator on ${type_name(target)}, and no method can redefine it"
     s"a prefix `$name` on ${type_name(target)} is the language's own, and no method can define it; only a data type, a class or a trait has a method `$name` taking no argument"
 
+/** Whether a method `name` with parameters `params`, the receiver first, that an impl of no trait adds
+ * to the built-in type `target`, is an operator with a built-in value on its left: a binary
+ * arithmetic, ordering, bitwise or shift operator taking one argument of a data type, a class, a
+ * trait or an opaque type, as `impl real` adding `*(v: Vec) -> Vec` for `k * v`. The operand's type
+ * is never built-in, so an operator between two built-in values stays the machine's. */
+private scalar_left_operator(c: *Checker, name: string, params: Buf[&Type], target: &Type) -> bool
+    if !scalar_builtin(target) || params.len() != 2 then return false
+    if !(arithmetic_method_name(name) || bitwise_method_name(name)) then return false
+    program_operand_type(zonk(c, params[1]))
+
+/** Whether `t` is a type a program declares rather than one the language builds in: a data type, a
+ * class, a trait or an opaque type, of any type arguments. */
+private program_operand_type(t: &Type) -> bool = *t match
+    Data(_, _, _) -> true
+    Class(_, _, _) -> true
+    Opaque(_, _, _, _) -> true
+    _ -> false
+
+// What a method named by a binary operator, added to a built-in type, is told where its operand's
+// type is built-in too: an operator between two built-in values is the machine's.
+private scalar_left_message(name: string, target: &Type) -> string = s"`$name` is the language's operator on ${type_name(target)}, and no method can redefine it; a method `$name` added to ${type_name(target)} takes one argument of a data type, a class, a trait or an opaque type"
+
+/** The type a built-in left operand of `left op right` is the receiver of a method `op` as: `l` where an
+ * impl adds `l`'s type a method of the name for the right operand's type `r`, a data type, a class, a
+ * trait or an opaque type (`k * v`). An integer literal on the left that `int` has no such method for
+ * is the `long`, then the `real`, that has one, as a literal takes the type it meets elsewhere: `2 * v`
+ * with `real` adding `*`. `None` where no such method serves, and the operator keeps its own meaning. */
+private scalar_left_type(c: *Checker, name: string, left: &Expr, l: &Type, r: &Type) -> Option[&Type]
+    if scalar_left_method(c, name, l, r) && scalar_left_fits(c, name, l, r) then return Some(zonk(c, l))
+    if is_literal(left) && *zonk(c, l) is Int(32)
+        val long_type: &Type = Int(64)
+        if scalar_left_method(c, name, long_type, r) && scalar_left_fits(c, name, long_type, r) then return Some(long_type)
+        val real_type: &Type = Real
+        if scalar_left_method(c, name, real_type, r) && scalar_left_fits(c, name, real_type, r) then return Some(real_type)
+    // Where none fits, the call names the overloads there are.
+    if scalar_left_method(c, name, l, r) then return Some(zonk(c, l))
+    None
+
+/** Reports `l op r`, a built-in `l` and an `r` of a type of the program, where the method `op` that
+ * takes `r` is one an extension adds to `l`'s type in a module this file does not import. */
+private refuse_unseen_scalar_left(c: *Checker, at: Span, name: string, l: &Type, r: &Type) -> bool
+    val x = zonk(c, l)
+    val y = zonk(c, r)
+    if !scalar_builtin(x) || !program_operand_type(y) then return false
+    for tm in c.trait_methods
+        val m = tm.function
+        val s = c.symbols[m]
+        if s.decl.name != name || s.params.len() != 2 || !added_applies(c, x, tm) || extension_seen(c, tm) then continue
+        val p = zonk(c, s.params[1])
+        if !(same_head(p, y) || is_trait_type(c, p) || fits(c, y, p)) then continue
+        c.note(unit_of(c), at, s"`$name` taking ${type_name(y)} is added to `${impls_owner(c, m)}` by ${module_label(s.module_name)}, which this file does not import")
+        return true
+    false
+
+/** Whether one of built-in type `l`'s methods `name` plainly takes a value of type `r`: one of `r`'s
+ * type with any type arguments, one `r` fits, or a trait, which the call itself checks `r` against. */
+private scalar_left_fits(c: *Checker, name: string, l: &Type, r: &Type) -> bool
+    val y = zonk(c, r)
+    for m in methods_of(c, zonk(c, l), name)
+        val s = c.symbols[m]
+        if s.params.len() >= 2
+            val p = zonk(c, s.params[1])
+            if same_head(p, y) || is_trait_type(c, p) || fits(c, y, p) then return true
+    false
+
+/** Whether built-in type `l` has a method `name` taking one argument that `l op r` calls, `r` being a
+ * data type, a class, a trait or an opaque type. A type that takes integers or decimals still meets a
+ * number by conversion (`i * big`), unless one of the methods takes that type itself. */
+private scalar_left_method(c: *Checker, name: string, l: &Type, r: &Type) -> bool
+    val x = zonk(c, l)
+    val y = zonk(c, r)
+    if !scalar_builtin(x) || !settled(y) || !program_operand_type(y) then return false
+    val ms = methods_of(c, x, name)
+    if !takes_one_argument(c, ms) then return false
+    if !(takes_integers(c, y) || takes_decimals(c, y)) then return true
+    for m in ms
+        val s = c.symbols[m]
+        if s.params.len() >= 2
+            if same_head(zonk(c, s.params[1]), y) then return true
+    false
+
 // A prefix operator on a data type, a class or a type parameter with a method of its name taking no
 // argument is a call of that method, whatever it yields: `-a` is `a.-()`, `!a` is `a.!()`. Where the
 // type has none, `None`, and the operator keeps its own meaning.
@@ -19108,6 +19903,11 @@ private binary_expr(c: *Checker, e: &Expr, op: BinaryOp, left: &Expr, right: &Ex
         val l = check_expr(c, left, Some(r.ty))
         // A literal that became a value of a type with a method of the operator's name calls it.
         if operator_method(c, op, l.ty) then return operator_method_call(c, e.span, op_span, left, l, binary_spelling(op), checked_slot(c, r), expected)
+        // So does a literal beside a value of a type of the program that its type has such a method
+        // for: `2.0 * v`.
+        if scalar_left_type(c, binary_spelling(op), left, l.ty, r.ty) is Some(as_type)
+            val receiver = if same_type(as_type, zonk(c, l.ty)) then l else check_expr(c, left, Some(as_type))
+            return operator_method_call(c, e.span, op_span, left, receiver, binary_spelling(op), checked_slot(c, r), expected)
         return operate(c, e.span, op_span, op, binary_spelling(op), l, r)
     val l = refined_operand(c, check_expr(c, left, expected))
     if operator_method(c, op, l.ty)
@@ -19125,7 +19925,12 @@ private binary_expr(c: *Checker, e: &Expr, op: BinaryOp, left: &Expr, right: &Ex
                 val arg = if integer_type(c, zonk(c, r.ty)) then from_integer(c, r, zonk(c, l.ty)) elif big_int_beside(c, r.ty, l.ty) then from_big_int(c, r, zonk(c, l.ty)) else r
                 return operator_method_call(c, e.span, op_span, left, l, binary_spelling(op), checked_slot(c, arg), expected)
         return operator_method_call(c, e.span, op_span, left, l, binary_spelling(op), right, expected)
-    operate(c, e.span, op_span, op, binary_spelling(op), l, refined_operand(c, check_expr(c, right, Some(l.ty))))
+    val r = refined_operand(c, check_expr(c, right, Some(l.ty)))
+    // A built-in value beside a value of a type of the program calls the method its type has for it,
+    // where an impl adds one: `k * v`.
+    if scalar_left_type(c, binary_spelling(op), left, l.ty, r.ty) is Some(_) then return operator_method_call(c, e.span, op_span, left, l, binary_spelling(op), checked_slot(c, r), expected)
+    if refuse_unseen_scalar_left(c, e.span, binary_spelling(op), l.ty, r.ty) then return TExpr(e.span, ErrorType, UnitConst)
+    operate(c, e.span, op_span, op, binary_spelling(op), l, r)
 
 // Whether one of the methods `ms` takes an integer as its first argument.
 private takes_an_integer(c: *Checker, ms: Buf[usize]) -> bool
@@ -19486,7 +20291,12 @@ private compare_expr(c: *Checker, e: &Expr, operands: Buf[&Expr], ops: Buf[Compa
     var methods: Buf[Option[LinkMethod]] = buf()
     for i in 0..<ops.len()
         methods.push(None)
-        if ordering_op(ops[i]) && ordering_method(c, ops[i], settle_operand(c, typed[i], typed[i + 1]).ty)
+        // A built-in value beside a value of a type of the program calls the method its type has for
+        // it, where an impl adds one: `k < v`; a literal takes the type that has it.
+        if ordering_op(ops[i])
+            if scalar_left_type(c, compare_spelling(ops[i]), operands[i], typed[i].ty, typed[i + 1].ty) is Some(as_type)
+                if !same_type(as_type, zonk(c, typed[i].ty)) then typed[i] = check_expr(c, operands[i], Some(as_type))
+        if ordering_op(ops[i]) && (ordering_method(c, ops[i], settle_operand(c, typed[i], typed[i + 1]).ty) || scalar_left_method(c, compare_spelling(ops[i]), typed[i].ty, typed[i + 1].ty))
             val left = settle_operand(c, typed[i], typed[i + 1])
             if ops.len() == 1 then return operator_method_call(c, e.span, e.span, checked_slot(c, left), left, compare_spelling(ops[0]), checked_slot(c, typed[1]), None)
             methods[i] = Some(link_method(c, ops[i], left, typed[i + 1]))
@@ -20798,7 +21608,7 @@ private yield_param(kind: string, start: usize, pattern: &Pattern) -> string = p
  * `body`. */
 private element_function(pattern: &Pattern, item: string, definitions: Buf[&Expr], body: &Expr) -> &Expr
     var params: Buf[LambdaParam] = buf()
-    params.push(LambdaParam(pattern.span, item, None))
+    params.push(LambdaParam(pattern.span, item, None, false))
     var items: Buf[&Expr] = buf()
     items.push(element_binding(pattern, name_at(pattern.span, item)))
     for d in definitions do items.push(d)
@@ -21105,8 +21915,22 @@ is_array_class(k: ClassSymbol) -> bool = k.module_name == CoreModule && k.name =
 /** Whether a class is the core library's `Vector`, whose one field is the array of its elements. */
 is_vector_class(k: ClassSymbol) -> bool = k.module_name == CoreModule && k.name == "Vector" && !k.decl.object
 
-/** Whether a function's last parameter is repeated, `values: T*`. */
-declares_variadic(f: &Function) -> bool = f.params.len() > 0 && f.params[f.params.len() - 1].variadic
+/** Whether a function has a repeated parameter, `values: T*`: its last, or its last before its `using`
+ * section. */
+declares_variadic(f: &Function) -> bool = repeated_at(f) is Some(_)
+
+/** The position among `f`'s written parameters of its repeated one, if it has one. */
+repeated_at(f: &Function) -> Option[usize]
+    for i in 0..<f.params.len()
+        if f.params[i].variadic then return Some(i)
+    None
+
+/** How many parameters `f`'s `using` section holds, which come last. */
+section_size(f: &Function) -> usize
+    var n = 0usize
+    for p in f.params
+        if p.contextual then n += 1
+    n
 
 /** `Vector[t]`: inside its function, a repeated parameter of element type `t` is a vector. */
 private vector_of(c: *Checker, t: &Type) -> &Type = core_class_of(c, "Vector", t)
@@ -21617,7 +22441,7 @@ private apply_text(c: *Checker, o: usize, m: usize) -> string
     for i in 1..<f.params.len()
         names.push(f.param_names[i])
         params.push(f.params[i])
-    candidate_text(c.classes[o].name + ".apply", f.type_params, names, params, declares_variadic(f.decl))
+    candidate_text(c.classes[o].name + ".apply", f.type_params, names, params, repeated_at(f.decl))
 
 // A call by the name of object `o`, which declares `apply`: `Name(…)` chooses among the object's
 // `apply` methods and, for a companion, the constructor its name has in call position, the class's
@@ -21637,7 +22461,7 @@ private apply_call(c: *Checker, at: Span, name_span: Span, name: string, o: usiz
     if variant is Some(v)
         val s = variant_signature(c, v)
         signatures.push(s)
-        labels.push(candidate_text(s.name, s.type_params, s.names, s.params, s.variadic))
+        labels.push(candidate_text(s.name, s.type_params, s.names, s.params, repeated_of(s)))
     val first_method = signatures.len()
     for m in ms
         signatures.push(method_signature(c, receiver, m, ErrorType))
@@ -21662,17 +22486,21 @@ private apply_value(c: *Checker, at: Span, name: string, o: usize, ids: Buf[usiz
     val receiver = global_read(c, at, c.classes[o].global.unwrap())
     val constructors = callable_constructors(c, ids)
     val ms = object_applies(c, o)
+    // A data type's variant of the object's name is its constructor, as a class's is.
+    var variants: Buf[VariantRef] = buf()
+    if companion_variant(c, o, name) is Some(v) then variants.push(v)
+    val first_method = constructors.len() + variants.len()
     var labels: Buf[string] = buf()
     var fitting: Buf[usize] = buf()
     var fitting_labels: Buf[string] = buf()
     var owners: Buf[usize] = buf()
     var counts: Buf[usize] = buf()
     var compared: Buf[Buf[&Type]] = buf()
-    for k in 0..<constructors.len() + ms.len()
-        val s = if k < constructors.len() then function_signature(c, constructors[k], ErrorType) else method_signature(c, receiver, ms[k - constructors.len()], ErrorType)
-        val label = if k < constructors.len() then overload_text(c, constructors[k]) else apply_text(c, o, ms[k - constructors.len()])
+    for k in 0..<first_method + ms.len()
+        val s = if k < constructors.len() then function_signature(c, constructors[k], ErrorType) elif k < first_method then variant_signature(c, variants[0]) else method_signature(c, receiver, ms[k - first_method], ErrorType)
+        val label = if k < constructors.len() then overload_text(c, constructors[k]) elif k < first_method then candidate_text(s.name, s.type_params, s.names, s.params, repeated_of(s)) else apply_text(c, o, ms[k - first_method])
         labels.push(label)
-        val view = substitute_all(s.params, s.owner, s.known)
+        val view = before_section(substitute_all(s.params, s.owner, s.known), s.section)
         if accepts(c, view, s.owner, s.type_params.len(), params)
             fitting.push(k)
             fitting_labels.push(label)
@@ -21688,11 +22516,12 @@ private apply_value(c: *Checker, at: Span, name: string, o: usize, ids: Buf[usiz
             c.note(unit, at, s"`$name` used as ${type_name(zonk(c, expected.unwrap()))} is ambiguous: ${joined_labels(fitting_labels)} each accept it")
             return TExpr(at, ErrorType, UnitConst)
     if k < constructors.len() then function_value(c, at, constructors[k], None, expected)
-    else method_value(c, at, receiver, ms[k - constructors.len()], None, expected)
+    elif k < first_method then variant_function(c, at, name_at(at, name), name, variants[0], None, expected)
+    else method_value(c, at, receiver, ms[k - first_method], None, expected)
 
 private function_signature(c: *Checker, id: usize, result: &Type) -> Signature
     val f = c.symbols[id]
-    Signature(f.name, true, f.type_params, f.type_owner, f.params, f.param_names, f.defaults, result, enclosing_type_args(f), None, declares_variadic(f.decl), function_sites(c, id, 0), buf())
+    Signature(f.name, true, f.type_params, f.type_owner, f.params, f.param_names, f.defaults, result, enclosing_type_args(f), None, declares_variadic(f.decl), function_sites(c, id, 0), buf(), section_size(f.decl))
 
 /** A generic local function's type arguments for the type parameters it shares with the code it is
  * declared in: those parameters themselves, as every call it can be named from sees them. */
@@ -21821,6 +22650,24 @@ private choose_among(c: *Checker, at: Span, name_span: Span, name: string, signa
             val fit = fits_call(c, bound_signatures[k], bindings[k], args, typed, written)
             if !bound_signatures[k].variadic && fit then fixed_fits = true
             if !untupling[k] && fit then direct_fits = true
+    // A collection literal checked by itself took its elements' own types, `{"a": "x"}` a
+    // `Map[string, string]`. Where no candidate takes it so, it is tried against each candidate's
+    // parameter instead, as it would be checked against a single function's, so it becomes the
+    // `Map[string, Param]` the one candidate it can be asks for.
+    if !any_fits(c, bound_signatures, bindings, args, typed, written)
+        var retried = false
+        for j in 0..<args.len()
+            if typed[j] is Some(_) && collection_literal(argument_value(args[j]))
+                typed[j] = None
+                trials.push(j)
+                retried = true
+        if retried
+            fixed_fits = false
+            direct_fits = false
+            for k in 0..<bound.len()
+                val fit = fits_call(c, bound_signatures[k], bindings[k], args, typed, written)
+                if !bound_signatures[k].variadic && fit then fixed_fits = true
+                if !untupling[k] && fit then direct_fits = true
     var considered: Buf[bool] = buf()
     for k in 0..<bound.len()
         considered.push(!(fixed_fits && bound_signatures[k].variadic) && !(direct_fits && untupling[k]) && fits_call(c, bound_signatures[k], bindings[k], args, typed, written))
@@ -22284,10 +23131,11 @@ private overload_text(c: *Checker, id: usize) -> string
         names.push(f.param_names[i])
         params.push(f.params[i])
     // A local function shows its own type parameters, not those it shares with the enclosing code.
-    candidate_text(f.name, if f.root is Some(_) then f.decl.type_params else f.type_params, names, params, declares_variadic(f.decl))
+    candidate_text(f.name, if f.root is Some(_) then f.decl.type_params else f.type_params, names, params, repeated_at(f.decl))
 
-/** A candidate of a call as written, for a diagnostic: "`f[T](x: T)`". */
-private candidate_text(name: string, type_params: Buf[TypeParam], names: Buf[string], params: Buf[&Type], variadic: bool) -> string
+/** A candidate of a call as written, for a diagnostic: "`f[T](x: T)`". `repeated` is the position of
+ * its repeated parameter among `params`. */
+private candidate_text(name: string, type_params: Buf[TypeParam], names: Buf[string], params: Buf[&Type], repeated: Option[usize]) -> string
     var text = name
     if type_params.len() > 0
         text = text + "["
@@ -22298,7 +23146,7 @@ private candidate_text(name: string, type_params: Buf[TypeParam], names: Buf[str
     text = text + "("
     for i in 0..<params.len()
         if i > 0 then text = text + ", "
-        text = text + names[i] + ": " + param_type_text(params[i], variadic && i + 1 == params.len())
+        text = text + names[i] + ": " + param_type_text(params[i], repeated == Some(i))
     "`" + text + ")`"
 
 /** A parameter's type as declared: a repeated parameter, held as `Vector[T]`, is written `T*`. */
@@ -22935,12 +23783,12 @@ private takes_one_argument(c: *Checker, ms: Buf[usize]) -> bool
     for m in ms
         val s = c.symbols[m]
         var required = 0usize
-        // A repeated parameter takes zero arguments or more, so it is never required.
-        val repeated = declares_variadic(s.decl)
+        // A repeated parameter takes zero arguments or more, so it is never required, and a `using`
+        // section is filled from the givens.
         for i in 1..<s.params.len()
-            if repeated && i + 1 == s.params.len() then continue
+            if !written_required(s, i) then continue
             if i >= s.defaults.len() || s.defaults[i] is None then required += 1
-        if required <= 1 && s.params.len() >= 2 then return true
+        if required <= 1 && s.params.len() - section_size(s.decl) >= 2 then return true
     false
 
 // Whether one of the methods `ms` can be called with no argument: the method `-` a prefix `-` calls.
@@ -22948,12 +23796,18 @@ private takes_no_argument(c: *Checker, ms: Buf[usize]) -> bool
     for m in ms
         val s = c.symbols[m]
         var required = 0usize
-        val repeated = declares_variadic(s.decl)
         for i in 1..<s.params.len()
-            if repeated && i + 1 == s.params.len() then continue
+            if !written_required(s, i) then continue
             if i >= s.defaults.len() || s.defaults[i] is None then required += 1
         if required == 0 then return true
     false
+
+/** Whether parameter `i` of method `s` (its receiver at 0) is one a call writes an argument for unless
+ * it has a default: neither its repeated parameter nor in its `using` section. */
+private written_required(s: FunctionSymbol, i: usize) -> bool
+    if i == 0 || i - 1 >= s.decl.params.len() then return true
+    val p = s.decl.params[i - 1]
+    !p.variadic && !p.contextual
 
 // An infix call of a method that takes some other number of arguments. A tuple written as the
 // argument is spelled back as the arguments of a dotted call.
@@ -23069,7 +23923,7 @@ private method_signature(c: *Checker, receiver: &TExpr, m: usize, result: &Type)
         params.push(with_self(c, m, receiver.ty, target.params[i]))
         names.push(target.param_names[i])
         defaults.push(if i < target.defaults.len() then target.defaults[i] else None)
-    Signature(target.decl.name, true, target.type_params, target.type_owner, params, names, defaults, with_self(c, m, receiver.ty, result), known, Some(receiver), declares_variadic(target.decl), function_sites(c, m, 1), buf())
+    Signature(target.decl.name, true, target.type_params, target.type_owner, params, names, defaults, with_self(c, m, receiver.ty, result), known, Some(receiver), declares_variadic(target.decl), function_sites(c, m, 1), buf(), section_size(target.decl))
 
 /** Type `t` of method `m` with the `Self` of a trait declaring `m` as the receiver's type. */
 private with_self(c: *Checker, m: usize, receiver_type: &Type, t: &Type) -> &Type
@@ -23380,14 +24234,14 @@ private variant_signature(c: *Checker, v: VariantRef) -> Signature
                     kept.push(if kept_constructor(args[i], owner, i) then TypeVar(owner, i, d.decl.type_params[i].name) else args[i])
                 Data(id, name, kept)
             _ -> r
-        None -> return Signature(variant.name, called, variant.params, owner, variant.fields, variant.field_names, variant.defaults, own_type(d, v.data), buf(), None, false, variant_sites(c, v), buf())
+        None -> return Signature(variant.name, called, variant.params, owner, variant.fields, variant.field_names, variant.defaults, own_type(d, v.data), buf(), None, false, variant_sites(c, v), buf(), 0)
     var fixed: Buf[Option[&Type]] = buf()
     for j in 0..<variant.params.len()
         var named = names_type_var(result, owner, j)
         for f in variant.fields
             if names_type_var(f, owner, j) then named = true
         fixed.push(if named then None else Some(Nothing))
-    Signature(variant.name, called, variant.params, owner, variant.fields, variant.field_names, variant.defaults, result, buf(), None, false, variant_sites(c, v), fixed)
+    Signature(variant.name, called, variant.params, owner, variant.fields, variant.field_names, variant.defaults, result, buf(), None, false, variant_sites(c, v), fixed, 0)
 
 /** What a call is checked against: a function's or a variant's parameters and result, written in
  * terms of the type parameters `type_params` that belong to `owner`. `called` is false for a variant
@@ -23408,7 +24262,8 @@ private struct Signature
     /** A method's receiver, as the call holds it: its defaults take it before the parameters. */
     receiver: Option[&TExpr]
     /** Whether the last parameter is repeated: its type is `Vector[T]`, and the call gives it any
-     * number of `T`s, or one sequence spliced with `xs*`. */
+     * number of `T`s, or one sequence spliced with `xs*`. It is the last parameter before the `using`
+     * section (`repeated_of`). */
     variadic: bool
     /** Where each parameter is declared, for an argument written with its name; empty unless the
      * check is recording references. */
@@ -23417,6 +24272,12 @@ private struct Signature
      * of a data type that one of its refined variants names in neither its fields nor its result,
      * as `T` in `IntLit(value: int) -> Expr[int]`. Empty where every parameter is the call's. */
     fixed: Buf[Option[&Type]]
+    /** How many of the parameters, the last ones, are its `using` section: passed only by name, and
+     * otherwise filled from the givens in scope after the written arguments chose the signature. */
+    section: usize
+
+/** The position of `s`'s repeated parameter, the last before its `using` section, if it has one. */
+private repeated_of(s: Signature) -> Option[usize] = if s.variadic then Some(s.params.len() - s.section - 1) else None
 
 /** A call's arguments, one per parameter in parameter order, its solved type arguments, and its
  * result type. `prelude` evaluates what the call needs first: the written arguments in the order
@@ -23474,13 +24335,19 @@ private bind_arguments(c: *Checker, at: Span, s: Signature, args: Buf[Argument],
     var positional = 0usize
     // A repeated parameter takes every positional argument from its position on, or one sequence
     // spliced with `xs*` as the only one.
-    val repeated: Option[usize] = if s.variadic then Some(s.params.len() - 1) else None
+    val repeated = repeated_of(s)
+    // Positional arguments and an indented block reach only the parameters before the `using`
+    // section, whose parameters are passed by name or filled from the givens (`fill_contextual`).
+    val written = s.params.len() - s.section
+    var all_positional = 0usize
+    for a in args
+        if a.name is None && !a.block then all_positional += 1
     for j in 0..<args.len()
         val a = args[j]
         if a.block
             // An indented block after the call's line is given to the last parameter, which takes
             // a delayed expression or a function.
-            val last = s.params.len()
+            val last = written
             if last == 0 || slots[last - 1] is Some(_)
                 if report
                     if last == 0 then c.note(unit, a.span, s"`${s.name}` takes no arguments, so the indented block after the call has no $noun to be given to")
@@ -23517,14 +24384,19 @@ private bind_arguments(c: *Checker, at: Span, s: Signature, args: Buf[Argument],
                         continue
                 if spliced
                     if report
-                        val given = if j < s.params.len() then s"`${s.names[j]}`, which is not repeated" else "no parameter"
+                        val given = if j < written then s"`${s.names[j]}`, which is not repeated" else "no parameter"
                         c.note(unit, a.span, s"`*` passes a sequence to a repeated parameter, but this argument of `${s.name}` is given to $given")
                     fits = false
                     targets.push(None)
                     continue
-                if j < s.params.len()
+                if j < written
                     slots[j] = Some(j)
                     targets.push(Some(j))
+                elif j < s.params.len() && all_positional <= s.params.len()
+                    // A positional argument written for a contextual parameter: one is passed by name.
+                    if report then c.note(unit, a.span, s"`${s.names[j]}` is a contextual parameter of `${s.name}`, passed by name: `${s.names[j]} = …`")
+                    fits = false
+                    targets.push(None)
                 else targets.push(None)
             Some(n) ->
                 named = true
@@ -23555,26 +24427,274 @@ private bind_arguments(c: *Checker, at: Span, s: Signature, args: Buf[Argument],
     var has_defaults = false
     for d in s.defaults
         if d is Some(_) then has_defaults = true
-    if positional > s.params.len() && !s.variadic
-        if report then c.note(unit, at, s"`${s.name}` takes ${count(s.params.len(), "argument")}, not $positional")
+    if positional > s.params.len() && !s.variadic || (positional > written && !s.variadic && fits)
+        if report then c.note(unit, at, s"`${s.name}` takes ${count(written, "argument")}, not $positional")
         return Binding(slots, targets, false)
     // A call already reported for a misplaced or misnamed argument is not also reported for the
     // parameter that argument was probably meant for.
     if !fits then return Binding(slots, targets, false)
+    // A contextual parameter given nothing is filled afterwards, from a given or its default.
     var missing: Buf[string] = buf()
-    for i in 0..<s.params.len()
+    for i in 0..<written
         if slots[i] is None && s.defaults[i] is None && repeated != Some(i) then missing.push(s.names[i])
     if missing.len() > 0
         fits = false
         if !report then return Binding(slots, targets, false)
         if !named && !has_defaults && s.variadic
-            c.note(unit, at, s"`${s.name}` takes at least ${count(s.params.len() - 1, "argument")}, not ${args.len()}")
+            c.note(unit, at, s"`${s.name}` takes at least ${count(written - 1, "argument")}, not ${args.len()}")
         elif !named && !has_defaults
-            c.note(unit, at, s"`${s.name}` takes ${count(s.params.len(), "argument")}, not ${args.len()}")
+            c.note(unit, at, s"`${s.name}` takes ${count(written, "argument")}, not ${args.len()}")
         else
             for m in missing
                 c.note(unit, at, s"`${s.name}` needs an argument for `$m`, which has no default")
     Binding(slots, targets, fits)
+
+/** A call's arguments with its `using` section filled: the written ones, then one by name for each
+ * contextual parameter a given fills, already checked, and their binding. */
+private struct Filled
+    args: Buf[Argument]
+    checked: Buf[Option[&TExpr]]
+    binding: Binding
+
+// Fills each contextual parameter of a call the written arguments fit and leave it to: from the given
+// in the nearest scope whose type conforms to the parameter's (`fitting_givens`), or else from its
+// default, which the call computes as any omitted argument's. With neither, or with two givens fitting
+// at the nearest level, the call is an error. A filled argument is an ordinary argument by name, a read
+// of the given, which evaluates nothing.
+private fill_contextual(c: *Checker, at: Span, s: Signature, args: Buf[Argument], checked: Buf[Option[&TExpr]], binding: Binding) -> Filled
+    if s.section == 0 || !binding.fits then return Filled(args, checked, binding)
+    val unit = unit_of(c)
+    var out_args: Buf[Argument] = buf()
+    var out_checked: Buf[Option[&TExpr]] = buf()
+    for j in 0..<args.len()
+        out_args.push(args[j])
+        out_checked.push(if j < checked.len() then checked[j] else None)
+    var ok = true
+    var added = false
+    // For an editor, the given each parameter was filled with (`index_filled_call`).
+    var fills: Buf[Fill] = buf()
+    for i in s.params.len() - s.section..<s.params.len()
+        if binding.slots[i] is Some(_) then continue
+        val want = zonk(c, s.params[i])
+        val param = s.names[i]
+        if *want is ErrorType
+            ok = false
+            continue
+        val found = fitting_givens(c, at, want)
+        if found.len() == 1
+            out_args.push(Argument(at, Some(param), Expr(at, Name(param)), false))
+            out_checked.push(Some(given_read(c, at, found[0])))
+            if c.index is Some(_) then fills.push(Fill(param, filled_from(found[0])))
+            added = true
+        elif found.len() > 1
+            var each: Buf[string] = buf()
+            for g in found
+                val shown = type_name(zonk(c, g.ty))
+                each.push(s"`${g.name}` (${article(shown)} `$shown`, ${place_of(c, g.unit, unit, g.span)})")
+            val how_many = if found.len() == 2 then "two" elif found.len() == 3 then "three" else s"${found.len()}"
+            c.note(unit, at, s"$how_many givens fit `$param: ${type_name(want)}` of `${s.name}` here: ${spoken_list(each)}; pass `$param = …`")
+            ok = false
+        elif s.defaults[i] is None
+            c.note(unit, at, s"`${s.name}` needs ${article(type_name(want))} `${type_name(want)}` for `$param`, and no given of that type is in scope: declare one (`given $param = …`), take one as `using`, import one, or pass `$param = …`${given_import_hint(c, want)}")
+            ok = false
+    if c.index is Some(_) then index_filled_call(c, at, if ok then fills else buf())
+    if !ok then return Filled(args, checked, Binding(binding.slots, binding.targets, false))
+    if !added then return Filled(args, checked, binding)
+    Filled(out_args, out_checked, bind_arguments(c, at, s, out_args, false))
+
+// Where a given a call is filled from is read, as the editor's index records it.
+private filled_from(g: GivenCandidate) -> FilledFrom = g.source match
+    LocalGiven(index) -> FilledLocal(index)
+    ParamGiven(i) -> FilledParam(i, g.ty)
+    FieldGiven(k, i) -> FilledField(k, i)
+    ModuleGiven(global) -> FilledGlobal(global)
+
+/** A given a call may be filled from: its name, type and declaration, and where its value is read. */
+private struct GivenCandidate
+    name: string
+    ty: &Type
+    unit: usize
+    span: Span
+    source: GivenSource
+
+private enum GivenSource
+    /** A block's given, or a contextual parameter of a local function or a lambda: a local. */
+    LocalGiven(local: usize)
+    /** A contextual parameter of the function being checked, its parameter `index`. */
+    ParamGiven(index: usize)
+    /** A contextual parameter of the enclosing class's constructor, or a given of the enclosing
+     * object's body: field `index` of class `class`. */
+    FieldGiven(class: usize, index: usize)
+    /** A given at the module's top level: module-level value `global`. */
+    ModuleGiven(global: usize)
+
+// The givens that fit a parameter of type `want` where a call is written: those at the first level
+// outward holding any, of the levels of the chapter's scope walk. The enclosing blocks, innermost first,
+// each with the givens declared before the call, with a local function's or a lambda's contextual
+// parameters a level between its body and the block it is written in; then the contextual parameters
+// of the function being checked; then those of the enclosing class's constructor or actor, for its
+// methods and field initializers; then the givens of the enclosing object's body; then the module's own
+// top-level givens. A nearer level wins outright; two fitting at one level are both returned.
+private fitting_givens(c: *Checker, at: Span, want: &Type) -> Buf[GivenCandidate]
+    var found: Buf[GivenCandidate] = buf()
+    // A given's scope is the position in `visible` where its block begins: a nested block's is
+    // greater than that of any block enclosing it which holds a given visible here.
+    var nearest = 0usize
+    for g in c.body.givens
+        if !local_visible(c, g.local) then continue
+        val ty = zonk(c, c.body.locals[g.local].ty)
+        if !given_fits(c, ty, want) then continue
+        if found.len() > 0 && g.scope < nearest then continue
+        if found.len() > 0 && g.scope > nearest then found.clear()
+        nearest = g.scope
+        found.push(GivenCandidate(c.body.locals[g.local].name, ty, unit_of(c), g.span, LocalGiven(g.local)))
+    if found.len() > 0 then return found
+    val root = c.symbols[c.body.root]
+    // A constructor's parameters are its fields, but in its superclass's arguments.
+    if !root.constructor || c.super_args
+        val offset = if root.params.len() > root.decl.params.len() then root.params.len() - root.decl.params.len() else 0usize
+        for k in 0..<root.decl.params.len()
+            val p = root.decl.params[k]
+            if !p.contextual || k + offset >= root.params.len() then continue
+            val ty = zonk(c, root.params[k + offset])
+            if given_fits(c, ty, want) then found.push(GivenCandidate(root.param_names[k + offset], ty, root.unit, p.span, ParamGiven(k + offset)))
+        if found.len() > 0 then return found
+    if c.super_args || in_static(c) then return given_module_level(c, want)
+    if enclosing_class(c) is Some(k)
+        val cls = c.classes[k]
+        if !cls.decl.object
+            for cp in cls.decl.params
+                if !cp.param.contextual then continue
+                val name = cp.param.pattern.kind match
+                    Name(n) -> n
+                    _ -> continue
+                val i = class_field(c, k, name) match
+                    Some(i) -> i
+                    None -> continue
+                val ty = zonk(c, field_type(c, k, i, at))
+                if given_fits(c, ty, want) then found.push(GivenCandidate(name, ty, cls.unit, cp.param.span, FieldGiven(k, i)))
+        else
+            for m in cls.decl.members
+                val f = m match
+                    FieldMember(f) -> f
+                    _ -> continue
+                if !f.given then continue
+                val i = class_field(c, k, f.name) match
+                    Some(i) -> i
+                    None -> continue
+                // In the object's body, a given is in scope from its declaration on.
+                if c.body.root == cls.initializer && i >= c.classes[k].ready then continue
+                if cls.fields[i].ty is None && c.building[k] == 1 then continue
+                val ty = zonk(c, field_type(c, k, i, at))
+                if given_fits(c, ty, want) then found.push(GivenCandidate(f.name, ty, cls.unit, f.span, FieldGiven(k, i)))
+        if found.len() > 0 then return found
+    given_module_level(c, want)
+
+/** The givens of the module level that fit `want`: the module's own top-level givens, of every file of
+ * the module, together with those another module declares that the module exports by name and those
+ * the call's file imports by name, each under the name the export or import binds. A module imported
+ * whole brings in none. One whose initializer is being checked, the call's own among them, is not yet
+ * a value. */
+private given_module_level(c: *Checker, want: &Type) -> Buf[GivenCandidate]
+    var found: Buf[GivenCandidate] = buf()
+    val module_name = c.symbols[c.current].module_name
+    for g in 0..<c.globals.len()
+        val global = c.globals[g]
+        if !global.given || global.module_name != module_name then continue
+        given_global_fits(c, g, global.name, want, &found)
+    var seen: Buf[usize] = buf()
+    for u in c.units
+        if u.file.module_name != module_name then continue
+        for e in u.file.exports
+            if c.exports.get(qualified(module_name, e.binding)) is Some(key)
+                if c.global_names.get(key) is Some(g)
+                    if c.globals[g].given && c.globals[g].module_name != module_name && !holds_index(seen, g)
+                        seen.push(g)
+                        given_global_fits(c, g, e.binding, want, &found)
+    val unit = unit_of(c)
+    if unit < c.files.len()
+        for i in c.units[unit].file.imports
+            if c.files[unit].imports.get(i.binding) is Some(key)
+                if c.global_names.get(key) is Some(g)
+                    if c.globals[g].given && c.globals[g].module_name != module_name && !holds_index(seen, g)
+                        seen.push(g)
+                        given_global_fits(c, g, i.binding, want, &found)
+    found
+
+/** Adds module-level given `g`, reached by `name`, to `found` where it fits `want`. */
+private given_global_fits(c: *Checker, g: usize, name: string, want: &Type, found: *Buf[GivenCandidate])
+    val global = c.globals[g]
+    val init = global.init
+    if c.symbols[init].result is None
+        if c.states[init] != 0 then return
+        check_function(c, init)
+    val ty = zonk(c, c.symbols[init].result.unwrap_or(ErrorType))
+    if given_fits(c, ty, want) then found.push(GivenCandidate(name, ty, global.unit, global.span, ModuleGiven(g)))
+
+private holds_index(items: Buf[usize], x: usize) -> bool
+    for i in items
+        if i == x then return true
+    false
+
+/** The note a call that finds no given adds where a module its file imports whole declares one that
+ * fits, or exports one: the import to write. Empty where none does. */
+private given_import_hint(c: *Checker, want: &Type) -> string
+    val unit = unit_of(c)
+    if unit >= c.files.len() then return ""
+    val own = c.symbols[c.current].module_name
+    var hints: Buf[string] = buf()
+    for i in c.units[unit].file.imports
+        val module_path = c.files[unit].modules.get(i.binding) match
+            Some(m) -> m
+            None -> continue
+        if module_path == own then continue
+        // The module's own givens, and those it exports, each by the name the module presents it under.
+        var offered: Buf[(usize, string)] = buf()
+        for g in 0..<c.globals.len()
+            val global = c.globals[g]
+            if global.given && global.module_name == module_path && exported(c, qualified(global.module_name, global.name))
+                offered.push((g, global.name))
+        for u in c.units
+            if u.file.module_name != module_path then continue
+            for e in u.file.exports
+                if c.exports.get(qualified(module_path, e.binding)) is Some(key)
+                    if c.global_names.get(key) is Some(g)
+                        if c.globals[g].given && exported(c, key) then offered.push((g, e.binding))
+        for (g, name) in offered
+            if c.files[unit].imports.get(name) is Some(_) then continue
+            val init = c.globals[g].init
+            if c.symbols[init].result is None
+                if c.states[init] != 0 then continue
+                check_function(c, init)
+            val ty = zonk(c, c.symbols[init].result.unwrap_or(ErrorType))
+            if !given_fits(c, ty, want) then continue
+            hints.push(s"`$module_path` declares the given `$name`, which this file does not import: `import $module_path.{$name}`")
+    if hints.len() == 0 then return ""
+    var out = ""
+    for h in hints
+        out = out + "; " + h
+    out
+
+/** Whether a given of type `ty` fills a parameter of type `want`: its type conforms to it. */
+private given_fits(c: *Checker, ty: &Type, want: &Type) -> bool = !(*ty is ErrorType) && fits(c, ty, want)
+
+/** Whether local `index` is in scope. */
+private local_visible(c: *Checker, index: usize) -> bool
+    for v in c.body.visible
+        if v == index then return true
+    false
+
+/** The read of given `g` where a call is written, which a contextual parameter is passed: a captured
+ * local or parameter is recorded as a capture, as a read of it by name would be. */
+private given_read(c: *Checker, at: Span, g: GivenCandidate) -> &TExpr = g.source match
+    LocalGiven(index) ->
+        if c.body.locals[index].owner != c.current then c.body.uses.push(CaptureUse(c.current, index, false))
+        TExpr(at, g.ty, Local(index))
+    ParamGiven(i) ->
+        if c.current != c.body.root then c.body.uses.push(CaptureUse(c.current, i, true))
+        TExpr(at, g.ty, Param(i))
+    FieldGiven(k, i) -> field_read(c, at, at, self_ref(c, at), k, i, true)
+    ModuleGiven(global) -> global_read(c, at, global)
 
 // Records each name written in an argument (`width = 3`) as a reference to the parameter it names.
 private index_argument_names(c: *Checker, unit: usize, s: Signature, args: Buf[Argument], binding: Binding)
@@ -23594,7 +24714,7 @@ private index_argument_names(c: *Checker, unit: usize, s: Signature, args: Buf[A
 // Checks a call against a signature: binds its arguments to the parameters, solves the type
 // arguments, and checks each argument against its parameter's type. `checked` holds, for an
 // overloaded call, the arguments checked while its overload was chosen; it is empty otherwise.
-private apply(c: *Checker, at: Span, name_span: Span, s: Signature, args: Buf[Argument], explicit: Option[Buf[&TypeExpr]], expected: Option[&Type], checked: Buf[Option[&TExpr]]) -> AppliedCall
+private apply(c: *Checker, at: Span, name_span: Span, s: Signature, written_args: Buf[Argument], explicit: Option[Buf[&TypeExpr]], expected: Option[&Type], written_checked: Buf[Option[&TExpr]]) -> AppliedCall
     val unit = unit_of(c)
     val name = s.name
     val called = s.called
@@ -23603,8 +24723,14 @@ private apply(c: *Checker, at: Span, name_span: Span, s: Signature, args: Buf[Ar
     val params = s.params
     val result = s.result
     val known = s.known
-    var binding = bind_arguments(c, at, s, args, true)
-    index_argument_names(c, unit, s, args, binding)
+    val bound = bind_arguments(c, at, s, written_args, true)
+    index_argument_names(c, unit, s, written_args, bound)
+    // The `using` section is filled once the written arguments fit: each parameter they leave is
+    // given the given in scope, passed as an argument by name already checked.
+    val filled = fill_contextual(c, at, s, written_args, written_checked, bound)
+    val args = filled.args
+    val checked = filled.checked
+    var binding = filled.binding
     val first = c.vars.len()
     var type_args: Buf[&Type] = buf()
     // The parameters a call writes or infers: those after the known ones, but for any fixed.
@@ -23758,8 +24884,8 @@ private apply(c: *Checker, at: Span, name_span: Span, s: Signature, args: Buf[Ar
         if *t.ty is Nothing then ty = Nothing
     // The arguments of a repeated parameter become one vector, made where the first of them is
     // written, or after the others when there are none.
-    if s.variadic && binding.fits
-        val packed = pack_repeated(c, at, wanted, binding, args, typed)
+    if repeated_of(s) is Some(r) && binding.fits
+        val packed = pack_repeated(c, at, wanted, r, binding, args, typed)
         typed = packed.typed
         binding = packed.binding
     // Arguments written in parameter order with none omitted are passed as they are; otherwise each
@@ -23782,25 +24908,39 @@ private apply(c: *Checker, at: Span, name_span: Span, s: Signature, args: Buf[Ar
         val local = hidden_local(c, t.ty)
         prelude[prelude.len() - 1] = TExpr(t.span, Unit, Let(local, t))
         held[binding.targets[j].unwrap()] = Some(TExpr(t.span, t.ty, Local(local)))
+    // The `using` section's defaults come first, each seeing the section before it, and then the
+    // other parameters', each seeing those before it and the whole section.
+    val section_start = params.len() - s.section
+    var order: Buf[usize] = buf()
+    for i in section_start..<params.len()
+        order.push(i)
+    for i in 0..<section_start
+        order.push(i)
+    for i in order
+        if held[i] is Some(_) then continue
+        val default = s.defaults[i].unwrap()
+        // A default written as a literal is the literal itself, with nothing to call.
+        if literal_default(c, default) is Some(written)
+            held[i] = Some(check_expr(c, written, Some(zonk(c, wanted[i]))))
+            continue
+        local_use(c, default, at)
+        var before: Buf[&TExpr] = buf()
+        if s.receiver is Some(r) then before.push(r)
+        if i >= section_start
+            for k in section_start..<i
+                before.push(held[k].unwrap())
+        else
+            for k in 0..<i
+                before.push(held[k].unwrap())
+            for k in section_start..<params.len()
+                before.push(held[k].unwrap())
+        val wanted_ty = zonk(c, wanted[i])
+        val local = hidden_local(c, wanted_ty)
+        prelude.push(TExpr(at, Unit, Let(local, TExpr(at, wanted_ty, Call(default, before, default_type_args(c, s, default, solved))))))
+        held[i] = Some(TExpr(at, wanted_ty, Local(local)))
     var passed: Buf[&TExpr] = buf()
-    for i in 0..<params.len()
-        held[i] match
-            Some(value) -> passed.push(value)
-            None ->
-                val default = s.defaults[i].unwrap()
-                // A default written as a literal is the literal itself, with nothing to call.
-                if literal_default(c, default) is Some(written)
-                    passed.push(check_expr(c, written, Some(zonk(c, wanted[i]))))
-                    continue
-                local_use(c, default, at)
-                var before: Buf[&TExpr] = buf()
-                if s.receiver is Some(r) then before.push(r)
-                for k in 0..<i
-                    before.push(passed[k])
-                val wanted_ty = zonk(c, wanted[i])
-                val local = hidden_local(c, wanted_ty)
-                prelude.push(TExpr(at, Unit, Let(local, TExpr(at, wanted_ty, Call(default, before, default_type_args(c, s, default, solved))))))
-                passed.push(TExpr(at, wanted_ty, Local(local)))
+    for h in held
+        passed.push(h.unwrap())
     AppliedCall(passed, solved, ty, prelude, false)
 
 /** The body of default function `id` when it is a literal of a built-in type (a number, which may
@@ -23824,7 +24964,7 @@ private argument_type(c: *Checker, s: Signature, params: Buf[&Type], binding: Bi
     val i = binding.targets[j] match
         Some(i) -> i
         None -> return None
-    if !s.variadic || i + 1 != params.len() then return Some(params[i])
+    if repeated_of(s) != Some(i) then return Some(params[i])
     val element = repeated_element(params[i])
     if args[j].value.kind is Splice(_) then Some(core_class_of(c, "Iterable", element)) else Some(element)
 
@@ -23927,10 +25067,10 @@ private struct Packed
     typed: Buf[&TExpr]
     binding: Binding
 
-// Replaces the arguments of the repeated parameter, the last of `params`, with the vector they make,
-// at the place of the first of them; with none, an empty vector follows the other arguments.
-private pack_repeated(c: *Checker, at: Span, params: Buf[&Type], binding: Binding, args: Buf[Argument], typed: Buf[&TExpr]) -> Packed
-    val r = params.len() - 1
+// Replaces the arguments of the repeated parameter `r`, the last of `params` before any `using`
+// section, with the vector they make, at the place of the first of them; with none, an empty vector
+// follows the other arguments.
+private pack_repeated(c: *Checker, at: Span, params: Buf[&Type], r: usize, binding: Binding, args: Buf[Argument], typed: Buf[&TExpr]) -> Packed
     val element = zonk(c, repeated_element(params[r]))
     var out: Buf[&TExpr] = buf()
     var targets: Buf[Option[usize]] = buf()
@@ -24060,6 +25200,14 @@ private holds_literal(e: &Expr) -> bool
             false
         _ -> false
 
+/** Whether `e` is a sequence, set or map literal, whose elements take their types from what is
+ * expected of it where something is. */
+private collection_literal(e: &Expr) -> bool = e.kind match
+    ListLit(_) -> true
+    SetLit(_) -> true
+    MapLit(_, _) -> true
+    _ -> false
+
 /** Whether `e` is made of number literals alone: a literal, or an operation or an `if` whose operands
  * or branches are, as `1_000_000_000_000 + 2001` is. Its type comes wholly from context. */
 private literal_expression(e: &Expr) -> bool
@@ -24125,6 +25273,7 @@ private exits_lambda(e: &Expr) -> bool = e.kind match
     MapLit(keys, values) -> any_exits_lambda(keys) || any_exits_lambda(values)
     Block(items, _) -> any_exits_lambda(items)
     Binding(_, _, value, _) -> exits_lambda(value)
+    GivenBinding(_, _, value) -> exits_lambda(value)
     Destructure(_, _, value, _) -> exits_lambda(value)
     // A local `lazy val`'s initializer is a lambda's body.
     LazyBinding(_, _, _) -> false
@@ -24309,9 +25458,10 @@ private named_function_value(c: *Checker, at: Span, name: string, explicit: Opti
     var compared: Buf[Buf[&Type]] = buf()
     for id in ids
         val f = c.symbols[id]
-        if accepts(c, f.params, f.type_owner, f.type_params.len(), params)
+        val taken = before_section(f.params, section_size(f.decl))
+        if accepts(c, taken, f.type_owner, f.type_params.len(), params)
             fitting.push(id)
-            compared.push(f.params)
+            compared.push(taken)
     if fitting.len() == 0
         c.note(unit, at, s"no overload of `$name` has the parameter types of ${type_name(zonk(c, expected.unwrap()))}; the overloads are ${overload_list(c, ids)}")
         return TExpr(at, ErrorType, UnitConst)
@@ -24392,7 +25542,10 @@ private function_value(c: *Checker, at: Span, id: usize, explicit: Option[Buf[&T
             val written = resolve_written_args(c, unit, types, type_params, known.len())
             for i in 0..<types.len()
                 unify(c, type_args[known.len() + i], written[i])
-    val declared: &Type = Function(marked_value_params(c, id, 0, target.params, expected), result, sendable_wanted(c, expected))
+    // A `using` section is filled where the value is made, so the value takes the parameters before it.
+    val section = section_size(target.decl)
+    val taken = before_section(target.params, section)
+    val declared: &Type = Function(marked_value_params(c, id, 0, taken, expected), result, sendable_wanted(c, expected))
     val ty = substitute(declared, target.type_owner, type_args)
     if expected is Some(want) then unify(c, ty, want)
     hold_marked_params(c, unit, at, id, 0, ty)
@@ -24407,8 +25560,36 @@ private function_value(c: *Checker, at: Span, id: usize, explicit: Option[Buf[&T
     // The type arguments, written or taken from the expected type, are held to their bounds as a
     // call's are.
     hold_to_bounds(c, unit, at, s"`${target.name}`", target.type_owner, type_params, solved, known.len())
-    c.symbols[id].value = true
-    TExpr(at, zonk(c, ty), FunctionValue(id, solved))
+    if section == 0
+        c.symbols[id].value = true
+        return TExpr(at, zonk(c, ty), FunctionValue(id, solved))
+    // With a section, the value is a closure calling the function as a call written here would: its
+    // section filled from the givens in scope here, which the closure captures, or from its defaults.
+    // `rows.foreach(insert)` is `rows.foreach(row -> insert(row))`.
+    val made = zonk(c, ty)
+    var names: Buf[string] = buf()
+    for i in 0..<taken.len()
+        names.push(target.param_names[i])
+    val closure = value_closure(c, at, made, names)
+    val offset = target.params.len() - target.decl.params.len()
+    val repeated = repeated_at(target.decl) match
+        Some(r) -> Some(r + offset)
+        None -> None
+    val passed = passed_on(at, closure, names, repeated)
+    c.body.calls.push(LocalCall(c.current, closure.id))
+    val outer = c.current
+    c.current = closure.id
+    val call = call_function(c, at, at, id, passed.args, None, Some(closure.result), passed.checked)
+    c.current = outer
+    c.bodies[closure.id] = Some(call)
+    TExpr(at, made, FunctionValue(closure.id, buf()))
+
+/** `params` without their last `count`, a `using` section: the parameters a function value takes. */
+private before_section(params: Buf[&Type], count: usize) -> Buf[&Type]
+    var out: Buf[&Type] = buf()
+    for i in 0..<params.len() - count
+        out.push(params[i])
+    out
 
 /** The `apply` methods a value of type `t` may be called through: those of its class, of its bounds
  * for a type parameter, or of its impls. */
@@ -24473,6 +25654,7 @@ private lambda_expr(c: *Checker, e: &Expr, params: Buf[LambdaParam], body: &Expr
     var wanted: Buf[&Type] = buf()
     var wanted_result: Option[&Type] = None
     var mismatched = false
+    var untyped = false
     if expected is Some(want)
         val known = zonk(c, want)
         if *known is Function(ps, r, _)
@@ -24524,7 +25706,11 @@ private lambda_expr(c: *Checker, e: &Expr, params: Buf[LambdaParam], body: &Expr
                 elif i < wanted.len() && !(*known is Var(_)) && !mismatched
                     ty = known
                     open_params.push(i)
-                elif !mismatched then c.note(unit, p.span, untyped_param(p.name, false))
+                elif !mismatched
+                    c.note(unit, p.span, untyped_param(p.name, false))
+                    // A placeholder lambda written where no function is expected is reported
+                    // once, here, rather than again as a function of errors meeting that type.
+                    if placeholder_lambda(params) then untyped = true
         types.push(ty)
         local_types.push(local.unwrap_or(ty))
     var result: Option[&Type] = None
@@ -24559,6 +25745,8 @@ private lambda_expr(c: *Checker, e: &Expr, params: Buf[LambdaParam], body: &Expr
     var param_locals: Buf[usize] = buf()
     for i in 0..<params.len()
         param_locals.push(declare_local(c, params[i].span, names[i], local_types[i], false))
+        // A parameter after `using` is a given in the body.
+        if params[i].contextual then c.body.givens.push(GivenLocal(param_locals[i], params[i].span, mark))
     c.symbols[id].param_locals = param_locals
     note_refined_function(c, id)
     check_body(c, id, body, hint)
@@ -24582,7 +25770,7 @@ private lambda_expr(c: *Checker, e: &Expr, params: Buf[LambdaParam], body: &Expr
         if wanted_result is Some(r) then unify(c, r, yields)
     // A lambda written where a `@sendable` function is expected is converted to one where it is made,
     // which holds what it captures and what it reaches to the rules for one (`check_sendable_arguments`).
-    val ty: &Type = if mismatched then ErrorType else Function(types, yields, sendable_wanted(c, expected))
+    val ty: &Type = if mismatched || untyped then ErrorType else Function(types, yields, sendable_wanted(c, expected))
     TExpr(e.span, ty, FunctionValue(id, buf()))
 
 /** Whether `t` is an `Option` or a `Result` known in all but its value: a `?` or a `return` in a
@@ -24654,7 +25842,7 @@ private untupled_lambda(c: *Checker, e: &Expr, params: Buf[LambdaParam], body: &
             items.push(Expr(p.span, Binding(p.name, declared[i], element, false)))
     items.push(body)
     var one: Buf[LambdaParam] = buf()
-    one.push(LambdaParam(e.span, whole, None))
+    one.push(LambdaParam(e.span, whole, None, false))
     val wrapped = Expr(body.span, Block(items, false))
     lambda_expr(c, e, one, wrapped, expected, delayed)
 
@@ -24698,7 +25886,7 @@ private matched_type_known(c: *Checker, e: &Expr, t: &Type) -> bool
 
 private match_params(at: Span) -> Buf[LambdaParam]
     var params: Buf[LambdaParam] = buf()
-    params.push(LambdaParam(at, MatchParam, None))
+    params.push(LambdaParam(at, MatchParam, None, false))
     params
 
 private match_body(at: Span, arms: Buf[Arm]) -> &Expr = Expr(at, Match(Expr(at, Name(MatchParam)), arms))

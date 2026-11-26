@@ -1,0 +1,760 @@
+module avin.net.redis
+
+// A client of a Redis server, over TCP or TLS. `Redis.connect` opens a connection and speaks RESP3 on
+// it where the server does, RESP2 where it does not; `command` sends any command and answers its
+// reply as a `Value`, and the typed methods send the common ones and answer what their replies mean.
+// A connection that breaks is made again by the next command, a few times over, waiting longer each
+// time; the command it broke under answers the failure, since it may or may not have run.
+
+import avin.io
+import avin.io.{IoError, TimedOut}
+import avin.net.{ByteStream, TcpStream}
+import avin.net.tls.{TlsClient, TlsError, TlsStream, Transport}
+import avin.threads.{Pool, sleep, withTimeout}
+import avin.time.{Duration, millis, minutes, seconds}
+
+// Why a command, or a connection, failed.
+data RedisError
+  // The connection could not be made, broke, or a wait on it ran out (`TimedOut`).
+  ConnectionFailed(error: IoError)
+  // The connection is gone: the server closed it, or the client was closed (`text` says which).
+  ConnectionClosed(text: string)
+  // TLS could not be set up over the connection.
+  TlsFailed(error: TlsError)
+  // The server sent something that is not RESP, or is past one of the client's `RespLimits`. The
+  // connection is closed, since what follows cannot be read.
+  ProtocolFailed(error: RespError)
+  // The server answered with an error: `code` is its first word (`ERR`, `WRONGTYPE`, `NOAUTH`,
+  // `WRONGPASS`, `EXECABORT`), `text` the whole of it.
+  ServerError(code: string, text: string)
+  // The server's reply is not of the kind the method expects: `expected` says what that was, `got`
+  // is the reply.
+  UnexpectedReply(expected: string, got: Value)
+
+impl Error for RedisError
+  message -> string = self match
+    ConnectionFailed(e) -> e.message
+    ConnectionClosed(text) -> text
+    TlsFailed(e) -> e match
+      Transport(io) -> io.message
+      _ -> s"TLS failed: $e"
+    ProtocolFailed(e) -> e.message
+    ServerError(_, text) -> s"the Redis server answered: $text"
+    UnexpectedReply(expected, got) -> s"the Redis server answered $got, not $expected"
+
+  cause -> Option[Error] = self match
+    ConnectionFailed(e) -> Some(e)
+    ProtocolFailed(e) -> Some(e)
+    _ -> None
+
+impl Display for RedisError
+  display(out: Writer, spec: FormatSpec) = out.writeField(message, spec)
+
+// An error reply as a `ServerError`; any other value is the caller's.
+private serverErrorOf(text: string) -> RedisError
+  val space = text.indexOf(" ")
+  ServerError(if space < 0 then text else text.slice(0, space), text)
+
+// How a client connects: who it is, which database, over what, and how long it waits.
+// - `username` and `password` authenticate it; a password with no username is the `default` user's.
+// - `database` is the one `SELECT` chooses once it has connected; zero, the server's first, sends no
+//   `SELECT`.
+// - `tls`, where it is given, makes the connection TLS, checked against what it trusts, the
+//   certificate's name checked against `tlsHost` where it is given and the host connected to where not.
+// - `clientName` is sent as the connection's name, which `CLIENT LIST` shows.
+// - `protocol` is 3 to ask for RESP3 with `HELLO 3` and fall back to RESP2 where the server answers
+//   that it has no `HELLO`, or 2 to speak RESP2 without asking.
+// - `connectTimeout` bounds making the connection, TLS and the handshake included (10 seconds by
+//   default); `timeout` bounds each wait for the server after that (30 seconds by default), and zero
+//   or less takes it away.
+// - `reconnectAttempts` is how many times the next command tries to make a broken connection again
+//   (3 by default; zero never does), waiting `reconnectDelay` before the second try (100 ms by
+//   default) and twice as long before each one after, up to `maxReconnectDelay` (5 seconds).
+// - `limits` bounds what the server may send.
+// A `protocol` other than 2 or 3, or a negative `database` or `reconnectAttempts`, traps.
+class RedisOptions(
+    val username: Option[string] = None,
+    val password: Option[string] = None,
+    val database: int = 0,
+    val tls: Option[TlsClient] = None,
+    val tlsHost: Option[string] = None,
+    val clientName: Option[string] = None,
+    val protocol: int = 3,
+    val connectTimeout: Duration = seconds(10),
+    val timeout: Duration = seconds(30),
+    val reconnectAttempts: int = 3,
+    val reconnectDelay: Duration = millis(100),
+    val maxReconnectDelay: Duration = seconds(5),
+    val limits: RespLimits = RespLimits()
+): Sendable
+  private val checked = redisOptionsChecked(protocol, database, reconnectAttempts)
+
+private redisOptionsChecked(protocol: int, database: int, attempts: int) -> bool
+  if protocol != 2 && protocol != 3 then fail(s"RESP protocol $protocol: Redis speaks 2 and 3")
+  if database < 0 then fail(s"database $database: databases are numbered from zero")
+  if attempts < 0 then fail(s"$attempts reconnect attempts: it is at least zero")
+  true
+
+// One open connection, with the parser reading it and the protocol agreed on.
+private class Connection(val stream: ByteStream, val parser: RespParser, val peer: string)
+  var protocol = 2
+
+  // Sends `bytes`; a failure is the connection's.
+  send(bytes: Array[byte]) -> Result[unit, RedisError] = stream.write(bytes).mapErr(e -> ConnectionFailed(e))
+
+  // The next value the server sends, as it is: an error reply is a value here.
+  reply() -> Result[Value, RedisError]
+    while true
+      parser.next() match
+        Ok(Some(v)) -> return Ok(v)
+        Ok(None) -> fill()?
+        Err(e) -> return Err(ProtocolFailed(e))
+    Err(ConnectionClosed("unreachable"))
+
+  // The next reply to a command: a push, which the server sends on its own, is passed over.
+  answer() -> Result[Value, RedisError]
+    while true
+      val v = reply()?
+      if !(v is Push(_)) then return Ok(v)
+    Err(ConnectionClosed("unreachable"))
+
+  // Reads what the server sends: one read, which waits, then, while more has arrived, more, until the
+  // parser holds twice what it held, so a reply arriving in many pieces is parsed a few times, not
+  // once a piece.
+  private fill() -> Result[unit, RedisError]
+    val before = parser.buffered
+    val got = stream.read(65536).mapErr(e -> ConnectionFailed(e))?
+    if got.length == 0 then return Err(ConnectionClosed(s"the Redis server at $peer closed the connection"))
+    parser.feed(got)
+    while parser.buffered < 2 * before && stream.readable()
+      val more = stream.read(65536).mapErr(e -> ConnectionFailed(e))?
+      if more.length == 0 then return Ok(())
+      parser.feed(more)
+    Ok(())
+
+  // Sends one command and answers its reply, an error reply as `ServerError`.
+  call(args: Vector[string]) -> Result[Value, RedisError]
+    send(encodeCommand(args))?
+    replyResult(answer()?)
+
+  close() = _ = stream.close()
+
+// A reply, an error reply being `Err(ServerError)`.
+private replyResult(v: Value) -> Result[Value, RedisError] = v.plain match
+  SimpleError(t) -> Err(serverErrorOf(t))
+  BlobError(t) -> Err(serverErrorOf(t))
+  _ -> Ok(v)
+
+// The connection to `host` and `port`, its handshake done, within `options.connectTimeout`.
+private connectWith(host: string, port: int, options: RedisOptions) -> Result[Connection, RedisError]
+  val peer = s"$host:$port"
+  if options.connectTimeout.micros <= 0 then return opened(host, port, options)
+  withTimeout(options.connectTimeout, _ -> opened(host, port, options)) match
+    Some(made) -> made
+    None -> Err(ConnectionFailed(IoError(TimedOut, "connect to", peer)))
+
+private opened(host: string, port: int, options: RedisOptions) -> Result[Connection, RedisError]
+  val peer = s"$host:$port"
+  val tcp = TcpStream.connect(host, port).mapErr(e -> ConnectionFailed(e))?
+  if tcp.setTimeout(options.timeout) is Err(e)
+    _ = tcp.close()
+    return Err(ConnectionFailed(e))
+  val stream: ByteStream = options.tls match
+    None -> tcp
+    Some(settings) -> TlsStream.client(tcp, options.tlsHost.getOrElse(host), settings) match
+      Ok(s) -> s
+      Err(e) ->
+        _ = tcp.close()
+        return Err(TlsFailed(e))
+  val c = Connection(stream, RespParser(options.limits), peer)
+  handshake(c, options) match
+    Ok(_) -> Ok(c)
+    Err(e) ->
+      c.close()
+      Err(e)
+
+// `HELLO 3`, with the credentials and the name, where the options ask for RESP3; where the server
+// answers that it has no `HELLO`, or no RESP3, or for RESP2, `AUTH` and `CLIENT SETNAME` instead.
+// Then `SELECT` for a database other than zero.
+private handshake(c: Connection, options: RedisOptions) -> Result[unit, RedisError]
+  var spoken = false
+  if options.protocol == 3
+    val hello = Buffer[string]("HELLO", "3")
+    if options.password is Some(p)
+      hello.append("AUTH")
+      hello.append(options.username.getOrElse("default"))
+      hello.append(p)
+    if options.clientName is Some(n)
+      hello.append("SETNAME")
+      hello.append(n)
+    c.call(hello.toVector) match
+      Ok(_) ->
+        c.protocol = 3
+        spoken = true
+      Err(ServerError(code, text)) if helloMissing(code, text) -> ()
+      Err(e) -> return Err(e)
+  if !spoken
+    if options.password is Some(p)
+      val auth = if options.username is Some(u) then Vector("AUTH", u, p) else Vector("AUTH", p)
+      _ = c.call(auth)?
+    if options.clientName is Some(n) then _ = c.call(Vector("CLIENT", "SETNAME", n))?
+  if options.database != 0 then _ = c.call(Vector("SELECT", s"${options.database}"))?
+  Ok(())
+
+// Whether an error answering `HELLO` says the server has no `HELLO` or no RESP3, so RESP2 is spoken:
+// `NOPROTO`, or an unknown command.
+private helloMissing(code: string, message: string) -> bool =
+  code == "NOPROTO" || (code == "ERR" && message.toLower.contains("unknown command"))
+
+// The commands of a pipeline or a transaction, each sent as `command` sends one. Methods add one
+// command each, in order.
+class Pipeline()
+  private val commands = Buffer[Array[byte]]()
+
+  // Adds a command, its name and its arguments.
+  command(args: string*) = commands.append(encodeCommand(args))
+
+  // Adds a command whose arguments are bytes.
+  commandBytes(args: Array[byte]*) = commands.append(encodeCommandBytes(args))
+
+  // How many commands it holds.
+  length -> int = commands.length
+
+  encoded() -> Vector[Array[byte]] = commands.toVector
+
+// What a key's time to live is, as `ttl` answers it.
+data Expiry
+  // There is no such key.
+  NoKey
+  // The key never expires.
+  NoExpiry
+  // The key expires once `remaining` has passed.
+  ExpiresIn(remaining: Duration)
+
+// A connection to a Redis server, made by `Redis.connect`, and the commands sent on it. It belongs to
+// the code that made it: share one between threads through a pool, `Redis.pool`. Every method answers
+// `Err` for an error reply, as `ServerError`, and for a connection that failed; a failure leaves the
+// connection to be made again by the next command, which tries `options.reconnectAttempts` times.
+// Once `close` is called, every command answers `ConnectionClosed`.
+class Redis(
+    private val host: string,
+    private val port: int,
+    val options: RedisOptions,
+    private var link: Option[Connection]
+)
+  private var closed = false
+
+  // The RESP version the connection speaks, 3 or 2; 0 while it is broken and not yet made again.
+  protocol -> int = link match
+    Some(c) -> c.protocol
+    None -> 0
+
+  // Whether the client is open and its connection unbroken.
+  isOpen -> bool = !closed && link.isDefined
+
+  // Closes the connection; every command afterwards answers `ConnectionClosed`. Closing again does
+  // nothing.
+  close() -> Result[unit, RedisError]
+    closed = true
+    if link is Some(c) then c.close()
+    link = None
+    Ok(())
+
+  // The connection, made again where it broke.
+  private ready() -> Result[Connection, RedisError]
+    if closed then return Err(ConnectionClosed("the Redis client is closed"))
+    if link is Some(c) then return Ok(c)
+    if options.reconnectAttempts == 0
+      return Err(ConnectionClosed(s"the connection to $host:$port broke, and reconnecting is off"))
+    var delay = options.reconnectDelay
+    var last = ConnectionClosed(s"the connection to $host:$port broke")
+    for attempt in 0 ..< options.reconnectAttempts
+      if attempt > 0
+        sleep(delay)
+        delay = if delay.micros * 2 > options.maxReconnectDelay.micros then options.maxReconnectDelay else Duration(
+          delay.micros * 2
+        )
+      connectWith(host, port, options) match
+        Ok(c) ->
+          link = Some(c)
+          return Ok(c)
+        // A refusal by the server, a wrong password for one, is not cured by trying again.
+        Err(ServerError(code, text)) -> return Err(ServerError(code, text))
+        Err(e) -> last = e
+    Err(last)
+
+  // `f` on the connection; a failure of the connection, not an error reply, breaks it.
+  private using[T](f: (Connection) -> Result[T, RedisError]) -> Result[T, RedisError]
+    val c = ready()?
+    val r = f(c)
+    if r is Err(e) && breaks(e)
+      c.close()
+      link = None
+    r
+
+  // Sends `commands`, encoded, and answers their replies as they are, in order. They go a batch of
+  // at most 64 KiB at a time, its replies read before the next is sent, so a long pipeline never
+  // fills both directions of the connection at once.
+  private exchange(commands: Vector[Array[byte]]) -> Result[Vector[Value], RedisError] = using(c ->
+    val replies = Buffer[Value]()
+    var i = 0
+    while i < commands.length
+      val batch = ByteSink()
+      var n = 0
+      while i < commands.length && (n == 0 || batch.length + commands(i).length <= 65536)
+        batch.addAll(commands(i))
+        i += 1
+        n += 1
+      c.send(batch.toArray())?
+      for _ in 0 ..< n do replies.append(c.answer()?)
+    Ok(replies.toVector))
+
+  // Sends a command, its name and its arguments, and answers its reply; an error reply is
+  // `Err(ServerError)`.
+  command(args: string*) -> Result[Value, RedisError] = call(args)
+
+  // Sends a command whose arguments are bytes.
+  commandBytes(args: Array[byte]*) -> Result[Value, RedisError] = single(encodeCommandBytes(args))
+
+  private call(args: Vector[string]) -> Result[Value, RedisError] = single(encodeCommand(args))
+
+  private single(encoded: Array[byte]) -> Result[Value, RedisError] = using(c ->
+    c.send(encoded)?
+    replyResult(c.answer()?))
+
+  // Sends the commands `build` adds to a pipeline, all of them before reading a reply, and answers
+  // each command's reply in order, an error reply as its `Err`. The outer `Err` is a failure of the
+  // connection, after which which of the commands ran is not known.
+  pipeline(build: (Pipeline) -> unit) -> Result[Vector[Result[Value, RedisError]], RedisError]
+    val p = Pipeline()
+    build(p)
+    Ok(exchange(p.encoded())?.map(v -> replyResult(v)))
+
+  // Runs the commands `build` adds as a transaction, `MULTI` before them and `EXEC` after, sent at
+  // once as a pipeline: the server runs all of them, one after another with nothing between, or
+  // none. The answer is each command's reply in order, an error reply as its `Err`; `None` where a
+  // key `watch` watches changed, so nothing ran; and `Err(ServerError("EXECABORT", …))` where the
+  // server refused a command as it was queued, so nothing ran either.
+  transaction(build: (Pipeline) -> unit) -> Result[Option[Vector[Result[Value, RedisError]]], RedisError]
+    val p = Pipeline()
+    build(p)
+    val all = Vector(encodeCommand(Vector("MULTI"))) ++ p.encoded() :+ encodeCommand(Vector("EXEC"))
+    val replies = exchange(all)?
+    replyResult(replies(0))?
+    replyResult(replies(replies.length - 1))?.plain match
+      Null -> Ok(None)
+      ArrayValue(xs) -> Ok(Some(xs.map(v -> replyResult(v))))
+      other -> Err(UnexpectedReply("the replies of a transaction", other))
+
+  // Watches `keys` for the next `transaction`, which runs nothing where one has changed.
+  watch(keys: string*) -> Result[unit, RedisError] = okOf(call(Vector("WATCH") ++ keys)?)
+
+  // Stops watching every key.
+  unwatch() -> Result[unit, RedisError] = okOf(call(Vector("UNWATCH"))?)
+
+  // The server's answer to `PING`: `PONG`.
+  ping() -> Result[string, RedisError] = textOf("a pong", call(Vector("PING"))?)
+
+  // Makes `database` the connection's database, until it is made again, when `options.database` is.
+  select(database: int) -> Result[unit, RedisError] = okOf(call(Vector("SELECT", s"$database"))?)
+
+  // Removes every key of the connection's database.
+  flushDb() -> Result[unit, RedisError] = okOf(call(Vector("FLUSHDB"))?)
+
+  // How many keys the connection's database holds.
+  dbSize() -> Result[long, RedisError] = longOf(call(Vector("DBSIZE"))?)
+
+  // Sends `message` to every client subscribed to `channel`, and answers how many received it.
+  publish(channel: string, message: string) -> Result[long, RedisError] =
+    longOf(call(Vector("PUBLISH", channel, message))?)
+
+  // Strings.
+
+  // The key's value as text; `None` where there is no such key. A value that is not UTF-8 is
+  // `UnexpectedReply`, which `getBytes` reads.
+  get(key: string) -> Result[Option[string], RedisError] = optionalText(call(Vector("GET", key))?)
+
+  // The key's value as bytes; `None` where there is no such key.
+  getBytes(key: string) -> Result[Option[Array[byte]], RedisError] = optionalBytes(call(Vector("GET", key))?)
+
+  // Sets the key to `value`, forever.
+  set(key: string, value: string) -> Result[unit, RedisError] = okOf(call(Vector("SET", key, value))?)
+
+  // Sets the key to the bytes `value`, forever.
+  set(key: string, value: Array[byte]) -> Result[unit, RedisError] =
+    okOf(commandBytes("SET".utf8, key.utf8, value)?)
+
+  // Sets the key to `value`, to expire after `ttl`, in whole milliseconds, a part of one counting as
+  // one.
+  set(key: string, value: string, ttl: Duration) -> Result[unit, RedisError] =
+    okOf(call(Vector("SET", key, value, "PX", s"${millisOf(ttl)}"))?)
+
+  // Sets the key to `value` where it is not set, expiring after `ttl` where one is given, and
+  // answers whether it did.
+  setIfAbsent(key: string, value: string, ttl: Option[Duration] = None) -> Result[bool, RedisError]
+    val args = Vector("SET", key, value, "NX") ++ (ttl match
+      Some(d) -> Vector("PX", s"${millisOf(d)}")
+      None -> Vector.empty[string]())
+    val v = call(args)?
+    if v.isNull then Ok(false) else okOf(v).map(_ -> true)
+
+  // The values of `keys`, in order, each `None` where there is no such key.
+  mget(keys: string*) -> Result[Vector[Option[string]], RedisError]
+    val v = call(Vector("MGET") ++ keys)?
+    val items = itemsOf("an array of values", v)?
+    var out = Vector.empty[Option[string]]()
+    for x in items do out = out :+ optionalText(x)?
+    Ok(out)
+
+  // Sets each key to its value, all at once.
+  mset(pairs: (string, string)*) -> Result[unit, RedisError]
+    var args = Vector("MSET")
+    for (k, v) in pairs do args = args :+ k :+ v
+    okOf(call(args)?)
+
+  // Adds one to the key's number, a missing key counting as zero, and answers the new number.
+  incr(key: string) -> Result[long, RedisError] = longOf(call(Vector("INCR", key))?)
+
+  // Adds `n` to the key's number, and answers the new number.
+  incrBy(key: string, n: long) -> Result[long, RedisError] = longOf(call(Vector("INCRBY", key, s"$n"))?)
+
+  // Takes one from the key's number, and answers the new number.
+  decr(key: string) -> Result[long, RedisError] = longOf(call(Vector("DECR", key))?)
+
+  // Takes `n` from the key's number, and answers the new number.
+  decrBy(key: string, n: long) -> Result[long, RedisError] = longOf(call(Vector("DECRBY", key, s"$n"))?)
+
+  // Adds `x` to the key's floating-point number, and answers the new number.
+  incrByFloat(key: string, x: real) -> Result[real, RedisError] =
+    realReply(call(Vector("INCRBYFLOAT", key, doubleText(x)))?)
+
+  // Adds `value` to the end of the key's string, and answers its new length in bytes.
+  append(key: string, value: string) -> Result[long, RedisError] = longOf(call(Vector("APPEND", key, value))?)
+
+  // Keys.
+
+  // Removes `keys`, and answers how many there were.
+  del(keys: string*) -> Result[long, RedisError] = longOf(call(Vector("DEL") ++ keys)?)
+
+  // How many of `keys` exist, a key named twice counting twice.
+  exists(keys: string*) -> Result[long, RedisError] = longOf(call(Vector("EXISTS") ++ keys)?)
+
+  // Makes the key expire after `ttl`, in whole milliseconds, a part of one counting as one; answers
+  // whether there is such a key.
+  expire(key: string, ttl: Duration) -> Result[bool, RedisError] =
+    boolOf(call(Vector("PEXPIRE", key, s"${millisOf(ttl)}"))?)
+
+  // How long until the key expires.
+  ttl(key: string) -> Result[Expiry, RedisError] = longOf(call(Vector("PTTL", key))?) match
+    Ok(-2) -> Ok(NoKey)
+    Ok(-1) -> Ok(NoExpiry)
+    Ok(ms) -> Ok(ExpiresIn(millis(ms)))
+    Err(e) -> Err(e)
+
+  // Makes the key never expire; answers whether it had been going to.
+  persist(key: string) -> Result[bool, RedisError] = boolOf(call(Vector("PERSIST", key))?)
+
+  // Every key in the database matching `pattern` (`*` for all), a page of `count` at a time, by
+  // `SCAN`: a key there throughout is answered at least once, perhaps more than once; a key added
+  // or removed meanwhile may be answered or not. A failure is the last element.
+  scan(pattern: string = "*", count: int = 100) -> Iterator[Result[string, RedisError]] =
+    Scanned(ScanCursor(self, Vector("SCAN"), pattern, count))
+
+  // Hashes.
+
+  // Sets each field of the hash at `key` to its value, and answers how many fields are new.
+  hset(key: string, pairs: (string, string)*) -> Result[long, RedisError]
+    var args = Vector("HSET", key)
+    for (f, v) in pairs do args = args :+ f :+ v
+    longOf(call(args)?)
+
+  // The field's value; `None` where the hash, or the field, is not there.
+  hget(key: string, field: string) -> Result[Option[string], RedisError] =
+    optionalText(call(Vector("HGET", key, field))?)
+
+  // The values of `fields`, in order, each `None` where it is not there.
+  hmget(key: string, fields: string*) -> Result[Vector[Option[string]], RedisError]
+    val items = itemsOf("an array of values", call(Vector("HMGET", key) ++ fields)?)?
+    var out = Vector.empty[Option[string]]()
+    for x in items do out = out :+ optionalText(x)?
+    Ok(out)
+
+  // Every field of the hash and its value; empty where there is no such hash.
+  hgetAll(key: string) -> Result[Map[string, string], RedisError] =
+    textPairs(call(Vector("HGETALL", key))?).map(ps -> HashMap.from(ps))
+
+  // Removes `fields` from the hash, and answers how many there were.
+  hdel(key: string, fields: string*) -> Result[long, RedisError] = longOf(call(Vector("HDEL", key) ++ fields)?)
+
+  // Whether the hash has the field.
+  hexists(key: string, field: string) -> Result[bool, RedisError] = boolOf(call(Vector("HEXISTS", key, field))?)
+
+  // Adds `n` to the field's number, and answers the new number.
+  hincrBy(key: string, field: string, n: long) -> Result[long, RedisError] =
+    longOf(call(Vector("HINCRBY", key, field, s"$n"))?)
+
+  // How many fields the hash has.
+  hlen(key: string) -> Result[long, RedisError] = longOf(call(Vector("HLEN", key))?)
+
+  // The hash's fields and values, a page of `count` at a time, by `HSCAN`, as `scan` answers keys.
+  hscan(key: string, pattern: string = "*", count: int = 100) -> Iterator[Result[(string, string), RedisError]] =
+    PairScanned(ScanCursor(self, Vector("HSCAN", key), pattern, count))
+
+  // Lists.
+
+  // Adds `values` to the front of the list, one after another, and answers its new length.
+  lpush(key: string, values: string*) -> Result[long, RedisError] = longOf(call(Vector("LPUSH", key) ++ values)?)
+
+  // Adds `values` to the back of the list, in order, and answers its new length.
+  rpush(key: string, values: string*) -> Result[long, RedisError] = longOf(call(Vector("RPUSH", key) ++ values)?)
+
+  // Takes the list's first value; `None` where it is empty.
+  lpop(key: string) -> Result[Option[string], RedisError] = optionalText(call(Vector("LPOP", key))?)
+
+  // Takes the list's last value; `None` where it is empty.
+  rpop(key: string) -> Result[Option[string], RedisError] = optionalText(call(Vector("RPOP", key))?)
+
+  // The list's values from `start` to `stop`, both included, a negative index counting from the end:
+  // `lrange(key, 0, -1)` is all of them.
+  lrange(key: string, start: long, stop: long) -> Result[Vector[string], RedisError] =
+    textsOf(call(Vector("LRANGE", key, s"$start", s"$stop"))?)
+
+  // The list's length.
+  llen(key: string) -> Result[long, RedisError] = longOf(call(Vector("LLEN", key))?)
+
+  // Sets.
+
+  // Adds `members` to the set, and answers how many were new.
+  sadd(key: string, members: string*) -> Result[long, RedisError] = longOf(call(Vector("SADD", key) ++ members)?)
+
+  // Removes `members` from the set, and answers how many were there.
+  srem(key: string, members: string*) -> Result[long, RedisError] = longOf(call(Vector("SREM", key) ++ members)?)
+
+  // The set's members, in no order.
+  smembers(key: string) -> Result[Vector[string], RedisError] = textsOf(call(Vector("SMEMBERS", key))?)
+
+  // Whether `member` is in the set.
+  sismember(key: string, member: string) -> Result[bool, RedisError] =
+    boolOf(call(Vector("SISMEMBER", key, member))?)
+
+  // How many members the set has.
+  scard(key: string) -> Result[long, RedisError] = longOf(call(Vector("SCARD", key))?)
+
+  // The set's members, a page of `count` at a time, by `SSCAN`, as `scan` answers keys.
+  sscan(key: string, pattern: string = "*", count: int = 100) -> Iterator[Result[string, RedisError]] =
+    Scanned(ScanCursor(self, Vector("SSCAN", key), pattern, count))
+
+  // Sorted sets.
+
+  // Adds each member with its score, or gives one there its new score, and answers how many were
+  // new. Each entry is `(score, member)`, in the order `ZADD` takes them.
+  zadd(key: string, entries: (real, string)*) -> Result[long, RedisError]
+    var args = Vector("ZADD", key)
+    for (s, m) in entries do args = args :+ doubleText(s) :+ m
+    longOf(call(args)?)
+
+  // The members from rank `start` to `stop`, lowest score first, both included, a negative rank
+  // counting from the end.
+  zrange(key: string, start: long, stop: long) -> Result[Vector[string], RedisError] =
+    textsOf(call(Vector("ZRANGE", key, s"$start", s"$stop"))?)
+
+  // `zrange` with each member's score.
+  zrangeWithScores(key: string, start: long, stop: long) -> Result[Vector[(string, real)], RedisError] =
+    scoredOf(call(Vector("ZRANGE", key, s"$start", s"$stop", "WITHSCORES"))?)
+
+  // The member's score; `None` where it is not in the set.
+  zscore(key: string, member: string) -> Result[Option[real], RedisError]
+    val v = call(Vector("ZSCORE", key, member))?
+    if v.isNull then Ok(None) else realReply(v).map(x -> Some(x))
+
+  // Adds `x` to the member's score, a member not there starting from zero, and answers the new
+  // score.
+  zincrBy(key: string, x: real, member: string) -> Result[real, RedisError] =
+    realReply(call(Vector("ZINCRBY", key, doubleText(x), member))?)
+
+  // The member's rank, lowest score first, from zero; `None` where it is not in the set.
+  zrank(key: string, member: string) -> Result[Option[long], RedisError]
+    val v = call(Vector("ZRANK", key, member))?
+    if v.isNull then Ok(None) else longOf(v).map(n -> Some(n))
+
+  // Removes `members`, and answers how many were there.
+  zrem(key: string, members: string*) -> Result[long, RedisError] = longOf(call(Vector("ZREM", key) ++ members)?)
+
+  // How many members the sorted set has.
+  zcard(key: string) -> Result[long, RedisError] = longOf(call(Vector("ZCARD", key))?)
+
+  // The members and their scores, a page of `count` at a time, by `ZSCAN`, as `scan` answers keys.
+  zscan(key: string, pattern: string = "*", count: int = 100) -> Iterator[Result[(string, real), RedisError]] =
+    ScoreScanned(ScanCursor(self, Vector("ZSCAN", key), pattern, count))
+
+object Redis
+  // A connection to the Redis server at `host` and `port`, made at once, in one attempt; reconnecting
+  // is for a connection that has broken.
+  connect(host: string, port: int = 6379, options: RedisOptions = RedisOptions()) -> Result[Redis, RedisError]
+    val c = connectWith(host, port, options)?
+    Ok(Redis(host, port, options, Some(c)))
+
+  // A pool of connections to the server, shared between threads and actors: `pool.use(r -> r.get(k))`
+  // lends one connection for the call. A connection is made as one is needed, up to `maxSize`; one
+  // that has broken is not lent again but closed, and one idle for longer than `idleTimeout` is
+  // closed. A call waits at most `acquireTimeout` for a connection, and where `maxWaiting` calls
+  // already wait fails at once. The pool is `avin.threads.Pool`, which says the rest.
+  pool(
+      host: string,
+      port: int = 6379,
+      options: RedisOptions = RedisOptions(),
+      maxSize: int = 8,
+      minIdle: int = 0,
+      idleTimeout: Option[Duration] = Some(minutes(5)),
+      acquireTimeout: Option[Duration] = Some(seconds(10)),
+      maxLifetime: Option[Duration] = None,
+      maxWaiting: Option[int] = None
+  ) -> Pool[Redis, RedisError] = Pool[Redis, RedisError](
+    () -> Redis.connect(host, port, options),
+    maxSize = maxSize,
+    minIdle = minIdle,
+    validate = Some(r -> r.isOpen),
+    destroy = Some(r -> _ = r.close()),
+    idleTimeout = idleTimeout,
+    acquireTimeout = acquireTimeout,
+    maxLifetime = maxLifetime,
+    maxWaiting = maxWaiting
+  )
+
+// A duration in whole milliseconds, a part of one counting as one.
+private millisOf(d: Duration) -> long = if d.micros % 1000 > 0 then d.micros / 1000 + 1 else d.micros / 1000
+
+// Whether a failure leaves the connection unusable: everything but an error reply and a reply of the
+// wrong kind.
+private breaks(e: RedisError) -> bool = e match
+  ServerError(_, _) -> false
+  UnexpectedReply(_, _) -> false
+  _ -> true
+
+private okOf(v: Value) -> Result[unit, RedisError] = v.plain match
+  SimpleString(_) -> Ok(())
+  other -> Err(UnexpectedReply("OK", other))
+
+private longOf(v: Value) -> Result[long, RedisError] = v.plain match
+  Number(n) -> Ok(n)
+  other -> Err(UnexpectedReply("a number", other))
+
+private boolOf(v: Value) -> Result[bool, RedisError] = v.plain.asBool match
+  Some(b) -> Ok(b)
+  None -> Err(UnexpectedReply("a boolean", v.plain))
+
+private realReply(v: Value) -> Result[real, RedisError] = v.plain.asReal match
+  Some(x) -> Ok(x)
+  None -> Err(UnexpectedReply("a floating-point number", v.plain))
+
+private textOf(expected: string, v: Value) -> Result[string, RedisError] = v.plain.asText match
+  Some(t) -> Ok(t)
+  None -> Err(UnexpectedReply(expected, v.plain))
+
+private optionalText(v: Value) -> Result[Option[string], RedisError] =
+  if v.isNull then Ok(None) else textOf("text, or no value", v).map(t -> Some(t))
+
+private optionalBytes(v: Value) -> Result[Option[Array[byte]], RedisError] =
+  if v.isNull then Ok(None) else v.plain match
+    BlobString(b) -> Ok(Some(b.toArray()))
+    other -> Err(UnexpectedReply("bytes, or no value", other))
+
+private itemsOf(expected: string, v: Value) -> Result[Vector[Value], RedisError] = v.plain.asItems match
+  Some(xs) -> Ok(xs)
+  None -> Err(UnexpectedReply(expected, v.plain))
+
+private textsOf(v: Value) -> Result[Vector[string], RedisError]
+  val items = itemsOf("an array of text", v)?
+  var out = Vector.empty[string]()
+  for x in items do out = out :+ textOf("text", x)?
+  Ok(out)
+
+private textPairs(v: Value) -> Result[Vector[(string, string)], RedisError]
+  val es = v.plain.asEntries match
+    Some(es) -> es
+    None -> return Err(UnexpectedReply("a map", v.plain))
+  var out = Vector.empty[(string, string)]()
+  for (k, x) in es do out = out :+ (textOf("text", k)?, textOf("text", x)?)
+  Ok(out)
+
+// Members and scores: RESP3's array of pairs, or RESP2's flat array of a member and its score in
+// turn.
+private scoredOf(v: Value) -> Result[Vector[(string, real)], RedisError]
+  val items = itemsOf("members and their scores", v)?
+  var out = Vector.empty[(string, real)]()
+  if items.forall(x -> x.plain is ArrayValue(_))
+    for x in items
+      val pair = itemsOf("a member and its score", x)?
+      if pair.length != 2 then return Err(UnexpectedReply("a member and its score", x))
+      out = out :+ (textOf("a member", pair(0))?, realReply(pair(1))?)
+    return Ok(out)
+  if items.length % 2 != 0 then return Err(UnexpectedReply("members and their scores", v))
+  for (m, s) in pairedUp(items) do out = out :+ (textOf("a member", m)?, realReply(s)?)
+  Ok(out)
+
+// The pages of a `SCAN`, `HSCAN`, `SSCAN` or `ZSCAN`: `base` is the command and its key, to which the
+// cursor, `MATCH` and `COUNT` are added.
+private class ScanCursor(
+    private val redis: Redis,
+    private val base: Vector[string],
+    private val pattern: string,
+    private val count: int
+)
+  private var cursor = "0"
+  private var started = false
+  private var page = Vector.empty[Value]()
+  private var at = 0
+  private var failure: Option[RedisError] = None
+
+  // Whether a page is to be read, or there is more of the one read.
+  more() -> bool
+    while at >= page.length && failure.isEmpty && !(started && cursor == "0")
+      fetch()
+    at < page.length || failure.isDefined
+
+  // The next item, which `more` said is there; a failure once, after which there is no more.
+  take() -> Result[Value, RedisError]
+    if at < page.length
+      val v = page(at)
+      at += 1
+      return Ok(v)
+    val e = failure.get
+    failure = None
+    cursor = "0"
+    started = true
+    Err(e)
+
+  private fetch()
+    started = true
+    redis.command((base ++ Vector(cursor, "MATCH", pattern, "COUNT", s"$count"))*) match
+      Ok(v) -> v.plain.asItems match
+        Some(parts) if parts.length == 2 && parts(0).asText.isDefined && parts(1).asItems.isDefined ->
+          cursor = parts(0).asText.get
+          page = parts(1).asItems.get
+          at = 0
+        _ -> failure = Some(UnexpectedReply("a cursor and a page", v))
+      Err(e) -> failure = Some(e)
+
+// Every element of a scan as text.
+private class Scanned(private val c: ScanCursor): Iterator[Result[string, RedisError]]
+  override hasNext() -> bool = c.more()
+
+  override next() -> Result[string, RedisError] = c.take().flatMap(v -> textOf("text", v))
+
+// The elements of a scan in pairs, a field and its value.
+private class PairScanned(private val c: ScanCursor): Iterator[Result[(string, string), RedisError]]
+  override hasNext() -> bool = c.more()
+
+  override next() -> Result[(string, string), RedisError]
+    val k = textOf("a field", c.take()?)?
+    if !c.more() then return Err(UnexpectedReply("a field's value", Null))
+    Ok((k, textOf("a value", c.take()?)?))
+
+// The elements of a scan in pairs, a member and its score.
+private class ScoreScanned(private val c: ScanCursor): Iterator[Result[(string, real), RedisError]]
+  override hasNext() -> bool = c.more()
+
+  override next() -> Result[(string, real), RedisError]
+    val m = textOf("a member", c.take()?)?
+    if !c.more() then return Err(UnexpectedReply("a member's score", Null))
+    Ok((m, realReply(c.take()?)?))

@@ -1,0 +1,208 @@
+module dev.avinlang.compiler
+@tests
+
+import sh.sysl.parsing.source_of
+import sysl.buf.{Buf, buf}
+import sysl.fs.{make_temp_dir, remove_dir_all}
+
+// Where a delayed argument's closure lives: one written at a call of a function of the program, by
+// name, through a method table or of a function value, is made in the caller's frame, and what it
+// holds is kept alive until the call returns; a closure that could outlive the call, one capturing a
+// by-name parameter, copies the parameter's closure to the heap first.
+
+private stack_lowered(text: string) -> MirProgram = lower_source(repository_toolchain(), source_of("probe.avin", text)) match
+    Ok(p) -> p
+    Err(d) -> panic(d)
+
+private stack_function(program: MirProgram, name: string) -> MirFunction
+    for f in program.functions
+        if f.symbol == "<program>." + name then return f
+    panic("no function " + name)
+
+/** What function `name` of the program `text` makes and calls. */
+private struct Made
+    stack: int
+    heap: int
+    keeps: int
+    kept_delayed: int
+    /** Whether every value of the function stored into an object made in the frame is held by a
+     * `Keep`. */
+    kept_after: bool
+    /** Whether a block's last instruction before its terminator is a `Keep`. */
+    keep_last: bool
+
+private made_of(text: string, name: string) -> Made
+    val f = stack_function(stack_lowered(text), name)
+    var stack = 0
+    var heap = 0
+    var keeps = 0
+    var kept_delayed = 0
+    var keep_last = false
+    // The objects made in the frame and the addresses of their fields, then what is stored there.
+    var places: Buf[usize] = buf()
+    var stored: Buf[usize] = buf()
+    var kept: Buf[usize] = buf()
+    for block in f.blocks
+        val n = block.insts.len()
+        for inst in block.insts
+            inst match
+                StackObject(d, _) ->
+                    stack = stack + 1
+                    places.push(d)
+                Offset(d, Value(base), _) -> if holds(places, base) then places.push(d)
+                Alloc(_, _) -> heap = heap + 1
+                Keep(values) ->
+                    keeps = keeps + 1
+                    for v in values
+                        if v is Value(x) then kept.push(x)
+                Call(_, Runtime(symbol, _), _) -> if symbol == "avin_rt_keep_delayed" then kept_delayed = kept_delayed + 1
+                Store(Value(at), Value(v)) -> if holds(places, at) then stored.push(v)
+                _ -> ()
+        if n > 0 && block.insts[n - 1] is Keep(_) then keep_last = true
+    var kept_after = true
+    for s in stored
+        if !holds(kept, s) then kept_after = false
+    Made(stack, heap, keeps, kept_delayed, kept_after, keep_last)
+
+private holds(values: Buf[usize], v: usize) -> bool
+    for x in values
+        if x == v then return true
+    false
+
+/** The LLVM text of the function whose symbol is `symbol` in `ir`. */
+private stack_symbol_text(ir: string, symbol: string) -> string
+    val head = "@\"" + symbol + "\"("
+    var out = ""
+    var inside = false
+    for line in ir.split("\n")
+        if line.starts_with("define ") && line.contains(head) then inside = true
+        if inside
+            out = out + line + "\n"
+            if line == "}" then return out
+    out
+
+private stack_text(text: string, name: string) -> string = stack_symbol_text(emit_llvm(stack_lowered(text)), "<program>." + name)
+
+private stack_cached(files: Buf[ProgramFile], cache: string) -> CachedLowering = cached_lowering(repository_toolchain(), files, cache) match
+    Ok(c) -> c
+    Err(d) -> panic(d)
+
+private const Twice: string = "twice(value: -> int) -> int = value + value\n\n"
+
+@test("a delayed argument that captures is made in the caller's frame, not on the heap")
+capturing_argument_is_on_the_stack()
+    val m = made_of(Twice + "caller(n: int) -> int\n  val r = twice(n * 3)\n  r + 1\n\nmain()\n  println(caller(2))\n", "caller")
+    assert_eq(m.stack, 1)
+    assert_eq(m.heap, 0)
+    assert_eq(m.kept_delayed, 0)
+
+@test("what a delayed argument made in the frame holds is kept alive until after the call")
+stack_argument_is_kept_after_the_call()
+    val m = made_of(Twice + "caller(s: string) -> int\n  val r = twice(s.byteLength)\n  r + 1\n\nmain()\n  println(caller(\"abc\"))\n", "caller")
+    assert_eq(m.stack, 1)
+    assert_eq(m.keeps, 1)
+    assert(m.kept_after)
+
+@test("a call in tail position passed a delayed argument made in the frame is no tail call")
+stack_argument_call_is_no_tail_call()
+    val text = Twice + "caller(n: int) -> int = twice(n * 3)\n\nmain()\n  println(caller(2))\n"
+    val m = made_of(text, "caller")
+    assert_eq(m.stack, 1)
+    assert(m.keep_last)
+    val ir = stack_text(text, "caller")
+    assert(!ir.contains("musttail"), ir)
+    assert(ir.contains("%so"), ir)
+    assert(!ir.contains("avin_rt_alloc"), ir)
+
+@test("the frame's storage for a delayed argument made in a loop is one alloca at the entry")
+loop_reuses_the_entry_storage()
+    val text = Twice + "caller(n: int) -> int\n  var total = 0\n  for i in 0 ..< n\n    total += twice(i * 2)\n  total\n\nmain()\n  println(caller(4))\n"
+    assert_eq(made_of(text, "caller").stack, 1)
+    val ir = stack_text(text, "caller")
+    assert_eq(ir.count_of(" = alloca { ptr, i64, ["), 1usize, ir)
+    val entry = ir.split("\nb1:")[0]
+    assert(entry.contains(" = alloca { ptr, i64, ["), ir)
+    assert(!ir.contains("avin_rt_alloc"), ir)
+
+@test("a delayed argument that captures nothing is the constant closure, in no frame and on no heap")
+constant_argument_is_constant()
+    val m = made_of(Twice + "caller() -> int = twice(7)\n\nmain()\n  println(caller())\n", "caller")
+    assert_eq(m.stack, 0)
+    assert_eq(m.heap, 0)
+    assert_eq(m.keeps, 0)
+
+@test("a by-name parameter passed on makes no closure and copies nothing")
+forwarded_parameter_makes_nothing()
+    val m = made_of(Twice + "forwarded(value: -> int) -> int = twice(value)\n\nmain()\n  val k = 3\n  println(forwarded(k + 1))\n", "forwarded")
+    assert_eq(m.stack, 0)
+    assert_eq(m.heap, 0)
+    assert_eq(m.kept_delayed, 0)
+    assert_eq(m.keeps, 0)
+
+@test("a lambda capturing a by-name parameter copies the parameter's closure to the heap first")
+lambda_capture_keeps_on_heap()
+    val m = made_of("later(value: -> int) -> () -> int = () -> value + 1\n\nmain()\n  val k = 3\n  val f = later(k * 2)\n  println(f())\n", "later")
+    assert_eq(m.kept_delayed, 1)
+    assert_eq(m.heap, 1)
+    assert_eq(m.stack, 0)
+
+@test("a local function capturing a by-name parameter, made a value, copies the parameter's closure to the heap first")
+local_function_capture_keeps_on_heap()
+    val m = made_of("later(value: -> int) -> () -> int\n  read() -> int = value * 2\n  read\n\nmain()\n  val k = 3\n  println(later(k + 1)())\n", "later")
+    assert_eq(m.kept_delayed, 1)
+    assert_eq(m.stack, 0)
+
+@test("a delayed argument capturing a by-name parameter is made in the frame, the parameter's closure on the heap")
+nested_argument_keeps_parameter_on_heap()
+    val m = made_of(Twice + "nested(value: -> int) -> int = twice(value + 1)\n\nmain()\n  val k = 3\n  println(nested(k * 2))\n", "nested")
+    assert_eq(m.stack, 1)
+    assert_eq(m.kept_delayed, 1)
+    assert_eq(m.heap, 0)
+    assert(m.kept_after)
+
+@test("a call through a method table is passed its delayed argument in the frame")
+dispatched_argument_is_on_the_stack()
+    val text = "trait Sink\n  put(line: -> string) -> int\n\nclass Quiet(val k: int): Sink\n  override put(line: -> string) -> int = k\n\nclass Loud(val k: int): Sink\n  override put(line: -> string) -> int = line.byteLength + k\n\ncaller(s: Sink, n: int) -> int = s.put(s\"n $n\") + 1\n\nmain()\n  println(caller(Quiet(0), 1) + caller(Loud(0), 2))\n"
+    val m = made_of(text, "caller")
+    assert_eq(m.stack, 1)
+    assert_eq(m.heap, 0)
+    assert(m.kept_after)
+
+@test("a call of a function value taking a by-name parameter is passed its delayed argument in the frame")
+function_value_argument_is_on_the_stack()
+    val text = "caller(f: (-> int) -> int, n: int) -> int = f(n * 2) + 1\n\nmain()\n  val g: (-> int) -> int = v -> v + v\n  println(caller(g, 3))\n"
+    val m = made_of(text, "caller")
+    assert_eq(m.stack, 1)
+    assert_eq(m.heap, 0)
+    assert(m.kept_after)
+
+@test("a delayed argument of a generic function's instance is made in the frame")
+generic_argument_is_on_the_stack()
+    val text = "pair[T](value: -> T) -> (T, T) = (value, value)\n\ncaller(s: string) -> int\n  val p = pair(s + \"!\")\n  p.0.byteLength + p.1.byteLength\n\nmain()\n  println(caller(\"ab\"))\n"
+    val m = made_of(text, "caller")
+    assert_eq(m.stack, 1)
+    assert(m.kept_after)
+
+@test("a call that becomes a jump back to the function's start passes its delayed argument on the heap")
+self_tail_call_argument_is_on_the_heap()
+    val text = "sum(n: int, acc: -> int) -> int = if n == 0 then acc else sum(n - 1, acc + n)\n\nmain()\n  println(sum(4, 0))\n"
+    val m = made_of(text, "sum")
+    assert_eq(m.stack, 0)
+    assert_eq(m.heap, 1)
+    assert_eq(m.kept_delayed, 1)
+
+@test("a call kept in the instance cache gives back its frame's objects and keeps as a clean build does")
+cache_round_trips_stack_objects()
+    val dir = make_temp_dir("avin-bn").unwrap()
+    defer _ = remove_dir_all(dir)
+    val text = Twice + "caller(n: int) -> int\n  val r = twice(n * 3)\n  r + 1\n\nmain()\n  println(caller(2))\n"
+    var files: Buf[ProgramFile] = buf()
+    files.push(ProgramFile(source_of(dir + "/main.avin", text), None, false, buf(), ""))
+    val first = stack_cached(files, dir + "/cache")
+    val second = stack_cached(files, dir + "/cache")
+    var reused = false
+    for i in 0..<second.program.functions.len()
+        if second.program.functions[i].symbol == "<program>.caller" then reused = second.program.reused[i]
+    assert(reused)
+    assert_eq(second.llvm, first.llvm)
+    assert(second.llvm.contains("%so"))

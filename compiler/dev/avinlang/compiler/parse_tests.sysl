@@ -28,7 +28,7 @@ private declarations(text: string) -> string
             ImplItem(d) -> show_impl(d)
             AliasItem(d) -> show_alias(d)
             ValueItem(v) ->
-                var value = "(" + (if v.lazy then "lazy " else "") + (if v.mutable then "var " else "val ") + v.name
+                var value = "(" + (if v.lazy then "lazy " else "") + (if v.given then "given " else (if v.mutable then "var " else "val ")) + v.name
                 if v.declared is Some(t) then value = value + ": " + show_type(t)
                 value + " " + show_expr(v.value) + ")"
         out = out + shown + "\n"
@@ -86,6 +86,24 @@ infix_errors()
     assert(diagnostics("f(xs: Xs) -> int = xs size\n").contains("`size` has no argument"))
     assert(diagnostics("f(xs: Xs) -> bool = xs size == 0\n").contains("a member is reached with a dot, as `xs.size`, or `xs.size()` for a method declared with an empty parameter list"))
     assert(diagnostics("f(xs: Xs) -> int\n    val n = (xs\n        size 1)\n    n\n").contains("an infix call starts on its receiver's line"))
+
+@test("a keyword used as a name gives its own error and no infix-call cascade")
+keyword_as_name()
+    val closer = diagnostics("f(at: int) -> int\n    while at < 3\n        val r = if at > 1\n            1\n        else\n            2\n        end = at\n    at\n")
+    assert(!closer.contains("end ="))
+    assert(!closer.contains("a member is reached with a dot"))
+    assert(!closer.contains("expected a name"))
+    // `end` followed by a name still closes the form it follows.
+    assert_eq(diagnostics("f(at: int) -> int\n    val r = if at > 1\n        1\n    else\n        2\n    end if\n    r\n"), "")
+    assert(diagnostics("f(at: int) -> int\n    val r = if at > 1\n        1\n    else\n        2\n    end match\n    r\n").contains("`end match` cannot close `if`"))
+    for kw in ["do", "while"]
+        val d = diagnostics(s"f(at: int) -> int\n    $kw = at\n    at\n")
+        assert(!d.contains("a member is reached with a dot"))
+        assert(!d.contains("has no argument"))
+    // A receiver that spans lines is quoted as `…`, never pasted whole.
+    val multi = diagnostics("f(xs: Xs) -> int\n    val n = (\n        val a = xs\n        a\n    ) size\n    n\n")
+    assert(multi.contains("as `….size`"))
+    assert(!multi.contains("val a = xs\n"))
 
 @test("an operator is the longest run of operator characters, and one the language lacks names a method")
 symbol_calls()
@@ -457,6 +475,25 @@ placeholder_lambdas()
     assert_eq(tree("f(x -> _)"), "(call f (fn (x) _))")
     // A function's name with only its parameters is that function.
     assert(diagnostics("main() = [1].map(double(_))\n").contains("`double(_)` is the function `double` itself; pass it as `double`"))
+
+@test("each branch of an `if` or `match` and a block's last line in a placeholder's place is a place of its own")
+placeholder_branches()
+    assert_eq(tree("f(if c then _ + 1 else _ - 1)"), "(call f (if c (fn (_$1) (+ _$1 1)) (fn (_$1) (- _$1 1))))")
+    assert_eq(tree("f(if c then _ + 1 elif d then _ * 2 else 0)"), "(call f (if c (fn (_$1) (+ _$1 1)) (if d (fn (_$1) (* _$1 2)) 0)))")
+    assert_eq(tree("f(if c then _ + _ else x)"), "(call f (if c (fn (_$1 _$2) (+ _$1 _$2)) x))")
+    // The condition, the subject and a guard keep their own `_`, as does a branch that is `_` alone.
+    assert_eq(tree("f(if _ then a else b)"), "(call f (if _ a b))")
+    assert_eq(tree("f(if c then _ else b)"), "(call f (if c _ b))")
+    // Outside a place, a branch's or an arm's `_` is left for the checker to report.
+    assert_eq(tree("if c then _ + 1 else 0"), "(if c (+ _ 1) 0)")
+    assert_eq(tree("x match\n    1 -> _ + 1\n    _ -> b\n"), "(match x (1 -> (+ _ 1)) (_ -> b))")
+    // A declared value, a function with a declared result and its clauses are places; a function
+    // with none is not.
+    assert(!diagnostics("main() -> int\n    val f: (int) -> int = if true then _ + 1 else _ - 1\n    f(1)\n").contains("error"))
+    assert(!diagnostics("inc(n: int) -> (int) -> int = n match\n    0 -> _ + 1\n    _ -> _ + n\n").contains("error"))
+    assert(diagnostics("op(name: string) -> (int) -> int\nop(\"a\") = double(_)\nop(_) = _ + 1\n").contains("`double(_)` is the function `double` itself"))
+    assert(!diagnostics("op(name: string) -> (int) -> int\nop(\"a\") = _ * 2\nop(_)\n    | true = _ + 1\n    | _ = _ - 1\n").contains("error"))
+    assert(!diagnostics("noResult(c: bool) = if c then double(_) else 0\n").contains("error"))
 
 @test("calls take positional and named arguments, and type arguments")
 calls()
@@ -1088,11 +1125,42 @@ for_yield()
     assert_eq(tree("for\n    x in xs\n    y = f(x)\n    if q(y)\nyield y\n"), "(for (x xs) (= y (call f x) (if (call q y))) (yield y))")
     assert(diagnostics("f() =\n    val v = for y = 1, x in xs yield x\n").contains("a `for` starts with a generator"))
     assert(diagnostics("f() =\n    val v = for x in xs, x = 1 yield x\n").contains("`x` is already bound in this `for`"))
-    assert(diagnostics("f() =\n    for x in xs, y = x do g(y)\n").contains("a value definition between generators needs `yield`"))
-    assert(diagnostics("f() =\n    for x in xs, y in ys do g(x)\n").contains("a `for` without `yield` has one generator and no guards"))
-    assert(diagnostics("f() =\n    for x in xs if p(x)\n        g(x)\n").contains("a `for` without `yield` has one generator and no guards"))
     assert(diagnostics("f() =\n    for\n        x in xs\n    g(x)\n").contains("generators written in a block after `for` need `yield`"))
+    assert(diagnostics("f() =\n    for\n        x in xs\n    do g(x)\n").contains("generators written in a block after `for` need `yield`"))
     assert(diagnostics("f() =\n    val yield = 1\n").contains("`yield` is a keyword"))
+
+@test("a `for` without `yield` is the loops its generators, guards and definitions would nest into")
+for_loop_generators()
+    assert_eq(tree("for i in a, j in b do f(i, j)"), "(for i a (for j b (call f i j)))")
+    assert_eq(tree("for i in a, j in b, k in c do f(k)"), "(for i a (for j b (for k c (call f k))))")
+    assert_eq(tree("for x in xs if p(x) do f(x)"), "(for x xs (if (call p x) (call f x)))")
+    assert_eq(tree("for x in xs if p(x) if q(x) do f(x)"), "(for x xs (if (call p x) (if (call q x) (call f x))))")
+    assert_eq(tree("for i in a if p(i), j in b if q(j) do f(i, j)"), "(for i a (if (call p i) (for j b (if (call q j) (call f i j)))))")
+    assert_eq(tree("for x in xs, y = g(x) do f(y)"), "(for x xs (block! (val y (call g x)) (call f y)))")
+    assert_eq(tree("for x in xs, y = g(x) if p(y), z in zs do f(z)"), "(for x xs (block! (val y (call g x)) (if (call p y) (for z zs (call f z)))))")
+    assert_eq(tree("for x in xs, (a, b) = g(x) do f(a)"), "(for x xs (block! (val (tuple a b) (call g x)) (call f a)))")
+    assert_eq(tree("for x in xs, _ = g(x) do f(x)"), "(for x xs (block! (call g x) (call f x)))")
+    assert_eq(tree("for i in a, j in b\n    f(i)\n    g(j)\n"), "(for i a (for j b (block! (call f i) (call g j))))")
+    assert_eq(tree("for x in xs if p(x)\n    f(x)\n"), "(for x xs (if (call p x) (block! (call f x))))")
+    assert(parses("f() =\n    for i in a, j in b\n        g(i)\n    end for\n"))
+    assert(diagnostics("f() =\n    for i in a, j in b g(i)\n").contains("a one-line `for` needs `do`"))
+    assert(diagnostics("f() =\n    for if p(x) do g(x)\n") != "")
+    assert(diagnostics("f() =\n    for y = 1, x in xs do g(x)\n").contains("a `for` starts with a generator"))
+    assert(diagnostics("f() =\n    for x in xs, x = 1 do g(x)\n").contains("`x` is already bound in this `for`"))
+
+@test("`yield` may start a line indented under a one-line `for`'s clauses")
+for_yield_continued()
+    assert_eq(declarations("f() =\n    for d in ds if d != c\n        yield d\n"), "(def f() (block (for (d ds (if (d != c))) (yield d))))\n")
+    assert_eq(declarations("f() =\n    for d in ds if d != c\n        yield d\n"), declarations("f() =\n    for d in ds if d != c yield d\n"))
+    assert_eq(declarations("f() =\n    for i in a, j in b\n        yield i * j\n    g()\n"), declarations("f() =\n    for i in a, j in b yield i * j\n    g()\n"))
+    assert_eq(declarations("f() =\n    val v = for x in xs\n        yield x + 1\n    v\n"), declarations("f() =\n    val v = for x in xs yield x + 1\n    v\n"))
+    // The yielded value may itself be an indented block under the `yield` line.
+    assert(parses("f() =\n    val v = for x in xs if p(x)\n        yield\n            val y = x + 1\n            y * y\n    v\n"))
+    assert(parses("f() =\n    for x in xs\n        yield x\n    end for\n"))
+    // A line after the `yield` line, still under the clauses, is not part of it.
+    assert(diagnostics("f() =\n    for x in xs\n        yield x\n        g()\n").contains("ends with that `yield`'s value"))
+    // An indented line that starts with anything but `yield` is the body of a loop.
+    assert_eq(tree("for x in xs\n    f(x)\n"), "(for x xs (block! (call f x)))")
 
 @test("malformed parameters, end markers and layout are diagnosed once each")
 syntax_errors()
@@ -1525,3 +1593,90 @@ declared_levels_read()
 private level_named(op: string) -> string = precedence_level(op) match
     Some(t) -> level_operator(t)
     None -> "none"
+
+// ---- contextual parameters ----
+
+@test("`given` declares a given in a block, at the top level and in an object's body, with or without its type")
+given_declarations()
+    assert_eq(declarations("given log = FileLogger(\"a\")\n"), "(given log (call FileLogger \"a\"))\n")
+    assert_eq(declarations("given log: Logger = FileLogger(\"a\")\n"), "(given log: Logger (call FileLogger \"a\"))\n")
+    assert_eq(declarations("private given clock = SystemClock\n"), "(given clock SystemClock)\n")
+    assert_eq(declarations("object App\n    given log: Logger = make()\n    private given clock = SystemClock\n"), "(object App (given log: Logger (call make)) (private given clock SystemClock))\n")
+    assert_eq(declarations("main()\n    given tx = db.begin()\n    save(row)\n"), "(def main() (block! (given tx (call (. db begin))) (call save row)))\n")
+    assert_eq(declarations("main()\n    given tx: Tx = begin()\n    0\n"), "(def main() (block! (given tx: Tx (call begin)) 0))\n")
+    // A Unicode name, and a value on the lines after it.
+    assert_eq(declarations("main()\n    given журнал = Logger()\n    0\n"), "(def main() (block! (given журнал (call Logger)) 0))\n")
+    assert(parses("main()\n    given tx =\n        val db = open()\n        db.begin()\n    0\n"))
+    // Nested blocks each declare their own.
+    assert(parses("main()\n    given a = A()\n    if ok\n        given a = A()\n        f()\n    f()\n"))
+
+@test("`given` is a keyword only where it begins a given, and an ordinary name elsewhere")
+given_contextual_keyword()
+    assert_eq(tree("args.given(\"out\")"), "(call (. args given) \"out\")")
+    assert(parses("main()\n    var given = 1\n    given = 2\n    given += 1\n    println(given)\n"))
+    assert(parses("class A(val given: int)\n    val g = given\n"))
+    assert(parses("given(x: int) -> int = x\nmain() = given(1)\n"))
+    assert(parses("data D(given: int)\nf(given: string) = given\n"))
+    assert(parses("main()\n    val given = 1\n    if given > 0 then given else 0\n"))
+    assert(parses("main()\n    val x = if ok then given else 1\n"))
+    assert(parses("main()\n    given max other\n"))
+    assert(parses("class A\n    given() = 1\n    val given = 2\n"))
+
+@test("a given has a name, is a `val`, takes no annotations, and is declared in no data body")
+given_refusals()
+    assert(diagnostics("main()\n    given Logger(\"a\")\n").contains("every given has a name"))
+    assert(diagnostics("given Logger(\"a\")\n").contains("every given has a name"))
+    assert(diagnostics("main()\n    given val tx = begin()\n").contains("a given is a `val` already"))
+    assert(diagnostics("main()\n    given var tx = begin()\n").contains("a given is a `val`: it is never reassigned"))
+    assert(diagnostics("@inline\ngiven tx = begin()\n").contains("a given takes no annotations"))
+    assert(diagnostics("object O\n    @inline\n    given tx = begin()\n").contains("a given takes no annotations"))
+    assert(diagnostics("object O\n    static given tx = begin()\n").contains("only a method can be `static`; a given belongs to the object"))
+    assert(diagnostics("object O\n    override given tx = begin()\n").contains("only a method can be marked `override`"))
+    assert(diagnostics("data Shape\n    Circle(r: real)\n    given s = Shape.Circle(1.0)\n").contains("a data type declares no givens"))
+    assert(diagnostics("main()\n    given tx: Tx\n").contains("expected"))
+
+@test("`using` begins a parameter list's contextual section, last, on functions, methods and constructors")
+using_sections()
+    assert_eq(declarations("insert(row: Row, using tx: Tx) = 1\n"), "(def insert(row: Row, using tx: Tx) 1)\n")
+    assert_eq(declarations("f(using tx: Tx, log: Logger) = 1\n"), "(def f(using tx: Tx, log: Logger) 1)\n")
+    assert_eq(declarations("now(using clock: Clock = SystemClock) -> int = 1\n"), "(def now(using clock: Clock = SystemClock) -> int 1)\n")
+    assert_eq(declarations("log(m: string, level: Level = Info, using logger: Logger) = 1\n"), "(def log(m: string, level: Level = Info, using logger: Logger) 1)\n")
+    // After a repeated parameter.
+    assert_eq(declarations("all(xs: int*, using log: Logger) = 1\n"), "(def all(xs: int*, using log: Logger) 1)\n")
+    assert_eq(declarations("class Service(name: string, using db: Db, log: Logger)\n"), "(class Service(name: string, using db: Db, log: Logger))\n")
+    assert_eq(declarations("class Service(using db: Db)\n    run() = db.go()\n"), "(class Service(using db: Db) (def run() (call (. db go))))\n")
+    assert(parses("class A\n    m(x: int, using tx: Tx) = x\n    static s(using tx: Tx) = 1\n"))
+    assert(parses("trait T\n    m(using tx: Tx) -> int\n"))
+    assert(parses("impl string\n    m(using tx: Tx) = 1\n"))
+    assert(parses("f[T: Ord](x: T, using tx: Tx) = x\n"))
+    assert(parses("main()\n    local(n: int, using tx: Tx) = n\n    0\n"))
+    assert(parses("f(n: int, using tx: Tx) -> int\n    n\n"))
+    assert(parses("actor Counter(start: int, using log: Logger) receives int\n    receive\n        n -> ()\n"))
+    // A parameter named `using` is still one.
+    assert_eq(declarations("f(using: Mode) = using\n"), "(def f(using: Mode) using)\n")
+    assert_eq(declarations("f(a: int, using: Mode) = a\n"), "(def f(a: int, using: Mode) a)\n")
+
+@test("a `using` section is written once, of named, single, by-value parameters, never on a data variant")
+using_refusals()
+    assert(diagnostics("f(using a: A, using b: B) = 1\n").contains("`using` begins the contextual section once"))
+    assert(diagnostics("data D(x: int, using tx: Tx)\n").contains("a data variant's fields take no `using` section"))
+    assert(diagnostics("data D\n    V(using tx: Tx)\n").contains("a data variant's fields take no `using` section"))
+    assert(diagnostics("f(using xs: Tx*) = 1\n").contains("a contextual parameter cannot be repeated"))
+    assert(diagnostics("f(using tx: -> Tx) = 1\n").contains("a contextual parameter cannot be by-name"))
+    assert(diagnostics("f(using _: Tx) = 1\n").contains("a contextual parameter needs a name"))
+    assert(diagnostics("f(xs: int*, n: int, using tx: Tx) = 1\n").contains("a repeated parameter must be last, before only a `using` section"))
+    assert(diagnostics("class C(using val db: Db)\n").contains("a contextual parameter is a private field and a given in the body"))
+    assert(diagnostics("class C(using var db: Db)\n").contains("a contextual parameter is a private field and a given in the body"))
+    assert(diagnostics("class C(using a: A, using b: B)\n").contains("`using` begins the contextual section once"))
+    assert(diagnostics("class C(using xs: A*)\n").contains("a contextual parameter cannot be repeated"))
+
+@test("a lambda's parameters after `using` are givens in its body")
+using_lambdas()
+    assert_eq(tree("using tx -> insert(row)"), "(fn (using tx) (call insert row))")
+    assert_eq(tree("(a, using tx: Tx) -> a"), "(fn (a using tx: Tx) a)")
+    assert_eq(tree("db.transaction(using tx -> insert(row))"), "(call (. db transaction) (fn (using tx) (call insert row)))")
+    assert(parses("main()\n    db.transaction using tx ->\n        insert(row)\n"))
+    assert(diagnostics("main()\n    val f = (using a: A, using b: B) -> 1\n").contains("`using` begins the contextual section once"))
+    // `using` alone is an ordinary parameter's or value's name.
+    assert_eq(tree("using -> using"), "(fn (using) using)")
+    assert_eq(tree("f(using)"), "(call f using)")

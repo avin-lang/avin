@@ -30,14 +30,30 @@ impl Error for PatternError
     if 0 <= index < pattern.charCount then text = text + "\n" + " ".repeat(index) + "^"
     text
 
-// One character drawn from a class: its answers for the ASCII characters looked up in a table, and
-// the test for any other.
-private data CharSet(table: Array[bool], test: (int) -> bool)
+// The test of whether a character, as its code point, is a member of a class. It is `@sendable`, so
+// a compiled pattern made of them is shared between threads as it is.
+private type CharTest = @sendable (int) -> bool
 
-private charSet(test: (int) -> bool) -> CharSet = CharSet(Array.tabulate(128, k -> test(k)), test)
+// One character drawn from a class: its answers for the ASCII characters held as bits, those below 64
+// in `low` and the rest below 128 in `high`, and the test for any other. Nothing in it changes once
+// it is made.
+private data CharSet(low: long, high: long, test: CharTest)
+
+private charSet(test: CharTest) -> CharSet
+  var low: long = 0
+  var high: long = 0
+  for k in 0 ..< 64
+    if test(k) then low = low | charBit(k)
+    if test(k + 64) then high = high | charBit(k)
+  CharSet(low, high, test)
+
+// The bit for `k`, from 0 to 63, in a word of a `CharSet`.
+private charBit(k: int) -> long = long(1) << long(k)
 
 impl CharSet
-  contains(c: int) -> bool = if c < 128 then table(c) else test(c)
+  contains(c: int) -> bool = if c < 64 then (low & charBit(c)) != 0 elif c < 128 then (
+    high & charBit(c - 64)
+  ) != 0 else test(c)
 
 // How a repetition gives back what it took: the most first, the fewest first, or never.
 private val Greedy: int = 0
@@ -71,7 +87,7 @@ private data Tree
   // One character of a class.
   Chars(set: CharSet)
   // A run of characters matched exactly.
-  Literal(codes: Array[int])
+  Literal(codes: ArraySeq[int])
   Concat(items: Vector[Tree])
   // Alternatives tried left to right.
   Alternation(alternatives: Vector[Tree])
@@ -100,7 +116,7 @@ private data Tree
 // What an escape stands for: a character, a class, or a construct of its own.
 private data Escaped
   Code(code: int)
-  Class(test: (int) -> bool)
+  Class(test: CharTest)
   Construct(tree: Tree)
 
 // What a pattern reads as: its tree, the number of groups counting the whole match as group 0, and
@@ -512,14 +528,14 @@ private class Parser(text: string)
       val items = Buffer[Tree]()
       for c in codes do items.addOne(Chars(charSet(single(c))))
       return Ok(concatenation(items))
-    Ok(if codes.isEmpty then Empty else Literal(codes.toArray()))
+    Ok(if codes.isEmpty then Empty else Literal(codes.toArraySeq))
 
   // One literal character: exact, or a class of its cases.
   private singleTree(c: int) -> Tree
-    if has(CaseInsensitive) then Chars(charSet(single(c))) else Literal(Array.fill(1, c))
+    if has(CaseInsensitive) then Chars(charSet(single(c))) else Literal(ArraySeq(c))
 
   // The test for one character as a literal, with its other cases where matching ignores case.
-  private single(c: int) -> (int) -> bool
+  private single(c: int) -> CharTest
     if has(CaseInsensitive)
       if has(UnicodeCase)
         val upper = upperOf(c)
@@ -592,11 +608,11 @@ private class Parser(text: string)
       _ -> if isAsciiAlnum(int(ch)) then bad else Ok(Code(int(ch)))
 
   // The classes of `\d`, `\s` and `\w`: over ASCII, or under the `U` flag over all of Unicode.
-  private digitClass() -> (int) -> bool = if has(UnicodeCharacterClass) then categories(bit(9)) else isAsciiDigit
+  private digitClass() -> CharTest = if has(UnicodeCharacterClass) then categories(bit(9)) else isAsciiDigit
 
-  private spaceClass() -> (int) -> bool = if has(UnicodeCharacterClass) then isWhiteSpace else isAsciiSpace
+  private spaceClass() -> CharTest = if has(UnicodeCharacterClass) then isWhiteSpace else isAsciiSpace
 
-  private wordClass() -> (int) -> bool = if has(UnicodeCharacterClass) then isWord else isAsciiWord
+  private wordClass() -> CharTest = if has(UnicodeCharacterClass) then isWord else isAsciiWord
 
   // A back reference: more digits extend the number while it names a group already opened.
   private reference(first: int) -> Tree
@@ -672,9 +688,9 @@ private class Parser(text: string)
     Err(error("Illegal control escape sequence"))
 
   // A character class from its `[`; `consume` moves past its `]`.
-  private clazz(consume: bool) -> Result[(int) -> bool, PatternError]
-    var prev: Option[(int) -> bool] = None
-    var curr: Option[(int) -> bool] = None
+  private clazz(consume: bool) -> Result[CharTest, PatternError]
+    var prev: Option[CharTest] = None
+    var curr: Option[CharTest] = None
     val bits = Array.fill(256, false)
     var hasBits = false
     var isNeg = false
@@ -693,7 +709,7 @@ private class Parser(text: string)
         ch = next()
         if ch == '&'
           ch = next()
-          var right: Option[(int) -> bool] = None
+          var right: Option[CharTest] = None
           while ch != ']' && ch != '&'
             if ch == '['
               right = Some(unionOf(right, clazz(true)?))
@@ -739,7 +755,7 @@ private class Parser(text: string)
 
   // One member of a class: a character, which joins `bits` when it can and answers None, a range,
   // or a class an escape names.
-  private range(bits: Array[bool]) -> Result[Option[(int) -> bool], PatternError]
+  private range(bits: Array[bool]) -> Result[Option[CharTest], PatternError]
     var ch = peek()
     var code = 0
     if ch == '\\'
@@ -774,16 +790,17 @@ private class Parser(text: string)
           next()
         if m < code then return Err(error("Illegal character range"))
         val low = code
+        val high = m
         if has(CaseInsensitive)
           if has(UnicodeCase)
-            return Ok(Some(c -> (low <= c <= m) || caseRangeUnicode(low, m, c)))
-          return Ok(Some(c -> (low <= c <= m) || (c < 128 && caseRangeAscii(low, m, c))))
-        return Ok(Some(c -> low <= c <= m))
+            return Ok(Some(c -> (low <= c <= high) || caseRangeUnicode(low, high, c)))
+          return Ok(Some(c -> (low <= c <= high) || (c < 128 && caseRangeAscii(low, high, c))))
+        return Ok(Some(c -> low <= c <= high))
     Ok(bitsOrSingle(bits, code))
 
   // A character of a class below 256 joins the table, with its other cases where matching ignores
   // case; the few whose case partners lie outside the table under Unicode case are tested alone.
-  private bitsOrSingle(bits: Array[bool], c: int) -> Option[(int) -> bool]
+  private bitsOrSingle(bits: Array[bool], c: int) -> Option[CharTest]
     val unicodeCaseless = has(CaseInsensitive) && has(UnicodeCase)
     val partnerOutside = c == 0xff
       || c == 0xb5
@@ -810,7 +827,7 @@ private class Parser(text: string)
     Some(single(c))
 
   // `\p{…}` or `\pX`, and with `complement` its negation.
-  private family(singleLetter: bool, complement: bool) -> Result[(int) -> bool, PatternError]
+  private family(singleLetter: bool, complement: bool) -> Result[CharTest, PatternError]
     next()
     var name = ""
     if singleLetter
@@ -839,7 +856,7 @@ private class Parser(text: string)
       return found match
         Some(test) -> Ok(negatedIf(complement, test))
         None -> Err(error("Unknown Unicode property {name=<" + key + ">, value=<" + value + ">}"))
-    var found: Option[(int) -> bool] = None
+    var found: Option[CharTest] = None
     if name.startsWith("In")
       found = blockProperty(name.slice(2, name.byteLength))
     elif name.startsWith("Is")
@@ -866,15 +883,15 @@ private withEnd(codes: Buffer[char]) -> Array[char]
   codes.addOne('\u{0}')
   codes.toArray()
 
-private negatedIf(complement: bool, test: (int) -> bool) -> (int) -> bool = if complement then c -> !test(c) else test
+private negatedIf(complement: bool, test: CharTest) -> CharTest = if complement then c -> !test(c) else test
 
-private unionOf(left: Option[(int) -> bool], right: (int) -> bool) -> (int) -> bool = left match
+private unionOf(left: Option[CharTest], right: CharTest) -> CharTest = left match
   Some(l) -> c -> l(c) || right(c)
   None -> right
 
 // The members of a table of the characters below 256.
-private bitTest(bits: Array[bool]) -> (int) -> bool
-  val table = bits.copy()
+private bitTest(bits: Array[bool]) -> CharTest
+  val table = bits.toArraySeq
   c -> c < 256 && table(c)
 
 // Whether a case partner of the ASCII character `c` lies in the range.

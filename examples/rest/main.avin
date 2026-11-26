@@ -1,0 +1,135 @@
+// A REST service of to-do items, read and written as JSON and kept in memory. Every request is
+// served on a lightweight thread of its own; the items sit in a map behind a mutex, so concurrent
+// requests see each other's changes whole.
+//
+//   GET    /todos           every item, by id; `?done=true` or `?done=false` filters them
+//   POST   /todos           a new item from {"title": ..., "notes": ...}, answered 201 with its id
+//   GET    /todos/:id       one item
+//   PUT    /todos/:id       the item replaced
+//   POST   /todos/:id/done  the item marked done
+//   DELETE /todos/:id       the item removed, answered 204
+//
+//     avin run . 8080
+//     curl -d '{"title": "write docs"}' -H 'Content-Type: application/json' localhost:8080/todos
+//
+// Given `--try`, it serves on a port the system chooses, puts itself through its paces with the
+// HTTP client, sixteen clients adding items at once among them, and stops.
+//
+// args: --try
+// expect: exit 0
+import avin.collections.mutable.TreeMap
+import avin.net.http
+import avin.net.http.{Response, Route, Router, ServerRequest, ToResponse}
+import avin.threads.{Atomic, Mutex, scope}
+import dev.avinlang.json
+import dev.avinlang.json.{JsonDecoder, JsonEncoder, JsonOmitNone}
+import dev.avinlang.json.http.jsonResponse
+
+data Todo(id: int, title: string, @JsonOmitNone notes: Option[string], done: bool) derives JsonEncoder, JsonDecoder
+
+// What a client sends to make or replace an item.
+data Draft(title: string, notes: Option[string] = None, done: bool = false) derives JsonEncoder, JsonDecoder
+
+data Problem(error: string) derives JsonEncoder
+
+// The items, and the next id to give out.
+class Store(): Sendable
+  private val items = Mutex(TreeMap[int, Todo]())
+  private val nextId = Atomic(0)
+
+  all() -> Vector[Todo] = items.with(m -> m.values)
+
+  find(id: int) -> Option[Todo] = items.with(m -> m.get(id))
+
+  add(d: Draft) -> Todo
+    val todo = Todo(nextId.add(1), d.title, d.notes, d.done)
+    items.with(m -> m(todo.id) = todo)
+    todo
+
+  // Applies `change` to the item with `id`, answering the item as it is now.
+  change(id: int, @sendable change: (Todo) -> Todo) -> Option[Todo] = items.with(m ->
+    m.get(id).map(old ->
+      val now = change(old)
+      m(id) = now
+      now))
+
+  remove(id: int) -> bool = items.with(m -> m.remove(id).isDefined)
+
+notFound(id: int) -> Response = jsonResponse(404, Problem(s"no item $id"))
+
+routes(store: Store) -> Router = Router([
+    Route.get("/todos", r ->
+      val done = r.queryOption[bool]("done")?
+      Ok(jsonResponse(200, store.all().filter(t -> done.forall(_ == t.done))))),
+    Route.post("/todos", r ->
+      val draft = r.jsonBody[Draft]()?
+      Ok(jsonResponse(201, store.add(draft)))),
+    Route.get("/todos/:id", r ->
+      val id = r.paramAs[int]("id")?
+      Ok(store.find(id).map(jsonResponse(200, _)).getOrElse(notFound(id)))),
+    Route.put("/todos/:id", r ->
+      val id = r.paramAs[int]("id")?
+      val draft = r.jsonBody[Draft]()?
+      val replaced = store.change(id, t -> Todo(t.id, draft.title, draft.notes, draft.done))
+      Ok(replaced.map(jsonResponse(200, _)).getOrElse(notFound(id)))),
+    Route.post("/todos/:id/done", r ->
+      val id = r.paramAs[int]("id")?
+      Ok(store.change(id, t -> t with {done = true}).map(jsonResponse(200, _)).getOrElse(notFound(id)))),
+    Route.delete("/todos/:id", r ->
+      val id = r.paramAs[int]("id")?
+      Ok(if store.remove(id) then Response.empty(204) else notFound(id)))
+])
+
+// The client's side of the tour: each request and what came back.
+show(what: string, answer: Result[http.Response, http.HttpError])
+  answer match
+    Ok(r) if r.body.isEmpty -> println(s"$what -> ${r.status}")
+    Ok(r) -> println(s"$what -> ${r.status} ${r.text.trim}")
+    Err(e) -> println(s"$what -> ${e.message}")
+
+tour(base: string)
+  val jsonType = "application/json"
+  show("POST /todos", http.post(base + "/todos", "{\"title\": \"write the docs\"}", jsonType))
+  show(
+    "POST /todos",
+    http.post(base + "/todos", "{\"title\": \"fix the café's sign\", \"notes\": \"bring a ladder\"}", jsonType)
+  )
+  show("POST /todos", http.post(base + "/todos", "{\"title\": 7}", jsonType))
+  show("POST /todos", http.post(base + "/todos", "title=x", "application/x-www-form-urlencoded"))
+  show("GET /todos/2", http.get(base + "/todos/2"))
+  show("GET /todos/9", http.get(base + "/todos/9"))
+  show("GET /todos/two", http.get(base + "/todos/two"))
+  show("POST /todos/1/done", http.post(base + "/todos/1/done", "", jsonType))
+  show("PUT /todos/2", http.put(base + "/todos/2", "{\"title\": \"fix the sign\"}", jsonType))
+  show("GET /todos?done=true", http.get(base + "/todos?done=true"))
+  show("GET /todos?done=maybe", http.get(base + "/todos?done=maybe"))
+  show("DELETE /todos/1", http.delete(base + "/todos/1"))
+  show("DELETE /todos/1", http.delete(base + "/todos/1"))
+  show("GET /todos", http.get(base + "/todos"))
+  // Sixteen clients adding an item each at once: every one is stored, under an id of its own.
+  val statuses = scope(s ->
+    val clients = (1 .. 16).map(n ->
+      s.spawn(() -> http.post(base + "/todos", s"{\"title\": \"task $n\"}", jsonType).map(_.status).getOrElse(0)))
+    clients.map(_.join()))
+  println(s"sixteen clients: ${statuses.distinct}")
+  http.get(base + "/todos") match
+    Ok(r) -> json.decode[Vector[Todo]](r.text) match
+      Ok(todos) -> println(s"${todos.length} items, ids ${todos.map(_.id).mkString(" ")}")
+      Err(e) -> println(s"the list did not decode: $e")
+    Err(e) -> println(e.message)
+
+main(args: Vector[string]) -> int
+  val trying = args.contains("--try")
+  val port = if trying then 0 else args.headOption.flatMap(_.toIntOption()).getOrElse(8080)
+  val server = http.serve("127.0.0.1", port, routes(Store()).handle) match
+    Ok(s) -> s
+    Err(e) ->
+      eprintln(s"cannot listen: ${e.message}")
+      return 1
+  if trying
+    tour(s"http://127.0.0.1:${server.port()}")
+    server.shutdown()
+  else
+    println(s"serving on port ${server.port()}")
+    server.join()
+  0

@@ -1,0 +1,296 @@
+module avin.fs
+
+// Watching paths for changes. `watch` reads the trees at the paths it is given, then reads them again
+// every interval, or on every tick of a channel, and sends what changed between two readings to the
+// watcher's `events` channel, where any thread receives them, alone or as an arm of a `select`. The
+// readings and the sending run on a lightweight thread of the watcher's own, which `close` ends.
+//
+// What a reading keeps of each entry is its stamp: kind, size, times, permissions, owner and identity.
+// A watcher's public face is its `events` channel and its `close`; what finds the changes is the
+// driver thread alone, so an engine that is told of changes by the platform, rather than reading the
+// tree again, takes its place behind the same face.
+
+import avin.io
+import avin.io.IoError
+import avin.threads.{Channel, Thread, after, spawn}
+import avin.time.{Duration, Instant, seconds}
+
+// One change a watcher reports. `path` is the watched path joined with the entry's path below it, as
+// `walker` makes it; `isDir` says whether the entry is (or, removed, was) a directory.
+//
+// - `Created`: an entry is there that the last reading did not have.
+// - `Modified`: a file's contents, size, times, permissions, owner or identity changed; a
+//   directory's permissions or owner. A directory gaining or losing entries is reported as those
+//   entries' own events, not as its own modification.
+// - `Removed`: an entry the last reading had is gone.
+// - `Renamed`: an entry the last reading had at `from` is gone, and one with the same identity (the
+//   same device and inode, and for a file the same size and modification time) is at `to`, which the
+//   last reading did not have. Where no such pair is seen, the move is a `Removed` and a `Created`.
+// - `Overflowed`: the watched trees grew past `maxEntries` entries; it is the watcher's last event.
+data WatchEvent
+  Created(path: string, isDir: bool)
+  Modified(path: string, isDir: bool)
+  Removed(path: string, isDir: bool)
+  Renamed(from: string, to: string, isDir: bool)
+  Overflowed(limit: int)
+
+// A running watch: `events` delivers its changes, a reading's events in code-point order of their
+// paths (where a path changed what it is, its `Removed` before its `Created`). The channel holds at
+// most `capacity` events; while it is full the watcher waits to send and reads nothing, so a consumer
+// that lags is never handed a backlog bigger than that, and the next reading sees every change made
+// meanwhile. `close` ends the watch; events already sent may still be received, after which `events`
+// answers `None`, as it does once a `Overflowed` event or the end of the watcher's ticks ends it.
+class Watcher(
+  // Where the watcher's events are received. Nothing but the watcher may send to it.
+  val events: Channel[WatchEvent],
+  private val requests: Channel[Channel[int]],
+  private val stop: Channel[unit],
+  private val ended: Channel[unit],
+  private val driver: Thread[unit]
+): io.Close, Sendable
+  // Reads the paths now, whatever the interval or the ticks say, and answers once that reading's
+  // events are sent: how many there were. A reading already under way finishes first. `None` once the
+  // watch has ended. The events go to `events` as every reading's do, so where the channel may fill,
+  // another thread must be receiving, or `check` waits for ever.
+  check() -> Option[int]
+    val reply = Channel[int](1)
+    val asked = select
+      requests.send(reply) -> true
+      ended.receive() -> false
+    if asked then reply.receive() else None
+
+  // Ends the watch and waits for its thread to finish the reading or the send it is in. Closing
+  // again does nothing; it always answers `Ok`.
+  override close() -> Result[unit, IoError]
+    stop.close()
+    driver.join()
+    Ok(())
+
+  // Whether the watch has ended: closed, overflowed or out of ticks.
+  isClosed -> bool = ended.isClosed()
+
+// Watches `paths`, reading them again every `interval` after the last reading ended. Each path must
+// exist when the watch starts, or the answer is its `Err` (`NotFound`, say); it may go and come back
+// later, which is a `Removed` and a `Created`. A path that is a directory is watched with what it
+// holds: every entry below it with `recursive`, its own entries alone without. Symbolic links below
+// a watched path are watched as links and never followed; a watched path that is a link is followed.
+// A directory that cannot be listed keeps what the last reading found in it.
+//
+// The first reading is made before `watch` answers, so every change after it is reported. A reading
+// lists every directory and reads every entry's metadata, and keeps a stamp for each entry, which
+// bounds the memory: more than `maxEntries` entries in all is an `Err` at the start and an
+// `Overflowed` event later. An `interval` of zero or less, a `maxEntries` below one and a negative
+// `capacity` trap.
+watch(
+    paths: Vector[string],
+    interval: Duration = seconds(1),
+    recursive: bool = true,
+    maxEntries: int = 100000,
+    capacity: int = 1024
+) -> Result[Watcher, IoError]
+  if interval.micros <= 0 then fail(s"a watch every $interval: the interval is positive")
+  started(paths, None, interval, recursive, maxEntries, capacity)
+
+// `watch`, reading the paths again each time a value arrives on `ticks` rather than on a clock, which
+// lets a program decide when to look: a test, a `Ticker` of its own, or a request to check now. A
+// closed `ticks` ends the watch.
+watch(
+    paths: Vector[string],
+    ticks: Channel[Instant],
+    recursive: bool = true,
+    maxEntries: int = 100000,
+    capacity: int = 1024
+) -> Result[Watcher, IoError] = started(paths, Some(ticks), seconds(1), recursive, maxEntries, capacity)
+
+// What a watch reads: its paths, how deep below them, and at most how many entries in all.
+private data Watched(roots: Vector[string], maxDepth: int, limit: int)
+
+// What one reading kept of one entry: its type bits, size, modification and change times in
+// microseconds, permission bits, owner, group, inode and device.
+private data Stamp(
+    kind: int,
+    size: long,
+    modified: long,
+    changed: long,
+    permissions: int,
+    owner: long,
+    group: long,
+    inode: long,
+    device: long
+)
+
+private val DirectoryBits = 0o040000
+
+private stampOf(s: SyslStat) -> Stamp =
+  Stamp(
+    s.kindBits(),
+    s.sizeBytes(),
+    s.modifiedMicros(),
+    s.changedMicros(),
+    s.permissionBits(),
+    s.ownerId(),
+    s.groupId(),
+    s.inodeNumber(),
+    s.deviceNumber()
+  )
+
+private isDirStamp(s: Stamp) -> bool = s.kind == DirectoryBits
+
+private started(
+    paths: Vector[string],
+    ticks: Option[Channel[Instant]],
+    interval: Duration,
+    recursive: bool,
+    maxEntries: int,
+    capacity: int
+) -> Result[Watcher, IoError]
+  if maxEntries < 1 then fail(s"a watch of at most $maxEntries entries: it holds at least one")
+  if capacity < 0 then fail(s"a watch's events channel of capacity $capacity")
+  for p in paths
+    syslStat(p) match
+      Err(e) -> return Err(failed("watch", p)(e))
+      Ok(_) -> ()
+  val watched = Watched(paths, if recursive then int.MaxValue else 1, maxEntries)
+  val first = reading(watched, HashMap.empty[string, Stamp]()) match
+    Some(r) -> r
+    None -> return Err(IoError(io.Other(s"more entries than its limit of $maxEntries"), "watch", paths.mkString(", ")))
+  val events = Channel[WatchEvent](capacity)
+  val requests = Channel[Channel[int]](0)
+  val stop = Channel[unit](0)
+  val ended = Channel[unit](0)
+  val driver = spawn(() -> drive(watched, first, interval, ticks, requests, stop, ended, events))
+  Ok(Watcher(events, requests, stop, ended, driver))
+
+// The watcher's thread: wait for the next time to look or a `check`, read, send the changes and
+// answer the check, until stopped, out of ticks or overflowed; then end the events.
+private drive(
+    watched: Watched,
+    first: HashMap[string, Stamp],
+    interval: Duration,
+    ticks: Option[Channel[Instant]],
+    requests: Channel[Channel[int]],
+    stop: Channel[unit],
+    ended: Channel[unit],
+    events: Channel[WatchEvent]
+)
+  var seen = first
+  var going = true
+  while going
+    val clock = ticks match
+      Some(t) -> t
+      None -> after(interval)
+    val woke: Option[Option[Channel[int]]] = select
+      clock.receive() as Some(_) -> Some(None)
+      clock.receive() as None -> None
+      requests.receive() as Some(r) -> Some(Some(r))
+      stop.receive() -> None
+    woke match
+      None -> going = false
+      Some(reply) ->
+        var n = 0
+        reading(watched, seen) match
+          Some(now) ->
+            for e in changes(seen, now)
+              if going
+                going = sent(e, events, stop)
+                if going then n = n + 1
+            seen = now
+          None ->
+            if sent(Overflowed(watched.limit), events, stop) then n = 1
+            going = false
+        reply match
+          Some(r) -> r.send(n)
+          None -> ()
+  // Ended first, so a receiver told `None` by `events` finds the watcher closed.
+  ended.close()
+  events.close()
+
+// Sends `e`, unless the watch is stopped first; whether it was sent.
+private sent(e: WatchEvent, events: Channel[WatchEvent], stop: Channel[unit]) -> bool =
+  if stop.isClosed() then false
+  else select
+    events.send(e) -> true
+    stop.receive() -> false
+
+// A reading of every watched path, `previous` lending what a directory that cannot be listed held;
+// `None` where it finds more than the watch's limit of entries, stopping there.
+private reading(w: Watched, previous: HashMap[string, Stamp]) -> Option[HashMap[string, Stamp]]
+  val out = HashMap.newBuilder[string, Stamp]()
+  var count = 0
+  for root in w.roots
+    syslStat(root) match
+      Err(NotFound) -> ()
+      Err(_) -> count = count + kept(previous, root, true, out)
+      Ok(s) ->
+        out.addOne((root, stampOf(s)))
+        count = count + 1
+        if s.isDir()
+          for step in walker(root, maxDepth = w.maxDepth)
+            step match
+              Ok(e) ->
+                syslLinkStat(e.path) match
+                  Ok(es) ->
+                    out.addOne((e.path, stampOf(es)))
+                    count = count + 1
+                  // Gone between the listing and the look: it is not there.
+                  Err(_) -> ()
+                if e.error.isDefined then count = count + kept(previous, e.path, false, out)
+              Err(_) -> count = count + kept(previous, root, false, out)
+    if count > w.limit then return None
+  if count > w.limit then None else Some(out.result())
+
+// Adds to `out` what `previous` held below `dir`, and `dir` itself where `withDir`; how many it added.
+private kept(
+    previous: HashMap[string, Stamp],
+    dir: string,
+    withDir: bool,
+    out: Builder[(string, Stamp), HashMap[string, Stamp]]
+) -> int
+  val prefix = if dir.endsWith("/") then dir else dir + "/"
+  var n = 0
+  for (p, s) in previous
+    if p.startsWith(prefix) || withDir && p == dir
+      out.addOne((p, s))
+      n = n + 1
+  n
+
+// Whether an entry at one path changed between two readings, staying what it is.
+private differs(a: Stamp, b: Stamp) -> bool =
+  if isDirStamp(b) then a.permissions != b.permissions || a.owner != b.owner || a.group != b.group
+  else a != b
+
+// What a file is known by across a rename: device and inode, and for a file its size and
+// modification time too, which a rename keeps and a new file given a freed inode seldom matches.
+private identity(s: Stamp) -> (long, long, int, long, long) =
+  if isDirStamp(s) then (s.device, s.inode, s.kind, 0, 0)
+  else (s.device, s.inode, s.kind, s.size, s.modified)
+
+// The events between two readings, in code-point order of their paths.
+private changes(before: HashMap[string, Stamp], now: HashMap[string, Stamp]) -> Vector[WatchEvent]
+  val out = Buffer[(string, int, WatchEvent)]()
+  val created = Buffer[(string, Stamp)]()
+  for (p, s) in now
+    before.get(p) match
+      None -> created.addOne((p, s))
+      Some(old) ->
+        if old.kind != s.kind
+          out.addOne((p, 0, Removed(p, isDirStamp(old))))
+          out.addOne((p, 1, Created(p, isDirStamp(s))))
+        else if differs(old, s) then out.addOne((p, 0, Modified(p, isDirStamp(s))))
+  var gone = HashMap.empty[(long, long, int, long, long), string]()
+  val removed = Buffer[(string, Stamp)]()
+  for (p, s) in before
+    if now.get(p).isEmpty
+      removed.addOne((p, s))
+      gone = gone.updated(identity(s), p)
+  var renamed = HashMap.empty[string, bool]()
+  for (p, s) in created.toVector.sortBy(c -> c.0)
+    gone.get(identity(s)) match
+      Some(from) ->
+        out.addOne((p, 0, Renamed(from, p, isDirStamp(s))))
+        gone = gone.removed(identity(s))
+        renamed = renamed.updated(from, true)
+      None -> out.addOne((p, 1, Created(p, isDirStamp(s))))
+  for (p, s) in removed
+    if renamed.get(p).isEmpty then out.addOne((p, 0, Removed(p, isDirStamp(s))))
+  out.toVector.sortBy(e -> (e.0, e.1)).map(e -> e.2)

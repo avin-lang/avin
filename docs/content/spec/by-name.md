@@ -73,3 +73,24 @@ expression, a `return`, `break` or `continue` that would leave the expression is
 
 A delayed argument is a closure with no parameters. When it cannot escape, which is always the case
 for a parameter that is only read or forwarded, its environment lives on the caller's stack.
+
+A delayed argument written at a call, whether by name, through a method or of a function value,
+lives in the caller's frame for as long as the call runs, and making it allocates nothing; one
+that captures nothing is a constant. Passing a by-name parameter on passes the same closure. The
+one way to keep a delayed expression past the call is a closure that captures the parameter: a
+lambda, a local function used as a value, or another delayed argument. That closure copies the
+parameter's delayed expression to the heap where it is made, so it can still be evaluated after
+the call has returned. A call that becomes a jump back to the start of its own function makes its
+delayed arguments on the heap, since the frame they would live in is the one the jump reuses.
+
+```text
+log(on: bool, message: -> string) = if on then println(message)
+
+later(value: -> int) -> () -> int = () -> value + 1
+
+main()
+  for i in 0 ..< 1000
+    log(false, s"step $i")   // allocates nothing
+  val f = later(41)          // the parameter is copied to the heap when the lambda is made
+  println(f())
+```

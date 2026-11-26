@@ -105,6 +105,9 @@ parse_declared(src: Source, declared: Buf[DeclaredLevel]) -> Parsed
         elif p.at("derive") && p.ahead(1) != "(" && p.ahead(1) != "[" && p.ahead(1) != "="
             if hidden then p.report.add(error(start.to(p.ended()), "a derive template has no name, so it cannot be private"))
             file.items.push(ImplItem(parse_derive(&p, start, annotations)))
+        elif given_ahead(&p)
+            if annotations.len() > 0 then p.report.add(error(annotations[0].span, "a given takes no annotations"))
+            file.items.push(ValueItem(given_decl(&p, start, true)))
         elif (p.at("val") || p.at("var")) && p.ahead(1) != "("
             file.items.push(parse_value(&p, start, annotations, false))
         elif lazy_ahead(&p)
@@ -151,6 +154,56 @@ required_name(p: *Parser) -> string
 /** Whether `lazy` begins a `lazy val` here: like `open` before `class`, `lazy` is a modifier only
  * before `val` or `var`, and elsewhere an ordinary name. */
 lazy_ahead(p: *Parser) -> bool = p.at("lazy") && (p.ahead(1) == "val" || p.ahead(1) == "var")
+
+/** Whether `using`, `offset` tokens ahead, begins a parameter list's contextual section: it is
+ * followed by a parameter's name (or a modifier before one). Elsewhere `using` is an ordinary name,
+ * so a parameter `using: Mode` is still one. */
+using_ahead(p: *Parser, offset: usize) -> bool
+    if p.ahead(offset) != "using" then return false
+    p.toks.peek_at(offset + 1) match
+        Some(t) -> t.value == Word
+        None -> false
+
+/** Whether `given` begins a given here: before a name and its `:` or `=`, or before `val`, `var` or a
+ * capitalized name, which are reported as a given written without its own name or as a `val`/`var`.
+ * Elsewhere `given` is an ordinary name: `args.given("out")`, `given = 3`, `given(x)`. */
+given_ahead(p: *Parser) -> bool
+    if !p.at("given") then return false
+    val next = p.toks.peek_at(1) match
+        Some(t) -> t
+        None -> return false
+    if next.value != Word then return false
+    val word = p.ahead(1)
+    if word == "val" || word == "var" then return true
+    if is_keyword(word) then return false
+    p.ahead(2) == ":" || p.ahead(2) == "=" || is_capitalized(word)
+
+/** `given name = value` or `given name: Type = value`, from `given`: a `val` that is also a given.
+ * A given written without a name of its own (`given Logger(…)`) or with `val`/`var` is reported. */
+parse_given(p: *Parser, at: Span) -> &Expr
+    p.expect("given")
+    if p.at("val") || p.at("var")
+        val message = if p.at("val") then "a given is a `val` already, so `val` is not written: `given name = value`" else "a given is a `val`: it is never reassigned, and context that changes is an object whose own state changes; write `given name = value`"
+        p.report.add(error(p.toks.here(), message))
+        p.toks.advance()
+    if p.ahead(1) != ":" && p.ahead(1) != "="
+        p.report.add(error(at.to(p.toks.here()), "every given has a name, which a call passes it explicitly by and another file imports it by: `given name = value`"))
+        skip_line(p)
+        return Expr(at, Invalid)
+    val name = declared_name(p, "a given")
+    var declared: Option[&TypeExpr] = None
+    if p.accept(":") then declared = Some(parse_type(p))
+    val binding = binding_value(p, at, false, None, name, declared)
+    binding.kind match
+        Binding(n, d, value, _) -> Expr(binding.span, GivenBinding(n, d, value))
+        _ -> binding
+
+/** A given declared at a module's top level or in an object's body, as the field `public` makes it. */
+private given_decl(p: *Parser, at: Span, public: bool) -> FieldDecl
+    val given = parse_given(p, at)
+    given.kind match
+        GivenBinding(name, declared, value) -> FieldDecl(given.span, name, declared, value, false, public, false, true)
+        _ -> FieldDecl(given.span, "_", None, Expr(given.span, Invalid), false, public, false, false)
 
 /** Whether the word after a modifier begins a member or a function: a name that is not a keyword,
  * or a word that opens a declaration. `open(…)` and `open = …` stay a call and an assignment. */
@@ -719,9 +772,15 @@ private parse_sequence_item(p: *Parser) -> &Pattern
 parse_params(p: *Parser, function: bool) -> Buf[Param]
     var params: Buf[Param] = buf()
     p.expect("(")
+    var contextual = false
     if !p.at(")")
         loop
             val start = p.toks.here()
+            if using_ahead(p, 0)
+                if contextual then p.report.add(error(start, "`using` begins the contextual section once: every parameter after it is contextual already"))
+                elif !function then p.report.add(error(start, "a data variant's fields take no `using` section: each is given where the value is made"))
+                p.toks.advance()
+                contextual = true
             val annotations = parse_inline_annotations(p)
             // A function's parameter may be marked `@sendable`, `@isolating` or `@isolated`, and a
             // Sysl binding's parameter taking a function `@threaded`, which the checker holds to
@@ -755,13 +814,16 @@ parse_params(p: *Parser, function: bool) -> Buf[Param]
             if variadic
                 if !function then p.report.add(error(star, "a data field cannot be repeated"))
                 if !named then p.report.add(error(pattern.span, "a repeated parameter needs a name"))
-                if !p.at(")") then p.report.add(error(star, "a repeated parameter must be last"))
+                if contextual then p.report.add(error(star, "a contextual parameter cannot be repeated: a given is one value"))
+                elif !p.at(")") && !(p.at(",") && using_ahead(p, 1)) then p.report.add(error(star, "a repeated parameter must be last, before only a `using` section"))
                 if default is Some(d) then p.report.add(error(d.span, "a repeated parameter cannot have a default: a call that gives it nothing passes an empty vector"))
             if by_name
                 if !function then p.report.add(error(pattern.span, "a data field cannot be by-name"))
-                if variadic then p.report.add(error(pattern.span, "a repeated parameter cannot be by-name"))
+                if contextual then p.report.add(error(pattern.span, "a contextual parameter cannot be by-name: a given is a value already made"))
+                elif variadic then p.report.add(error(pattern.span, "a repeated parameter cannot be by-name"))
                 if !named then p.report.add(error(pattern.span, "a by-name parameter needs a name"))
-            params.push(Param(start.to(p.ended()), pattern, ty, default, by_name, variadic, annotations))
+            elif contextual && !named then p.report.add(error(pattern.span, "a contextual parameter needs a name: a call passes one explicitly by it, `name = …`"))
+            params.push(Param(start.to(p.ended()), pattern, ty, default, by_name, variadic, annotations, contextual))
             if !p.accept(",") || p.at(")") then break
     p.expect(")")
     params
@@ -921,6 +983,11 @@ private parse_declared_function(p: *Parser, annotations: Buf[Annotation], define
         p.report.add(error(p.toks.here(), "a guard belongs to a clause; write the clauses on the lines after the signature"))
         p.toks.advance()
         expression(p, 3)
+    // A written result type is what a placeholder lambda in the body takes its parameters from, as a
+    // declared value's type is: `adder(n: int) -> (int) -> int = _ + n`.
+    val scoped = result match
+        Some(r) -> !(r.kind is Tuple(_))
+        None -> false
     val equals = p.accept("=")
     var body: Option[&Expr] = None
     val indented = p.at_kind(Indent)
@@ -929,7 +996,7 @@ private parse_declared_function(p: *Parser, annotations: Buf[Annotation], define
     if equals || indented
         // An indented body after a header with neither `=` nor a result type is a procedure body:
         // its last value is discarded and the function yields unit.
-        val b = parse_line_body(p, !equals && result is None)
+        val b = result_body(p, parse_line_body(p, !equals && result is None), scoped)
         body = Some(b)
         end = b.span
         optional_end(p, name, indented)
@@ -944,7 +1011,7 @@ private parse_declared_function(p: *Parser, annotations: Buf[Annotation], define
                 p.toks.advance()
             elif p.at_kind(Newline) && p.ahead(1) == name && p.ahead(2) == "(" && clause_ahead(p, 1) then p.toks.advance()
             elif !(after_block(p) && p.at(name) && p.ahead(1) == "(" && clause_ahead(p, 0)) then break
-            val clause = parse_clause(p)
+            val clause = parse_clause(p, scoped)
             end = clause.span
             clauses.push(clause)
     Function(annotations, start.to(end), name_span, name, type_params, params, result, body, clauses, parameterless)
@@ -982,7 +1049,9 @@ private clause_ahead(p: *Parser, offset: usize) -> bool
 
 // `name(patterns) = body`, `name(patterns) | guard = body`, or `name(patterns)` followed by an
 // indented block of `| guard = body` lines, tried in order, where `| _ = body` always holds.
-private parse_clause(p: *Parser) -> Clause
+// `scoped` says the function's written result type gives each body's placeholder lambda its
+// parameters.
+private parse_clause(p: *Parser, scoped: bool) -> Clause
     val start = p.toks.here()
     p.toks.advance()
     p.expect("(")
@@ -1000,8 +1069,8 @@ private parse_clause(p: *Parser) -> Clause
         if line_start_guard(p, body) is Some(bar)
             p.report.add(error(bar, s"a guard on a line of its own continues the line above, not a second guard; write the guards in an indented block below the clause: `${from_utf8_unchecked(p.src.text(start))}(parameters)` then `    | condition = body` for each, ending with `| _ = body`"))
             body = Expr(body.span, Invalid)
-        bodies.push(GuardedBody(Some(guard), body))
-    elif p.accept("=") then bodies.push(GuardedBody(None, parse_line_body(p, false)))
+        bodies.push(GuardedBody(Some(guard), result_body(p, body, scoped)))
+    elif p.accept("=") then bodies.push(GuardedBody(None, result_body(p, parse_line_body(p, false), scoped)))
     elif p.accept_kind(Indent)
         loop
             if p.toks.at_end() || p.accept_kind(Dedent) then break
@@ -1016,11 +1085,15 @@ private parse_clause(p: *Parser) -> Clause
             if p.at("_") && p.ahead(1) == "=" then p.toks.advance()
             else guard = Some(expression(p, 3))
             p.expect("=")
-            bodies.push(GuardedBody(guard, parse_line_body(p, false)))
+            bodies.push(GuardedBody(guard, result_body(p, parse_line_body(p, false), scoped)))
             if p.toks.position == before then p.toks.advance()
     else p.report.add(error(p.toks.here(), "expected `=`, a guard, or indented guards after a clause's arguments"))
     val end = if bodies.len() > 0 then bodies[bodies.len() - 1].body.span else start
     Clause(start.to(end), patterns, bodies)
+
+// A function's or clause's body, made a placeholder lambda where it holds one and `scoped` says the
+// written result type expects it.
+private result_body(p: *Parser, body: &Expr, scoped: bool) -> &Expr = if scoped then placeholder_scope(p, body) else body
 
 // A one-line guard's body followed by a line that starts with `|` reads as the body continued, so
 // `| n < 0 = 1` then `| _ = 2` is `1 | _ = 2`, an assignment. The span of that `|` where the body is
@@ -1145,6 +1218,10 @@ private parse_data(p: *Parser, start: Span, annotations: Buf[Annotation]) -> &Da
         if p.accept_kind(Newline) then continue
         val before = p.toks.position
         val at = p.toks.here()
+        if given_ahead(p)
+            p.report.add(error(at, "a data type declares no givens: declare one in a block, at the module's top level or in an object"))
+            skip_line(p)
+            continue
         val variant_annotations = parse_inline_annotations(p)
         // An annotation may stand on the line before its variant.
         if variant_annotations.len() > 0 then p.accept_kind(Newline)
@@ -1356,14 +1433,14 @@ private parse_value(p: *Parser, start: Span, annotations: Buf[Annotation], lazy:
             p.toks.advance()
             _ = parse_line_body(p, false)
         val span = start.to(p.ended())
-        return ValueItem(FieldDecl(span, value_name, declared, Expr(at.to(p.ended()), CConstant(name)), false, true, false))
+        return ValueItem(FieldDecl(span, value_name, declared, Expr(at.to(p.ended()), CConstant(name)), false, true, false, false))
     p.toks.advance()
     val binding = parse_binding(p, start, mutable)
     binding.kind match
-        Binding(name, declared, value, _) -> ValueItem(FieldDecl(binding.span, name, declared, value, mutable && !lazy, true, lazy))
+        Binding(name, declared, value, _) -> ValueItem(FieldDecl(binding.span, name, declared, value, mutable && !lazy, true, lazy, false))
         _ ->
             p.report.add(error(binding.span, "a module-level declaration names one value"))
-            ValueItem(FieldDecl(binding.span, "_", None, Expr(binding.span, Invalid), mutable, true, false))
+            ValueItem(FieldDecl(binding.span, "_", None, Expr(binding.span, Invalid), mutable, true, false, false))
 
 // `owner: string`, `val name: string`, `var balance: int`, `private var count: int`
 parse_class_params(p: *Parser) -> Buf[ClassParam] = parse_field_params(p, "a class parameter is a field, so it cannot be by-name")
@@ -1373,9 +1450,14 @@ parse_class_params(p: *Parser) -> Buf[ClassParam] = parse_field_params(p, "a cla
 parse_field_params(p: *Parser, by_name: string) -> Buf[ClassParam]
     var params: Buf[ClassParam] = buf()
     p.expect("(")
+    var contextual = false
     if !p.at(")")
         loop
             val start = p.toks.here()
+            if using_ahead(p, 0)
+                if contextual then p.report.add(error(start, "`using` begins the contextual section once: every parameter after it is contextual already"))
+                p.toks.advance()
+                contextual = true
             val annotations = parse_inline_annotations(p)
             val hidden = p.accept("private")
             if lazy_ahead(p)
@@ -1387,7 +1469,8 @@ parse_field_params(p: *Parser, by_name: string) -> Buf[ClassParam]
                 mutable = true
                 marked = true
             elif p.accept("val") then marked = true
-            if hidden && !marked then p.report.add(error(start, "a plain class parameter is already private; `private` goes before `val` or `var`"))
+            if contextual && (marked || hidden) then p.report.add(error(start, "a contextual parameter is a private field and a given in the body, so it takes no `val`, `var` or `private`"))
+            elif hidden && !marked then p.report.add(error(start, "a plain class parameter is already private; `private` goes before `val` or `var`"))
             val name_at = p.toks.here()
             val name = declared_name(p, "a field")
             val pattern = Pattern(name_at.to(p.ended()), Name(name))
@@ -1401,9 +1484,11 @@ parse_field_params(p: *Parser, by_name: string) -> Buf[ClassParam]
             var default: Option[&Expr] = None
             if p.accept("=") then default = Some(expression(p, 0))
             if variadic
-                if !p.at(")") then p.report.add(error(star, "a repeated parameter must be last"))
+                if contextual then p.report.add(error(star, "a contextual parameter cannot be repeated: a given is one value"))
+                elif !p.at(")") && !(p.at(",") && using_ahead(p, 1)) then p.report.add(error(star, "a repeated parameter must be last, before only a `using` section"))
                 if default is Some(d) then p.report.add(error(d.span, "a repeated parameter cannot have a default: a call that gives it nothing passes an empty vector"))
-            params.push(ClassParam(Param(start.to(p.ended()), pattern, ty, default, false, variadic, annotations), mutable, marked && !hidden))
+            val public = marked && !hidden && !contextual
+            params.push(ClassParam(Param(start.to(p.ended()), pattern, ty, default, false, variadic, annotations, contextual), mutable && !contextual, public))
             if !p.accept(",") || p.at(")") then break
     p.expect(")")
     params
@@ -1429,6 +1514,12 @@ parse_class_member(p: *Parser) -> ClassMember
         return ExportMember(parse_member_export(p, start, !hidden))
     // `def` follows the modifiers and begins a method, with or without a parameter list.
     if p.at("def") && accept_def(p) then return MethodMember(parse_def_function(p, annotations), !hidden, overrides, static_member)
+    // A given in an object's body; the checker refuses one in any other body.
+    if given_ahead(p)
+        if annotations.len() > 0 then p.report.add(error(annotations[0].span, "a given takes no annotations"))
+        if overrides then p.report.add(error(start, "only a method can be marked `override`"))
+        if static_member then p.report.add(error(start, "only a method can be `static`; a given belongs to the object"))
+        return FieldMember(given_decl(p, start, !hidden))
     val lazy = lazy_ahead(p)
     if lazy then p.toks.advance()
     if annotations.len() > 0
@@ -1453,7 +1544,7 @@ parse_class_member(p: *Parser) -> ClassMember
             binding = binding_value(p, start, mutable, None, name, Some(declared))
         else binding = parse_binding(p, start, mutable)
         binding.kind match
-            Binding(name, declared, value, _) -> return FieldMember(FieldDecl(binding.span, name, declared, value, mutable && !lazy, !hidden, lazy))
+            Binding(name, declared, value, _) -> return FieldMember(FieldDecl(binding.span, name, declared, value, mutable && !lazy, !hidden, lazy, false))
             _ ->
                 p.report.add(error(binding.span, "a field declaration names one field"))
                 return StatementMember(Expr(binding.span, Invalid))

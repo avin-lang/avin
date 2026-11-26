@@ -1,0 +1,1072 @@
+module dev.avinlang.compiler
+
+import sh.sysl.markdown.{Doc, Kind, NodeId, gfm, gfm_html, parse_with, to_html_with}
+import sh.sysl.parsing.{Source, Span, source_of}
+import sysl.buf.{Buf, buf}
+import sysl.container.{Map, map}
+import sysl.fs.{entries, exists, is_dir, make_dir_all, remove_file, write_text_atomic}
+import sysl.path.{file_name, parent, stem}
+import sysl.slices.sort_by
+import sysl.text.{StrBuilder, from_utf8_lossy, str_builder}
+
+// `avin doc`: a program's API documentation, as a static site of plain HTML pages.
+//
+// **The program is checked first, as `avin check` checks it, and the checker's own record of every
+// name is what the pages are made from.** The definition index the language server reads records each
+// declaration at its name, with the header hover shows and the comment above it; every public
+// declaration of every module the program reads is found there by walking the modules' files. A type
+// named in a signature links to the declaration the checker resolved it to, so two types of one name
+// in two modules are never confused.
+//
+// **A doc comment is the comment directly above a declaration**: its `//` lines, past any annotations
+// between, exactly what hover shows. It is Markdown, with GitHub's extensions. A
+// fenced block with no language or `avin` is Avin code, coloured by Avin's lexer and parsed by
+// `--check`. A link whose destination is a declaration's path, `[the map](Vector.map)`, links to that
+// declaration, and `[Name]` or `` [`Name`] `` with no destination does too, resolved from the
+// declaration the comment documents: its type's members, its module, then the whole program.
+//
+// **Each module is a page**, `<module>.html`; the root module's declarations are on `index.html`
+// beside the list of modules. A package's own modules come first, then the modules of the packages it
+// depends on and of the standard library that it reads, so every link stays inside the site;
+// `--std-url` links the standard library's names to pages published elsewhere instead.
+
+/** The file `avin doc` writes in every directory it writes, which it alone may write into again. */
+const DocMarker: string = ".avin-doc"
+
+doc_usage() -> string = "usage: avin doc [<program>] [-o <dir>] [--check] [--std-url <url>] [<features>]\n       avin doc --std [-o <dir>] [--check]"
+
+/** One documented declaration, or one `impl` block. */
+struct DocEntry
+    /** What it is: `function`, `method`, `field`, `class`, `trait`, `object`, `data`, `variant`,
+     * `type`, `value`, `impl`, or `export` for a member export. */
+    kind: string
+    name: string
+    /** The module whose page lists it. */
+    home: usize
+    anchor: string
+    /** Its header as Avin code: for a function, a method, a field and a value what hover shows, and
+     * for a type its declaration's first line. */
+    signature: string
+    doc: string
+    unit: usize
+    span: Span
+    /** The type or impl it is a member of. */
+    parent: Option[usize]
+    members: Buf[usize]
+    /** The type parameters its signature names, its own and its owners'. */
+    type_params: Buf[string]
+    /** The path a doc comment names it by: `module.Type.member`, or `Type.member` in the root module. */
+    path: string
+    /** For an impl listed with a type of another module, the module that holds the impl. */
+    from_module: string
+    /** The type names written in its declaration, each with the declaration the checker resolved it
+     * to. */
+    links: Buf[DocLink]
+
+/** A name written in a declaration and the key of what it names: `file:offset` of that declaration's
+ * name. */
+struct DocLink
+    name: string
+    key: string
+
+/** Whose module it is: the program's own, a dependency's, or the standard library's. */
+enum DocGroup
+    OwnModule
+    DependencyModule
+    LibraryModule
+
+/** One module of the site: the page it is written to, the comment above its `module` line, its
+ * top-level declarations and its exports. */
+struct DocModule
+    name: string
+    page: string
+    group: DocGroup
+    doc: string
+    unit: usize
+    items: Buf[usize]
+    exports: Buf[DocExport]
+
+/** An `export` line of a module, with what it presents where the site documents it. */
+struct DocExport
+    text: string
+    target: Option[usize]
+
+/** Everything the pages are made from. */
+struct DocSite
+    title: string
+    /** Where the standard library's pages are when they are not written here, or empty. */
+    std_url: string
+    units: Buf[SourceUnit]
+    /** The group of each unit, and whether a unit's declarations are documented at all: a test module
+     * is not. */
+    unit_groups: Buf[DocGroup]
+    unit_shown: Buf[bool]
+    modules: Buf[DocModule]
+    module_index: Map[string, usize]
+    entries: Buf[DocEntry]
+    by_key: Map[string, usize]
+    by_path: Map[string, usize]
+    /** Short names, `Name` and `Type.member`, with whether more than one declaration has it. */
+    by_name: Map[string, usize]
+    ambiguous: Map[string, bool]
+    anchors: Map[string, bool]
+    /** The references the check recorded, unit by unit, in order of place. */
+    refs: Buf[Buf[Reference]]
+    /** What is wrong with the doc comments of the program's own modules. */
+    problems: Buf[string]
+    pages: Buf[string]
+
+/** `avin doc [<program>] [-o <dir>] [--check] [--std-url <url>] [<features>]` and `avin doc --std`:
+ * the program's API documentation written to `-o` (`.avin/doc` beside the program by default), or with
+ * `--check` only checked: a link in a doc comment that leads nowhere and an Avin block that does not
+ * parse fail it. */
+doc_command(here: string, args: []const string, tc: Option[Toolchain], say: string -> unit, note: string -> unit) -> int
+    var target: Option[string] = None
+    var output: Option[string] = None
+    var std_url: Option[string] = None
+    var std = false
+    var check = false
+    var flags = FeatureFlags(false, false, false, buf())
+    var i = 2usize
+    while i < args.len
+        val a = args[i]
+        val took = feature_flag(args, i, &flags)
+        if took > 0
+            i += took
+            continue
+        if a == "-o" && i + 1 < args.len && output is None
+            output = Some(args[i + 1])
+            i += 2
+            continue
+        if a == "--std-url" && i + 1 < args.len && std_url is None
+            std_url = Some(args[i + 1])
+            i += 2
+            continue
+        if a == "--std" && !std then std = true
+        elif a == "--check" && !check then check = true
+        elif !a.starts_with("-") && target is None then target = Some(a)
+        else
+            note(doc_usage())
+            return 2
+        i += 1
+    if std && (target is Some(_) || flags.given || std_url is Some(_))
+        note(doc_usage())
+        return 2
+    val toolchain = tc match
+        Some(t) -> t
+        None ->
+            note(NoToolchain)
+            return 1
+    if library_version_error(toolchain) is Some(message)
+        note(message)
+        return 1
+    var files: Buf[ProgramFile] = buf()
+    var title = "Avin standard library"
+    var home = here
+    if !std
+        val path = target.unwrap_or(here)
+        if target is None && is_dir(path) && !holds_program(path)
+            note(s"avin: no Avin program here: $path holds no ${ManifestName} and no `.avin` or `.lavin` files")
+            return 1
+        val program = load_program_with(path, default_fetching(), flags.choice(true)) match
+            Ok(p) -> p
+            Err(message) ->
+                note(message.trim_end())
+                return 1
+        files = program.files
+        title = program.package.unwrap_or(doc_title_of(program.root))
+        home = if is_dir(program.root) then program.root else parent(program.root).unwrap_or("")
+        if home == "" then home = "."
+    val loaded = load_units(toolchain.library_dir(), files, std, src -> src) match
+        Ok(l) -> l
+        Err(message) ->
+            note("avin: " + message)
+            return 1
+    if loaded.broken
+        var diagnostics = ""
+        for u in loaded.units
+            if u.report.has_errors() then diagnostics = diagnostics + u.report.render(u.src)
+        note(diagnostics.trim_end())
+        return 1
+    val checked = check_program(loaded.units, loaded.root_module, true, true)
+    if checked.has_errors()
+        note(checked.render().trim_end())
+        return 1
+    var site = doc_site(title, if std then "" else std_url.unwrap_or(""), loaded.units, loaded.library, files, std, checked.references)
+    val pages = doc_pages(&site)
+    if check
+        for p in site.problems
+            note(p)
+        if site.problems.len() > 0
+            val are = if site.problems.len() == 1 then "problem is" else "problems are"
+            note(s"avin: ${site.problems.len()} documentation $are reported above")
+            return 1
+        say(s"checked the documentation of ${doc_own_modules(site)} modules")
+        return 0
+    val dir = output.unwrap_or(home + "/.avin/doc")
+    doc_write(dir, pages) match
+        Ok(_) -> ()
+        Err(message) ->
+            note(message)
+            return 1
+    for p in site.problems
+        note("warning: " + p)
+    say(s"wrote $dir/index.html")
+    0
+end doc_command
+
+// The title of a program without a manifest: its file's or directory's name.
+private doc_title_of(root: string) -> string
+    val whole = absolute_path(root)
+    if is_dir(root) then return file_name(whole).unwrap_or(root)
+    stem(whole).unwrap_or(root)
+
+private doc_own_modules(site: DocSite) -> usize
+    var n = 0usize
+    for m in 0..<site.modules.len()
+        if site.modules[m].group == OwnModule && doc_has_page(site, m) then n += 1
+    n
+
+// Whether a module has something to show: a public declaration, an export or a comment of its own.
+// The root module always has the index.
+private doc_has_page(site: DocSite, m: usize) -> bool =
+    site.modules[m].name == "" || site.modules[m].items.len() > 0 || site.modules[m].exports.len() > 0 || site.modules[m].doc != ""
+
+/** One file of the site. */
+struct DocPage
+    name: string
+    text: string
+
+// Writes the pages into `dir`, a new directory, an empty one, or one `avin doc` wrote before, whose
+// pages from then are removed first so that a module no longer there leaves no page behind.
+private doc_write(dir: string, pages: Buf[DocPage]) -> Result[(), string]
+    if exists(dir) && !is_dir(dir) then return Err(s"avin: $dir is not a directory")
+    if is_dir(dir)
+        val names = entries(dir).map_err(e -> s"avin: $dir: ${e.to_string()}")?
+        if names.len() > 0 && !exists(dir + "/" + DocMarker)
+            return Err(s"avin: $dir holds files `avin doc` did not write; name a new or empty directory with -o")
+        for name in names
+            if name.ends_with(".html") || name.ends_with(".css") || name.ends_with(".js")
+                remove_file(dir + "/" + name).map_err(e -> s"avin: $dir/$name: ${e.to_string()}")?
+    else make_dir_all(dir).map_err(e -> s"avin: $dir: ${e.to_string()}")?
+    write_text_atomic(dir + "/" + DocMarker, "").map_err(e -> s"avin: $dir: ${e.to_string()}")?
+    for p in pages
+        write_text_atomic(dir + "/" + p.name, p.text).map_err(e -> s"avin: $dir/${p.name}: ${e.to_string()}")?
+    Ok(())
+
+// ---- the model ----
+
+/** The site of a checked program: `units` as loaded, the first `library` of them the standard
+ * library's, the rest `files`' in order; with `std`, the library is the program documented. */
+doc_site(title: string, std_url: string, units: Buf[SourceUnit], library: usize, files: Buf[ProgramFile], std: bool, references: Buf[Reference]) -> DocSite
+    var site = DocSite(title, std_url, units, buf(), buf(), buf(), map(), buf(), map(), map(), map(), map(), map(), buf(), buf(), buf())
+    var unit_of: Map[string, usize] = map()
+    for u in 0..<units.len()
+        unit_of.put(units[u].src.name, u)
+        site.refs.push(buf())
+        // The check adds a file of its own after the program's, which no one wrote.
+        val written = u < library + files.len()
+        val group = if u < library then (if std then OwnModule else LibraryModule) elif !written then LibraryModule elif files[u - library].dependency then DependencyModule else OwnModule
+        site.unit_groups.push(group)
+        site.unit_shown.push(written && doc_shown_unit(units[u].file, group))
+    for r in references
+        if unit_of.get(r.at_file) is Some(u) then site.refs[u].push(r)
+    for u in 0..<units.len()
+        sort_by(site.refs[u].view_mut(), doc_ref_before)
+    // Modules in the order their pages are listed: the program's own, its dependencies', the library's.
+    for pass in 0..<3
+        for u in 0..<units.len()
+            if !site.unit_shown[u] || doc_group_rank(site.unit_groups[u]) != pass then continue
+            doc_module_of(&site, u)
+    for u in 0..<units.len()
+        if site.unit_shown[u] then doc_unit(&site, u)
+    doc_keyed(&site)
+    for u in 0..<units.len()
+        if site.unit_shown[u] then doc_impls(&site, u)
+    for u in 0..<units.len()
+        if site.unit_shown[u] then doc_exports(&site, u)
+    site
+
+private doc_ref_before(a: Reference, b: Reference) -> bool = a.at_span.start < b.at_span.start
+
+private doc_group_rank(g: DocGroup) -> usize = g match
+    OwnModule -> 0
+    DependencyModule -> 1
+    LibraryModule -> 2
+
+// Whether a file's declarations are documented: a file of tests, and the files of a package's `tests`
+// module, are not.
+private doc_shown_unit(file: SourceFile, group: DocGroup) -> bool
+    if file.tests_only then return false
+    if group != LibraryModule && (file.module_name == "tests" || file.module_name.starts_with("tests.")) then return false
+    true
+
+// The module the unit `u` belongs to, made when it is the first of its files.
+private doc_module_of(site: *DocSite, u: usize) -> usize
+    val name = site.units[u].file.module_name
+    val doc = doc_module_comment(site.units[u])
+    if site.module_index.get(name) is Some(m)
+        if site.modules[m].doc == "" then site.modules[m].doc = doc
+        return m
+    val m = site.modules.len()
+    site.modules.push(DocModule(name, doc_page_name(name), site.unit_groups[u], doc, u, buf(), buf()))
+    site.module_index.put(name, m)
+    m
+
+/** The page a module is written to: the root module's declarations are on the index. */
+doc_page_name(module_name: string) -> string =
+    if module_name == "" then "index.html" elif module_name == "index" then "index_.html" else module_name + ".html"
+
+// The comment above a file's `module` line, which documents its module.
+private doc_module_comment(u: SourceUnit) -> string
+    if u.file.module_name == "" || u.file.module_span.is_empty() then return ""
+    var at = u.file.module_span.start
+    while at > 0 && u.src.bytes[at - 1] != u8('\n')
+        at -= 1
+    doc_before(u.src.bytes, at)
+
+private doc_unit(site: *DocSite, u: usize)
+    val m = doc_module_of(site, u)
+    val file = site.units[u].file
+    for i in 0..<file.items.len()
+        if i < file.private_items.len() && file.private_items[i] then continue
+        val e = file.items[i] match
+            FunctionItem(f) -> doc_function(site, u, m, f, None, false)
+            DataItem(d) -> doc_data(site, u, m, d)
+            ClassItem(d) -> doc_class(site, u, m, d)
+            ValueItem(v) -> doc_value(site, u, m, v)
+            AliasItem(a) -> Some(doc_add(site, "type", a.name, m, alias_header(a), doc_comment(site, u, a.span, a.name), u, a.span, None, doc_param_names(a.type_params)))
+            ImplItem(_) -> None
+        if e is Some(k) then site.modules[m].items.push(k)
+
+// Adds an entry, named by its path and, for the shorter forms a doc comment may use, by its name.
+private doc_add(site: *DocSite, kind: string, name: string, m: usize, signature: string, doc: string, u: usize, span: Span, parent: Option[usize], type_params: Buf[string]) -> usize
+    val k = site.entries.len()
+    val module_name = site.modules[m].name
+    val owner = parent match
+        Some(p) -> site.entries[p].path
+        None -> module_name
+    val path = if kind == "impl" || kind == "export" then "" elif owner == "" then name else owner + "." + name
+    var params = type_params
+    if parent is Some(p)
+        for t in site.entries[p].type_params
+            params.push(t)
+    val page = site.modules[m].page
+    // A member is anchored under its type, an impl's methods under the type the impl is for.
+    var wanted = name
+    if parent is Some(p)
+        val e = site.entries[p]
+        val within = if e.kind != "impl" then e.anchor elif e.parent is Some(t) then site.entries[t].anchor else doc_anchor_text(e.name)
+        wanted = within + "." + (if kind == "impl" then "impl" elif kind == "export" then "export" else name)
+    elif kind == "impl" then wanted = name + ".impl"
+    val anchor = doc_unique_anchor(site, page, wanted)
+    site.entries.push(DocEntry(kind, name, m, anchor, signature, doc, u, span, parent, buf(), params, path, "", doc_links_in(*site, u, span)))
+    if parent is Some(p) then site.entries[p].members.push(k)
+    // A record's variant is named as its type is, and the name means the type.
+    val record = parent is Some(_) && kind == "variant" && site.entries[parent.unwrap_or(0)].name == name
+    if path != "" && !record
+        if site.by_path.get(path) is None then site.by_path.put(path, k)
+        doc_add_name(site, name, k)
+        if parent is Some(p)
+            if site.entries[p].kind != "impl" then doc_add_name(site, site.entries[p].name + "." + name, k)
+    k
+
+private doc_add_name(site: *DocSite, name: string, k: usize)
+    // Overloads, and a class and its companion, are one path, which names the first of them.
+    if site.by_name.get(name) is Some(other)
+        if other != k && site.entries[other].path != site.entries[k].path then site.ambiguous.put(name, true)
+    else site.by_name.put(name, k)
+
+// An anchor no other entry of the page has: the name, and for an overload the name with a number.
+private doc_unique_anchor(site: *DocSite, page: string, wanted: string) -> string
+    val base = doc_anchor_text(wanted)
+    var anchor = base
+    var n = 2usize
+    while site.anchors.get(page + "#" + anchor) is Some(_)
+        anchor = s"$base-$n"
+        n += 1
+    site.anchors.put(page + "#" + anchor, true)
+    anchor
+
+// A name as an anchor: letters, digits, `_`, `-` and `.` stay, and any other byte is written as `~`
+// and its hex, so an operator method has one too.
+private doc_anchor_text(name: string) -> string
+    var out = str_builder()
+    val digits = "0123456789abcdef"
+    for b in name.bytes
+        if word_byte(b) && b < 0x80 || b == u8('.') || b == u8('-') then out.push(from_utf8_lossy([b]))
+        else
+            out.push("~")
+            out.push(digits[usize(b >> 4)..<usize(b >> 4) + 1])
+            out.push(digits[usize(b & 15)..<usize(b & 15) + 1])
+    out.finish()
+
+private doc_param_names(params: Buf[TypeParam]) -> Buf[string]
+    var out: Buf[string] = buf()
+    for p in params
+        out.push(p.name)
+    out
+
+private doc_function(site: *DocSite, u: usize, m: usize, f: &Function, parent: Option[usize], static_member: bool) -> Option[usize]
+    if f.name.starts_with("<") then return None
+    val r = doc_declared(*site, u, f.span, f.name)
+    var signature = r match
+        Some(d) -> d.detail
+        None -> f.name + show_type_params(f.type_params) + "(…)"
+    if parent is Some(_) then signature = doc_member_signature(signature, f.name)
+    if static_member then signature = "static " + signature
+    val doc = r match
+        Some(d) -> d.doc
+        None -> ""
+    Some(doc_add(site, if parent is Some(_) then "method" else "function", f.name, m, signature, doc, u, f.span, parent, doc_param_names(f.type_params)))
+
+/** A member's header without the type it belongs to: `map[U](f: (T) -> U) -> Option[U]` rather than
+ * `Option[T].map[U](…)`, the type being the section it is listed in. */
+doc_member_signature(detail: string, name: string) -> string
+    var depth = 0
+    val b = detail.bytes
+    for k in 0..<b.len
+        val c = b[k]
+        if c == u8('[') || c == u8('(') then depth += 1
+        elif c == u8(']') || c == u8(')') then depth -= 1
+        elif c == u8('.') && depth == 0
+            val rest = detail[k + 1..]
+            if rest.starts_with(name) && (rest.bytes.len == name.bytes.len || !word_byte(rest.bytes[name.bytes.len])) then return rest
+    detail
+
+private doc_data(site: *DocSite, u: usize, m: usize, d: &DataDecl) -> Option[usize]
+    val k = doc_add(site, "data", d.name, m, data_head(d), doc_comment(site, u, d.span, d.name), u, d.span, None, doc_param_names(d.type_params))
+    for v in d.variants
+        // A record written on one line has one comment, its type's.
+        val doc = doc_comment(site, u, v.span, v.name)
+        _ = doc_add(site, "variant", v.name, m, variant_header(v), if doc == site.entries[k].doc then "" else doc, u, v.span, Some(k), doc_param_names(v.type_params))
+    // A record's fields are read by name, so each is a member of its own.
+    if d.variants.len() == 1
+        for f in d.variants[0].fields
+            val name = doc_pattern_name(f.pattern)
+            if name != "" then _ = doc_field(site, u, m, name, f.span, Some(k), "val " + name + ": " + show_type(f.ty))
+    Some(k)
+
+private doc_class(site: *DocSite, u: usize, m: usize, d: &ClassDecl) -> Option[usize]
+    val kind = if d.object then "object" elif d.modifier == "trait" then "trait" else "class"
+    val k = doc_add(site, kind, d.name, m, class_decl_header(d), doc_comment(site, u, d.span, d.name), u, d.span, None, doc_param_names(d.type_params))
+    for cp in d.params
+        if !cp.public then continue
+        val name = doc_pattern_name(cp.param.pattern)
+        if name != "" then _ = doc_field(site, u, m, name, cp.param.span, Some(k), (if cp.mutable then "var " else "val ") + name + ": " + show_type(cp.param.ty))
+    doc_members(site, u, m, d.members, k)
+    Some(k)
+
+// The public fields and methods of a class body or an impl.
+private doc_members(site: *DocSite, u: usize, m: usize, members: Buf[ClassMember], k: usize)
+    for member in members
+        member match
+            FieldMember(f) ->
+                if f.public
+                    val shown = f.declared match
+                        Some(t) -> ": " + show_type(t)
+                        None -> ""
+                    _ = doc_field(site, u, m, f.name, f.span, Some(k), (if f.mutable then "var " else "val ") + f.name + shown)
+            AbstractFieldMember(f) ->
+                if f.public then _ = doc_field(site, u, m, f.name, f.span, Some(k), (if f.mutable then "var " else "val ") + f.name + ": " + show_type(f.declared))
+            MethodMember(method, public, _, static_member) ->
+                if public then _ = doc_function(site, u, m, method, Some(k), static_member)
+            // A member export presents the members of a field's value as the type's own.
+            ExportMember(x) ->
+                if x.public then _ = doc_add(site, "export", x.via, m, doc_member_export_text(x), doc_before(site.units[u].src.bytes, x.span.start), u, x.span, Some(k), buf())
+            StatementMember(_) -> ()
+
+/** A member export as it is written: `export f.*`, `export f.m` or `export f.{m, n as k}`. */
+doc_member_export_text(x: MemberExport) -> string
+    if x.wildcard then return s"export ${x.via}.*"
+    var names: Buf[string] = buf()
+    for n in x.names
+        names.push(if n.binding != "" && n.binding != n.name then n.name + " as " + n.binding else n.name)
+    if names.len() == 1 then return s"export ${x.via}.${names[0]}"
+    var out = s"export ${x.via}.{"
+    for i in 0..<names.len()
+        out = out + (if i > 0 then ", " else "") + names[i]
+    out + "}"
+
+// A field: what hover shows for it where the checker recorded it, `written` otherwise.
+private doc_field(site: *DocSite, u: usize, m: usize, name: string, span: Span, parent: Option[usize], written: string) -> usize
+    val r = doc_declared(*site, u, span, name)
+    val signature = r match
+        Some(d) -> d.detail
+        None -> written
+    val doc = r match
+        Some(d) -> d.doc
+        None -> doc_before(site.units[u].src.bytes, span.start)
+    doc_add(site, "field", name, m, signature, doc, u, span, parent, buf())
+
+private doc_value(site: *DocSite, u: usize, m: usize, v: FieldDecl) -> Option[usize]
+    val r = doc_declared(*site, u, v.span, v.name)
+    val signature = r match
+        Some(d) -> d.detail
+        None -> (if v.mutable then "var " else "val ") + v.name
+    val doc = r match
+        Some(d) -> d.doc
+        None -> ""
+    Some(doc_add(site, "value", v.name, m, signature, doc, u, v.span, None, buf()))
+
+private doc_pattern_name(p: &Pattern) -> string = p.kind match
+    Name(n) -> n
+    _ -> ""
+
+// The doc comment of the declaration of `name` within `span`, as the checker recorded it.
+private doc_comment(site: *DocSite, u: usize, span: Span, name: string) -> string = doc_declared(*site, u, span, name) match
+    Some(r) -> r.doc
+    None -> doc_before(site.units[u].src.bytes, span.start)
+
+/** The reference the checker recorded at the declaration of `name` within `span` of unit `u`: the
+ * first one there that declares and spells it. */
+private doc_declared(site: DocSite, u: usize, span: Span, name: string) -> Option[Reference]
+    val refs = site.refs[u]
+    var k = doc_first_at(refs, span.start)
+    while k < refs.len() && refs[k].at_span.start < span.end
+        val r = refs[k]
+        if r.declares() && doc_spelled(site.units[u].src, r.at_span) == name then return Some(r)
+        k += 1
+    None
+
+// The first of `refs`, in order of place, at or after `start`.
+private doc_first_at(refs: Buf[Reference], start: usize) -> usize
+    var lo = 0usize
+    var hi = refs.len()
+    while lo < hi
+        val mid = (lo + hi) / 2
+        if refs[mid].at_span.start < start then lo = mid + 1 else hi = mid
+    lo
+
+private doc_spelled(src: Source, at: Span) -> string =
+    if at.end <= src.bytes.len then from_utf8_lossy(src.bytes[at.start..<at.end]) else ""
+
+// The type names written within `span` of unit `u`, each with what the checker resolved it to.
+private doc_links_in(site: DocSite, u: usize, span: Span) -> Buf[DocLink]
+    var out: Buf[DocLink] = buf()
+    val refs = site.refs[u]
+    var k = doc_first_at(refs, span.start)
+    while k < refs.len() && refs[k].at_span.start < span.end
+        val r = refs[k]
+        k += 1
+        if r.declares() || !doc_type_kind(r.kind) then continue
+        out.push(DocLink(doc_spelled(site.units[u].src, r.at_span), doc_key(r.declared_file, r.declared_span)))
+    out
+
+private doc_type_kind(kind: NameKind) -> bool = kind match
+    ClassName | RecordName | EnumName | TraitName | AliasName -> true
+    _ -> false
+
+private doc_key(file: string, at: Span) -> string = s"$file:${at.start}"
+
+// Every entry is known by where the checker recorded its declaration, which is how a type named in a
+// signature finds the entry it links to.
+private doc_keyed(site: *DocSite)
+    for k in 0..<site.entries.len()
+        val e = site.entries[k]
+        if e.kind == "impl" || e.kind == "export" then continue
+        if doc_declared(*site, e.unit, e.span, e.name) is Some(r)
+            if site.by_key.get(doc_key(r.at_file, r.at_span)) is None then site.by_key.put(doc_key(r.at_file, r.at_span), k)
+
+// The unit's impls: each with the type it is for, where the site documents that type among modules of
+// the same kind, and otherwise with the module it is written in.
+private doc_impls(site: *DocSite, u: usize)
+    val m = doc_module_of(site, u)
+    val file = site.units[u].file
+    for i in 0..<file.items.len()
+        if i < file.private_items.len() && file.private_items[i] then continue
+        file.items[i] match
+            ImplItem(d) ->
+                if d.template || d.derived is Some(_) then continue
+                var owner: Option[usize] = None
+                for l in doc_links_in(*site, u, d.target.span)
+                    if owner is None
+                        if site.by_key.get(l.key) is Some(t)
+                            if site.modules[site.entries[t].home].group == site.modules[m].group then owner = Some(t)
+                var header = "impl" + show_type_params(d.type_params) + " "
+                if d.trait_name is Some(t) then header = header + show_type(t) + " for "
+                header = header + show_type(d.target)
+                val home = owner match
+                    Some(t) -> site.entries[t].home
+                    None -> m
+                // An impl is named by the type it is for, which anchors it where it is listed alone.
+                val k = doc_add(site, "impl", doc_base_name(show_type(d.target)), home, header, doc_before(site.units[u].src.bytes, d.span.start), u, d.span, owner, doc_param_names(d.type_params))
+                if home != m then site.entries[k].from_module = site.modules[m].name
+                if owner is None then site.modules[home].items.push(k)
+                // An impl's methods are named after its type wherever it is listed.
+                site.entries[k].path = owner match
+                    Some(t) -> site.entries[t].path
+                    None -> doc_qualified(site.modules[m].name, doc_base_name(show_type(d.target)))
+                doc_members(site, u, home, d.members, k)
+            _ -> ()
+
+private doc_qualified(module_name: string, name: string) -> string = if module_name == "" then name else module_name + "." + name
+
+// A type's name without its type arguments: `Box` of `Box[T]`.
+private doc_base_name(text: string) -> string = text.index_of("[") match
+    Some(i) -> text[0..<i]
+    None -> text
+
+// The unit's `export` lines, each with the declaration it presents, which the module's path names too.
+private doc_exports(site: *DocSite, u: usize)
+    val m = doc_module_of(site, u)
+    for i in site.units[u].file.exports
+        var target: Option[usize] = None
+        for r in doc_refs_at(*site, u, i.name_span)
+            if target is None
+                if site.by_key.get(doc_key(r.declared_file, r.declared_span)) is Some(t) then target = Some(t)
+        if target is None then target = site.by_path.get(i.path)
+        val last = doc_last_segment(i.path)
+        var text = "export " + i.path
+        if i.binding != "" && i.binding != last then text = text + " as " + i.binding
+        site.modules[m].exports.push(DocExport(text, target))
+        if target is Some(t)
+            val path = doc_qualified(site.modules[m].name, if i.binding != "" then i.binding else last)
+            if site.by_path.get(path) is None then site.by_path.put(path, t)
+
+private doc_refs_at(site: DocSite, u: usize, at: Span) -> Buf[Reference]
+    var out: Buf[Reference] = buf()
+    val refs = site.refs[u]
+    var k = doc_first_at(refs, at.start)
+    while k < refs.len() && refs[k].at_span.start == at.start
+        out.push(refs[k])
+        k += 1
+    out
+
+private doc_last_segment(path: string) -> string = path.last_index_of(".") match
+    Some(i) -> path[i + 1..]
+    None -> path
+
+// ---- resolving names ----
+
+/** The URL of the page of module `m`, from any page of the site. */
+private doc_module_url(site: DocSite, m: usize) -> string
+    val page = site.modules[m].page
+    if site.modules[m].group == LibraryModule && site.std_url != "" then return site.std_url.trim_end_matches("/") + "/" + page
+    page
+
+/** The URL of an entry, from any page of the site. */
+private doc_entry_url(site: DocSite, k: usize) -> string = doc_module_url(site, site.entries[k].home) + "#" + site.entries[k].anchor
+
+/** The declaration or module a path in a doc comment of entry `from` names: a member of its type, a
+ * declaration of its module, a full path, a declaration of the prelude, or the one declaration of the
+ * site with that name. */
+doc_resolve(site: DocSite, path: string, m: usize, from: Option[usize]) -> Option[string]
+    var at = from
+    while at is Some(_)
+        val e = at.unwrap_or(0)
+        val owner = site.entries[e].path
+        if owner != "" && site.by_path.get(owner + "." + path) is Some(t) then return Some(doc_entry_url(site, t))
+        at = site.entries[e].parent
+    if site.by_path.get(doc_qualified(site.modules[m].name, path)) is Some(t) then return Some(doc_entry_url(site, t))
+    if site.by_path.get(path) is Some(t) then return Some(doc_entry_url(site, t))
+    if site.module_index.get(path) is Some(n) then return Some(doc_module_url(site, n))
+    if site.by_path.get(CoreModule + "." + path) is Some(t) then return Some(doc_entry_url(site, t))
+    if site.ambiguous.get(path) is None
+        if site.by_name.get(path) is Some(t) then return Some(doc_entry_url(site, t))
+    None
+
+// The page a type name in entry `k`'s signature links to: the declaration the checker resolved it to,
+// or for a name the checker inferred, the one type of the site with that name.
+private doc_type_url(site: DocSite, k: usize, word: string) -> Option[string]
+    val e = site.entries[k]
+    if word == e.name && e.kind != "impl" then return None
+    for l in e.links
+        if l.name == word
+            return site.by_key.get(l.key) match
+                Some(t) -> Some(doc_entry_url(site, t))
+                None -> None
+    for t in e.type_params
+        if t == word then return None
+    if !is_capitalized(word) then return None
+    if site.ambiguous.get(word) is None
+        if site.by_name.get(word) is Some(t)
+            if doc_is_type(site.entries[t].kind) then return Some(doc_entry_url(site, t))
+    None
+
+private doc_is_type(kind: string) -> bool = kind == "class" || kind == "trait" || kind == "object" || kind == "data" || kind == "type"
+
+// ---- doc comments ----
+
+/** A doc comment as HTML, its links to declarations resolved from entry `k`; what is wrong with it is
+ * added to the site's problems when the entry is the program's own. */
+private doc_markdown(site: *DocSite, text: string, m: usize, k: Option[usize], place: string) -> string
+    if text == "" then return ""
+    val own = site.modules[m].group == OwnModule
+    var defs = str_builder()
+    var defined: Map[string, bool] = map()
+    for label in doc_shortcut_labels(text)
+        if defined.get(label) is Some(_) then continue
+        defined.put(label, true)
+        val ticked = label.bytes.len >= 2 && label.starts_with("`") && label.ends_with("`")
+        val path = if ticked then label[1..<label.bytes.len - 1] else label
+        if !doc_path_like(path) then continue
+        doc_resolve(*site, path, m, k) match
+            Some(url) -> defs.push(s"\n\n[$label]: <$url>")
+            None -> if ticked && own then doc_problem(site, s"$place links to `$path`, which names no declaration")
+    val doc = parse_with(text + defs.finish(), gfm())
+    for i in 0..<doc.len()
+        val n = NodeId(u32(i))
+        doc.kind(n) match
+            Kind.Link(dest, title) ->
+                if doc_relative(dest)
+                    val bare = dest.index_of("#") match
+                        Some(h) -> dest[0..<h]
+                        None -> dest
+                    if doc_path_like(dest)
+                        doc_resolve(*site, dest, m, k) match
+                            Some(url) -> doc.set_kind(n, Kind.Link(url, title))
+                            None -> if !doc_is_page(*site, bare) && own then doc_problem(site, s"$place links to `$dest`, which names no declaration and no page")
+                    elif bare != "" && !doc_is_page(*site, bare) && own then doc_problem(site, s"$place links to `$dest`, which is no page of the documentation")
+            Kind.CodeBlock(info, literal, fenced) ->
+                if fenced && own && doc_avin_block(info)
+                    if doc_block_problem(literal) is Some(why) then doc_problem(site, s"$place: an Avin block in it does not parse: $why")
+            _ -> ()
+    val code: &Fn(string, string) -> Option[string] = (info, literal) -> if doc_avin_block(info) then Some(weave_code_block(literal)) else None
+    to_html_with(doc, gfm_html() with { highlight = Some(code) })
+
+// A problem, once: a module's first paragraph is read for the index as well as for its page.
+private doc_problem(site: *DocSite, text: string)
+    for p in site.problems
+        if p == text then return
+    site.problems.push(text)
+
+// A block of a doc comment is Avin when its info string names no language or names `avin`.
+private doc_avin_block(info: string) -> bool
+    val word = info.trim()
+    val first = word.index_of(" ") match
+        Some(i) -> word[0..<i]
+        None -> word
+    first == "" || first == "avin"
+
+private doc_is_page(site: DocSite, name: string) -> bool
+    for p in site.pages
+        if p == name then return true
+    false
+
+/** Why an Avin block of a doc comment does not parse, or `None` when it does: as a file of
+ * declarations, or failing that as the statements of a function's body. */
+doc_block_problem(code: string) -> Option[string]
+    val whole = parse(source_of("doc.avin", code))
+    if !whole.report.has_errors() then return None
+    var wrapped = str_builder()
+    wrapped.push("docExample()\n")
+    for line in code.split("\n")
+        if line.trim() != "" then wrapped.push("  " + line)
+        wrapped.push("\n")
+    val body = parse(source_of("doc.avin", wrapped.finish()))
+    if !body.report.has_errors() then return None
+    // A block that begins with a declaration is told about as one; any other as statements.
+    var first = code.trim_start()
+    var stop = 0usize
+    while stop < first.bytes.len && word_byte(first.bytes[stop])
+        stop += 1
+    val declares = is_declaration_word(first[0..<stop]) || first.starts_with("@")
+    val (report, src, shift) = if declares then (whole.report, whole.source, 0usize) else (body.report, body.source, 1usize)
+    for i in 0..<report.len()
+        val d = report.at(i)
+        if d.severity is Error
+            val line = src.locate(d.span.start).line
+            return Some(s"${d.message} (line ${if line > shift then line - shift else 1} of the block)")
+    Some("it does not parse")
+
+// The labels of the links a comment writes as `[label]` alone, with no destination after them.
+private doc_shortcut_labels(text: string) -> Buf[string]
+    var out: Buf[string] = buf()
+    val b = text.bytes
+    var fenced = false
+    var line_start = true
+    var k = 0usize
+    while k < b.len
+        if line_start
+            var j = k
+            while j < b.len && b[j] == u8(' ')
+                j += 1
+            if j + 2 < b.len && b[j] == u8('`') && b[j + 1] == u8('`') && b[j + 2] == u8('`') then fenced = !fenced
+        line_start = b[k] == u8('\n')
+        if fenced || b[k] != u8('[') || k > 0 && (b[k - 1] == u8('\\') || b[k - 1] == u8('!') || b[k - 1] == u8(']'))
+            k += 1
+            continue
+        var j = k + 1
+        while j < b.len && b[j] != u8(']') && b[j] != u8('[') && b[j] != u8('\n')
+            j += 1
+        if j >= b.len || b[j] != u8(']')
+            k += 1
+            continue
+        val next = if j + 1 < b.len then b[j + 1] else u8(' ')
+        if next != u8('(') && next != u8('[') && next != u8(':') && j > k + 1 then out.push(text[k + 1..<j])
+        k = j + 1
+    out
+
+/** Whether a link's text or destination is a declaration's path: names joined by dots. */
+doc_path_like(text: string) -> bool
+    if text == "" || text.starts_with(".") || text.ends_with(".") then return false
+    val b = text.bytes
+    if u8('0') <= b[0] <= u8('9') then return false
+    for k in 0..<b.len
+        if !word_byte(b[k]) && b[k] != u8('.') then return false
+        if b[k] == u8('.') && k + 1 < b.len && b[k + 1] == u8('.') then return false
+    true
+
+// Whether a link's destination is relative to the page: no scheme, and not a fragment or an absolute
+// path alone.
+private doc_relative(dest: string) -> bool
+    if dest == "" || dest.starts_with("#") || dest.starts_with("/") then return false
+    for b in dest.bytes
+        if b == u8(':') then return false
+        if b == u8('/') || b == u8('?') || b == u8('#') then return true
+    true
+
+// ---- pages ----
+
+/** Every file of the site: the index, a page per module that has something to show, the stylesheet
+ * and the names the search box finds. A module of the standard library is left out where `--std-url`
+ * says its pages are elsewhere. */
+doc_pages(site: *DocSite) -> Buf[DocPage]
+    var shown: Buf[usize] = buf()
+    for m in 0..<site.modules.len()
+        if !doc_writes(*site, m) then continue
+        if !doc_has_page(*site, m) then continue
+        shown.push(m)
+        site.pages.push(site.modules[m].page)
+    if !doc_is_page(*site, "index.html") then site.pages.push("index.html")
+    var out: Buf[DocPage] = buf()
+    out.push(DocPage("index.html", doc_index_page(site, shown)))
+    for m in shown
+        if site.modules[m].name != "" then out.push(DocPage(site.modules[m].page, doc_module_page(site, m)))
+    out.push(DocPage("style.css", doc_style()))
+    out.push(DocPage("search.js", doc_search_script(*site, shown)))
+    out
+
+private doc_writes(site: DocSite, m: usize) -> bool = site.modules[m].group != LibraryModule || site.std_url == ""
+
+private doc_index_page(site: *DocSite, shown: Buf[usize]) -> string
+    var body = str_builder()
+    body.push(s"<h1>${doc_escape(site.title)}</h1>\n")
+    for m in shown
+        if site.modules[m].name == ""
+            body.push(doc_markdown(site, site.modules[m].doc, m, None, doc_module_place(*site, m)))
+            doc_sections(site, &body, m)
+    var sorted: Buf[usize] = buf()
+    for m in shown
+        var at = sorted.len()
+        while at > 0 && site.modules[m].name < site.modules[sorted[at - 1]].name
+            at -= 1
+        sorted.insert(at, m)
+    for g in 0..<3
+        var listed = false
+        for m in sorted
+            if site.modules[m].name == "" || doc_group_rank(site.modules[m].group) != g then continue
+            if !listed
+                val heading = if g == 0 then "Modules" elif g == 1 then "Dependencies" else "Standard library"
+                body.push(s"<h2>$heading</h2>\n<dl class=\"modules\">\n")
+                listed = true
+            body.push(s"<dt><a href=\"${doc_module_url(*site, m)}\">${doc_escape(site.modules[m].name)}</a></dt>")
+            body.push("<dd>" + doc_summary(site, m) + "</dd>\n")
+        if listed then body.push("</dl>\n")
+    doc_page_text(*site, site.title, body.finish())
+
+// The first paragraph of a module's comment, for the list of modules.
+private doc_summary(site: *DocSite, m: usize) -> string
+    val text = site.modules[m].doc
+    val first = text.index_of("\n\n") match
+        Some(i) -> text[0..<i]
+        None -> text
+    var html = doc_markdown(site, first, m, None, doc_module_place(*site, m)).trim()
+    if html.starts_with("<p>") && html.ends_with("</p>") then html = html[3..<html.bytes.len - 4]
+    html
+
+private doc_module_place(site: DocSite, m: usize) -> string
+    val u = site.modules[m].unit
+    s"${site.units[u].src.name}: the comment of module `${site.modules[m].name}`"
+
+private doc_module_page(site: *DocSite, m: usize) -> string
+    var body = str_builder()
+    body.push(s"<h1><span class=\"kind\">module</span> ${doc_escape(site.modules[m].name)}</h1>\n")
+    body.push(doc_markdown(site, site.modules[m].doc, m, None, doc_module_place(*site, m)))
+    doc_sections(site, &body, m)
+    doc_page_text(*site, site.modules[m].name + " – " + site.title, body.finish())
+
+// A module's declarations, by kind, in the order they are written.
+private doc_sections(site: *DocSite, body: *StrBuilder, m: usize)
+    val items = site.modules[m].items
+    for section in 0..<4
+        var started = false
+        for k in items
+            val kind = site.entries[k].kind
+            val here = if section == 0 then doc_is_type(kind) elif section == 1 then kind == "function" elif section == 2 then kind == "value" else kind == "impl"
+            if !here then continue
+            if !started
+                val heading = if section == 0 then "Types" elif section == 1 then "Functions" elif section == 2 then "Values" else "Implementations"
+                body.push(s"<h2>$heading</h2>\n")
+                started = true
+            doc_entry_html(site, body, k)
+    val exports = site.modules[m].exports
+    if exports.len() > 0
+        body.push("<h2>Exports</h2>\n<ul class=\"exports\">\n")
+        for x in exports
+            body.push("<li><code>")
+            x.target match
+                Some(t) -> body.push(s"<a href=\"${doc_entry_url(*site, t)}\">${doc_escape(x.text)}</a>")
+                None -> body.push(doc_escape(x.text))
+            body.push("</code></li>\n")
+        body.push("</ul>\n")
+
+private doc_entry_html(site: *DocSite, body: *StrBuilder, k: usize)
+    val e = site.entries[k]
+    body.push(s"<section class=\"decl ${e.kind}\" id=\"${doc_escape(e.anchor)}\">\n")
+    body.push(s"<div class=\"sig\"><a class=\"anchor\" href=\"#${doc_escape(e.anchor)}\" aria-label=\"link to ${doc_escape(e.name)}\">#</a>")
+    body.push("<pre><code>" + doc_signature_html(*site, k) + "</code></pre></div>\n")
+    if e.from_module != "" then body.push(s"<p class=\"from\">in module <code>${doc_escape(e.from_module)}</code></p>\n")
+    val place = s"${site.units[e.unit].src.name}:${site.units[e.unit].src.locate(e.span.start).line}: the doc comment of `${e.name}`"
+    val doc = doc_markdown(site, e.doc, e.home, Some(k), place)
+    if doc != "" then body.push("<div class=\"doc\">\n" + doc + "</div>\n")
+    if e.members.len() > 0
+        body.push("<div class=\"members\">\n")
+        // Variants, fields and methods, then the impls with their own.
+        for pass in 0..<2
+            for c in e.members
+                if (site.entries[c].kind == "impl") == (pass == 1) then doc_entry_html(site, body, c)
+        body.push("</div>\n")
+    body.push("</section>\n")
+
+/** An entry's signature as HTML, coloured as Avin, each type it names a link to that type's entry. */
+private doc_signature_html(site: DocSite, k: usize) -> string = highlight_avin_linked(site.entries[k].signature, word -> doc_type_url(site, k, word))
+
+private doc_page_text(site: DocSite, title: string, body: string) -> string
+    var out = str_builder()
+    out.push("<!doctype html>\n<html lang=\"en\">\n<head>\n<meta charset=\"utf-8\">\n")
+    out.push("<meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">\n")
+    out.push(s"<title>${doc_escape(title)}</title>\n<link rel=\"stylesheet\" href=\"style.css\">\n</head>\n<body>\n")
+    out.push(s"<header><a class=\"home\" href=\"index.html\">${doc_escape(site.title)}</a>")
+    out.push("<input id=\"search\" type=\"search\" placeholder=\"Search names\" autocomplete=\"off\" aria-label=\"Search names\"></header>\n")
+    out.push("<ul id=\"results\" hidden></ul>\n<main>\n")
+    out.push(body)
+    out.push("</main>\n<script src=\"search.js\"></script>\n</body>\n</html>\n")
+    out.finish()
+
+/** Text made safe between tags and inside a quoted attribute. */
+doc_escape(text: string) -> string
+    var out = str_builder()
+    var from = 0usize
+    for k in 0..<text.bytes.len
+        val b = text.bytes[k]
+        val entity = if b == u8('<') then "&lt;" elif b == u8('>') then "&gt;" elif b == u8('&') then "&amp;" elif b == u8('"') then "&quot;" else ""
+        if entity != ""
+            out.push(text[from..<k])
+            out.push(entity)
+            from = k + 1
+    out.push(text[from..<text.bytes.len])
+    out.finish()
+
+// The names the search box finds, written pages only: each with its kind, its module and its URL.
+private doc_search_script(site: DocSite, shown: Buf[usize]) -> string
+    var out = str_builder()
+    out.push("var avinDocNames = [\n")
+    for k in 0..<site.entries.len()
+        val e = site.entries[k]
+        if e.kind == "impl" || e.kind == "export" then continue
+        var listed = false
+        for m in shown
+            if m == e.home then listed = true
+        if !listed then continue
+        val shown_name = if e.path != "" then e.path else e.name
+        out.push(s"[${doc_js(shown_name)}, ${doc_js(e.kind)}, ${doc_js(doc_entry_url(site, k))}],\n")
+    out.push("];\n")
+    out.push(doc_search_code())
+    out.finish()
+
+// A string as a JavaScript literal.
+private doc_js(text: string) -> string
+    var out = str_builder()
+    out.push("\"")
+    for b in text.bytes
+        if b == u8('"') || b == u8('\\') then out.push("\\" + from_utf8_lossy([b]))
+        elif b == u8('<') then out.push("\\u003c")
+        elif b < 0x20 then out.push(" ")
+        else out.push(from_utf8_lossy([b]))
+    out.push("\"")
+    out.finish()
+
+private doc_search_code() -> string = raw"""
+    (function () {
+      var input = document.getElementById("search");
+      var results = document.getElementById("results");
+      if (!input || !results) return;
+      input.addEventListener("input", function () {
+        var q = input.value.trim().toLowerCase();
+        results.textContent = "";
+        if (q === "") { results.hidden = true; return; }
+        var found = avinDocNames.filter(function (n) { return n[0].toLowerCase().indexOf(q) >= 0; });
+        found.sort(function (a, b) {
+          var ea = a[0].toLowerCase().endsWith(q) ? 0 : 1, eb = b[0].toLowerCase().endsWith(q) ? 0 : 1;
+          return ea - eb || a[0].length - b[0].length || (a[0] < b[0] ? -1 : 1);
+        });
+        found.slice(0, 50).forEach(function (n) {
+          var li = document.createElement("li");
+          var a = document.createElement("a");
+          a.href = n[2];
+          a.textContent = n[0];
+          var kind = document.createElement("span");
+          kind.className = "kind";
+          kind.textContent = " " + n[1];
+          li.appendChild(a);
+          li.appendChild(kind);
+          results.appendChild(li);
+        });
+        results.hidden = found.length === 0;
+      });
+    })();
+    """
+
+// The stylesheet every page links: a colour is named once, as a custom property, and the dark palette
+// answers the same names.
+private doc_style() -> string = raw"""
+    :root {
+      --bg: #fdfdfc; --fg: #1a1a18; --muted: #6b6b66; --rule: #e2e2dd; --code-bg: #f6f6f4;
+      --accent: #4a5f8a; --hl-keyword: #8a3d6b; --hl-string: #3f6b40; --hl-comment: #86867e;
+      --hl-number: #9a5b23; --hl-type: #3d6478; --hl-operator: #6b6b66;
+    }
+    @media (prefers-color-scheme: dark) {
+      :root {
+        --bg: #16161a; --fg: #e6e6e2; --muted: #9a9a94; --rule: #2c2c33; --code-bg: #1e1e24;
+        --accent: #9db2dd; --hl-keyword: #d69ac4; --hl-string: #9ccb9d; --hl-comment: #7e7e88;
+        --hl-number: #e0a86a; --hl-type: #8fc0d6; --hl-operator: #9a9a94;
+      }
+    }
+    body { margin: 0; background: var(--bg); color: var(--fg); font: 16px/1.6 system-ui, sans-serif; }
+    header { display: flex; gap: 1em; align-items: center; padding: 0.6em 1em; border-bottom: 1px solid var(--rule); }
+    header .home { font-weight: 600; text-decoration: none; color: var(--fg); }
+    #search { flex: 1; max-width: 24em; margin-left: auto; padding: 0.3em 0.6em; font: inherit;
+      color: var(--fg); background: var(--code-bg); border: 1px solid var(--rule); border-radius: 4px; }
+    #results { list-style: none; margin: 0 auto; padding: 0.5em 1em; max-width: 52em; border-bottom: 1px solid var(--rule); }
+    #results li { padding: 0.1em 0; }
+    main { max-width: 52em; margin: 0 auto; padding: 1.5em 1em 4em; }
+    h1, h2, h3 { line-height: 1.25; margin: 1.4em 0 0.5em; }
+    h2 { border-bottom: 1px solid var(--rule); padding-bottom: 0.2em; }
+    a { color: var(--accent); }
+    code, pre { font: 0.9em/1.5 ui-monospace, Menlo, Consolas, monospace; }
+    :not(pre) > code { background: var(--code-bg); padding: 0.1em 0.3em; border-radius: 3px; }
+    pre { background: var(--code-bg); border: 1px solid var(--rule); border-radius: 4px; padding: 0.7em 1em; overflow-x: auto; }
+    .kind { color: var(--muted); font-weight: normal; }
+    .decl { margin: 1.2em 0; }
+    .sig { position: relative; }
+    .sig pre { margin: 0; }
+    .sig a[href^="#"].anchor { position: absolute; left: -1.2em; top: 0.6em; text-decoration: none; color: var(--muted); opacity: 0; }
+    .sig:hover .anchor { opacity: 1; }
+    .sig pre a { color: inherit; text-decoration: underline; text-decoration-color: var(--rule); }
+    .doc { margin: 0.4em 0 0 1em; }
+    .members { margin-left: 1.5em; padding-left: 1em; border-left: 2px solid var(--rule); }
+    .from { color: var(--muted); margin: 0.2em 0 0 1em; }
+    dl.modules dt { font-family: ui-monospace, Menlo, Consolas, monospace; margin-top: 0.6em; }
+    dl.modules dd { margin-left: 1.5em; color: var(--muted); }
+    blockquote { margin: 0 0 1em; padding-left: 1em; border-left: 3px solid var(--rule); color: var(--muted); }
+    table { border-collapse: collapse; }
+    th, td { border: 1px solid var(--rule); padding: 0.3em 0.6em; }
+    .hl-keyword { color: var(--hl-keyword); }
+    .hl-type { color: var(--hl-type); }
+    .hl-number { color: var(--hl-number); }
+    .hl-string { color: var(--hl-string); }
+    .hl-comment { color: var(--hl-comment); font-style: italic; }
+    .hl-operator { color: var(--hl-operator); }
+    """
