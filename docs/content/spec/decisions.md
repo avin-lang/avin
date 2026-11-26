@@ -14824,3 +14824,34 @@ Settled on the user's delegation 2026-11-11 (built on branch `json-derive`): **J
   bcrypt ignores it. *Alternatives weighed*: `verifyPassword -> bool` (hides malformed rows);
   `needsRehash` only on weaker costs; a `Result` from `hashPassword` (its parameters are the server's
   own, so a bad one is a programming error and traps, as `pbkdf2HmacSha256`'s do).
+- Settled on the user's delegation 2026-11-24 (branch `totp`): **one-time passwords live in
+  `avin.crypto` (file `otp.avin`), not a new module**, so the module lists of the reject tests do not
+  change and a program importing `avin.crypto` finds them beside `hmacSha1`. (1) Functions, not a
+  stateful object: `hotp(secret, counter, digits = 6, algorithm = OtpSha1)`, `totp(secret, at = now(),
+  digits, algorithm, period = 30, t0 = 0)`, `totpStep`, `verifyHotp`, `verifyTotp`. The clock is the
+  `at` argument, defaulting to `now()`; a test passes an `Instant`, so no clock type is needed.
+  Alternatives weighed: a `Totp` class holding the settings and a clock function (state to keep in step
+  with an account row, and a closure the caller must make `@sendable`). (2) The program's own settings
+  (empty secret, digits outside 6 to 8, a period under 1, a negative window or counter, a generated
+  secret under 16 bytes, a time before `t0`) trap; text that arrives from outside (a secret, a URI)
+  answers `Result`, and a code someone typed answers `None`. Digits stop at 8 because the truncated
+  value has 31 bits. (3) `verifyTotp` and `verifyHotp` return the matched step or counter, not a bool.
+  Every step in the window is computed and compared with `constantTimeEquals` whatever the first
+  answer, and the greatest match is answered, so the answer does not depend on where the match lies.
+  Replay: the caller stores the step and passes it back as `lastStep`; only steps after it are
+  accepted, so an accepted code, and any older one, is refused. A caller that does not pass it accepts a
+  code for as long as it stays in the window; the docs say so. Alternatives weighed: a bool (cannot
+  refuse reuse); a mutable verifier (hides the account state). (4) Algorithm names are `OtpSha1`,
+  `OtpSha256`, `OtpSha512`, since `Sha1` and the others are the streaming digest classes in the same
+  module. (5) Secrets are base32 text, upper case and unpadded when written, and either case, padded or
+  not, with spaces and hyphens left in, when read. (6) `OtpUri` holds the kind (`TimeBased(period)` or
+  `CounterBased(counter)`), secret, issuer, account, algorithm and digits; `uri` writes
+  `otpauth://totp/Issuer:account?secret=&issuer=&algorithm=&digits=&period=` with issuer and account
+  percent-escaped (`Url.encode`, so a colon inside either is `%3A` and only the label's own colon
+  divides it) and `parseOtpUri` reads it back, either type. It is lenient where apps are (case of the
+  scheme, type, algorithm and secret; missing `algorithm`, `digits`, `period` default to SHA1, 6, 30;
+  unknown parameters ignored; the `issuer` parameter beats the label's; `Issuer%3Aaccount` with that
+  `issuer` parameter is split) and strict where a wrong value would give wrong codes (a duplicate
+  parameter, a digits, period or counter a code cannot use, a missing secret, an empty account, a
+  secret that is not base32). A `+` is not read as a space. Alternatives weighed: leaving the issuer
+  only in the label (apps differ); reading `+` as a space (not what the URI format says).

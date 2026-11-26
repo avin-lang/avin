@@ -1,0 +1,293 @@
+// `avin.crypto`'s one-time passwords: every HOTP vector of RFC 4226 Appendix D and every TOTP vector of
+// RFC 6238 Appendix B, the verification window and its replay rule, secrets, and the `otpauth://` URI
+// written and read again.
+import avin.crypto.{hotp, totp, totpStep, verifyHotp, verifyTotp, generateOtpSecret, otpSecretText}
+import avin.crypto.{otpSecretFromText, parseOtpUri, OtpUri, OtpKind, TimeBased, CounterBased, OtpError, BadUri}
+import avin.crypto.{OtpAlgorithm, OtpSha1, OtpSha256, OtpSha512, BadSecret}
+import avin.time.{epochSeconds, Instant}
+
+private val Sha1Secret: Vector[byte] = "12345678901234567890".bytes
+private val Sha256Secret: Vector[byte] = "12345678901234567890123456789012".bytes
+private val Sha512Secret: Vector[byte] = "1234567890123456789012345678901234567890123456789012345678901234".bytes
+
+@test("HOTP gives the ten codes of RFC 4226 Appendix D, in six and in eight digits")
+hotpVectors()
+  val six = ["755224", "287082", "359152", "969429", "338314", "254676", "287922", "162583", "399871", "520489"]
+  val eight = [
+    "84755224", "94287082", "37359152", "26969429", "40338314", "68254676", "18287922", "82162583", "73399871",
+    "45520489",
+  ]
+  for i in 0 ..< 10
+    assertEq(hotp(Sha1Secret, long(i)), six(i))
+    assertEq(hotp(Sha1Secret, long(i), 8), eight(i))
+    assertEq(hotp(Sha1Secret, long(i), 7), eight(i).slice(1, 8))
+
+@test("TOTP gives the codes of RFC 6238 Appendix B for SHA-1, SHA-256 and SHA-512")
+totpVectors()
+  val times: Vector[long] = [59, 1111111109, 1111111111, 1234567890, 2000000000, 20000000000]
+  val sha1 = ["94287082", "07081804", "14050471", "89005924", "69279037", "65353130"]
+  val sha256 = ["46119246", "68084774", "67062674", "91819424", "90698825", "77737706"]
+  val sha512 = ["90693936", "25091201", "99943326", "93441116", "38618901", "47863826"]
+  for i in 0 ..< 6
+    val at = epochSeconds(times(i))
+    assertEq(totp(Sha1Secret, at, 8, OtpSha1), sha1(i))
+    assertEq(totp(Sha256Secret, at, 8, OtpSha256), sha256(i))
+    assertEq(totp(Sha512Secret, at, 8, OtpSha512), sha512(i))
+    assertEq(totp(Sha1Secret, at), sha1(i).slice(2, 8))
+
+@test("a step is the whole periods since t0, rounded down, and a period or t0 other than the default moves it")
+steps()
+  assertEq(totpStep(epochSeconds(0)), 0)
+  assertEq(totpStep(epochSeconds(29)), 0)
+  assertEq(totpStep(epochSeconds(30)), 1)
+  assertEq(totpStep(epochSeconds(59)), 1)
+  assertEq(totpStep(epochSeconds(60), 60), 1)
+  assertEq(totpStep(epochSeconds(59), 60), 0)
+  assertEq(totpStep(epochSeconds(100), 30, 40), 2)
+  assertEq(totpStep(epochSeconds(39), 30, 40), -1)
+  assertEq(totpStep(epochSeconds(10), 30, 40), -1)
+  assertEq(totpStep(epochSeconds(-1)), -1)
+  assertEq(totpStep(epochSeconds(-30)), -1)
+  assertEq(totpStep(epochSeconds(-31)), -2)
+  assertEq(totp(Sha1Secret, epochSeconds(100), 6, OtpSha1, 30, 40), hotp(Sha1Secret, 2))
+  assertEq(totp(Sha1Secret, epochSeconds(59), 6, OtpSha1, 60), hotp(Sha1Secret, 0))
+  assertEq(totp(Sha1Secret, Instant(59999999)), hotp(Sha1Secret, 1))
+
+@test("a code is zero-padded to its digits, and the counter's high bits are used")
+paddingAndCounter()
+  assertEq(totp(Sha1Secret, epochSeconds(1111111109), 6), "081804")
+  assertEq(hotp(Sha1Secret, 0).charCount, 6)
+  assertEq(hotp(Sha1Secret, 4294967296).charCount, 6)
+  assert(hotp(Sha1Secret, 4294967296) != hotp(Sha1Secret, 0))
+  assertEq(hotp(Sha1Secret, long.MaxValue).charCount, 6)
+  assertEq(hotp(Sha1Secret, 1, 6, OtpSha256).charCount, 6)
+
+@test("a secret of any length works: one byte, and one longer than the hash's block")
+secretLengths()
+  assertEq(hotp(Vector(byte(1)), 0).charCount, 6)
+  assertEq(hotp(Vector.fill(200, byte(7)), 0).charCount, 6)
+
+@test("verifyTotp answers the matched step across the window and nothing outside it")
+windowEdges()
+  val at = epochSeconds(1111111109)
+  val step = totpStep(at)
+  assertEq(verifyTotp(Sha1Secret, hotp(Sha1Secret, step), at), Some(step))
+  assertEq(verifyTotp(Sha1Secret, hotp(Sha1Secret, step - 1), at), Some(step - 1))
+  assertEq(verifyTotp(Sha1Secret, hotp(Sha1Secret, step + 1), at), Some(step + 1))
+  assertEq(verifyTotp(Sha1Secret, hotp(Sha1Secret, step - 2), at), None)
+  assertEq(verifyTotp(Sha1Secret, hotp(Sha1Secret, step + 2), at), None)
+  assertEq(verifyTotp(Sha1Secret, hotp(Sha1Secret, step - 1), at, 0), None)
+  assertEq(verifyTotp(Sha1Secret, hotp(Sha1Secret, step + 1), at, 0), None)
+  assertEq(verifyTotp(Sha1Secret, hotp(Sha1Secret, step), at, 0), Some(step))
+  assertEq(verifyTotp(Sha1Secret, hotp(Sha1Secret, step - 3), at, 3), Some(step - 3))
+  assertEq(verifyTotp(Sha1Secret, hotp(Sha1Secret, step + 3), at, 3), Some(step + 3))
+  assertEq(verifyTotp(Sha1Secret, hotp(Sha1Secret, step + 4), at, 3), None)
+
+@test("verifyTotp refuses wrong codes, wrong lengths, non-digits and the empty code")
+wrongCodes()
+  val at = epochSeconds(59)
+  assertEq(verifyTotp(Sha1Secret, "000000", at, 0), None)
+  assertEq(verifyTotp(Sha1Secret, "287082", at, 0), Some(1))
+  assertEq(verifyTotp(Sha1Secret, "28708", at, 0), None)
+  assertEq(verifyTotp(Sha1Secret, "2870820", at, 0), None)
+  assertEq(verifyTotp(Sha1Secret, "287082 ", at, 0), None)
+  assertEq(verifyTotp(Sha1Secret, " 287082", at, 0), None)
+  assertEq(verifyTotp(Sha1Secret, "", at), None)
+  assertEq(verifyTotp(Sha1Secret, "28708é", at, 0), None)
+  assertEq(verifyTotp(Sha1Secret, "94287082", at, 0, 6), None)
+  assertEq(verifyTotp(Sha1Secret, "94287082", at, 0, 8), Some(1))
+  assertEq(verifyTotp(Sha256Secret, "46119246", at, 0, 8), None)
+  assertEq(verifyTotp(Sha256Secret, "46119246", at, 0, 8, OtpSha256), Some(1))
+  assertEq(verifyTotp(Sha512Secret, "90693936", at, 0, 8, OtpSha512), Some(1))
+
+@test("lastStep refuses a step already used, and every older one")
+replay()
+  val at = epochSeconds(1111111109)
+  val step = totpStep(at)
+  val code = hotp(Sha1Secret, step)
+  assertEq(verifyTotp(Sha1Secret, code, at, 1, 6, OtpSha1, 30, 0, None), Some(step))
+  assertEq(verifyTotp(Sha1Secret, code, at, 1, 6, OtpSha1, 30, 0, Some(step)), None)
+  assertEq(verifyTotp(Sha1Secret, code, at, 1, 6, OtpSha1, 30, 0, Some(step + 1)), None)
+  assertEq(verifyTotp(Sha1Secret, code, at, 1, 6, OtpSha1, 30, 0, Some(step - 1)), Some(step))
+  val older = hotp(Sha1Secret, step - 1)
+  assertEq(verifyTotp(Sha1Secret, older, at, 1, 6, OtpSha1, 30, 0, Some(step)), None)
+  val newer = hotp(Sha1Secret, step + 1)
+  assertEq(verifyTotp(Sha1Secret, newer, at, 1, 6, OtpSha1, 30, 0, Some(step)), Some(step + 1))
+
+@test("a window that reaches before step 0 or before t0 skips those steps")
+windowBeforeStart()
+  assertEq(verifyTotp(Sha1Secret, hotp(Sha1Secret, 0), epochSeconds(0)), Some(0))
+  assertEq(verifyTotp(Sha1Secret, hotp(Sha1Secret, 1), epochSeconds(0)), Some(1))
+  assertEq(verifyTotp(Sha1Secret, hotp(Sha1Secret, 0), epochSeconds(5), 3, 6, OtpSha1, 30, 100), None)
+  assertEq(verifyTotp(Sha1Secret, hotp(Sha1Secret, 0), epochSeconds(5), 5, 6, OtpSha1, 30, 100), Some(0))
+  assertEq(verifyTotp(Sha1Secret, hotp(Sha1Secret, 0), epochSeconds(100), 1, 6, OtpSha1, 30, 100), Some(0))
+  assertEq(verifyTotp(Sha1Secret, hotp(Sha1Secret, 0), epochSeconds(-100), 0), None)
+
+@test("verifyHotp finds the counter, looks ahead, and never looks back")
+hotpVerification()
+  assertEq(verifyHotp(Sha1Secret, "755224", 0), Some(0))
+  assertEq(verifyHotp(Sha1Secret, "287082", 0), None)
+  assertEq(verifyHotp(Sha1Secret, "287082", 0, 1), Some(1))
+  assertEq(verifyHotp(Sha1Secret, "520489", 0, 9), Some(9))
+  assertEq(verifyHotp(Sha1Secret, "520489", 0, 8), None)
+  assertEq(verifyHotp(Sha1Secret, "755224", 1, 20), None)
+  assertEq(verifyHotp(Sha1Secret, "84755224", 0, 3, 8), Some(0))
+  assertEq(verifyHotp(Sha1Secret, "", 0, 3), None)
+  assertEq(verifyHotp(Sha1Secret, "75522", 0, 3), None)
+
+@test("generateOtpSecret makes 20 random bytes, or the length asked, and its text reads back")
+generation()
+  val a = generateOtpSecret()
+  val b = generateOtpSecret()
+  assertEq(a.length, 20)
+  assert(a != b)
+  assertEq(generateOtpSecret(16).length, 16)
+  assertEq(generateOtpSecret(64).length, 64)
+  assertEq(otpSecretFromText(otpSecretText(a)), Ok(a))
+  assertEq(otpSecretText(a).charCount, 32)
+  assert(!otpSecretText(generateOtpSecret(17)).contains("="))
+
+@test("secret text is base32 in either case, with grouping spaces and hyphens, and bad text is an error")
+secretText()
+  assertEq(otpSecretText("12345678901234567890".bytes), "GEZDGNBVGY3TQOJQGEZDGNBVGY3TQOJQ")
+  assertEq(otpSecretFromText("GEZDGNBVGY3TQOJQGEZDGNBVGY3TQOJQ"), Ok(Sha1Secret))
+  assertEq(otpSecretFromText("gezdgnbvgy3tqojqgezdgnbvgy3tqojq"), Ok(Sha1Secret))
+  assertEq(otpSecretFromText("GEZD GNBV GY3T QOJQ GEZD GNBV GY3T QOJQ"), Ok(Sha1Secret))
+  assertEq(otpSecretFromText("GEZD-GNBV-GY3T-QOJQ-GEZD-GNBV-GY3T-QOJQ"), Ok(Sha1Secret))
+  assert(otpSecretFromText("").isErr)
+  assert(otpSecretFromText("   ").isErr)
+  assert(otpSecretFromText("GEZDGNB1").isErr)
+  assert(otpSecretFromText("GEZDGNB!").isErr)
+  assert(otpSecretFromText("G").isErr)
+  assert(otpSecretFromText("ÉÉ").isErr)
+  assert(otpSecretFromText("GEZDGNBVGY======").isOk)
+  assert(otpSecretFromText("GEZDGNBVGY3TQOJQ====").isErr)
+  otpSecretFromText("!") match
+    Err(BadSecret(_)) -> ()
+    other -> fail(s"expected BadSecret, got ${other}")
+
+private val Account: OtpUri = OtpUri(TimeBased(30), Sha1Secret, Some("Example"), "alice@example.com", OtpSha1, 6)
+
+@test("a TOTP URI has the label, secret, issuer, algorithm, digits and period, escaped")
+uriText()
+  assertEq(
+    Account.uri,
+    "otpauth://totp/Example:alice%40example.com?secret=GEZDGNBVGY3TQOJQGEZDGNBVGY3TQOJQ&issuer=Example&algorithm=SHA1&digits=6&period=30",
+  )
+  assertEq(
+    OtpUri(TimeBased(60), Sha1Secret, None, "bob", OtpSha256, 8).uri,
+    "otpauth://totp/bob?secret=GEZDGNBVGY3TQOJQGEZDGNBVGY3TQOJQ&algorithm=SHA256&digits=8&period=60",
+  )
+  assertEq(
+    OtpUri(CounterBased(5), Sha1Secret, Some("A B"), "c&d=e", OtpSha512, 7).uri,
+    "otpauth://hotp/A%20B:c%26d%3De?secret=GEZDGNBVGY3TQOJQGEZDGNBVGY3TQOJQ&issuer=A%20B&algorithm=SHA512&digits=7&counter=5",
+  )
+  assertEq(s"${Account}", Account.uri)
+
+@test("a URI reads back as the value that wrote it, including Unicode, reserved and colon text")
+uriRoundTrip()
+  val issuers = ["Example", "Café Über", "例え", "a:b", "a%b", "100% & more", "x/y?z#w", "😀", "a+b", " lead"]
+  val accounts = ["alice", "alice@example.com", "élève:one", "例 え", "a/b?c=d&e#f", "%41", "a+b", "😀"]
+  val kinds = [TimeBased(30), TimeBased(1), TimeBased(86400), CounterBased(0), CounterBased(long.MaxValue)]
+  val algorithms = [OtpSha1, OtpSha256, OtpSha512]
+  var n = 0
+  for issuer in issuers
+    for account in accounts
+      val kind = kinds(n % kinds.length)
+      val algorithm = algorithms(n % 3)
+      val digits = 6 + n % 3
+      val original = OtpUri(
+        kind,
+        generateOtpSecret(16 + n % 9),
+        if n % 4 == 0 then None else Some(issuer),
+        account,
+        algorithm,
+        digits
+      )
+      assertEq(parseOtpUri(original.uri), Ok(original))
+      n += 1
+  assertEq(parseOtpUri(Account.uri), Ok(Account))
+
+@test("a URI is read as the apps write them: lower-case secret, missing optional parameters, either issuer spelling")
+uriLeniency()
+  assertEq(
+    parseOtpUri("otpauth://totp/Example:alice?secret=gezdgnbvgy3tqojqgezdgnbvgy3tqojq"),
+    Ok(OtpUri(TimeBased(30), Sha1Secret, Some("Example"), "alice", OtpSha1, 6)),
+  )
+  assertEq(
+    parseOtpUri("OTPAUTH://TOTP/alice?secret=GEZDGNBVGY3TQOJQGEZDGNBVGY3TQOJQ&algorithm=sha256&unknown=1"),
+    Ok(OtpUri(TimeBased(30), Sha1Secret, None, "alice", OtpSha256, 6)),
+  )
+  assertEq(
+    parseOtpUri("otpauth://totp/Old:alice?secret=GEZDGNBVGY3TQOJQGEZDGNBVGY3TQOJQ&issuer=New"),
+    Ok(OtpUri(TimeBased(30), Sha1Secret, Some("New"), "alice", OtpSha1, 6)),
+  )
+  assertEq(
+    parseOtpUri("otpauth://totp/Example%3Aalice?secret=GEZDGNBVGY3TQOJQGEZDGNBVGY3TQOJQ&issuer=Example"),
+    Ok(OtpUri(TimeBased(30), Sha1Secret, Some("Example"), "alice", OtpSha1, 6)),
+  )
+  assertEq(
+    parseOtpUri("otpauth://totp/Example%3Aalice?secret=GEZDGNBVGY3TQOJQGEZDGNBVGY3TQOJQ"),
+    Ok(OtpUri(TimeBased(30), Sha1Secret, None, "Example:alice", OtpSha1, 6)),
+  )
+  assertEq(
+    parseOtpUri("otpauth://totp/Example:%20alice?secret=GEZDGNBVGY3TQOJQGEZDGNBVGY3TQOJQ"),
+    Ok(OtpUri(TimeBased(30), Sha1Secret, Some("Example"), "alice", OtpSha1, 6)),
+  )
+  assertEq(
+    parseOtpUri("otpauth://hotp/alice?secret=GEZDGNBVGY3TQOJQGEZDGNBVGY3TQOJQ&counter=7&digits=8"),
+    Ok(OtpUri(CounterBased(7), Sha1Secret, None, "alice", OtpSha1, 8)),
+  )
+  assertEq(
+    parseOtpUri("otpauth://totp/alice?secret=GEZD%47NBVGY3TQOJQGEZDGNBVGY3TQOJQ"),
+    Ok(OtpUri(TimeBased(30), Sha1Secret, None, "alice", OtpSha1, 6)),
+  )
+
+private val Secret: string = "secret=GEZDGNBVGY3TQOJQGEZDGNBVGY3TQOJQ"
+
+private rejected(text: string) -> bool = parseOtpUri(text) match
+  Err(BadUri(_)) -> true
+  Err(BadSecret(_)) -> true
+  Ok(_) -> false
+
+@test("a URI that is not one, or has a value a code cannot use, is an error")
+uriRejections()
+  assert(rejected(""))
+  assert(rejected("otpauth://"))
+  assert(rejected("http://totp/alice?" + Secret))
+  assert(rejected("otpauth:/totp/alice?" + Secret))
+  assert(rejected("otpauth://totp"))
+  assert(rejected("otpauth://totp/alice"))
+  assert(rejected("otpauth://totp/alice?"))
+  assert(rejected("otpauth://steam/alice?" + Secret))
+  assert(rejected("otpauth://totp/?" + Secret))
+  assert(rejected("otpauth://totp/Example:?" + Secret))
+  assert(rejected("otpauth://totp/alice?issuer=x"))
+  assert(rejected("otpauth://totp/alice?secret="))
+  assert(rejected("otpauth://totp/alice?secret=GEZDGNB1"))
+  assert(rejected("otpauth://totp/alice?" + Secret + "&" + Secret))
+  assert(rejected("otpauth://totp/alice?" + Secret + "&algorithm=MD5"))
+  assert(rejected("otpauth://totp/alice?" + Secret + "&algorithm=SHA384"))
+  assert(rejected("otpauth://totp/alice?" + Secret + "&digits=5"))
+  assert(rejected("otpauth://totp/alice?" + Secret + "&digits=9"))
+  assert(rejected("otpauth://totp/alice?" + Secret + "&digits=x"))
+  assert(rejected("otpauth://totp/alice?" + Secret + "&digits=-6"))
+  assert(rejected("otpauth://totp/alice?" + Secret + "&digits="))
+  assert(rejected("otpauth://totp/alice?" + Secret + "&period=0"))
+  assert(rejected("otpauth://totp/alice?" + Secret + "&period=-30"))
+  assert(rejected("otpauth://totp/alice?" + Secret + "&period=abc"))
+  assert(rejected("otpauth://totp/alice?" + Secret + "&period=99999999999"))
+  assert(rejected("otpauth://hotp/alice?" + Secret))
+  assert(rejected("otpauth://hotp/alice?" + Secret + "&counter=-1"))
+  assert(rejected("otpauth://hotp/alice?" + Secret + "&counter=x"))
+  assert(rejected("otpauth://hotp/alice?" + Secret + "&counter=99999999999999999999"))
+  assert(rejected("otpauth://totp/al%ZZice?" + Secret))
+  assert(rejected("otpauth://totp/al%FFice?" + Secret))
+  assert(rejected("otpauth://totp/alice?" + Secret + "&issuer=%"))
+  assert(parseOtpUri("otpauth://hotp/alice?" + Secret + "&counter=9223372036854775807").isOk)
+
+@test("the error messages say what is wrong")
+errorMessages()
+  assertEq(BadUri("x").message, "not an otpauth URI: x")
+  assertEq(BadSecret("y").message, "not a usable secret: y")
+  assertEq(s"${OtpSha1} ${OtpSha256} ${OtpSha512}", "SHA1 SHA256 SHA512")

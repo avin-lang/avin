@@ -2313,6 +2313,48 @@ forge new ones. `seal` draws each nonce from `SecureRandom` and puts it in front
 its nonces (a record counter), which then answers for never repeating one. A key's text is its
 cipher, `AeadKey(AES-256-GCM)`, and nothing of the key.
 
+### One-time passwords
+
+HOTP (RFC 4226) and TOTP (RFC 6238), the codes an authenticator app shows, and the `otpauth://` URI
+that gives an app its secret. Every vector of RFC 4226 Appendix D and RFC 6238 Appendix B is a test.
+
+```text
+import avin.crypto.{generateOtpSecret, otpSecretText, totp, totpStep, verifyTotp, OtpUri, TimeBased, OtpSha1}
+import avin.time.epochSeconds
+
+main()
+  val secret = generateOtpSecret()
+  val at = epochSeconds(1700000000)
+  val code = totp(secret, at)
+  assertEq(code.charCount, 6)
+  val step = verifyTotp(secret, code, at)
+  assertEq(step, Some(totpStep(at)))
+  assertEq(verifyTotp(secret, code, at, 1, 6, OtpSha1, 30, 0, step), None)
+  val uri = OtpUri(TimeBased(30), secret, Some("Example"), "alice@example.com", OtpSha1, 6)
+  println(uri.uri)
+  println(otpSecretText(secret))
+```
+
+| Function | Meaning |
+| --- | --- |
+| `hotp(secret, counter, digits = 6, algorithm = OtpSha1) -> string` | The code for `counter`, zero-padded to 6, 7 or 8 digits. |
+| `totp(secret, at = now(), digits = 6, algorithm = OtpSha1, period = 30, t0 = 0) -> string` | The code for the step `at` is in. |
+| `totpStep(at = now(), period = 30, t0 = 0) -> long` | Whole periods since `t0` (seconds since the epoch), rounded down. |
+| `verifyTotp(secret, code, at = now(), window = 1, digits, algorithm, period, t0, lastStep = None) -> Option[long]` | The step, within `window` steps either side of the present one, whose code is `code`; `None` for a wrong code, a wrong length or a step not after `lastStep`. |
+| `verifyHotp(secret, code, counter, lookAhead = 0, digits, algorithm) -> Option[long]` | The counter from `counter` to `counter + lookAhead` whose code is `code`. |
+| `generateOtpSecret(length = 20) -> Vector[byte]` | Random bytes from `SecureRandom`; under 16 traps. |
+| `otpSecretText(secret)`, `otpSecretFromText(text)` | Base32, upper case without padding; and back, either case, with spaces and hyphens ignored (`Err(BadSecret)` for anything else). |
+| `OtpUri(kind, secret, issuer, account, algorithm, digits).uri` | `otpauth://totp/Issuer:account?secret=...&issuer=...&algorithm=SHA1&digits=6&period=30` (`hotp` with `counter=`), the issuer and account percent-escaped. |
+| `parseOtpUri(text) -> Result[OtpUri, OtpError]` | Reads either type back; `Err(BadUri)` for a duplicate parameter, a bad digits, period or counter, a missing secret or an empty account. |
+
+The comparison of a code with the expected one is in constant time, and every step of the window is
+computed whatever the first answer. **Refusing a reused code is the caller's part**: `verifyTotp`
+answers the step it matched, the caller stores it for the account, and passes it back as `lastStep`;
+only a later step is then accepted. Without it a code works for as long as it stays in the window
+(about 90 seconds at the default). `verifyHotp` answers the counter; store `matched + 1` as the next.
+A program's own wrong settings (an empty secret, digits outside 6 to 8, a period under 1, a negative
+window, a time before `t0`) trap.
+
 ## `avin.crypto.password`
 
 Password hashing for a server: Argon2id (RFC 9106) in the PHC string format, which every Argon2
