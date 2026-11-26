@@ -3324,7 +3324,8 @@ pipeline(c: TcpStream, queries: Vector[string]) -> Result[Vector[string], IoErro
   the reader stops its reading and leaves the writer sending. The connection closes once both halves
   are closed, or once both are unreachable. A closed half answers an error to every use but closing
   again, which does nothing and answers `Ok`; a TCP or Unix writer's close answers `Ok` even where
-  the other end has gone, and a TLS writer's answers whether TLS's close notice went out. There is
+  the other end has gone, and a TLS writer's answers whether TLS's close notice went out, except
+  that it answers `Ok` where the peer has reset the connection. There is
   no way to join the halves again.
 - **The connection split.** It is used up: every operation on it answers an error saying it has
   been split, it is readable and writable so that a select's arm runs and finds that out, its
@@ -3340,7 +3341,8 @@ pipeline(c: TcpStream, queries: Vector[string]) -> Result[Vector[string], IoErro
   half made it, and a reader never waits for room to send anything of its own while the writer is
   sending. A failure to send is the writer's to answer whichever half was sending: the reader reads
   on, and the writer answers it at every use after, its close included, so a close notice the reader
-  tried and failed to send is one that did not go out. A cancellation that stops a half inside an
+  tried and failed to send is one that did not go out (a close answers `Ok` instead where the
+  failure is the peer's reset). A cancellation that stops a half inside an
   operation lets the locks go.
 
 A `writeSome` hands a `TlsStream`, or its writer, at most one TLS record of plaintext. A
@@ -3459,7 +3461,7 @@ negative `timeout` traps.
 | `s.read`, `readLine`, `readAll`, `write`, `writeText`, `setTimeout` | As a `TcpStream`'s, of plaintext; the limit is the TCP connection's, for each of its waits. |
 | `s.readable() -> bool`, `s.readinessDescriptor() -> int` | Whether a read of plaintext would answer now: plaintext is buffered or TLS holds some decrypted, a whole record of it has arrived, or the peer has closed TLS or the connection. It hands TLS the ciphertext already on the socket, so part of a record is not taken for plaintext, and never waits for more; a failure it meets is answered by the next read. The descriptor is the TCP connection's. |
 | `s.shutdownOutput()` | Closes TLS (a `close_notify`) and the TCP connection's sending side; reading goes on. |
-| `s.close() -> Result[unit, IoError]` | Closes TLS as far as the peer can be told without waiting, then the connection; the `Err` is a failure to send that notice, the connection being closed either way. Again does nothing and answers `Ok`. |
+| `s.close() -> Result[unit, IoError]` | Closes TLS as far as the peer can be told without waiting, then the connection; the `Err` is a failure to send that notice, the connection being closed either way. Where the peer has already reset the connection the notice cannot go and the answer is `Ok`, as `TcpStream.close` answers. Again does nothing and answers `Ok`. |
 | `TlsClient(trusted = [])`, `c.trust(pem: string) -> TlsClient` | The machine's trusted authorities and those added: `trust` answers a client that also trusts the certificates in `pem`. |
 | `TlsServer(certificate, key)`, `TlsServer.of(certificate, key) -> Result[TlsServer, TlsError]` | A server's certificate (a chain, leaf first) and private key as PEM text; `of` checks they can be used and go together, and one made directly is checked at its first connection. |
 | `c.offer(names: Vector[string])`, `server.offer(names)` | The settings offering the application protocols `names` by ALPN, most preferred first, in place of those offered before; `[]` offers none, the default. A name empty or over 255 bytes long, or names over 65535 bytes in all, each with its length byte, trap. |

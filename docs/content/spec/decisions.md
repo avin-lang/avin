@@ -12097,6 +12097,15 @@ Settled on the user's delegation 2026-11-11 (built on branch `json-derive`): **J
     `idna.toUnicode`; a name that does not decode to a valid one is shown in ASCII, so a person is
     never shown a name the URL does not reach. `display` stays ASCII, the form that round-trips.
 
+- Settled by the user 2026-11-26 (branch `tls-close-reset`): **closing a TLS stream whose peer has
+  already reset the connection answers `Ok`**, as `TcpStream.close` does (a TCP close answers `Ok`
+  always). It covers the whole `TlsStream` and a split connection's writer, at the client and at
+  the server end. Other failures to send the close notice, a timeout for one, are still the
+  `Err`. Why: the notice's failing to go out because the socket is gone tells the caller nothing
+  it can act on, and a peer that closes with session tickets unread resets the connection, so the
+  answer was a race. Weighed: answering the error always, which the TCP close does not, and
+  ignoring every close failure, which would hide a send that timed out.
+
 ## Proposed
 
 - Settled on the user's delegation 2026-11-24 (branch `fs-content-type`): **`avin.fs` has
