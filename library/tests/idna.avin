@@ -14,16 +14,16 @@ import avin.net.idna.{
   LeadingMark, MaxLabelLength, Overflow
 }
 
-hexCode(text: string) -> int
+idnaHexCode(text: string) -> int
   var n = 0
   for c in text.chars
     n = n * 16 + c.asDigit
   n
 
 // Code points written in hexadecimal with a space between them, as a string.
-fromHex(text: string) -> string
+codesFromHex(text: string) -> string
   val out = StringWriter()
-  for code in text.split(" ") do out.writeChar(char(hexCode(code)))
+  for code in text.split(" ") do out.writeChar(char(idnaHexCode(code)))
   out.text
 
 // The sample strings of RFC 3492 §7.1, each its code points and its Punycode.
@@ -88,7 +88,7 @@ samples() -> Vector[(string, string)] = [
 rfcSamples()
   val wrong = Buffer[string]()
   for (codes, punycode) in samples()
-    val text = fromHex(codes)
+    val text = codesFromHex(codes)
     if idna.encodePunycode(text) != Ok(punycode) then wrong.addOne(s"encode $codes: ${idna.encodePunycode(text)}")
     if idna.decodePunycode(punycode) != Ok(text) then wrong.addOne(
       s"decode $punycode: ${idna.decodePunycode(punycode)}"
@@ -96,7 +96,7 @@ rfcSamples()
   assertEq(wrong.toVector, Vector.empty[string]())
   // The RFC's own spelling, with its case hint, decodes alike.
   val (russian, _) = samples()(8)
-  assertEq(idna.decodePunycode("b1abfaaepdrnnbgefbaDotcwatmq2g4l"), Ok(fromHex(russian)))
+  assertEq(idna.decodePunycode("b1abfaaepdrnnbgefbaDotcwatmq2g4l"), Ok(codesFromHex(russian)))
   // Digits read in either case; the ASCII characters are kept in theirs.
   assertEq(idna.decodePunycode("BCHER-KVA"), Ok("B\u{fc}CHER"))
   assertEq(idna.decodePunycode("bcher-KVA"), Ok("b\u{fc}cher"))
@@ -175,7 +175,7 @@ unescape(field: string) -> Option[string]
   var i = 0
   while i < text.byteLength
     if text.startsWith("\\u", i)
-      val c = hexCode(text.slice(i + 2, i + 6))
+      val c = idnaHexCode(text.slice(i + 2, i + 6))
       if 0xd800 <= c <= 0xdfff then return None
       out.writeChar(char(c))
       i += 6
@@ -193,14 +193,20 @@ statuses(field: string) -> Vector[string]
 
 // A line of the conformance file: the source, the expected `toUnicode` result and its status codes,
 // and the expected non-transitional `toAscii` result and its status codes.
-data Case(source: string, unicode: string, unicodeErrors: Vector[string], ascii: string, asciiErrors: Vector[string])
+data IdnaCase(
+    source: string,
+    unicode: string,
+    unicodeErrors: Vector[string],
+    ascii: string,
+    asciiErrors: Vector[string]
+)
 
 // The conformance file's lines, and how many were skipped for holding a surrogate.
-conformance() -> (Vector[Case], int)
+idnaConformance() -> (Vector[IdnaCase], int)
   val text = fs.readText("tests/fixtures/unicode/IdnaTestV2.txt") match
     Ok(t) -> t
     Err(e) -> fail(s"cannot read the conformance file: ${e.message}")
-  val found = Buffer[Case]()
+  val found = Buffer[IdnaCase]()
   var skipped = 0
   for line in text.split("\n")
     if line.isEmpty || line.startsWith("#") then continue
@@ -217,7 +223,7 @@ conformance() -> (Vector[Case], int)
     val unicodeErrors = statuses(fields(2))
     val ascii = if fields(3).trim.isEmpty then unicode else asciiField.getOrElse("")
     val asciiErrors = if fields(4).trim.isEmpty then unicodeErrors else statuses(fields(4))
-    found.addOne(Case(s, unicode, unicodeErrors, ascii, asciiErrors))
+    found.addOne(IdnaCase(s, unicode, unicodeErrors, ascii, asciiErrors))
   (found.toVector, skipped)
 
 // Whether `answer` is what the file expects: the result where no code counts, an error where one does.
@@ -228,11 +234,11 @@ agrees(answer: Result[string, IdnaError], expected: string, codes: Vector[string
     Err(_) -> errors.nonEmpty
 
 // The source, its code points, for a failure's message.
-shown(s: string) -> string = s.chars.map(c -> int(c).toString()).mkString(" ")
+codePoints(s: string) -> string = s.chars.map(c -> int(c).toString()).mkString(" ")
 
 @test("every line of the Unicode conformance file, with every check on")
 conformanceStrict()
-  val (cases, skipped) = conformance()
+  val (cases, skipped) = idnaConformance()
   assert(cases.length > 6000)
   // The two lines holding an unpaired surrogate.
   assertEq(skipped, 2)
@@ -244,14 +250,14 @@ conformanceStrict()
     val ok = agrees(unicode, c.unicode, c.unicodeErrors, ["X4_2"]) && agrees(ascii, c.ascii, c.asciiErrors, [])
     if !ok
       if failures < 10 then eprintln(
-        s"conformance line fails: ${shown(c.source)}: $unicode $ascii, expected ${c.unicode} ${c.unicodeErrors} ${c.ascii} ${c.asciiErrors}"
+        s"conformance line fails: ${codePoints(c.source)}: $unicode $ascii, expected ${c.unicode} ${c.unicodeErrors} ${c.ascii} ${c.asciiErrors}"
       )
       failures += 1
   assertEq(failures, 0)
 
 @test("every line of the Unicode conformance file, with the WHATWG URL standard's checks")
 conformanceWhatwg()
-  val (cases, _) = conformance()
+  val (cases, _) = idnaConformance()
   // The codes of the checks the URL standard turns off: hyphens, STD3 rules and DNS lengths.
   val off = ["V2", "V3", "U1", "A4_1", "A4_2", "X4_2"]
   var failures = 0
@@ -259,12 +265,12 @@ conformanceWhatwg()
     val unicode = idna.toUnicode(c.source)
     val ascii = idna.toAscii(c.source)
     if !agrees(unicode, c.unicode, c.unicodeErrors, off) || !agrees(ascii, c.ascii, c.asciiErrors, off)
-      if failures < 10 then eprintln(s"conformance line fails: ${shown(c.source)}: $unicode $ascii")
+      if failures < 10 then eprintln(s"conformance line fails: ${codePoints(c.source)}: $unicode $ascii")
       failures += 1
   assertEq(failures, 0)
 
 @test("toAscii maps, normalizes and writes labels beyond ASCII in Punycode; toUnicode reverses it")
-processing()
+idnaProcessing()
   assertEq(idna.toAscii("B\u{fc}cher.example"), Ok("xn--bcher-kva.example"))
   assertEq(idna.toUnicode("xn--bcher-kva.example"), Ok("b\u{fc}cher.example"))
   assertEq(idna.toUnicode("XN--BCHER-KVA.Example"), Ok("b\u{fc}cher.example"))
@@ -297,7 +303,7 @@ processing()
   assertEq(idna.toAscii("a_b c"), Ok("a_b c"))
 
 @test("each kind of error, in the label it is found in")
-errors()
+idnaErrors()
   assertEq(idna.toAscii("a.b\u{fffd}c"), Err(Disallowed(1)))
   assertEq(idna.toAscii("\u{e000}"), Err(Disallowed(0)))
   assertEq(idna.toAscii("a\u{378}"), Err(Disallowed(0)))
@@ -348,7 +354,7 @@ errors()
   assertEq(InvalidInput(3).message, "not Punycode at index 3")
 
 @test("lengths: DNS's limits where asked, and MaxLabelLength always")
-lengths()
+idnaLengths()
   val a63 = "a".repeat(63)
   assert(idna.toAscii(a63, verifyDnsLength = true).isOk)
   assertEq(idna.toAscii("a".repeat(64), verifyDnsLength = true), Err(LabelLength(0)))
@@ -376,7 +382,7 @@ lengths()
   assertEq(idna.toAscii("A".repeat(100000)), Ok("a".repeat(100000)))
 
 @test("hostile names are refused quickly: many labels, long Punycode, many joiners")
-hostile()
+idnaHostile()
   val many = "\u{fc}.".repeat(20000)
   assertEq(idna.toAscii(many), Ok("xn--tda.".repeat(20000)))
   assertEq(idna.toAscii("xn--" + "9".repeat(MaxLabelLength)), Err(BadPunycode(0)))
