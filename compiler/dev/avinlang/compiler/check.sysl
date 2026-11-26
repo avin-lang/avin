@@ -3526,16 +3526,14 @@ private report_static_mismatch(c: *Checker, unit: usize, at: Span, name: string,
     if declared then c.note(unit, at, s"`$name` is a static member of `$trait_name`, so its implementation is `static` too")
     else c.note(unit, at, s"`$name` is a method of `$trait_name`'s values, so its implementation is not `static`")
 
-// A static member of a trait is abstract: each implementing type gives its own, and no trait's
-// default body could be any type's. Anywhere else a static member has a body.
+// A static member of a trait is each implementing type's own: abstract, or with a default body that
+// is compiled for each implementing type that gives none, its `Self` that type. Anywhere else a
+// static member has a body.
 private static_member_allowed(c: *Checker, unit: usize, f: &Function, owner_name: string, in_trait: bool, overrides: bool) -> bool
     val bodyless = f.body is None && f.clauses.len() == 0
     if in_trait
         if overrides
             c.note(unit, f.name_span, s"`${f.name}` is static, so no trait overrides it: each type implementing the trait gives its own")
-            return false
-        if !bodyless
-            c.note(unit, f.name_span, s"`${f.name}` is a static member of `$owner_name`, so it has no default body: each type implementing `$owner_name` gives its own")
             return false
         return true
     if bodyless
@@ -6377,6 +6375,11 @@ private build_builtin_table(c: *Checker, b: usize, conformed: Buf[usize])
             if several && own is None then continue
             // An opaque type takes the trait's default bodies, which run on its value boxed.
             if own is None && *ty is Opaque(_, _, _, _) && !is_abstract_method(c.symbols[methods[j]]) && !is_trait_field(c, methods[j])
+                table[c.classes[t].base + j] = Some(methods[j])
+                continue
+            // A static member's default body is compiled for the type, as for any other, since no
+            // value is involved.
+            if own is None && c.symbols[methods[j]].static_member && !is_abstract_method(c.symbols[methods[j]])
                 table[c.classes[t].base + j] = Some(methods[j])
                 continue
             own match
@@ -23264,7 +23267,21 @@ private members_of_type(c: *Checker, t: &Type, name: string) -> Buf[usize] = *t 
         out
     _ ->
         val own = visible_methods(c, receiver_methods(c, t, name))
-        if scalar_builtin(t) then with_trait_methods(c, t, name, own) else own
+        with_static_defaults(c, t, name, if scalar_builtin(t) then with_trait_methods(c, t, name, own) else own)
+
+// A built-in type's members named `name`, with the default bodies of the static members of that name
+// its conformances take, which no impl of its declares: `int.whenMissing()` of `impl Missable for int`.
+private with_static_defaults(c: *Checker, t: &Type, name: string, found: Buf[usize]) -> Buf[usize]
+    for m in found
+        if c.symbols[m].static_member then return found
+    var out = found
+    for b in c.builtins
+        if !same_type(b.ty, t) && !builtin_covers(b.ty, t) then continue
+        for entry in b.table
+            if entry is Some(m)
+                val s = c.symbols[m]
+                if s.static_member && s.decl.name == name && s.receiver is None && !contains_id(out, m) then out.push(m)
+    out
 
 // `Type.name` without a call, where the type's static member `name` is meant: a function value of
 // it, which takes the member's parameters. Where the member is overloaded the expected function
@@ -23330,9 +23347,10 @@ private static_call(c: *Checker, at: Span, name_span: Span, target: &Expr, ty: &
             // A trait's default body is shared by every type implementing it, so its `Self` is no
             // one type whose static member it could call.
             // A constructor trait's default bodies are compiled for each constructor implementing
-            // it, so there `Self` is one constructor, whose static members are called.
+            // it, so there `Self` is one constructor, whose static members are called; and so is a
+            // static member's default body, for each type taking it, so there `Self` is that type.
             if c.self_trait is Some(k)
-                if owner == self_owner(k) && !is_constructor_trait(c, k)
+                if owner == self_owner(k) && !is_constructor_trait(c, k) && !in_static(c)
                     c.note(unit, target.span, s"`Self.$name()` cannot be called in a trait's default body, which every type implementing the trait shares; a function bounded by the trait calls it, as `T.$name()`")
                     reported = true
             if !reported then ms = bound_methods(c, t, name)

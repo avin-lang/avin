@@ -12097,6 +12097,44 @@ Settled on the user's delegation 2026-11-11 (built on branch `json-derive`): **J
     `idna.toUnicode`; a name that does not decode to a valid one is shown in ASCII, so a person is
     never shown a name the URL does not reach. `display` stays ASCII, the form that round-trips.
 
+- Settled by the user 2026-11-26 (branch `missing-trait`): **a trait's static member may have a
+  default body**, compiled separately for each conforming type that gives none of its own, with
+  `Self` that type, the way a derive template's body is
+  ([declarations](/spec/declarations/#static-members)). Before, a static member in a trait had no
+  body, since a trait's default bodies were shared code and a static member is each type's own; one
+  copy per type removes that reason. A static default may call the trait's other static members on
+  `Self`; a method's default body still may not, since it is one shared body. The default reaches a
+  built-in type too, as no value is involved, and is reached on the type's name, through a bound by
+  the trait and through a bound by a trait requiring it. The shared `Missable` trait needed it: a
+  type deriving a decoder takes `whenMissing`'s default with nothing more written. *Alternatives
+  rejected*: (B) keep the rule, `Missable` abstract, a core `derive Missable for T`, and every user
+  type writing `derives TomlDecoder, Missable` (a second entry on every decoded type, and forgetting
+  it is an error naming a trait the user never chose); (C) deriving a trait also derives any
+  derivable trait it requires that the type lacks (a new implicit rule about `derives`, where a
+  static default is an ordinary trait feature any trait can use).
+- Settled by the user 2026-11-25 (branch `missing-trait`): **one shared trait for absent-field
+  values, so codecs compose.** The core library's `Missable` (`static whenMissing() -> Option[Self]
+  = None`; `Some(None)` for `Option`) is the value a decoder takes for a field its input leaves out,
+  and every format's decoder trait requires it (`trait TomlDecoder: Missable`, `CborDecoder`,
+  `MsgpackDecoder`, the JSON package's `JsonDecoder`), declaring no `whenMissing` of its own. The
+  language keeps **one method per name and parameter types** on a type, serving every trait that
+  declares it ([impl](/spec/declarations/#impl)): two methods of one name on `int` would make every
+  call `int.whenMissing()` and every bound ambiguous, and coherence (one answer per type, found
+  without search) is what lets a call through any bound reach the type's method directly. So two
+  formats each declaring `whenMissing` and implementing it for `int` could not be imported together
+  (`` `whenMissing` is already a method of `int` with the same parameter types ``); with one shared
+  trait each type has one answer, which every format takes, and a type writing `impl Missable for T`
+  changes it for every format at once. The core states its own types' answers as their methods, so
+  a trait declaring a `whenMissing` of its own for one of them is refused rather than taken silently.
+  The formats' tables agreed before the move (`None` for every scalar, string, collection, tree and
+  date-time type; `Some(None)` for `Option`). Alternatives weighed: per-format names
+  (`tomlWhenMissing`, …; every format, and every package format to come, inventing a name for one
+  meaning, and a user type answering each separately); letting a type have one method per trait
+  (gives up the one-method rule the whole impl design rests on). Settled on the user's delegation
+  2026-11-25: **the name `Missable`**, after the core's capability names (`Enumerable`, `Sendable`,
+  `Buildable`), a bound reading "may be missing"; `Missing` was weighed and refused, since
+  `avin.net.http`'s `ParamError` has a variant `Missing` and `T: Missing` reads as a fact about `T`.
+
 ## Proposed
 
 - Settled on the user's delegation 2026-11-24 (branch `fs-content-type`): **`avin.fs` has

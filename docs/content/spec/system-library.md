@@ -2803,8 +2803,11 @@ perhaps in another order. A date outside the years 0 to 9999, which TOML cannot 
 **The derivations are those of JSON, on a tree**: a value is a table of its fields, by name; a type
 of several variants also carries its variant's name under the key `type`, written first. `@TomlKey(
 "name")` renames a field or a variant, `@TomlTag("kind")` the discriminator, and `@TomlOmit` leaves a
-field out both ways. A field absent from the input takes its default, or `None` for an `Option`, or
-is an error naming it; a key no field has is skipped. TOML has no null, so a field holding `None` is
+field out both ways. A field absent from the input takes its default, or its type's
+[`Missable`](/spec/derivation/#absent-fields-missable) answer (`None` for an `Option`, and a type's
+own where it writes one), or is an error naming it; a key no field has is skipped. `TomlDecoder`
+requires `Missable`, as CBOR's and MessagePack's decoders do, so the formats share one answer and a
+program may import any of them together. TOML has no null, so a field holding `None` is
 left out, and a `None` anywhere else, as an array's element, is an error. The built-in encoders and
 decoders are `bool`, `int` (an integer that fits), `long`, `real` (from a float or an integer),
 `string`, `Toml`, `Zoned`, `Instant` (written in UTC), `DateTime`, `Date`, `Time`, `Option`, `Vector`,

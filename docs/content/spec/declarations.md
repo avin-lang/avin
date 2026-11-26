@@ -1188,16 +1188,22 @@ value: `Add`'s `zero` and `Mul`'s `one` are the identities of their operators.
   and `Lone.hi` without a call is a function value bound to it. Where the type has a static member
   of the name, `Lone.unit()`, the name is the type's and calls the static member; a value's method
   of that name is then called on a value.
-- **In a trait a static member has no body**: a trait's default bodies are shared by every
-  conforming type, and a static member is each type's own. `Self` in its signature is the
-  implementing type, as in a method's. A trait never overrides a static member, and its default
-  bodies cannot call one on `Self`, which there is no one type; a
+- **In a trait a static member may have a default body**, which is compiled separately for each
+  conforming type that gives none of its own, with `Self` that type: `static whenMissing() ->
+  Option[Self] = None`. A static member is each type's own, so its default is no shared code, as a
+  method's default is, but one copy per type, as a [derive template](/spec/derivation/)'s body is.
+  `Self` in its signature is the implementing type, as in a method's. A static default body may call
+  the trait's other static members on `Self` (`Self.label()`), each the type's own. A method's default
+  body cannot call one on `Self`, which there is no one type; a
   [constructor trait](/spec/generics/#constructor-traits)'s defaults, compiled for each implementing
-  constructor, can.
-- **Every implementation gives it, with a body**, marked `static` as the trait's member is: an impl,
-  and a class's body with `override static`. An abstract class gives it too, since it belongs to the
-  type and not to a subclass's objects. A static member is static exactly where the trait's member
-  is, and is a trait's member, an implementation of one, or a
+  constructor, can. A trait never overrides a static member.
+- **Every implementation gives it, with a body, unless the trait's member has a default**, marked
+  `static` as the trait's member is: an impl, and a class's body with `override static`. An abstract
+  class gives it too, since it belongs to the type and not to a subclass's objects. A built-in type
+  takes a static default, as any type does, since no value is involved. The default is reached on the
+  type's name, through a bound by the trait, and through a bound by a trait requiring it. A static
+  member is static exactly where the trait's member is, and is a trait's member, an implementation of
+  one, or a
   [built-in type's own](#static-members-of-built-in-types). A class or `data` type keeps what belongs
   to the type in its companion object.
 - **A static member's body has no `self`**: neither `self` nor the members of a value by bare name.
@@ -1290,7 +1296,8 @@ implementing type, whose methods the trait's are. A conformance to such a trait 
 A built-in type conforms to a trait only through an impl, and meets the trait as a bound: each
 instance of generic code calls the impl's method directly. A built-in value is not an object, so a
 trait's default bodies, which every conforming object shares, do not reach it: an impl for a
-built-in type implements every method of the trait, defaults included.
+built-in type implements every method of the trait, defaults included. A static member's default,
+which belongs to no value, reaches it as it reaches any type.
 
 - **An impl adds methods, never state.** Its body declares methods only: no fields and no
   statements. A method an impl in a class's or an object's module adds to it is one of its methods,

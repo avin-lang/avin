@@ -529,7 +529,10 @@ lower_program_cached(program: TProgram, cached: Map[string, string], caching: bo
         if program.symbols[i].root is Some(r) then inside_generic_local = generic_locals[r]
         // A local function written in an arm on a variant hiding types is compiled for each pack,
         // through the calls and function values the arm's copies make.
-        if !inside_generic_local && !program.symbols[i].lambda && !is_generic(program, i) && !never_compiled(program, i) && !in_core_library(program, i) && !implementing[i] && !in_pack_scope(&l, i) then instance(&l, i, buf())
+        // A static member's default body, and what is declared in it, is compiled only for each type
+        // taking it, through the calls that reach it with that type.
+        val in_static_default = static_default(&l, program.symbols[program.symbols[i].root.unwrap_or(i)])
+        if !inside_generic_local && !in_static_default && !program.symbols[i].lambda && !is_generic(program, i) && !never_compiled(program, i) && !in_core_library(program, i) && !implementing[i] && !in_pack_scope(&l, i) then instance(&l, i, buf())
     val entry: Option[usize] = program.entry match
         Some(id) -> Some(instance(&l, id, buf()))
         None -> None
@@ -1049,7 +1052,8 @@ private method_table(l: *Lowering, t: &Type) -> Buf[Option[usize]]
                 table.push(None)
                 continue
         val symbol = l.program.symbols[m]
-        if is_abstract_method(symbol) || symbol.decl.type_params.len() > 0 || missing[p] || !slot_used(l, p, symbol.decl.name, known)
+        // A static member's default body is called on a type, never through a value's table.
+        if is_abstract_method(symbol) || static_default(l, symbol) || symbol.decl.type_params.len() > 0 || missing[p] || !slot_used(l, p, symbol.decl.name, known)
             table.push(None)
             continue
         table.push(Some(table_entry(l, t, m, implementation_args(l, t, m), p)))
@@ -3071,6 +3075,11 @@ private direct_call_keeping(l: *Lowering, e: &TExpr, function: usize, args: Buf[
     if constructor_trait_method(l, callee) && args.len() > 0
         val operands = call_operands(l, callee, args, false, kept)?
         return call_resolved(l, e, function, callee, args, operands, with_constructor(l, function, args[0].ty, type_args))
+    // A static member's default body is compiled for each type taking it, which follows its type
+    // arguments, so its `Self` is the type it is called on.
+    if static_default(l, callee) && args.len() > 0
+        val operands = call_operands(l, callee, args, false, kept)?
+        return call_resolved(l, e, function, callee, args, operands, with_static_self(l, callee, args[0].ty, type_args))
     // A trait's default body is compiled once for every conforming type, its `Self` an object: an
     // option kept as a pointer goes in as the object it stands for, and comes out as a pointer again.
     val default_body = is_trait_method(l, callee)
@@ -3083,6 +3092,23 @@ private direct_call_keeping(l: *Lowering, e: &TExpr, function: usize, args: Buf[
         val object = call_resolved(l, e, function, callee, args, operands, type_args)?
         return unbox(l, e.ty, object)
     call_resolved(l, e, function, callee, args, operands, type_args)
+
+/** Whether `symbol` is the default body of a static member a trait for types declares. */
+private static_default(l: *Lowering, symbol: FunctionSymbol) -> bool
+    if !symbol.static_member || is_abstract_method(symbol) then return false
+    symbol.owner_class match
+        Some(k) -> l.program.classes[k].decl.modifier == "trait" && !l.program.classes[k].constructor_trait
+        None -> false
+
+/** The type arguments of an instance of static default `symbol` for the type `receiver`: the
+ * method's own, then the type, which `Self` stands for in it. */
+private with_static_self(l: *Lowering, symbol: FunctionSymbol, receiver: &Type, type_args: Buf[&Type]) -> Buf[&Type]
+    if type_args.len() != symbol.type_params.len() then return type_args
+    var out: Buf[&Type] = buf()
+    for t in type_args
+        out.push(t)
+    out.push(concrete(l, receiver))
+    out
 
 /** Whether `symbol` is a method a constructor trait declares. */
 private constructor_trait_method(l: *Lowering, symbol: FunctionSymbol) -> bool = symbol.owner_class match
@@ -3484,14 +3510,16 @@ private struct Refinement
     args: Buf[&Type]
 
 // An instance of a constructor trait's method is given the constructor implementing the trait after
-// the method's type arguments, which `Self` stands for in it.
+// the method's type arguments, which `Self` stands for in it, and an instance of a static member's
+// default body the type taking it.
 private set_self(l: *Lowering, function: usize)
     l.self_owner = 0
     val symbol = l.program.symbols[function]
     val k = symbol.owner_class match
         Some(k) -> k
         None -> return
-    if !l.program.classes[k].constructor_trait || l.subst.len() <= symbol.type_params.len() then return
+    // A static member's default body is given the type taking it the same way.
+    if !(l.program.classes[k].constructor_trait || static_default(l, symbol)) || l.subst.len() <= symbol.type_params.len() then return
     l.self_owner = self_owner(k)
     var args: Buf[&Type] = buf()
     args.push(l.subst[symbol.type_params.len()])
@@ -6907,9 +6935,13 @@ private trap_name(l: *Lowering, reason: string, at: Span, file: string) -> strin
         for id in l.unit_functions.get(l.unit).unwrap()
             val other = l.program.symbols[id]
             if id != b && other.decl.span.start == mine.decl.span.start && other.decl.span.end == mine.decl.span.end && other.name != mine.name && member_part(other.name) == member_part(mine.name) then shared = true
+    // Files of one name in different modules (each format's `codec.avin`) are told apart by the
+    // module the file belongs to.
+    val functions = l.unit_functions.get(l.unit).unwrap()
+    val in_module = if functions.len() > 0 then s"${module_prefix(l.program.symbols[functions[0]].module_name)}/$file" else file
     val place = best match
-        Some(id) -> if shared then s"$file+${at.start}" else s"$best_name+${at.start - l.program.symbols[id].decl.span.start}"
-        None -> s"$file+${at.start}"
+        Some(id) -> if shared then s"$in_module+${at.start}" else s"$best_name+${at.start - l.program.symbols[id].decl.span.start}"
+        None -> s"$in_module+${at.start}"
     place + ":" + content_key(reason)[0..<12]
 
 /** A terminator that stops the program for `reason` at `at`. In the core library the place
@@ -7047,7 +7079,11 @@ private lower_kind(l: *Lowering, e: &TExpr, tail: bool) -> Option[Operand] = e.k
         if tail && l.tail_head is Some(_) && same_instance(l, function, type_args) then return tail_call(l, function, args)
         if tail && l.tail_calls && l.result_words.len() > 0 then return passed_words(l, e, function, args, type_args)
         returned_call(l, tail, direct_call(l, e, function, args, type_args))
-    Dispatch(function, slot, args, type_args) -> returned_call(l, tail, dispatch(l, function, slot, args, type_args))
+    Dispatch(function, slot, args, type_args) ->
+        // `Self.member()` in a static member's default body is called on the type the instance is
+        // compiled for, which has no object to dispatch on: its table names the member directly.
+        if args.len() > 0 && args[0].kind is TypeReceiver then return returned_call(l, tail, bound_call(l, e, function, Some(slot), args, type_args))
+        returned_call(l, tail, dispatch(l, function, slot, args, type_args))
     BoundCall(function, slot, args, type_args) -> returned_call(l, tail, bound_call(l, e, function, slot, args, type_args))
     Construct(variant, args, hidden) -> construct(l, e, variant, args, hidden)
     Collection(_, built) -> lower_expr(l, built)
