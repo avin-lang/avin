@@ -4,12 +4,12 @@ module avin.net
 // own on the connection's socket, so each belongs to its own thread, checked at every operation as
 // the connection's own handle is, and the two share the descriptor: a reader parked waiting for
 // bytes and a writer parked waiting for room wait on it at once, each parking only its own
-// lightweight thread on the runtime's poller. What the halves share besides is a count of those of
-// them still open; the second to close closes the socket.
+// lightweight thread on the runtime's poller. The handles are counted shares of the one socket, and
+// each half gives its share back when it closes, so the second to close closes the socket then, not
+// when the collector frees the halves.
 
 import avin.io
 import avin.io.IoError
-import avin.threads.Atomic
 import avin.time.Duration
 
 @sysl("sysl.net.Socket", named: "StreamReader")
@@ -73,14 +73,13 @@ private halves(
     peer: string,
     other: Option[string]
 ) -> (StreamReader, StreamWriter)
-  val open = Atomic(2)
-  val r: StreamReader = SocketReader(read, buffered, false, limitMs, peer, other, open)
-  val w: StreamWriter = SocketWriter(write, false, limitMs, peer, other, open)
+  val r: StreamReader = SocketReader(read, buffered, false, limitMs, peer, other)
+  val w: StreamWriter = SocketWriter(write, false, limitMs, peer, other)
   (r, w)
 
 // The reading half of a TCP or Unix connection.
 @trusted_sendable(
-  "it belongs to one thread at a time: a send hands it over, and every operation first checks its owner, so the code that handed it over traps; what it shares with its writing half is an atomic count"
+  "it belongs to one thread at a time: a send hands it over, and every operation first checks its owner, so the code that handed it over traps; what it shares with its writing half is the socket, whose counted shares the system's descriptor outlives until the last is given back"
 )
 private class SocketReader(
     private val conn: ReadSocket,
@@ -88,8 +87,7 @@ private class SocketReader(
     private var closed: bool,
     private var limitMs: int,
     private val peer: string,
-    private val other: Option[string],
-    private val open: Atomic[int]
+    private val other: Option[string]
 ): Sendable, StreamReader
   override remoteAddress -> Option[string] = other
 
@@ -125,39 +123,34 @@ private class SocketReader(
     limitMs = millisOf(d)
     Ok(())
 
-  // Stops reading; closing again does nothing. The socket closes once the writing half is closed too.
+  // Stops reading, giving back the half's share of the socket; closing again does nothing. The
+  // socket closes once the writing half is closed too.
   override close() -> Result[unit, IoError]
     mine()
     if !closed
       closed = true
-      if open.sub(1) == 0
-        shut = true
-        _ = conn.close()
+      conn.close()
     Ok(())
 
-  // Whether this half closed the socket, being the second half to close.
-  private var shut = false
-
   // Stops the program where the half belongs to another thread. `held()` checks the owner of a
-  // handle that is still open, the other half's closing having closed the descriptor or not, and
-  // `close()` of the handle this half closed checks it and does nothing else.
+  // handle that still holds its share, the other half's closing having closed the descriptor or
+  // not, and `close()` of a handle that has given its share back checks it and does nothing else.
   private mine()
-    if shut then _ = conn.close() else _ = conn.held()
+    if closed then _ = conn.close() else _ = conn.held()
 
   private received(max: int) -> Result[Array[byte], IoError]
     afterWait(halfReceive(conn, max, limitMs)).mapErr(failed("read from", peer))
 
 // The writing half of a TCP or Unix connection.
 @trusted_sendable(
-  "it belongs to one thread at a time: a send hands it over, and every operation first checks its owner, so the code that handed it over traps; what it shares with its reading half is an atomic count"
+  "it belongs to one thread at a time: a send hands it over, and every operation first checks its owner, so the code that handed it over traps; what it shares with its reading half is the socket, whose counted shares the system's descriptor outlives until the last is given back"
 )
 private class SocketWriter(
     private val conn: WriteSocket,
     private var closed: bool,
     private var limitMs: int,
     private val peer: string,
-    private val other: Option[string],
-    private val open: Atomic[int]
+    private val other: Option[string]
 ): Sendable, StreamWriter
   override remoteAddress -> Option[string] = other
 
@@ -190,22 +183,17 @@ private class SocketWriter(
     limitMs = millisOf(d)
     Ok(())
 
-  // Tells the other end nothing more will be sent and stops writing; closing again does nothing. The
-  // socket closes once the reading half is closed too. It answers `Ok` where the other end has gone
-  // already, as closing a connection does.
+  // Tells the other end nothing more will be sent and stops writing, giving back the half's share of
+  // the socket; closing again does nothing. The socket closes once the reading half is closed too.
+  // It answers `Ok` where the other end has gone already, as closing a connection does.
   override close() -> Result[unit, IoError]
     mine()
     if !closed
       closed = true
       _ = conn.shutdown(Write)
-      if open.sub(1) == 0
-        shut = true
-        _ = conn.close()
+      conn.close()
     Ok(())
-
-  // Whether this half closed the socket, being the second half to close.
-  private var shut = false
 
   // Stops the program where the half belongs to another thread, as the reading half's does.
   private mine()
-    if shut then _ = conn.close() else _ = conn.held()
+    if closed then _ = conn.close() else _ = conn.held()
