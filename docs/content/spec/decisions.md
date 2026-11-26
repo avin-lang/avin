@@ -4328,14 +4328,47 @@ spelling is better, as each entry says.
   blocking calls only (every such call a hand-off between threads).
 - Settled on the user's delegation 2026-11-06 (branch `lwt-scheduler`): **every lock and condition parks: `Mutex`, `Condition` and
   `Once` as well as channels, futures, promises and joins.** The runtime's one lock and one
-  condition, which all of them are built on, keep a queue of waiters; a lock let go goes straight to
-  its oldest waiter. The brief planned `Mutex` and `Condition` for the next step, keeping them
+  condition, which all of them are built on, keep a queue of waiters; a lock let go went straight to
+  its oldest waiter, until the barging lock settled by the user on 2026-11-26 (next entry) replaced
+  that. The brief planned `Mutex` and `Condition` for the next step, keeping them
   blocking until then. *Why*: channels, futures' cells and the pools are built on the very lock and
   condition `Mutex` uses, so keeping `Mutex` blocking meant a second, temporary implementation of
   both; and a `Mutex` whose holder parks can then never hold every worker. *Alternatives*: a parking
   lock and condition beside the blocking ones, used by channels and futures only, until the next
   step (two implementations, one to remove). Review with the user: it moves part of the next step
   into this one.
+- Settled by the user 2026-11-26 (branch `mutex-contention`), choosing it over keeping strict order:
+  **the runtime's lock barges, with a starvation bound, rather than handing itself to its oldest
+  waiter.** A thread takes a free lock with one compare-and-set and lets go of one nobody is parked
+  on with another. A thread finding it busy spins for up to 10 µs, then parks; with threads parked,
+  only one thread at a time spins (the one holding the lock's "awake" mark). Letting go with threads
+  parked and none awake leaves the lock free and wakes the oldest, which competes with threads
+  arriving meanwhile and, losing, parks again at the front; while a thread is awake for the lock,
+  letting it go wakes nobody. A first waiter that has waited over 1 ms since it first found the lock
+  busy is handed the lock, held, at most once a millisecond per lock, so no thread is overtaken for
+  ever and a lock whose waiters are all old does not turn back into a relay. The spec's "the mutex
+  goes to the thread that has waited longest" (`threads.md`, end of § Synchronization) became the
+  bound. `Pool` keeps its strict order through its own queue of tickets; `Semaphore` already
+  promised no order; `RwLock`, `Barrier`, `Once`, channels and futures keep their own rules over the
+  lock and condition. *Why*: handing a contended lock to a parked waiter makes every release wait for
+  a thread to be scheduled, a lock convoy every lock in the library inherited. Measured at -O2 on the
+  development machine (`tests/bench/mutex_contention.avin`, lock-and-let-go pairs a second, 1 / 2 /
+  4 / 8 / 16 threads), body of one addition: before 52.4M / 0.36M / 0.41M / 0.29M / 0.26M, after
+  56.6M / 12.4M / 5.2M / 5.7M / 5.3M; body of 200 arithmetic steps: before 1.52M / 0.28M / 0.27M /
+  0.27M / 0.26M, after 1.56M / 1.31M / 1.32M / 1.33M / 1.31M. The long body now keeps 84% of its
+  one-thread rate at 16 threads, and the short body 9 to 10%, up from 0.5%. The short body is bounded
+  by moving the lock's word between processors: additions to one `Atomic` from the same threads
+  reach 239M / 34M / 30M / 26M / 26M, and a lock costs at least two such steps and the guarded
+  value's own line. *Alternatives*: keeping strict order and making the hand-over cheaper (a fast
+  path and a spin before parking: the order kept, but every contended release still waits for one
+  processor-to-processor hand-over and a parked thread's scheduling); both kinds of lock, a barging
+  default and a fair one on request (more surface for a need only `Pool` has, which its own queue
+  meets); a bound per waiter alone, without the once-a-millisecond limit (measured: with 16 threads
+  all waiters grew old and the lock handed itself over at nearly every release, 0.95M a second); no
+  "awake" mark, a spin of 64 hints and a wake at every contended release (measured: 0.44M a second at
+  16 threads and the long body down to 0.18M, every release waking a thread that then lost); every
+  busy thread spinning, not only the one holding the mark (measured: about 15% slower at 8 and 16
+  threads with the short body).
 - Settled on the user's delegation 2026-11-06 (branch `lwt-scheduler`): **a context waits as the one waiter it holds**, since a thread
   waits on one thing at a time; a timed wait of a lightweight thread is a timer the monitor fires,
   added by the worker after the thread has switched away and taken off by the thread when it runs

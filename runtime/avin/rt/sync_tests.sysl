@@ -1,0 +1,178 @@
+module avin.rt
+@tests
+
+// What letting a lock go does with the threads waiting for it, checked on a lock whose queue holds
+// waiters set up as threads that found it busy would have left them. None of them belongs to a
+// lightweight thread, so a wake only changes the waiter's state.
+
+private var probe: ParkLock = new_park_lock(WaitsOnLock)
+private var probe_waiters: [3]Waiter = [new_waiter(); 3]
+
+/** A time a waiter's wait began that is inside the bound however long the test takes: a second from
+ * now. */
+private recent() -> long = now_micros() + 1000000
+
+/** A time a waiter's wait began that is past the bound. */
+private stale() -> long = now_micros() - 2 * LockFairAfter
+
+// Makes `probe` held, with `n` waiters on its queue, oldest first, each having begun to wait at the
+// time `since` gives for its place.
+private held_with(n: usize, first: long, rest: long)
+    probe = new_park_lock(WaitsOnLock)
+    probe.state.store(if n == 0 then LockHeld else LockHeld | LockParked)
+    for i in 0..<n
+        probe_waiters[i] = new_waiter()
+        probe_waiters[i].since = if i == 0 then first else rest
+        enqueue(&probe.waiting, &probe_waiters[i])
+
+@test("a lock nobody waits for is let go free, and taken again at once")
+let_go_with_no_waiter()
+    held_with(0, 0, 0)
+    let_park_lock_go(&probe)
+    assert_eq(probe.state.load(), 0u32)
+    assert(!park_lock_held(&probe))
+    assert(try_hold_park_lock(&probe))
+    assert_eq(probe.state.load(), LockHeld)
+    assert(park_lock_held(&probe))
+
+@test("a lock that is held cannot be taken without waiting, and stays as it was")
+try_hold_when_held()
+    held_with(0, 0, 0)
+    assert(!try_hold_park_lock(&probe))
+    assert_eq(probe.state.load(), LockHeld)
+    held_with(1, recent(), 0)
+    assert(!try_hold_park_lock(&probe))
+    assert_eq(probe.state.load(), LockHeld | LockParked)
+
+@test("letting go wakes the only waiter, inside the bound, to try again, and leaves the lock free")
+let_go_wakes_one_recent()
+    held_with(1, recent(), 0)
+    let_park_lock_go(&probe)
+    assert_eq(probe.state.load(), LockWoken)
+    assert(!park_lock_held(&probe))
+    assert_eq(probe_waiters[0].state.load(), WaitWoken)
+    assert(!probe_waiters[0].handed)
+    assert(probe.waiting.head == null)
+    assert(probe.waiting.tail == null)
+
+@test("letting go with more waiters wakes the oldest only, and leaves the lock free and marked parked")
+let_go_wakes_oldest_of_several()
+    held_with(3, recent(), recent())
+    let_park_lock_go(&probe)
+    assert_eq(probe.state.load(), LockParked | LockWoken)
+    assert_eq(probe_waiters[0].state.load(), WaitWoken)
+    assert_eq(probe_waiters[1].state.load(), WaitPending)
+    assert_eq(probe_waiters[2].state.load(), WaitPending)
+    assert(probe.waiting.head == &probe_waiters[1])
+    // A thread coming for the lock now takes it ahead of the woken waiter, and keeps both marks.
+    assert(try_hold_park_lock(&probe))
+    assert_eq(probe.state.load(), LockHeld | LockParked | LockWoken)
+    // While the woken waiter is awake, letting the lock go wakes nobody else.
+    let_park_lock_go(&probe)
+    assert_eq(probe.state.load(), LockParked | LockWoken)
+    assert_eq(probe_waiters[1].state.load(), WaitPending)
+    // Once it has taken the lock, clearing its mark, letting go wakes the next.
+    probe.state.store(LockHeld | LockParked)
+    let_park_lock_go(&probe)
+    assert_eq(probe_waiters[1].state.load(), WaitWoken)
+    assert(probe.waiting.head == &probe_waiters[2])
+    assert_eq(probe.state.load(), LockParked | LockWoken)
+
+@test("while a thread is awake for the lock, letting it go wakes nobody, not even a stale waiter")
+let_go_with_a_thread_awake()
+    held_with(1, stale(), 0)
+    probe.state.store(LockHeld | LockParked | LockWoken)
+    let_park_lock_go(&probe)
+    assert_eq(probe.state.load(), LockParked | LockWoken)
+    assert_eq(probe_waiters[0].state.load(), WaitPending)
+    assert(!probe_waiters[0].handed)
+    assert(probe.waiting.head == &probe_waiters[0])
+    // A lock held with only the mark of a thread awake, and nobody parked, is let go keeping the mark.
+    held_with(0, 0, 0)
+    probe.state.store(LockHeld | LockWoken)
+    let_park_lock_go(&probe)
+    assert_eq(probe.state.load(), LockWoken)
+
+@test("a waiter that has waited past the bound is handed the lock, which stays held")
+let_go_hands_to_stale()
+    held_with(1, stale(), 0)
+    let_park_lock_go(&probe)
+    assert_eq(probe.state.load(), LockHeld)
+    assert_eq(probe_waiters[0].state.load(), WaitWoken)
+    assert(probe_waiters[0].handed)
+    assert(probe.waiting.head == null)
+    assert(!try_hold_park_lock(&probe))
+
+@test("a lock handed to a stale waiter with others behind it stays held and marked parked")
+let_go_hands_to_stale_of_several()
+    held_with(2, stale(), recent())
+    let_park_lock_go(&probe)
+    assert_eq(probe.state.load(), LockHeld | LockParked)
+    assert(probe_waiters[0].handed)
+    assert(!probe_waiters[1].handed)
+    assert_eq(probe_waiters[1].state.load(), WaitPending)
+    // The holder it was handed to lets it go in turn: the next waiter, inside the bound, is woken.
+    let_park_lock_go(&probe)
+    assert_eq(probe.state.load(), LockWoken)
+    assert_eq(probe_waiters[1].state.load(), WaitWoken)
+    assert(!probe_waiters[1].handed)
+
+@test("only the oldest waiter's time counts: a stale waiter behind a recent one waits its turn")
+let_go_looks_at_the_oldest_only()
+    held_with(2, recent(), stale())
+    let_park_lock_go(&probe)
+    assert_eq(probe.state.load(), LockParked | LockWoken)
+    assert(!probe_waiters[0].handed)
+    assert_eq(probe_waiters[1].state.load(), WaitPending)
+    // The woken waiter takes the lock, clearing its mark, and lets it go: the stale one is handed it.
+    probe.state.store(LockHeld | LockParked)
+    let_park_lock_go(&probe)
+    assert_eq(probe.state.load(), LockHeld)
+    assert(probe_waiters[1].handed)
+    assert_eq(probe_waiters[1].state.load(), WaitWoken)
+
+@test("a lock hands itself over at most once a bound, so stale waiters do not make it a relay")
+let_go_hands_over_once_a_bound()
+    held_with(3, stale(), stale())
+    let_park_lock_go(&probe)
+    assert(probe_waiters[0].handed)
+    assert_eq(probe.state.load(), LockHeld | LockParked)
+    assert(probe.fair_at > now_micros())
+    // The thread it went to lets it go within the bound: the next stale waiter is only woken.
+    let_park_lock_go(&probe)
+    assert(!probe_waiters[1].handed)
+    assert_eq(probe_waiters[1].state.load(), WaitWoken)
+    assert_eq(probe.state.load(), LockParked | LockWoken)
+    // Once the bound has passed, the next is handed it again, the woken waiter having taken the lock.
+    probe.state.store(LockHeld | LockParked)
+    probe.fair_at = now_micros() - 1
+    let_park_lock_go(&probe)
+    assert(probe_waiters[2].handed)
+    assert_eq(probe.state.load(), LockHeld)
+
+@test("a waiter put at the front of a queue is first, ahead of those already on it")
+enqueue_first_keeps_the_front()
+    probe = new_park_lock(WaitsOnLock)
+    for i in 0..<3
+        probe_waiters[i] = new_waiter()
+    enqueue_first(&probe.waiting, &probe_waiters[0])
+    assert(probe.waiting.head == &probe_waiters[0])
+    assert(probe.waiting.tail == &probe_waiters[0])
+    enqueue(&probe.waiting, &probe_waiters[1])
+    enqueue_first(&probe.waiting, &probe_waiters[2])
+    assert(probe.waiting.head == &probe_waiters[2])
+    assert(probe_waiters[2].next == &probe_waiters[0])
+    assert(probe_waiters[0].prev == &probe_waiters[2])
+    assert(probe.waiting.tail == &probe_waiters[1])
+    assert(probe_waiters[2].linked)
+    unlink_waiter(&probe.waiting, &probe_waiters[2])
+    unlink_waiter(&probe.waiting, &probe_waiters[0])
+    unlink_waiter(&probe.waiting, &probe_waiters[1])
+    assert(probe.waiting.head == null)
+    assert(probe.waiting.tail == null)
+
+@test("a new waiter's record starts with no wait time and nothing handed")
+waiter_starts_clear()
+    val w = new_waiter()
+    assert(w.since == 0)
+    assert(!w.handed)

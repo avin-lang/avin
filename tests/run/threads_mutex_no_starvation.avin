@@ -1,0 +1,45 @@
+// expect: exit 0
+// Threads that take and let go of a mutex in a tight loop, so that it is free only for moments, do not
+// keep a thread waiting for it out: one that has waited longer than about a millisecond is handed the
+// mutex. Four such loops against one waiter, then against eight waiters at once; every waiter gets the
+// mutex, each well within five seconds (a bound loose enough for a loaded machine: a waiter that is
+// overtaken for ever never gets it at all), and the loops all make progress too.
+import avin.threads.{Atomic, Mutex, scope, sleep}
+import avin.time.{millis, monotonic}
+
+class Shared()
+  var n = 0
+
+main() -> int
+  val m = Mutex(Shared())
+  var failed = 0
+  for waiters in [1, 8]
+    val stop = Atomic(false)
+    val looping = Atomic(0)
+    val loops = Atomic(0)
+    val got = Atomic(0)
+    val slow = Atomic(0)
+    scope(s ->
+      for _ in 0 ..< 4
+        s.spawn(() ->
+          _ = looping.add(1)
+          var mine = 0
+          while !stop.load()
+            m.with(c -> c.n += 1)
+            mine += 1
+          if mine > 0 then _ = loops.add(1))
+      while looping.load() < 4 do sleep(millis(1))
+      sleep(millis(10))
+      scope(w ->
+        for _ in 0 ..< waiters
+          w.spawn(() ->
+            val start = monotonic().micros
+            m.with(c -> c.n += 1)
+            if monotonic().micros - start > 5000000 then _ = slow.add(1)
+            _ = got.add(1)))
+      stop.store(true))
+    println(
+      s"$waiters waiting: ${got.load()} got the mutex, ${slow.load()} waited over five seconds, ${loops.load()} loops ran"
+    )
+    if got.load() != waiters || slow.load() != 0 || loops.load() != 4 then failed += 1
+  failed

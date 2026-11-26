@@ -1387,12 +1387,20 @@ between taking the share and giving it back, and a trap there stops the program;
 is cancellable (a read, a permit's body), it runs at a cancellation point of its own inside the
 region, so a cancellation returns to it, the share is given back, and the cancellation goes on. A
 lock is an object on the
-collected heap holding whether a thread holds it and a queue of the threads waiting for it, and a
-condition one holding a queue alone; neither holds a reference, and the collector never moves
-either, so a waiter may be linked from one. Each queue has a guard, a futex lock held for a few
-instructions. A thread waits as the waiter its context holds: a lightweight thread parks, and any
-other thread sleeps on one condition shared by all such threads until its own waiter is woken
-(`runtime/avin/rt/scheduler.sysl`). A lock let go goes to its oldest waiter, which then holds it.
+collected heap holding a state word (held, whether a thread is parked on it, and whether a thread
+that will try for it is awake) and a queue of the
+threads waiting for it, and a condition one holding a queue alone; neither holds a reference, and
+the collector never moves either, so a waiter may be linked from one. Each queue has a guard, a futex
+lock held for a few instructions. A thread waits as the waiter its context holds: a lightweight
+thread parks, and any other thread sleeps on one condition shared by all such threads until its own
+waiter is woken (`runtime/avin/rt/scheduler.sysl`). A free lock is taken, and a lock nobody is
+parked on let go, with one compare-and-set each, never touching the queue. A thread that finds the
+lock busy spins for up to 10 µs and then parks; with threads parked, only the one that claims the
+"awake" mark spins, and the rest park at once. Letting go of a lock with parked threads and nobody
+awake leaves it free and wakes the oldest, which competes for it with threads arriving meanwhile and,
+losing, parks again at the front; a lock let go while a thread is awake for it wakes nobody. A first
+waiter that has waited longer than a millisecond since it first found the lock busy is handed the
+lock instead, held, at most once a millisecond per lock (`runtime/avin/rt/sync.sysl`).
 `condition_wait_for` takes a time in milliseconds and answers whether a notification came before it
 ran out; a lightweight thread's timed wait is a timer the scheduler's monitor fires. A thread that
 waits links a frame holding the objects it waits on onto its stack, waits safe, and unlinks the
