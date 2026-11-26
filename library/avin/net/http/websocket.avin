@@ -455,11 +455,12 @@ object WebSocket
   // A client's WebSocket to `url`, `ws://` or `wss://`, the latter over TLS checked as an `https`
   // request's is with `tls`. The handshake sends `headers` beside its own, offers `protocols` in
   // `Sec-WebSocket-Protocol` where there are any, and is answered within `timeout`, which also limits
-  // each write after it. A message longer than `maxMessageBytes` closes the WebSocket with `1009`,
-  // and its senders queue at most `outboxSize` messages. A server answering other than `101` is
-  // `Refused`, and one answering `101` with an accept key not its key's, an upgrade to another
-  // protocol or a subprotocol not offered is `BadHandshake`. A negative `maxMessageBytes` or
-  // `outboxSize` traps.
+  // each write after it; looking the host up, connecting and a `wss://` URL's TLS handshake must be
+  // done within `timeout` in all, zero taking each of these limits away. A message longer than
+  // `maxMessageBytes` closes the WebSocket with `1009`, and its senders queue at most `outboxSize`
+  // messages. A server answering other than `101` is `Refused`, and one answering `101` with an
+  // accept key not its key's, an upgrade to another protocol or a subprotocol not offered is
+  // `BadHandshake`. A negative `maxMessageBytes`, `outboxSize` or `timeout` traps.
   connect(
       url: string,
       headers: Vector[(string, string)] = Vector.empty[(string, string)](),
@@ -471,6 +472,7 @@ object WebSocket
   ) -> Result[WebSocket, WebSocketError]
     if maxMessageBytes < 0 then fail(s"a message limit of $maxMessageBytes bytes: it is at least zero")
     if outboxSize < 0 then fail(s"an outbox of $outboxSize messages: it holds at least zero")
+    if timeout.isNegative then fail(s"a WebSocket timeout of $timeout: it is at least zero")
     for (name, value) in headers
       checkHeader(name, value)
     val u = Url.parse(url).mapErr(e -> Unreachable(BadUrl(e)))?
@@ -479,11 +481,12 @@ object WebSocket
     val host = u.host.getOrElse("")
     if host.isEmpty then return Err(Unreachable(Unsupported(s"a URL without a host: $url")))
     val port = u.portOrDefault.getOrElse(if secure then 443 else 80)
-    val tcp = TcpStream.connect(addressOf(host), port).mapErr(e -> Unreachable(Io(e)))?
+    val start = monotonic()
+    val tcp = TcpStream.connect(addressOf(host), port, timeout).mapErr(e -> Unreachable(Io(e)))?
     if tcp.setTimeout(timeout) is Err(e)
       _ = tcp.close()
       return Err(Unreachable(Io(e)))
-    val stream: ByteStream = if !secure then tcp else TlsStream.client(tcp, addressOf(host), tls) match
+    val stream: ByteStream = if !secure then tcp else handshaken(tcp, addressOf(host), tls, start, timeout) match
       Ok(s) -> s
       Err(e) ->
         _ = tcp.close()

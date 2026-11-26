@@ -342,6 +342,7 @@ other type as its display.
 | `parseDateTime(text) -> Result[DateTime, TimeParseError]` | a date and a time joined by `T` or one space |
 | `parseTimestamp(text) -> Result[Instant, TimeParseError]` | a date-time and an offset: `Z`, `±hh:mm` or `±hhmm` |
 | `parseZoned(text) -> Result[Zoned, TimeParseError]` | a timestamp and, optionally, a zone name in brackets |
+| `parseHttpDate(text) -> Result[Instant, TimeParseError]`, `parseHttpDate(text, now)` | an HTTP-date in any of its three forms (below) |
 | `parsePeriod(text) -> Result[Period, TimeParseError]` | `P`, then years `Y`, months `M` and days `D` in that order, at least one, each with its own `-` where negative: what `toIsoString` writes |
 
 **Every display of `Instant`, `Date`, `Time`, `DateTime` and `Zoned` reads back** to an equal value,
@@ -356,6 +357,19 @@ fixed zone (`utc` for `Z` or any zero offset); with one, the offset must be the 
 show at that instant, so both readings of an autumn overlap are read and a reading in a spring gap is
 refused for its offset. A period's years are twelve months each, and `P12M` reads as `P1Y` does.
 Digits are ASCII only; any other character, a digit of another script included, is a shape error.
+
+**HTTP-dates** (RFC 9110 §5.6.7), the dates of `Date`, `Last-Modified`, `Expires` and
+`If-Modified-Since`. `instant.toHttpDate()` writes the one form a sender may use, IMF-fixdate,
+`Sun, 06 Nov 1994 08:49:37 GMT`: always UTC, a fraction of a second dropped toward the earlier second,
+and an instant outside the years 0000 to 9999 traps. `parseHttpDate` reads that form and the two
+obsolete ones: RFC 850, `Sunday, 06-Nov-94 08:49:37 GMT`, and `asctime`, `Sun Nov  6 08:49:37 1994`
+(a day under ten has a space, not a zero, before it). The match is exact: names in the capitals
+shown (`sun`, `NOV` and `gmt` are refused), the digit counts shown, single spaces, and no text
+before or after, so a header value is trimmed first. The day name must be the one the date falls on
+(`range:weekday` is `OutOfRange(text, "weekday")`), a second of `60` is refused as in every parse,
+and a parse never traps. A year of two digits, RFC 850 only, is in the century of `now`'s year
+unless that would be more than fifty years after `now`, and then in the century before;
+`parseHttpDate(text)` takes `now` from the clock and `parseHttpDate(text, now)` from its argument.
 
 `TimeParseError` is `BadShape(text, at, expected)`, `OutOfRange(text, field)`, `Trailing(text, at)`
 and `UnknownZone(text, name)`, `at` a byte offset into `text`. `field` is `year`, `month`, `day`,

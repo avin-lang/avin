@@ -1,0 +1,113 @@
+// expect: exit 0
+// UDP sockets among threads: an echo server on a lightweight thread answering two hundred clients,
+// each its own lightweight thread with its own socket, over IPv4 and IPv6; a socket handed to a
+// thread; a select waiting on two sockets and a channel at once; a receive parked on the poller ended
+// by a scope's cancellation and by a deadline; and a receive from `main`, which waits on the socket
+// alone.
+import avin.io.IoError
+import avin.net.{IpAddress, UdpSocket}
+import avin.threads.{Atomic, Channel, scope, sleep, spawn, withTimeout}
+import avin.time.{millis, monotonic}
+
+ok[T](r: Result[T, IoError]) -> T = r match
+  Ok(v) -> v
+  Err(e) -> fail(e.message)
+
+// Echoes `count` datagrams back to whoever sent each, then stops.
+echo(server: UdpSocket, count: int) -> int
+  for i in 0 ..< count
+    val d = ok(server.receiveFrom(512))
+    ok(server.sendTo(d.bytes, d.sender, d.senderPort))
+  ok(server.close())
+  count
+
+// `clients` lightweight threads, each sending one datagram to `server` and waiting for its echo.
+manyClients(host: string, address: IpAddress, clients: int)
+  val server = ok(UdpSocket.bind(host, 0))
+  val port = server.port()
+  val answered = Atomic(0)
+  val echoed = spawn(() -> echo(server, clients))
+  scope(s ->
+    for i in 0 ..< clients
+      s.spawn(() ->
+        val c = ok(UdpSocket.bind(address, 0))
+        ok(c.setTimeout(millis(10000)))
+        val message = s"client $i"
+        ok(c.sendTo(message.utf8, address, port))
+        val back = ok(c.receiveFrom(512))
+        if string.fromUtf8Lossy(back.bytes) == message && back.senderPort == port then _ = answered.add(1)
+        ok(c.close())))
+  println(s"$host: ${answered.load()} of $clients clients answered, ${echoed.join()} echoed")
+
+main()
+  manyClients("127.0.0.1", IpAddress.Localhost, 200)
+  manyClients("::1", IpAddress.LocalhostV6, 200)
+
+  // A socket handed to a thread is that thread's.
+  val handed = ok(UdpSocket.bind("127.0.0.1", 0))
+  val port = handed.port()
+  val receiver = spawn(() ->
+    val d = ok(handed.receiveFrom(100))
+    ok(handed.close())
+    string.fromUtf8Lossy(d.bytes))
+  val sender = ok(UdpSocket.bind("127.0.0.1", 0))
+  ok(sender.sendTo("handed over".utf8, IpAddress.Localhost, port))
+  println(receiver.join())
+
+  // One select over two sockets and a channel: whichever is ready first.
+  val left = ok(UdpSocket.bind("127.0.0.1", 0))
+  val right = ok(UdpSocket.bind("::1", 0))
+  val sixSender = ok(UdpSocket.bind("::1", 0))
+  val leftPort = left.port()
+  val rightPort = right.port()
+  val news = Channel[string]()
+  val seen = spawn(() ->
+    var got = Vector.empty[string]()
+    while got.length < 4
+      select
+        left.readable() -> got = got :+ s"left: ${string.fromUtf8Lossy(ok(left.receiveFrom(100)).bytes)}"
+        right.readable() -> got = got :+ s"right: ${string.fromUtf8Lossy(ok(right.receiveFrom(100)).bytes)}"
+        news.receive() as Some(m) -> got = got :+ s"news: $m"
+    got.sorted)
+  ok(sender.sendTo("to the left".utf8, IpAddress.Localhost, leftPort))
+  news.send("on the channel")
+  ok(sixSender.sendTo("to the right".utf8, IpAddress.LocalhostV6, rightPort))
+  ok(sender.sendTo("left again".utf8, IpAddress.Localhost, leftPort))
+  for line in seen.join() do println(line)
+  // A select's `writable()` arm: a datagram socket has room at once.
+  select
+    sender.writable() -> println("writable at once")
+    after millis(10000) -> fail("a datagram socket had no room to send")
+
+  // A receive parked on the poller ends when its scope is cancelled, promptly.
+  val quiet = ok(UdpSocket.bind("127.0.0.1", 0))
+  var cancelledAt = monotonic()
+  val ended = scope(s ->
+    val t = s.spawn(() -> quiet.receiveFrom(100).isOk)
+    sleep(millis(50))
+    cancelledAt = monotonic()
+    s.cancel()
+    t)
+  val stoppedAfter = (monotonic() - cancelledAt).micros / 1000
+  if ended.result().nonEmpty then fail("a cancelled receive gave a result")
+  if stoppedAfter > 2000 then fail(s"a cancelled receive took $stoppedAfter ms to stop")
+  println("a cancelled receive stops at once")
+  // A deadline ends one too, and the socket goes on working after it.
+  val again = ok(UdpSocket.bind("127.0.0.1", 0))
+  val start = monotonic()
+  val cut = withTimeout(millis(100), _ -> again.receiveFrom(100).isOk)
+  val took = (monotonic() - start).micros / 1000
+  if cut.nonEmpty then fail("a receive the deadline cut off answered")
+  if took < 100 || took > 2000 then fail(s"withTimeout took $took ms for a 100 ms deadline")
+  ok(sender.sendTo("after the deadline".utf8, IpAddress.Localhost, again.port()))
+  println(string.fromUtf8Lossy(ok(again.receiveFrom(100)).bytes))
+
+  // `main` waits on the socket alone, and a datagram sent from a thread wakes it.
+  val againPort = again.port()
+  val later = spawn(() ->
+    sleep(millis(20))
+    val s = ok(UdpSocket.bind("127.0.0.1", 0))
+    ok(s.sendTo("to main".utf8, IpAddress.Localhost, againPort))
+    ok(s.close()))
+  println(string.fromUtf8Lossy(ok(again.receiveFrom(100)).bytes))
+  later.join()

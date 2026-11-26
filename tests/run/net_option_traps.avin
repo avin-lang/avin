@@ -1,0 +1,63 @@
+// expect: exit 0
+// Socket options no socket can be given trap where they are used, each attempt here failing its own
+// actor: a keep-alive idle time or interval of zero or less, fewer than one probe, a negative buffer
+// size in options, a buffer of less than one byte asked of a connection, and a backlog of less than
+// one for a TCP or a Unix listener. `connect` and `bind` trap before anything is looked up, so a
+// host that does not resolve still traps.
+import avin.actors.{Stop, spawn}
+import avin.io.IoError
+import avin.net.{KeepAlive, ListenOptions, TcpListener, TcpOptions, TcpStream, UnixListener}
+import avin.time.{Duration, micros, seconds}
+
+ok[T](r: Result[T, IoError]) -> T = r match
+  Ok(v) -> v
+  Err(e) -> fail(e.message)
+
+actor Attempt(run: @sendable () -> unit) receives unit
+  run()
+  stop()
+  receive
+    _ -> ()
+
+attempt(name: string, @sendable run: () -> unit)
+  val a = spawn(Attempt(run), onFailure = Stop)
+  println(name, a.ended().await())
+
+// A connection to a listener on this machine, never accepted, which a connection does not need.
+connection(port: int) -> TcpStream = ok(TcpStream.connect("127.0.0.1", port))
+
+main()
+  val l = ok(TcpListener.bind("127.0.0.1", 0))
+  val port = l.port()
+  attempt("idle zero", () -> _ = connection(port).setKeepAlive(Some(KeepAlive(idle = Duration.Zero))))
+  attempt("idle negative", () -> _ = connection(port).setKeepAlive(Some(KeepAlive(idle = micros(-1)))))
+  attempt("interval zero", () -> _ = connection(port).setKeepAlive(Some(KeepAlive(interval = Duration.Zero))))
+  attempt(
+    "no probes",
+    () -> _ = TcpStream.connect(
+      "no.such.host.invalid",
+      80,
+      options = TcpOptions(keepAlive = Some(KeepAlive(count = 0)))
+    )
+  )
+  attempt(
+    "negative probes",
+    () -> _ = connection(port).configure(TcpOptions(keepAlive = Some(KeepAlive(seconds(1), seconds(1), -1))))
+  )
+  attempt("send buffer negative", () -> _ = TcpStream.connect("127.0.0.1", port, options = TcpOptions(sendBuffer = -1)))
+  attempt("receive buffer negative", () -> _ = connection(port).configure(TcpOptions(receiveBuffer = int.MinValue)))
+  attempt("send buffer zero", () -> _ = connection(port).setSendBuffer(0))
+  attempt("receive buffer zero", () -> _ = connection(port).setReceiveBuffer(0))
+  attempt("backlog zero", () -> _ = TcpListener.bind("no.such.host.invalid", 0, ListenOptions(backlog = 0)))
+  attempt("backlog negative", () -> _ = TcpListener.bind("127.0.0.1", 0, ListenOptions(backlog = -1)))
+  attempt(
+    "listener's connections",
+    () -> _ = TcpListener.bind("127.0.0.1", 0, ListenOptions(connections = TcpOptions(receiveBuffer = -1)))
+  )
+  attempt("unix backlog", () -> _ = UnixListener.bind("unused.sock", backlog = 0))
+  attempt("unix replacing backlog", () -> _ = UnixListener.bindReplacing("unused.sock", backlog = -5))
+  // Options that are only just allowed work.
+  val c = connection(port)
+  println("least allowed", c.setKeepAlive(Some(KeepAlive(micros(1), micros(1), 1))).isOk, c.setSendBuffer(1).isOk)
+  _ = c.close()
+  _ = l.close()

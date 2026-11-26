@@ -1,0 +1,165 @@
+// expect: exit 0
+// `fs.list` and `fs.entries`: a directory's entries with each one's full path and own kind, sorted
+// by name by code point, filtered by a pattern on the name, lazy in `entries`. Covered: every kind
+// (regular file, directory, a link to a file, a link to a directory, a dangling link, a FIFO),
+// the `isDir`/`isFile`/`isLink` helpers, paths with and without a trailing separator, hidden names,
+// Unicode and spaces in names, an empty directory, a missing directory, a file named as a directory,
+// 300 entries, patterns (`*`, `?`, sets, braces, hidden, no match), entries removed before the lazy
+// iterator reaches them, a directory that can be read but not entered, names that are not UTF-8
+// (where the file system allows them), and `fs.hardLink`.
+import avin.fs
+import avin.fs.DirEntry
+import avin.io.IoError
+import avin.process
+import avin.process.Command
+
+var root = ""
+
+say(line: Any)
+  println(if root == "" then s"$line" else s"$line".replace(root, "DIR"))
+
+// A compact line for an entry.
+show(e: DirEntry) -> string = s"${e.name} ${e.path} ${e.kind} dir=${e.isDir} file=${e.isFile} link=${e.isLink}"
+
+names(r: Result[Vector[DirEntry], IoError]) -> Any = r.map(es -> es.map(e -> e.name))
+
+main()
+  val dir = fs.createTempDir("avin-list") match
+    Ok(d) -> d
+    Err(e) ->
+      println(s"no directory: $e")
+      return
+  root = dir
+  // An empty directory lists as nothing; so does iterating it.
+  say(fs.list(dir))
+  say(fs.entries(dir).map(it -> it.toVector))
+  for n in ["b.txt", "a.txt", ".hidden", "ünï code", "Zed"] do _ = fs.writeText(dir + "/" + n, n)
+  _ = fs.createDir(dir + "/sub")
+  _ = fs.writeText(dir + "/sub/inner", "")
+  _ = fs.symlink("a.txt", dir + "/link-file")
+  _ = fs.symlink("sub", dir + "/link-dir")
+  _ = fs.symlink("nowhere", dir + "/link-dangling")
+  _ = Command("/usr/bin/mkfifo", dir + "/pipe").run()
+  val all = fs.list(dir).getOrElse([])
+  for e in all do say(show(e))
+  // Sorted exactly as `listDir` sorts, and each path is the directory joined with the name.
+  say(all.map(e -> e.name) == fs.listDir(dir).getOrElse([]))
+  say(all.forall(e -> e.path == dir + "/" + e.name))
+  // The kind is the entry's own: a link is a link, whatever it names, and a dangling one is listed.
+  say(all.filter(e -> e.isLink).map(e -> e.name))
+  say(all.filter(e -> e.isDir).map(e -> e.name))
+  say(all.filter(e -> e.isFile).map(e -> e.name))
+  // A trailing separator on the directory gives the same paths.
+  say(fs.list(dir + "/").map(es -> es.map(e -> e.path)) == fs.list(dir).map(es -> es.map(e -> e.path)))
+  // Only the directory's own entries, not what is inside a subdirectory.
+  say(names(fs.list(dir + "/sub")))
+  // Each path reads the entry it names.
+  say(all.forall(e -> e.isLink || fs.exists(e.path)))
+  // Errors: no such directory, a file where a directory should be, a link to a file.
+  say(fs.list(dir + "/missing"))
+  say(fs.list(dir + "/a.txt"))
+  say(fs.list(dir + "/link-file"))
+  say(fs.entries(dir + "/missing").map(_ -> "iterator"))
+  say(fs.entries(dir + "/a.txt").map(_ -> "iterator"))
+  // A link to a directory is listed through.
+  say(names(fs.list(dir + "/link-dir")))
+
+  // Patterns apply to the name.
+  say(names(fs.list(dir, Some("*.txt"))))
+  say(names(fs.list(dir, Some("*"))))
+  say(names(fs.list(dir, Some(".*"))))
+  say(names(fs.list(dir, Some("?.txt"))))
+  say(names(fs.list(dir, Some("[ab].txt"))))
+  say(names(fs.list(dir, Some("[!a].txt"))))
+  say(names(fs.list(dir, Some("{Zed,sub}"))))
+  say(names(fs.list(dir, Some("link-*"))))
+  say(names(fs.list(dir, Some("*.nothing"))))
+  say(names(fs.list(dir, Some("ünï*"))))
+  say(names(fs.list(dir, Some(""))))
+  // A filter keeps the order and the kind.
+  say(fs.list(dir, Some("link-*")).map(es -> es.map(e -> e.kind)))
+
+  // Many entries come back whole, sorted, once each.
+  _ = fs.createDir(dir + "/many")
+  for i in 0 ..< 300 do _ = fs.writeText(s"$dir/many/f$i", "")
+  val many = fs.list(dir + "/many").getOrElse([])
+  say(many.length)
+  say(many.map(e -> e.name) == many.map(e -> e.name).sorted)
+  say(many.map(e -> e.name).distinct.length)
+  say(many.forall(e -> e.isFile))
+  say(fs.list(dir + "/many", Some("f1?")).map(es -> es.length))
+
+  // The lazy form: the same entries, in the same order.
+  val lazyAll = fs.entries(dir).map(it -> it.toVector).getOrElse([])
+  say(lazyAll.forall(r -> r.isOk))
+  val listedNow = fs.list(dir).getOrElse([])
+  say(lazyAll.map(r -> r.map(e -> show(e)).getOrElse("")) == listedNow.map(show))
+  say(listedNow.length)
+  say(fs.entries(dir, Some("*.txt")).map(it -> it.toVector.map(r -> r.map(e -> e.name).getOrElse("?"))))
+  // Taking the first entries reads just those: a removed entry beyond them is never asked about.
+  val it = fs.entries(dir + "/many").getOrElse(Vector.empty[Result[DirEntry, IoError]]().iterator())
+  say(it.hasNext())
+  say(it.next().map(e -> e.name))
+  _ = fs.remove(dir + "/many/f100")
+  _ = fs.remove(dir + "/many/f99")
+  val rest = it.toVector
+  say(rest.length)
+  say(rest.forall(r -> r.isOk))
+  say(rest.exists(r -> r.map(e -> e.name == "f100").getOrElse(false)))
+  say(it.hasNext())
+  // A removed entry is also left out by `list` when it goes before the kind is read: simulated by a
+  // listing taken after the removal.
+  say(fs.list(dir + "/many").map(es -> es.length))
+  // An exhausted iterator and an empty one.
+  val none = fs.entries(dir + "/sub", Some("*.none")).getOrElse(Vector.empty[Result[DirEntry, IoError]]().iterator())
+  say(none.hasNext())
+
+  // A directory that can be read but not entered: the names are there, the kinds are not.
+  val uid = Command("/usr/bin/id", "-u").output().map(t -> t.trim).getOrElse("?")
+  _ = fs.createDir(dir + "/closed")
+  _ = fs.writeText(dir + "/closed/x", "")
+  _ = fs.setPermissions(dir + "/closed", 0o400)
+  if uid == "0"
+    say("true")
+    say("true")
+  else
+    say(fs.list(dir + "/closed").isErr)
+    say(fs.entries(dir + "/closed").map(it -> it.toVector.map(r -> r.isErr)).getOrElse([]))
+  _ = fs.setPermissions(dir + "/closed", 0o700)
+  // A directory that cannot be read at all.
+  _ = fs.setPermissions(dir + "/closed", 0o000)
+  say(uid == "0" || fs.list(dir + "/closed").isErr)
+  _ = fs.setPermissions(dir + "/closed", 0o700)
+
+  // Names that are not UTF-8, where the file system holds them (macOS's does not).
+  val bad = dir + "/bad"
+  _ = fs.createDir(bad)
+  val made = Command(
+    "/bin/sh",
+    "-c",
+    "exec 2>/dev/null; cd \"$0\" && : > \"$(printf 'x\\377y')\" && : > ok",
+    bad
+  ).run().map(s -> s.isSuccess).getOrElse(false)
+  say(!made || fs.list(bad).isErr)
+  say(!made || fs.listDir(bad).isErr)
+  say(!made || names(fs.list(bad, skipInvalid = true)) == Ok(["ok"]))
+  say(!made || fs.entries(bad).isErr)
+  say(!made || fs.entries(bad, skipInvalid = true).map(it -> it.toVector.length) == Ok(1))
+  say(!made || fs.list(bad, Some("*"), true).map(es -> es.length) == Ok(1))
+  // Skipping changes nothing where every name is text.
+  say(fs.list(dir, skipInvalid = true).map(es -> es.length) == fs.list(dir).map(es -> es.length))
+
+  // Hard links.
+  say(fs.hardLink(dir + "/a.txt", dir + "/second"))
+  say(fs.isSameFile(dir + "/a.txt", dir + "/second"))
+  say(fs.metadata(dir + "/a.txt").map(m -> m.links))
+  say(fs.readText(dir + "/second"))
+  _ = fs.writeText(dir + "/a.txt", "changed")
+  say(fs.readText(dir + "/second"))
+  say(fs.hardLink(dir + "/a.txt", dir + "/second"))
+  say(fs.hardLink(dir + "/nothing", dir + "/third"))
+  say(fs.hardLink(dir + "/sub", dir + "/subtwo").isErr)
+  _ = fs.remove(dir + "/a.txt")
+  say(fs.readText(dir + "/second"))
+  say(fs.metadata(dir + "/second").map(m -> m.links))
+  _ = fs.removeDirAll(dir)

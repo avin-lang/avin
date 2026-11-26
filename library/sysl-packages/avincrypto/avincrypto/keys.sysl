@@ -1,0 +1,634 @@
+// Keys and signatures over libcrypto, for `avin.crypto`.
+//
+// **A key crosses as its DER encoding and nothing else.** Each call parses the bytes it is given,
+// uses the key and frees it before returning, so no OpenSSL pointer is ever held between calls and
+// a key is a plain value any thread may use. A private key's bytes are PKCS#8 and a public key's are
+// SubjectPublicKeyInfo, whatever form they were read from.
+
+module avincrypto
+
+import avincrypto.c
+import sysl.slices.{as_ptr, as_mut_ptr}
+import sysl.raw.ptr_cast
+import sysl.buf.{Buf, buf, buf_filled}
+import sysl.text.{cstring, from_cstring}
+
+// The smallest and the largest RSA modulus read or generated, in bits.
+const min_rsa_bits: i32 = 2048
+const max_rsa_bits: i32 = 16384
+
+// Why a call refused.
+enum Refusal
+    // The bytes are not a key of a kind this reads, or the key is one it refuses.
+    BadKey(reason: string)
+    // The key is not the kind the scheme signs with.
+    Mismatch(reason: string)
+    // A sealed message did not open.
+    Unauthentic
+    // libcrypto failed, in its own words.
+    Failed(message: string)
+end Refusal
+
+// What a key is.
+enum KeyKind
+    Ed25519Key
+    EcP256Key
+    EcP384Key
+    RsaKey(bits: i32)
+end KeyKind
+
+// A signature scheme: the key kind, the digest and, for RSA, the padding.
+enum Scheme
+    Ed25519
+    EcdsaP256Sha256
+    EcdsaP384Sha384
+    RsaPkcs1Sha256
+    RsaPkcs1Sha384
+    RsaPkcs1Sha512
+    RsaPssSha256
+    RsaPssSha384
+    RsaPssSha512
+end Scheme
+
+// A key read or made: its kind and its canonical DER, PKCS#8 for a private key and
+// SubjectPublicKeyInfo for a public one.
+struct Key
+    kind: KeyKind
+    der: Buf[u8]
+end Key
+
+// -- failures -----------------------------------------------------------------------------------------
+
+// `what`, with the reason at the top of libcrypto's error queue, which is left empty.
+private[avincrypto] failed(what: string) -> Refusal
+    val code = c.err_get_error()
+
+    c.err_clear_error()
+
+    if code == 0 then return Refusal.Failed(what)
+
+    var text: [256]u8 = [0; 256]
+
+    c.err_error_string_n(code, &text[0], 256)
+
+    from_cstring(&text[0]) match
+        Ok(t) -> Refusal.Failed(s"${what}: ${t}")
+        Err(_) -> Refusal.Failed(what)
+end failed
+
+private bad_key(reason: string) -> Refusal
+    c.err_clear_error()
+    Refusal.BadKey(reason)
+end bad_key
+
+private no_pkey() -> *c.EvpPkey = ptr_cast(0usize)
+
+// -- reading ------------------------------------------------------------------------------------------
+
+// The private key `der` encodes, PKCS#8 or the traditional RSA or EC form, refused unless the
+// encoding is the whole of `der`.
+private parse_private(der: []const u8) -> Result[*c.EvpPkey, Refusal]
+    if der.len == 0 then return Err(bad_key("there are no bytes to read a private key from"))
+
+    c.err_clear_error()
+
+    val start = as_ptr(der)
+    var at = start
+    val key = c.d2i_auto_private_key(null, &at, i64(der.len))
+
+    if key == null then return Err(bad_key("the bytes are not an unencrypted private key in DER"))
+
+    if usize(at) != usize(start) + der.len
+        c.pkey_free(key)
+        return Err(bad_key("bytes follow the private key"))
+
+    Ok(key)
+end parse_private
+
+// The public key `der` encodes as a SubjectPublicKeyInfo, refused unless that is the whole of `der`.
+private parse_public(der: []const u8) -> Result[*c.EvpPkey, Refusal]
+    if der.len == 0 then return Err(bad_key("there are no bytes to read a public key from"))
+
+    c.err_clear_error()
+
+    val start = as_ptr(der)
+    var at = start
+    val key = c.d2i_pubkey(null, &at, i64(der.len))
+
+    if key == null then return Err(bad_key("the bytes are not a public key (SubjectPublicKeyInfo) in DER"))
+
+    if usize(at) != usize(start) + der.len
+        c.pkey_free(key)
+        return Err(bad_key("bytes follow the public key"))
+
+    Ok(key)
+end parse_public
+
+// The curve an elliptic-curve key is on, as OpenSSL names it.
+private curve_of(p: *c.EvpPkey) -> Option[string]
+    var name: [80]u8 = [0; 80]
+    var len: usize = 0
+
+    if c.pkey_group_name(p, &name[0], 80, &len) != 1 then return None
+
+    from_cstring(&name[0]) match
+        Ok(t) -> Some(t)
+        Err(_) -> None
+end curve_of
+
+// What `p` is, refusing every kind this does not read: another curve, an RSA key under 2048 or over
+// 16384 bits, a key restricted to RSASSA-PSS, Ed448, X25519, DSA.
+private kind_of(p: *c.EvpPkey) -> Result[KeyKind, Refusal]
+    val id = c.pkey_base_id(p)
+
+    if id == c.EVP_PKEY_ED25519 then return Ok(KeyKind.Ed25519Key)
+
+    if id == c.EVP_PKEY_EC
+        val curve = curve_of(p).unwrap_or("an unnamed curve")
+
+        if curve == "prime256v1" || curve == "P-256" then return Ok(KeyKind.EcP256Key)
+
+        if curve == "secp384r1" || curve == "P-384" then return Ok(KeyKind.EcP384Key)
+
+        return Err(bad_key(s"the key is on ${curve}, and the elliptic curves read are P-256 and P-384"))
+    end if
+
+    if id == c.EVP_PKEY_RSA
+        val bits = c.pkey_bits(p)
+
+        if bits < min_rsa_bits then return Err(bad_key(s"the RSA key has ${bits} bits, under the 2048 read"))
+
+        if bits > max_rsa_bits then return Err(bad_key(s"the RSA key has ${bits} bits, over the 16384 read"))
+
+        return Ok(KeyKind.RsaKey(bits))
+    end if
+
+    if id == c.EVP_PKEY_RSA_PSS
+        return Err(bad_key("the RSA key is restricted to PSS (RSASSA-PSS); RSA keys are read as rsaEncryption keys"))
+
+    Err(bad_key("the key is of a kind not read: the kinds read are Ed25519, ECDSA over P-256 and P-384, and RSA"))
+end kind_of
+
+// The PKCS#8 encoding of a private key.
+private pkcs8_of(p: *c.EvpPkey) -> Result[Buf[u8], Refusal]
+    val info = c.pkey_to_pkcs8(p)
+
+    if info == null then return Err(failed("the private key could not be encoded"))
+
+    var none: *u8 = ptr_cast(0usize)
+    val n = c.i2d_pkcs8(info, &none)
+
+    if n <= 0
+        c.pkcs8_free(info)
+        return Err(failed("the private key could not be encoded"))
+
+    var out = buf_filled(usize(n), u8(0))
+    var at = as_mut_ptr(out.view_mut())
+    val wrote = c.i2d_pkcs8(info, &at)
+
+    c.pkcs8_free(info)
+
+    if wrote != n then return Err(failed("the private key could not be encoded"))
+
+    Ok(out)
+end pkcs8_of
+
+// The SubjectPublicKeyInfo encoding of a key's public half.
+private spki_of(p: *c.EvpPkey) -> Result[Buf[u8], Refusal]
+    var none: *u8 = ptr_cast(0usize)
+    val n = c.i2d_pubkey(p, &none)
+
+    if n <= 0 then return Err(failed("the public key could not be encoded"))
+
+    var out = buf_filled(usize(n), u8(0))
+    var at = as_mut_ptr(out.view_mut())
+
+    if c.i2d_pubkey(p, &at) != n then return Err(failed("the public key could not be encoded"))
+
+    Ok(out)
+end spki_of
+
+// `p` described, as a private key or as its public half.
+private described(p: *c.EvpPkey, private_half: bool) -> Result[Key, Refusal]
+    val kind = kind_of(p)?
+    val der = if private_half then pkcs8_of(p)? else spki_of(p)?
+
+    Ok(Key(kind, der))
+end described
+
+// The private key in `der`, as its kind and PKCS#8.
+read_private(der: []const u8) -> Result[Key, Refusal]
+    val p = parse_private(der)?
+    val key = described(p, true)
+
+    c.pkey_free(p)
+
+    key
+end read_private
+
+// The public key in `der`, as its kind and SubjectPublicKeyInfo.
+read_public(der: []const u8) -> Result[Key, Refusal]
+    val p = parse_public(der)?
+    val key = described(p, false)
+
+    c.pkey_free(p)
+
+    key
+end read_public
+
+// The public half of the private key in `der`.
+public_of(der: []const u8) -> Result[Key, Refusal]
+    val p = parse_private(der)?
+    val key = described(p, false)
+
+    c.pkey_free(p)
+
+    key
+end public_of
+
+// -- making -------------------------------------------------------------------------------------------
+
+// A new private key of `kind`, from the operating system's randomness through OpenSSL's generator.
+generate(kind: KeyKind) -> Result[Key, Refusal]
+    val algorithm = kind match
+        Ed25519Key -> "ED25519"
+        RsaKey(_) -> "RSA"
+        else "EC"
+
+    kind match
+        RsaKey(bits) ->
+            if bits < min_rsa_bits || bits > max_rsa_bits
+                return Err(bad_key(s"an RSA key of ${bits} bits is not made: the sizes made are 2048 to 16384 bits"))
+        else ()
+
+    c.err_clear_error()
+
+    val name = cstring(algorithm)
+    val ctx = c.pkey_ctx_new_from_name(null, name.ptr, null)
+
+    if ctx == null then return Err(failed("key generation could not begin"))
+
+    var ready = c.pkey_keygen_init(ctx)
+
+    if ready == 1
+        kind match
+            EcP256Key ->
+                val curve = cstring("P-256")
+                ready = c.pkey_ctx_set_group_name(ctx, curve.ptr)
+            EcP384Key ->
+                val curve = cstring("P-384")
+                ready = c.pkey_ctx_set_group_name(ctx, curve.ptr)
+            RsaKey(bits) -> ready = c.pkey_ctx_set_rsa_keygen_bits(ctx, bits)
+            else ()
+    end if
+
+    var p = no_pkey()
+
+    if ready == 1 then ready = c.pkey_generate(ctx, &p)
+
+    c.pkey_ctx_free(ctx)
+
+    if ready != 1 || p == null then return Err(failed("the key could not be generated"))
+
+    val key = described(p, true)
+
+    c.pkey_free(p)
+
+    key
+end generate
+
+// The Ed25519 private key whose 32-byte seed is `seed` (RFC 8032's secret key).
+ed25519_private(seed: []const u8) -> Result[Key, Refusal]
+    if seed.len != 32 then return Err(bad_key(s"an Ed25519 private key is 32 bytes, and these are ${seed.len}"))
+
+    c.err_clear_error()
+
+    val p = c.pkey_new_raw_private_key(c.EVP_PKEY_ED25519, null, as_ptr(seed), 32)
+
+    if p == null then return Err(failed("the Ed25519 private key could not be made"))
+
+    val key = described(p, true)
+
+    c.pkey_free(p)
+
+    key
+end ed25519_private
+
+// The Ed25519 public key whose 32 bytes are `raw` (RFC 8032's encoding).
+ed25519_public(raw: []const u8) -> Result[Key, Refusal]
+    if raw.len != 32 then return Err(bad_key(s"an Ed25519 public key is 32 bytes, and these are ${raw.len}"))
+
+    c.err_clear_error()
+
+    val p = c.pkey_new_raw_public_key(c.EVP_PKEY_ED25519, null, as_ptr(raw), 32)
+
+    if p == null then return Err(bad_key("the bytes are not an Ed25519 public key"))
+
+    val key = described(p, false)
+
+    c.pkey_free(p)
+
+    key
+end ed25519_public
+
+// The 32 bytes of the Ed25519 public key in `der`, a SubjectPublicKeyInfo.
+ed25519_raw(der: []const u8) -> Result[Buf[u8], Refusal]
+    val p = parse_public(der)?
+
+    if c.pkey_base_id(p) != c.EVP_PKEY_ED25519
+        c.pkey_free(p)
+        return Err(Refusal.Mismatch("the key is not an Ed25519 key"))
+
+    var out = buf_filled(32, u8(0))
+    var len: usize = 32
+    val ok = c.pkey_get_raw_public_key(p, as_mut_ptr(out.view_mut()), &len)
+
+    c.pkey_free(p)
+
+    if ok != 1 || len != 32 then return Err(failed("the Ed25519 public key could not be read"))
+
+    Ok(out)
+end ed25519_raw
+
+// -- the schemes --------------------------------------------------------------------------------------
+
+private no_digest() -> *c.EvpMd = ptr_cast(0usize)
+
+// The digest a scheme hashes with, or none for Ed25519, which hashes inside the signature.
+private digest_of(scheme: Scheme) -> *c.EvpMd = scheme match
+    Ed25519 -> no_digest()
+    EcdsaP256Sha256 -> c.sha256()
+    RsaPkcs1Sha256 -> c.sha256()
+    RsaPssSha256 -> c.sha256()
+    EcdsaP384Sha384 -> c.sha384()
+    RsaPkcs1Sha384 -> c.sha384()
+    RsaPssSha384 -> c.sha384()
+    RsaPkcs1Sha512 -> c.sha512()
+    RsaPssSha512 -> c.sha512()
+
+private name_of(scheme: Scheme) -> string = scheme match
+    Ed25519 -> "Ed25519"
+    EcdsaP256Sha256 -> "ECDSA P-256 SHA-256"
+    EcdsaP384Sha384 -> "ECDSA P-384 SHA-384"
+    RsaPkcs1Sha256 -> "RSA PKCS#1 v1.5 SHA-256"
+    RsaPkcs1Sha384 -> "RSA PKCS#1 v1.5 SHA-384"
+    RsaPkcs1Sha512 -> "RSA PKCS#1 v1.5 SHA-512"
+    RsaPssSha256 -> "RSA-PSS SHA-256"
+    RsaPssSha384 -> "RSA-PSS SHA-384"
+    RsaPssSha512 -> "RSA-PSS SHA-512"
+
+// The padding an RSA scheme names: 1 for PKCS#1 v1.5, 2 for PSS, 0 for the others.
+private padding_of(scheme: Scheme) -> i32 = scheme match
+    RsaPkcs1Sha256 -> 1
+    RsaPkcs1Sha384 -> 1
+    RsaPkcs1Sha512 -> 1
+    RsaPssSha256 -> 2
+    RsaPssSha384 -> 2
+    RsaPssSha512 -> 2
+    else 0
+
+// The width of each of an ECDSA signature's two integers in bytes, or 0 for the other schemes.
+private width_of(scheme: Scheme) -> usize = scheme match
+    EcdsaP256Sha256 -> 32
+    EcdsaP384Sha384 -> 48
+    else 0
+
+// Whether a key of `kind` signs with `scheme`.
+private fits(kind: KeyKind, scheme: Scheme) -> bool = scheme match
+    Ed25519 -> kind match
+        Ed25519Key -> true
+        else false
+    EcdsaP256Sha256 -> kind match
+        EcP256Key -> true
+        else false
+    EcdsaP384Sha384 -> kind match
+        EcP384Key -> true
+        else false
+    else kind match
+        RsaKey(_) -> true
+        else false
+
+private suits(p: *c.EvpPkey, scheme: Scheme) -> Result[unit, Refusal]
+    val kind = kind_of(p)?
+
+    if !fits(kind, scheme) then return Err(Refusal.Mismatch(s"the key does not sign with ${name_of(scheme)}"))
+
+    Ok(())
+end suits
+
+// Sets an RSA scheme's padding on the key context a digest's initialisation made: PSS with a salt
+// as long as the digest and MGF1 over the same digest (RFC 8017's recommendation, and what TLS 1.3
+// and JOSE use).
+private padded(pctx: *c.EvpPkeyCtx, scheme: Scheme) -> i32
+    val padding = padding_of(scheme)
+
+    if padding == 0 then return 1
+
+    if pctx == null then return 0
+
+    if padding == 1 then return if c.pkey_ctx_set_rsa_padding(pctx, c.RSA_PKCS1_PADDING) > 0 then 1 else 0
+
+    if c.pkey_ctx_set_rsa_padding(pctx, c.RSA_PKCS1_PSS_PADDING) <= 0 then return 0
+
+    if c.pkey_ctx_set_rsa_pss_saltlen(pctx, c.RSA_PSS_SALTLEN_DIGEST) <= 0 then return 0
+
+    1
+end padded
+
+// -- the two directions -------------------------------------------------------------------------------
+
+// The signature the private key in `der` makes over `message` with `scheme`. An ECDSA signature is
+// DER, an `ECDSA-Sig-Value`.
+sign(der: []const u8, scheme: Scheme, message: []const u8) -> Result[Buf[u8], Refusal]
+    val p = parse_private(der)?
+    val signature = signed(p, scheme, message)
+
+    c.pkey_free(p)
+
+    signature
+end sign
+
+private signed(p: *c.EvpPkey, scheme: Scheme, message: []const u8) -> Result[Buf[u8], Refusal]
+    suits(p, scheme)?
+
+    c.err_clear_error()
+
+    val ctx = c.md_ctx_new()
+
+    if ctx == null then return Err(failed("a signature could not begin"))
+
+    var pctx: *c.EvpPkeyCtx = ptr_cast(0usize)
+    var ready = c.digest_sign_init(ctx, &pctx, digest_of(scheme), null, p)
+
+    if ready == 1 then ready = padded(pctx, scheme)
+
+    var nothing: [1]u8 = [0; 1]
+    val tbs = if message.len == 0 then &nothing[0] else as_ptr(message)
+    var size: usize = 0
+
+    if ready == 1 then ready = c.digest_sign(ctx, null, &size, tbs, message.len)
+
+    var out: Buf[u8] = buf()
+
+    if ready == 1
+        out = buf_filled(size, u8(0))
+        ready = c.digest_sign(ctx, as_mut_ptr(out.view_mut()), &size, tbs, message.len)
+    end if
+
+    c.md_ctx_free(ctx)
+
+    if ready != 1 then return Err(failed(s"the message could not be signed with ${name_of(scheme)}"))
+
+    out.truncate(size)
+
+    Ok(out)
+end signed
+
+// Whether `signature` is the public key in `der`'s signature over `message` with `scheme`.
+//
+// **Once the check has begun, every answer is a verdict**: a signature of the wrong length or a
+// malformed encoding is `Ok(false)` exactly as a forged one is, since it is bytes somebody else sent.
+// `Err` is a question that could not be asked: a key that is not one, or one of the wrong kind.
+verify(der: []const u8, scheme: Scheme, message: []const u8, signature: []const u8) -> Result[bool, Refusal]
+    val p = parse_public(der)?
+    val verdict = verified(p, scheme, message, signature)
+
+    c.pkey_free(p)
+
+    verdict
+end verify
+
+private verified(p: *c.EvpPkey, scheme: Scheme, message: []const u8, signature: []const u8) -> Result[bool, Refusal]
+    suits(p, scheme)?
+
+    if signature.len == 0 then return Ok(false)
+
+    c.err_clear_error()
+
+    val ctx = c.md_ctx_new()
+
+    if ctx == null then return Err(failed("a verification could not begin"))
+
+    var pctx: *c.EvpPkeyCtx = ptr_cast(0usize)
+    var ready = c.digest_verify_init(ctx, &pctx, digest_of(scheme), null, p)
+
+    if ready == 1 then ready = padded(pctx, scheme)
+
+    var nothing: [1]u8 = [0; 1]
+    val tbs = if message.len == 0 then &nothing[0] else as_ptr(message)
+    val answer = if ready == 1 then c.digest_verify(ctx, as_ptr(signature), signature.len, tbs, message.len) else -1
+
+    c.md_ctx_free(ctx)
+
+    if ready != 1 then return Err(failed(s"a ${name_of(scheme)} verification could not begin"))
+
+    c.err_clear_error()
+
+    Ok(answer == 1)
+end verified
+
+// -- the two forms of an ECDSA signature --------------------------------------------------------------
+
+// A DER `ECDSA-Sig-Value` as its two integers, each written big-endian in the curve's width: the form
+// JOSE, COSE and WebCrypto carry. `None` unless `der` is exactly one DER signature, in its one
+// canonical encoding, of two non-negative integers that fit the width.
+ecdsa_fixed(der: []const u8, scheme: Scheme) -> Option[Buf[u8]]
+    val width = width_of(scheme)
+
+    if width == 0 || der.len == 0 then return None
+
+    c.err_clear_error()
+
+    val start = as_ptr(der)
+    var at = start
+    val sig = c.d2i_ecdsa_sig(null, &at, i64(der.len))
+
+    if sig == null
+        c.err_clear_error()
+        return None
+    end if
+
+    var answer: Option[Buf[u8]] = None
+
+    if usize(at) == usize(start) + der.len && canonical(sig, der)
+        val r = c.ecdsa_sig_r(sig)
+        val s = c.ecdsa_sig_s(sig)
+
+        if c.bn_is_negative(r) == 0 && c.bn_is_negative(s) == 0
+            var all: []u8 = [0; 2 * width]
+            val wr = c.bn_bn2binpad(r, as_mut_ptr(all[0..<width]), i32(width))
+            val ws = c.bn_bn2binpad(s, as_mut_ptr(all[width..<(2 * width)]), i32(width))
+
+            if wr == i32(width) && ws == i32(width)
+                var out: Buf[u8] = buf()
+                out.extend(all)
+                answer = Some(out)
+            end if
+        end if
+    end if
+
+    c.ecdsa_sig_free(sig)
+    c.err_clear_error()
+
+    answer
+end ecdsa_fixed
+
+// Whether `der` is the encoding OpenSSL itself writes for `sig`, byte for byte.
+private canonical(sig: *c.EcdsaSig, der: []const u8) -> bool
+    var none: *u8 = ptr_cast(0usize)
+    val n = c.i2d_ecdsa_sig(sig, &none)
+
+    if n <= 0 || usize(n) != der.len then return false
+
+    var again = buf_filled(usize(n), u8(0))
+    var at = as_mut_ptr(again.view_mut())
+
+    if c.i2d_ecdsa_sig(sig, &at) != n then return false
+
+    val v = again.view()
+    var same = true
+
+    for i in 0..<der.len
+        if v[i] != der[i] then same = false
+
+    same
+end canonical
+
+// Two integers written big-endian in the curve's width, as the DER `ECDSA-Sig-Value` OpenSSL signs
+// and verifies. `None` unless `fixed` is exactly twice the width.
+ecdsa_der(fixed: []const u8, scheme: Scheme) -> Option[Buf[u8]]
+    val width = width_of(scheme)
+
+    if width == 0 || fixed.len != 2 * width then return None
+
+    c.err_clear_error()
+
+    val none: *c.BigNum = ptr_cast(0usize)
+    val r = c.bn_bin2bn(as_ptr(fixed[0..<width]), i32(width), none)
+    val s = c.bn_bin2bn(as_ptr(fixed[width..<(2 * width)]), i32(width), none)
+    val sig = c.ecdsa_sig_new()
+
+    if r == null || s == null || sig == null || c.ecdsa_sig_set0(sig, r, s) != 1
+        if r != null then c.bn_free(r)
+        if s != null then c.bn_free(s)
+        if sig != null then c.ecdsa_sig_free(sig)
+        c.err_clear_error()
+        return None
+    end if
+
+    var nothing: *u8 = ptr_cast(0usize)
+    val n = c.i2d_ecdsa_sig(sig, &nothing)
+    var answer: Option[Buf[u8]] = None
+
+    if n > 0
+        var out = buf_filled(usize(n), u8(0))
+        var at = as_mut_ptr(out.view_mut())
+
+        if c.i2d_ecdsa_sig(sig, &at) == n then answer = Some(out)
+    end if
+
+    c.ecdsa_sig_free(sig)
+    c.err_clear_error()
+
+    answer
+end ecdsa_der

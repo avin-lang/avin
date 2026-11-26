@@ -1,0 +1,162 @@
+// expect: exit 0
+// CORS: an allowed origin echoed with `Vary: Origin`, `*` answered as `*` and with no `Vary`, and an
+// origin not allowed given no CORS header while the request is still handled; several origins, an
+// origin compared exactly, a predicate, and the origin `null` as any other; credentials always echoing the
+// origin, and `Allow-Credentials` on every allowed answer; exposed headers; no `Origin` passing
+// through; a preflight answered `204` without reaching the handler, with its methods, headers (named,
+// or reflected where none are named, compared without regard to case), and max age, and one asking for
+// a method or header not allowed, or from an origin not allowed, given none of them; `Vary` merged
+// into the handler's, once, and a `*` left alone; and the policies that trap.
+import avin.net.http.{Cors, Handler, Response, ServerRequest}
+import avin.threads.Atomic
+import avin.time.{Duration, seconds}
+
+// How many requests reached the handler.
+class Counter(): Sendable
+  val seen = Atomic(0)
+
+show(r: Response) -> string
+  val cors = r.headers.filter(h -> h.0.startsWith("Access-Control-") || h.0 == "Vary")
+  s"${r.status} ${cors.map(h -> s"${h.0}=${h.1}").mkString("; ")}"
+
+get(origin: Option[string]) -> ServerRequest = origin match
+  Some(o) -> ServerRequest("GET", "/", Vector(("Origin", o)))
+  None -> ServerRequest("GET", "/")
+
+preflight(origin: string, method: string, asked: Option[string] = None) -> ServerRequest
+  val base = Vector(("Origin", origin), ("Access-Control-Request-Method", method))
+  val hs = asked match
+    Some(a) -> base :+ ("Access-Control-Request-Headers", a)
+    None -> base
+  ServerRequest("OPTIONS", "/", hs)
+
+main()
+  val counter = Counter()
+  val ok: Handler = _ ->
+    counter.seen.add(1)
+    Response.text(200, "ok")
+  val count = () -> counter.seen.load()
+
+  // `*`: the same answer to every origin, and no `Vary`.
+  val any = Cors().middleware(ok)
+  println(show(any(get(Some("https://a.example")))))
+  println(show(any(get(Some("null")))))
+  println(show(any(get(None))))
+
+  // A list of origins: allowed ones echoed, others unmarked but handled; an origin
+  // compared exactly, case and all.
+  val listed = Cors(origins = ["https://a.example", "https://b.example"]).middleware(ok)
+  println(show(listed(get(Some("https://a.example")))))
+  println(show(listed(get(Some("https://b.example")))))
+  println(show(listed(get(Some("HTTPS://A.EXAMPLE")))))
+  val before = count()
+  println(show(listed(get(Some("https://evil.example")))))
+  println(count() - before)
+  println(show(listed(get(Some("https://a.example.evil")))))
+  println(show(listed(get(None))))
+  println(show(listed(get(Some("null")))))
+  println(show(listed(get(Some("")))))
+  println(Cors(origins = []).allows("https://a.example"))
+  println(show(Cors(origins = []).middleware(ok)(get(Some("https://a.example")))))
+
+  // A predicate, alone and beside a list; `null` allowed only by naming it.
+  val pred = Cors(origins = [], allowOrigin = o -> o.endsWith(".example")).middleware(ok)
+  println(show(pred(get(Some("https://a.example")))))
+  println(show(pred(get(Some("https://a.test")))))
+  val both = Cors(origins = ["https://x.test"], allowOrigin = o -> o.endsWith(".example")).middleware(ok)
+  println(
+    [
+      both(get(Some("https://x.test"))).header("Access-Control-Allow-Origin"),
+      both(get(Some("https://q.example"))).header("Access-Control-Allow-Origin")
+    ]
+  )
+  println(show(Cors(origins = ["null"]).middleware(ok)(get(Some("null")))))
+
+  // Credentials: the origin echoed, never `*`, even where a predicate allows any.
+  val creds = Cors(origins = ["https://a.example"], credentials = true).middleware(ok)
+  println(show(creds(get(Some("https://a.example")))))
+  println(show(creds(get(Some("https://b.example")))))
+  val credsAny = Cors(origins = [], allowOrigin = _ -> true, credentials = true).middleware(ok)
+  println(show(credsAny(get(Some("https://z.example")))))
+  println(show(credsAny(get(Some("null")))))
+
+  // Exposed headers, on allowed responses only.
+  val exposing = Cors(origins = ["https://a.example"], exposed = ["X-Total", "X-Page"]).middleware(ok)
+  println(show(exposing(get(Some("https://a.example")))))
+  println(show(exposing(get(Some("https://b.example")))))
+  println(show(Cors(exposed = ["X-One"]).middleware(ok)(get(Some("https://b.example")))))
+
+  // A preflight: answered `204` and never handled.
+  val policy = Cors(
+    origins = ["https://a.example"],
+    methods = ["GET", "PUT", "DELETE"],
+    headers = ["Content-Type", "X-Token"],
+    credentials = true,
+    maxAge = Some(seconds(600))
+  ).middleware(ok)
+  val handled = count()
+  println(show(policy(preflight("https://a.example", "PUT"))))
+  println(show(policy(preflight("https://a.example", "PUT", Some("content-type, X-TOKEN")))))
+  println(show(policy(preflight("https://a.example", "PUT", Some("Content-Type")))))
+  println(show(policy(preflight("https://a.example", "PUT", Some("")))))
+  println(show(policy(preflight("https://a.example", "PUT", Some(" , ")))))
+  println(count() - handled)
+  // Asking for a method not allowed, a header not allowed, one of several not allowed, or from an
+  // origin not allowed: still `204`, with nothing granted.
+  println(show(policy(preflight("https://a.example", "PATCH"))))
+  println(show(policy(preflight("https://a.example", "put"))))
+  println(show(policy(preflight("https://a.example", "PUT", Some("X-Other")))))
+  println(show(policy(preflight("https://a.example", "PUT", Some("Content-Type, X-Other")))))
+  println(show(policy(preflight("https://b.example", "PUT"))))
+  println(count() - handled)
+  // Without `Access-Control-Request-Method` an `OPTIONS` is an ordinary request; without an
+  // `Origin`, so is a preflight.
+  val plainOptions = ServerRequest("OPTIONS", "/", Vector(("Origin", "https://a.example")))
+  println(show(policy(plainOptions)))
+  println(count() - handled)
+  println(show(policy(ServerRequest("OPTIONS", "/", Vector(("Access-Control-Request-Method", "PUT"))))))
+  println(count() - handled)
+  // A `GET` carrying `Access-Control-Request-Method` is no preflight.
+  println(
+    show(
+      policy(
+        ServerRequest("GET", "/", Vector(("Origin", "https://a.example"), ("Access-Control-Request-Method", "PUT")))
+      )
+    )
+  )
+
+  // Header names are read without regard to case.
+  println(
+    show(
+      policy(
+        ServerRequest("OPTIONS", "/", Vector(("origin", "https://a.example"), ("access-control-request-method", "GET")))
+      )
+    )
+  )
+
+  // No named headers: whatever is asked for is allowed, and no `Allow-Headers` where none is.
+  val open = Cors(origins = ["*"], methods = ["POST"]).middleware(ok)
+  println(show(open(preflight("https://a.example", "POST", Some("X-A, X-B")))))
+  println(show(open(preflight("https://a.example", "POST"))))
+  println(show(open(preflight("https://a.example", "GET"))))
+  println(
+    show(Cors(methods = ["GET"], maxAge = Some(Duration(0))).middleware(ok)(preflight("https://a.example", "GET")))
+  )
+  println(
+    show(
+      Cors(methods = ["GET"], maxAge = Some(Duration(1999999))).middleware(ok)(preflight("https://a.example", "GET"))
+    )
+  )
+
+  // `Vary` merged into the handler's: appended, once, and a `*` left alone.
+  val vary = (v: Vector[string]) -> Cors(origins = ["https://a.example"]).middleware(
+    _ -> v.foldLeft(Response.text(200, "ok"), (r: Response, x: string) -> r.withHeader("Vary", x))
+  )
+  println(show(vary(["Accept-Encoding"])(get(Some("https://a.example")))))
+  println(show(vary(["Accept-Encoding", "Cookie"])(get(Some("https://a.example")))))
+  println(show(vary(["Accept, Origin"])(get(Some("https://a.example")))))
+  println(show(vary(["origin"])(get(Some("https://a.example")))))
+  println(show(vary(["*"])(get(Some("https://a.example")))))
+  println(show(vary(["Accept"])(get(Some("https://evil.example")))))
+  println(show(vary(["Accept"])(get(None))))
+  println(show(vary([])(get(None))))

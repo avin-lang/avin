@@ -1,0 +1,834 @@
+// `avin.net.redis`'s client against a fake server of the test's own: a TCP server, TLS too, that
+// reads each command and answers it from a script, so every command the client sends is checked word
+// for word and every reply shape is one the test chose. The handshake in RESP3 and its fall back to
+// RESP2, AUTH, SELECT, the typed commands over replies of both protocols, pushes and attributes,
+// pipelines and transactions, publish and subscribe, reconnecting, timeouts, a server that breaks the
+// protocol, the pool and TLS.
+
+import avin.fs
+import avin.io.{IoError, TimedOut}
+import avin.net.{ByteStream, TcpListener, TcpServer, TcpStream}
+
+import avin.net.redis.{
+  ArrayValue, Attributed, BlobString, ConnectionClosed, ConnectionFailed, ExpiresIn, Malformed, NoExpiry, NoKey, Null,
+  Number, ProtocolFailed, PubSubMessage, Redis, RedisError, RedisOptions, RespLimits, RespParser, ServerError,
+  SimpleString, Subscriber, TlsFailed, TooLong, UnexpectedReply, Value, blobOf
+}
+
+import avin.net.tls.{Certificate, TlsClient, TlsServer, TlsStream}
+import avin.threads.{Atomic, Channel, scope, sleep, spawn}
+import avin.time.{Duration, millis, monotonic, seconds}
+
+// What a fake server answers: given the connection's number from 1, the command's number on that
+// connection from 0, and its words, the bytes to send back, as text; `None` closes the connection,
+// and text ending `<close>` is sent without it and then closes the connection.
+type RedisAnswer = @sendable (int, int, Vector[string]) -> Option[string]
+
+// A fake server: its port, the commands it has received, as their words joined by spaces, and how
+// many connections it has accepted.
+class RedisFake(val server: TcpServer, private val seen: Channel[string], val connections: Atomic[int])
+  port -> int = server.port()
+
+  // The commands received since the last call, in order.
+  commands() -> Vector[string]
+    var out = Vector.empty[string]()
+    while seen.tryReceive() is Some(c) do out = out :+ c
+    out
+
+  stop() = server.stop()
+
+redisServe(conn: ByteStream, n: int, answer: RedisAnswer, seen: Channel[string])
+  val p = RespParser()
+  var i = 0
+  while true
+    p.next() match
+      Ok(Some(v)) ->
+        val words = v.asItems.getOrElse(Vector.empty[Value]()).map(x -> x.asText.getOrElse("?"))
+        seen.send(words.mkString(" "))
+        val reply = answer(n, i, words)
+        i += 1
+        reply match
+          Some(text) if text.endsWith("<close>") ->
+            _ = conn.writeText(text.dropRight(7))
+            return
+          Some(text) -> if conn.writeText(text).isErr then return
+          None -> return
+      Ok(None) -> conn.read(65536) match
+        Ok(bytes) if bytes.length > 0 -> p.feed(bytes)
+        _ -> return
+      Err(_) -> return
+
+// A fake server answering by `answer`, over TLS with `tls` where it is given.
+redisFake(answer: RedisAnswer, tls: Option[TlsServer] = None) -> RedisFake
+  val seen = Channel[string]()
+  val count = Atomic(0)
+  val server = TcpServer.start(
+    "127.0.0.1",
+    0,
+    (conn, _) ->
+      val n = count.add(1)
+      tls match
+        None -> redisServe(conn, n, answer, seen)
+        Some(identity) -> TlsStream.server(conn, identity) match
+          Ok(secure) -> redisServe(secure, n, answer, seen)
+          Err(_) -> ()
+  ) match
+    Ok(s) -> s
+    Err(e) -> fail(e.message)
+  RedisFake(server, seen, count)
+
+// Answers from scripts, one for each connection in order, the last for every connection after: the
+// command numbered `i` on a connection must be the script's step `i`, its words joined by spaces, and
+// is answered with that step's reply; any other is answered with an error naming both.
+redisSteps(scripts: Vector[Vector[(string, string)]]) -> RedisAnswer = (n, i, words) ->
+  val script = scripts(if n - 1 < scripts.length then n - 1 else scripts.length - 1)
+  val said = words.mkString(" ")
+  if i >= script.length
+    Some(s"-ERR the script has no step ${i + 1} for: $said\r\n")
+  else
+    val (expected, reply) = script(i)
+    if said != expected then Some(s"-ERR the script expected `$expected`, not `$said`\r\n") else Some(reply)
+
+// One connection's script, the fake answered by it on every connection.
+redisScript(steps: (string, string)*) -> RedisFake = redisFake(redisSteps(Vector(steps)))
+
+// The answer to `HELLO 3`: a map, as a server that speaks RESP3 sends it.
+val redisHello3 = "%2\r\n$6\r\nserver\r\n$5\r\nredis\r\n$5\r\nproto\r\n:3\r\n"
+
+val redisNoHello = "-ERR unknown command 'HELLO', with args beginning with: '3' \r\n"
+
+redisOk[T](r: Result[T, RedisError]) -> T = r match
+  Ok(v) -> v
+  Err(e) -> fail(s"unexpected Redis error: ${e.message}")
+
+redisConnect(
+    fake: RedisFake,
+    options: RedisOptions = RedisOptions()
+) -> Redis = redisOk(Redis.connect("127.0.0.1", fake.port, options))
+
+// What a failure was, by kind, for comparing.
+redisKind[T](r: Result[T, RedisError]) -> string = r match
+  Ok(_) -> "ok"
+  Err(ConnectionFailed(IoError(TimedOut, _, _))) -> "timed out"
+  Err(ConnectionFailed(_)) -> "connection failed"
+  Err(ConnectionClosed(_)) -> "closed"
+  Err(TlsFailed(Certificate(_, _))) -> "certificate refused"
+  Err(TlsFailed(_)) -> "tls failed"
+  Err(ProtocolFailed(Malformed(_, _))) -> "malformed"
+  Err(ProtocolFailed(TooLong(_, _, _, _))) -> "too long"
+  Err(ProtocolFailed(_)) -> "protocol"
+  Err(ServerError(code, _)) -> s"server $code"
+  Err(UnexpectedReply(_, _)) -> "unexpected"
+
+@test("the RESP3 handshake sends HELLO 3 with the credentials and the name, then SELECT")
+redisHandshake3()
+  val fake = redisScript(
+    ("HELLO 3 AUTH alice s3cret SETNAME app", redisHello3),
+    ("SELECT 2", "+OK\r\n"),
+    ("PING", "+PONG\r\n")
+  )
+  val r = redisConnect(
+    fake,
+    RedisOptions(username = Some("alice"), password = Some("s3cret"), clientName = Some("app"), database = 2)
+  )
+  assertEq(r.protocol, 3)
+  assertEq(r.ping(), Ok("PONG"))
+  assertEq(fake.commands(), Vector("HELLO 3 AUTH alice s3cret SETNAME app", "SELECT 2", "PING"))
+  // A password with no username is the default user's; database zero sends no SELECT.
+  val plain = redisScript(("HELLO 3 AUTH default pw", redisHello3), ("PING", "+PONG\r\n"))
+  assertEq(redisConnect(plain, RedisOptions(password = Some("pw"))).ping(), Ok("PONG"))
+  assertEq(plain.commands(), Vector("HELLO 3 AUTH default pw", "PING"))
+  val bare = redisScript(("HELLO 3", redisHello3), ("PING", "+PONG\r\n"))
+  assertEq(redisConnect(bare).ping(), Ok("PONG"))
+  assertEq(bare.commands(), Vector("HELLO 3", "PING"))
+
+@test("a server with no HELLO, or no RESP3, is spoken to in RESP2, with AUTH and CLIENT SETNAME")
+redisFallback2()
+  val old = redisScript(
+    ("HELLO 3 AUTH default pw SETNAME app", redisNoHello),
+    ("AUTH pw", "+OK\r\n"),
+    ("CLIENT SETNAME app", "+OK\r\n"),
+    ("SELECT 1", "+OK\r\n"),
+    ("PING", "+PONG\r\n")
+  )
+  val r = redisConnect(old, RedisOptions(password = Some("pw"), clientName = Some("app"), database = 1))
+  assertEq(r.protocol, 2)
+  assertEq(r.ping(), Ok("PONG"))
+  val noproto = redisScript(
+    ("HELLO 3 AUTH bob pw", "-NOPROTO unsupported protocol version\r\n"),
+    ("AUTH bob pw", "+OK\r\n"),
+    ("GET k", "$-1\r\n")
+  )
+  val r2 = redisConnect(noproto, RedisOptions(username = Some("bob"), password = Some("pw")))
+  assertEq(r2.protocol, 2)
+  assertEq(r2.get("k"), Ok(None))
+  // Without credentials the fall back sends nothing more.
+  val quiet = redisScript(("HELLO 3", redisNoHello), ("PING", "+PONG\r\n"))
+  assertEq(redisConnect(quiet).protocol, 2)
+
+@test("protocol 2 never sends HELLO")
+redisProtocol2()
+  val fake = redisScript(("AUTH pw", "+OK\r\n"), ("PING", "+PONG\r\n"))
+  val r = redisConnect(fake, RedisOptions(password = Some("pw"), protocol = 2))
+  assertEq(r.protocol, 2)
+  assertEq(r.ping(), Ok("PONG"))
+  assertEq(fake.commands(), Vector("AUTH pw", "PING"))
+  val none = redisScript(("PING", "+PONG\r\n"))
+  assertEq(redisConnect(none, RedisOptions(protocol = 2)).ping(), Ok("PONG"))
+  assertEq(none.commands(), Vector("PING"))
+
+@test("a refused password, or database, fails the connection with the server's error")
+redisRefusals()
+  val wrong = redisScript(
+    ("HELLO 3 AUTH default bad", "-WRONGPASS invalid username-password pair or user is disabled.\r\n")
+  )
+  val r = Redis.connect("127.0.0.1", wrong.port, RedisOptions(password = Some("bad")))
+  assertEq(redisKind(r), "server WRONGPASS")
+  assert(r.err.get.message.contains("invalid username-password pair"))
+  val wrong2 = redisScript(("HELLO 3 AUTH default bad", redisNoHello), ("AUTH bad", "-ERR invalid password\r\n"))
+  assertEq(redisKind(Redis.connect("127.0.0.1", wrong2.port, RedisOptions(password = Some("bad")))), "server ERR")
+  val noAuth = redisScript(("HELLO 3", "-NOAUTH HELLO must be called with the client already authenticated\r\n"))
+  assertEq(redisKind(Redis.connect("127.0.0.1", noAuth.port)), "server NOAUTH")
+  val db = redisScript(("HELLO 3", redisHello3), ("SELECT 99", "-ERR DB index is out of range\r\n"))
+  assertEq(redisKind(Redis.connect("127.0.0.1", db.port, RedisOptions(database = 99))), "server ERR")
+  // Nothing listening is a failure to connect.
+  val l = redisOk(TcpListener.bind("127.0.0.1", 0).mapErr(e -> ConnectionFailed(e)))
+  val port = l.port()
+  _ = l.close()
+  assertEq(redisKind(Redis.connect("127.0.0.1", port)), "connection failed")
+
+@test("command sends any command and answers its reply as it is; an error reply is ServerError")
+redisCommand()
+  val fake = redisScript(
+    ("HELLO 3", redisHello3),
+    ("FOO bar", "-ERR unknown command 'FOO'\r\n"),
+    ("BLOB", "!12\r\nSYNTAX oops!\r\n"),
+    ("ALL", "*6\r\n+s\r\n:1\r\n,1.5\r\n#t\r\n_\r\n%1\r\n+k\r\n~1\r\n(12345678901234567890\r\n"),
+    ("ECHO ключ 😀", "$4\r\n😀\r\n"),
+    ("ERR", "-ERR\r\n")
+  )
+  val r = redisConnect(fake)
+  assertEq(r.command("FOO", "bar"), Err(ServerError("ERR", "ERR unknown command 'FOO'")))
+  assertEq(r.command("BLOB"), Err(ServerError("SYNTAX", "SYNTAX oops!")))
+  val all = redisOk(r.command("ALL"))
+  assertEq(all.asItems.map(xs -> xs.length), Some(6))
+  assertEq(all.asItems.get(5).asEntries.get(0).0, SimpleString("k"))
+  assertEq(r.command("ECHO", "ключ", "😀"), Ok(blobOf("😀")))
+  assertEq(r.command("ERR"), Err(ServerError("ERR", "ERR")))
+  // An error reply leaves the connection as it was.
+  assertEq(fake.connections.load(), 1)
+  assert(r.isOpen)
+
+// Replies to the typed commands in RESP3's forms, then RESP2's, which the same calls read the same.
+redisTypedScript(three: bool) -> Vector[(string, string)]
+  val nil = if three then "_\r\n" else "$-1\r\n"
+  Vector(
+    if three then ("HELLO 3", redisHello3) else ("HELLO 3", redisNoHello),
+    ("GET k", "$1\r\nv\r\n"),
+    ("GET none", nil),
+    ("SET k v", "+OK\r\n"),
+    ("SET k v PX 1500", "+OK\r\n"),
+    ("SET k v PX 1501", "+OK\r\n"),
+    ("SET k v NX", "+OK\r\n"),
+    ("SET k v NX PX 10", nil),
+    ("MGET a b", s"*2\r\n$$1\r\n1\r\n$nil"),
+    ("MSET a 1 b 2", "+OK\r\n"),
+    ("INCR n", ":1\r\n"),
+    ("INCRBY n 5", ":6\r\n"),
+    ("DECR n", ":5\r\n"),
+    ("DECRBY n -2", ":7\r\n"),
+    ("INCRBYFLOAT f 1.5", "$3\r\n2.5\r\n"),
+    ("APPEND s xyz", ":3\r\n"),
+    ("DEL a b", ":2\r\n"),
+    ("EXISTS a a", ":2\r\n"),
+    ("PEXPIRE k 1000", ":1\r\n"),
+    ("PEXPIRE none 1", ":0\r\n"),
+    ("PTTL k", ":1500\r\n"),
+    ("PTTL p", ":-1\r\n"),
+    ("PTTL none", ":-2\r\n"),
+    ("PERSIST k", ":1\r\n"),
+    ("HSET h a 1 b 2", ":2\r\n"),
+    ("HGET h a", "$1\r\n1\r\n"),
+    ("HGET h z", nil),
+    ("HMGET h a z", s"*2\r\n$$1\r\n1\r\n$nil"),
+    (
+      "HGETALL h",
+      if three then "%2\r\n$1\r\na\r\n$1\r\n1\r\n$1\r\nb\r\n$1\r\n2\r\n" else "*4\r\n$1\r\na\r\n$1\r\n1\r\n$1\r\nb\r\n$1\r\n2\r\n"
+    ),
+    ("HGETALL empty", if three then "%0\r\n" else "*0\r\n"),
+    ("HDEL h a", ":1\r\n"),
+    ("HEXISTS h b", ":1\r\n"),
+    ("HINCRBY h n 3", ":3\r\n"),
+    ("HLEN h", ":1\r\n"),
+    ("LPUSH l a b", ":2\r\n"),
+    ("RPUSH l c", ":3\r\n"),
+    ("LPOP l", "$1\r\nb\r\n"),
+    ("RPOP l", "$1\r\nc\r\n"),
+    ("LPOP e", nil),
+    ("LRANGE l 0 -1", "*1\r\n$1\r\na\r\n"),
+    ("LLEN l", ":1\r\n"),
+    ("SADD s a b", ":2\r\n"),
+    ("SREM s b", ":1\r\n"),
+    ("SMEMBERS s", if three then "~1\r\n$1\r\na\r\n" else "*1\r\n$1\r\na\r\n"),
+    ("SISMEMBER s a", ":1\r\n"),
+    ("SCARD s", ":1\r\n"),
+    ("ZADD z 1 a 2.5 b", ":2\r\n"),
+    ("ZRANGE z 0 -1", "*2\r\n$1\r\na\r\n$1\r\nb\r\n"),
+    (
+      "ZRANGE z 0 -1 WITHSCORES",
+      if three then "*2\r\n*2\r\n$1\r\na\r\n,1\r\n*2\r\n$1\r\nb\r\n,2.5\r\n" else "*4\r\n$1\r\na\r\n$1\r\n1\r\n$1\r\nb\r\n$3\r\n2.5\r\n"
+    ),
+    ("ZSCORE z b", if three then ",2.5\r\n" else "$3\r\n2.5\r\n"),
+    ("ZSCORE z q", nil),
+    ("ZINCRBY z 1 a", if three then ",2\r\n" else "$1\r\n2\r\n"),
+    ("ZRANK z b", ":1\r\n"),
+    ("ZRANK z q", nil),
+    ("ZREM z a", ":1\r\n"),
+    ("ZCARD z", ":1\r\n"),
+    ("ZADD z inf top -inf bottom", ":2\r\n"),
+    ("DBSIZE", ":3\r\n"),
+    ("FLUSHDB", "+OK\r\n"),
+    ("SELECT 3", "+OK\r\n"),
+    ("PUBLISH ch hi", ":0\r\n"),
+    ("WATCH a b", "+OK\r\n"),
+    ("UNWATCH", "+OK\r\n"),
+    ("GET h", "-WRONGTYPE Operation against a key holding the wrong kind of value\r\n"),
+    ("INCR s", "$1\r\nx\r\n"),
+    ("PING", "+PONG\r\n")
+  )
+
+redisTyped(three: bool)
+  val fake = redisScript(redisTypedScript(three)*)
+  val r = redisConnect(fake)
+  assertEq(r.protocol, if three then 3 else 2)
+  assertEq(r.get("k"), Ok(Some("v")))
+  assertEq(r.get("none"), Ok(None))
+  assertEq(r.set("k", "v"), Ok(()))
+  assertEq(r.set("k", "v", millis(1500)), Ok(()))
+  // A part of a millisecond counts as one.
+  assertEq(r.set("k", "v", Duration(1500001)), Ok(()))
+  assertEq(r.setIfAbsent("k", "v"), Ok(true))
+  assertEq(r.setIfAbsent("k", "v", Some(millis(10))), Ok(false))
+  assertEq(r.mget("a", "b"), Ok(Vector(Some("1"), None)))
+  assertEq(r.mset(("a", "1"), ("b", "2")), Ok(()))
+  assertEq(r.incr("n"), Ok(1))
+  assertEq(r.incrBy("n", 5), Ok(6))
+  assertEq(r.decr("n"), Ok(5))
+  assertEq(r.decrBy("n", -2), Ok(7))
+  assertEq(r.incrByFloat("f", 1.5), Ok(2.5))
+  assertEq(r.append("s", "xyz"), Ok(3))
+  assertEq(r.del("a", "b"), Ok(2))
+  assertEq(r.exists("a", "a"), Ok(2))
+  assertEq(r.expire("k", seconds(1)), Ok(true))
+  assertEq(r.expire("none", Duration(1)), Ok(false))
+  assertEq(r.ttl("k"), Ok(ExpiresIn(millis(1500))))
+  assertEq(r.ttl("p"), Ok(NoExpiry))
+  assertEq(r.ttl("none"), Ok(NoKey))
+  assertEq(r.persist("k"), Ok(true))
+  assertEq(r.hset("h", ("a", "1"), ("b", "2")), Ok(2))
+  assertEq(r.hget("h", "a"), Ok(Some("1")))
+  assertEq(r.hget("h", "z"), Ok(None))
+  assertEq(r.hmget("h", "a", "z"), Ok(Vector(Some("1"), None)))
+  val all = redisOk(r.hgetAll("h"))
+  assertEq(all.size, 2)
+  assertEq(all.get("a"), Some("1"))
+  assertEq(all.get("b"), Some("2"))
+  assertEq(redisOk(r.hgetAll("empty")).size, 0)
+  assertEq(r.hdel("h", "a"), Ok(1))
+  assertEq(r.hexists("h", "b"), Ok(true))
+  assertEq(r.hincrBy("h", "n", 3), Ok(3))
+  assertEq(r.hlen("h"), Ok(1))
+  assertEq(r.lpush("l", "a", "b"), Ok(2))
+  assertEq(r.rpush("l", "c"), Ok(3))
+  assertEq(r.lpop("l"), Ok(Some("b")))
+  assertEq(r.rpop("l"), Ok(Some("c")))
+  assertEq(r.lpop("e"), Ok(None))
+  assertEq(r.lrange("l", 0, -1), Ok(Vector("a")))
+  assertEq(r.llen("l"), Ok(1))
+  assertEq(r.sadd("s", "a", "b"), Ok(2))
+  assertEq(r.srem("s", "b"), Ok(1))
+  assertEq(r.smembers("s"), Ok(Vector("a")))
+  assertEq(r.sismember("s", "a"), Ok(true))
+  assertEq(r.scard("s"), Ok(1))
+  assertEq(r.zadd("z", (1.0, "a"), (2.5, "b")), Ok(2))
+  assertEq(r.zrange("z", 0, -1), Ok(Vector("a", "b")))
+  assertEq(r.zrangeWithScores("z", 0, -1), Ok(Vector(("a", 1.0), ("b", 2.5))))
+  assertEq(r.zscore("z", "b"), Ok(Some(2.5)))
+  assertEq(r.zscore("z", "q"), Ok(None))
+  assertEq(r.zincrBy("z", 1.0, "a"), Ok(2.0))
+  assertEq(r.zrank("z", "b"), Ok(Some(1)))
+  assertEq(r.zrank("z", "q"), Ok(None))
+  assertEq(r.zrem("z", "a"), Ok(1))
+  assertEq(r.zcard("z"), Ok(1))
+  assertEq(r.zadd("z", (real.PositiveInfinity, "top"), (real.NegativeInfinity, "bottom")), Ok(2))
+  assertEq(r.dbSize(), Ok(3))
+  assertEq(r.flushDb(), Ok(()))
+  assertEq(r.select(3), Ok(()))
+  assertEq(r.publish("ch", "hi"), Ok(0))
+  assertEq(r.watch("a", "b"), Ok(()))
+  assertEq(r.unwatch(), Ok(()))
+  assertEq(redisKind(r.get("h")), "server WRONGTYPE")
+  // A reply of the wrong kind is `UnexpectedReply`, and the connection goes on.
+  assertEq(r.incr("s"), Err(UnexpectedReply("a number", blobOf("x"))))
+  assertEq(r.ping(), Ok("PONG"))
+  assertEq(fake.connections.load(), 1)
+  // Every step of the script was asked for, in order.
+  assertEq(fake.commands(), redisTypedScript(three).map(s -> s.0))
+
+@test("the typed commands over RESP3's replies")
+redisTyped3() = redisTyped(true)
+
+@test("the typed commands over RESP2's replies")
+redisTyped2() = redisTyped(false)
+
+@test("a push before a reply is passed over, and attributes come off for the typed commands")
+redisPushesAndAttributes()
+  val fake = redisScript(
+    ("HELLO 3", redisHello3),
+    ("GET k", ">2\r\n$10\r\ninvalidate\r\n*1\r\n$1\r\nk\r\n>2\r\n+x\r\n+y\r\n$1\r\nv\r\n"),
+    ("GET a", "|1\r\n+ttl\r\n:5\r\n$1\r\nv\r\n"),
+    ("GET a", "|1\r\n+ttl\r\n:5\r\n$1\r\nv\r\n"),
+    ("INCR a", "|1\r\n+x\r\n+y\r\n:9\r\n"),
+    ("GET e", "|1\r\n+x\r\n+y\r\n-ERR inside\r\n")
+  )
+  val r = redisConnect(fake)
+  assertEq(r.get("k"), Ok(Some("v")))
+  assertEq(r.get("a"), Ok(Some("v")))
+  assertEq(r.command("GET", "a"), Ok(Attributed(Vector((SimpleString("ttl"), Number(5))), blobOf("v"))))
+  assertEq(r.incr("a"), Ok(9))
+  assertEq(redisKind(r.get("e")), "server ERR")
+
+@test("a pipeline sends every command before reading, and answers each reply in order")
+redisPipeline()
+  val fake = redisScript(
+    ("HELLO 3", redisHello3),
+    ("SET a 1", "+OK\r\n"),
+    ("BAD", "-ERR unknown command 'BAD'\r\n"),
+    ("GET a", "$1\r\n1\r\n"),
+    ("PING", "+PONG\r\n")
+  )
+  val r = redisConnect(fake)
+  val replies = redisOk(r.pipeline(p ->
+    p.command("SET", "a", "1")
+    p.command("BAD")
+    p.commandBytes("GET".utf8, "a".utf8)))
+  assertEq(
+    replies,
+    Vector(Ok(SimpleString("OK")), Err(ServerError("ERR", "ERR unknown command 'BAD'")), Ok(blobOf("1")))
+  )
+  // An empty pipeline sends nothing.
+  assertEq(r.pipeline(_ -> ()), Ok(Vector.empty[Result[Value, RedisError]]()))
+  assertEq(r.ping(), Ok("PONG"))
+
+@test("a pipeline far longer than one batch keeps its order and loses nothing")
+redisLongPipeline()
+  val counted = Atomic(0)
+  val fake = redisFake((_, _, words) -> words(0) match
+    "HELLO" -> Some(redisHello3)
+    "INCR" -> Some(s":${counted.add(1)}\r\n")
+    _ -> Some("-ERR unexpected\r\n"))
+  val r = redisConnect(fake)
+  val n = 20000
+  val replies = redisOk(r.pipeline(p -> for i in 0 ..< n do p.command("INCR", s"key-$i-${"x".repeat(i % 50)}")))
+  assertEq(replies.length, n)
+  for i in 0 ..< n do assertEq(replies(i), Ok(Number(long(i + 1))))
+  assertEq(fake.connections.load(), 1)
+
+@test("a transaction runs its commands between MULTI and EXEC, and answers what EXEC did")
+redisTransactions()
+  val fake = redisScript(
+    ("HELLO 3", redisHello3),
+    ("MULTI", "+OK\r\n"),
+    ("SET a 1", "+QUEUED\r\n"),
+    ("INCR a", "+QUEUED\r\n"),
+    ("EXEC", "*2\r\n+OK\r\n:2\r\n"),
+    ("MULTI", "+OK\r\n"),
+    ("INCR a", "+QUEUED\r\n"),
+    ("EXEC", "_\r\n"),
+    ("MULTI", "+OK\r\n"),
+    ("NOPE", "-ERR unknown command 'NOPE'\r\n"),
+    ("EXEC", "-EXECABORT Transaction discarded because of previous errors.\r\n"),
+    ("MULTI", "+OK\r\n"),
+    ("SET a 1", "+QUEUED\r\n"),
+    ("LPUSH a x", "+QUEUED\r\n"),
+    ("EXEC", "*2\r\n+OK\r\n-WRONGTYPE Operation against a key holding the wrong kind of value\r\n"),
+    ("MULTI", "-ERR MULTI calls can not be nested\r\n"),
+    ("EXEC", "-ERR EXEC without MULTI\r\n"),
+    ("MULTI", "+OK\r\n"),
+    ("EXEC", "*0\r\n"),
+    ("PING", "+PONG\r\n")
+  )
+  val r = redisConnect(fake)
+  assertEq(
+    r.transaction(t ->
+      t.command("SET", "a", "1")
+      t.command("INCR", "a")),
+    Ok(Some(Vector(Ok(SimpleString("OK")), Ok(Number(2)))))
+  )
+  // A watched key that changed: EXEC answers null and nothing ran.
+  assertEq(r.transaction(t -> t.command("INCR", "a")), Ok(None))
+  assertEq(redisKind(r.transaction(t -> t.command("NOPE"))), "server EXECABORT")
+  val mixed = redisOk(r.transaction(t ->
+    t.command("SET", "a", "1")
+    t.command("LPUSH", "a", "x"))).get
+  assertEq(mixed(0), Ok(SimpleString("OK")))
+  assertEq(redisKind(mixed(1)), "server WRONGTYPE")
+  assertEq(redisKind(r.transaction(_ -> ())), "server ERR")
+  assertEq(r.transaction(_ -> ()), Ok(Some(Vector.empty[Result[Value, RedisError]]())))
+  // Every reply was read, so the connection is in step.
+  assertEq(r.ping(), Ok("PONG"))
+  assertEq(fake.connections.load(), 1)
+
+@test("a broken connection fails its command and is made again by the next one")
+redisReconnect()
+  val fake = redisFake(
+    redisSteps(
+      Vector(
+        Vector(("HELLO 3", redisHello3), ("GET a", "<close>")),
+        Vector(("HELLO 3", redisHello3), ("GET a", "$1\r\n1\r\n"))
+      )
+    )
+  )
+  val r = redisConnect(fake, RedisOptions(reconnectDelay = millis(5)))
+  assertEq(redisKind(r.get("a")), "closed")
+  assert(!r.isOpen)
+  assertEq(r.protocol, 0)
+  assertEq(r.get("a"), Ok(Some("1")))
+  assert(r.isOpen)
+  assertEq(fake.connections.load(), 2)
+
+@test("reconnecting off, a server gone, and a server refusing the password again")
+redisReconnectLimits()
+  val off = redisFake(redisSteps(Vector(Vector(("HELLO 3", redisHello3), ("GET a", "<close>")))))
+  val r = redisConnect(off, RedisOptions(reconnectAttempts = 0))
+  assertEq(redisKind(r.get("a")), "closed")
+  val again = r.get("a")
+  assertEq(redisKind(again), "closed")
+  assert(again.err.get.message.contains("reconnecting is off"))
+  assertEq(off.connections.load(), 1)
+  // A server gone: each attempt is refused, waiting longer each time, and the last failure is the
+  // answer.
+  val l = redisOk(TcpListener.bind("127.0.0.1", 0).mapErr(e -> ConnectionFailed(e)))
+  val port = l.port()
+  val serving = spawn(() ->
+    val c = l.accept().ok.get
+    redisServe(c, 1, redisSteps(Vector(Vector(("HELLO 3", redisHello3), ("PING", "<close>")))), Channel[string]())
+    _ = c.close()
+    _ = l.close())
+  val gone = redisOk(Redis.connect("127.0.0.1", port, RedisOptions(reconnectAttempts = 3, reconnectDelay = millis(20))))
+  assertEq(redisKind(gone.ping()), "closed")
+  serving.join()
+  val started = monotonic()
+  assertEq(redisKind(gone.ping()), "connection failed")
+  // Two waits between three attempts: 20 ms, then 40.
+  assert((monotonic() - started).micros >= 60000)
+  // A refusal by the server is not tried again.
+  val refusing = redisFake(
+    redisSteps(
+      Vector(
+        Vector(("HELLO 3 AUTH default pw", redisHello3), ("GET a", "<close>")),
+        Vector(("HELLO 3 AUTH default pw", "-WRONGPASS invalid username-password pair\r\n"))
+      )
+    )
+  )
+  val r3 = redisConnect(
+    refusing,
+    RedisOptions(password = Some("pw"), reconnectAttempts = 3, reconnectDelay = millis(5))
+  )
+  assertEq(redisKind(r3.get("a")), "closed")
+  assertEq(redisKind(r3.get("a")), "server WRONGPASS")
+  assertEq(refusing.connections.load(), 2)
+
+@test("a reply slower than the timeout fails as TimedOut, and the connection is made again")
+redisTimeouts()
+  val fake = redisFake(
+    redisSteps(
+      Vector(
+        Vector(("HELLO 3", redisHello3), ("GET slow", "")),
+        Vector(("HELLO 3", redisHello3), ("GET a", "$1\r\n1\r\n"))
+      )
+    )
+  )
+  val r = redisConnect(fake, RedisOptions(timeout = millis(200), reconnectDelay = millis(5)))
+  val started = monotonic()
+  assertEq(redisKind(r.get("slow")), "timed out")
+  assert((monotonic() - started).micros >= 190000)
+  assertEq(r.get("a"), Ok(Some("1")))
+  assertEq(fake.connections.load(), 2)
+  // A server that never answers the handshake: the connection's own timeout is longer, and
+  // `connectTimeout` ends it.
+  val mute = redisScript(("HELLO 3", ""))
+  val began = monotonic()
+  val made = Redis.connect("127.0.0.1", mute.port, RedisOptions(connectTimeout = millis(200)))
+  assertEq(redisKind(made), "timed out")
+  assert((monotonic() - began).micros < 5000000)
+
+@test("a server that breaks the protocol, or sends past the limits, fails the command and the connection")
+redisProtocolFailures()
+  val fake = redisFake(
+    redisSteps(
+      Vector(
+        Vector(("HELLO 3", redisHello3), ("GET a", "?garbage\r\n")),
+        Vector(("HELLO 3", redisHello3), ("GET big", "$7\r\nhello!!\r\n")),
+        Vector(("HELLO 3", redisHello3), ("GET deep", "*1\r\n*1\r\n*1\r\n:1\r\n")),
+        Vector(("HELLO 3", redisHello3), ("GET a", "$1\r\n1\r\n"))
+      )
+    )
+  )
+  val r = redisConnect(
+    fake,
+    RedisOptions(limits = RespLimits(maxBulkBytes = 6, maxDepth = 2), reconnectDelay = millis(5))
+  )
+  assertEq(redisKind(r.get("a")), "malformed")
+  assert(!r.isOpen)
+  assertEq(redisKind(r.get("big")), "too long")
+  assertEq(redisKind(r.get("deep")), "protocol")
+  assertEq(r.get("a"), Ok(Some("1")))
+  assertEq(fake.connections.load(), 4)
+
+@test("closing the client: every command afterwards answers ConnectionClosed, and closing again is fine")
+redisClose()
+  val fake = redisScript(("HELLO 3", redisHello3), ("PING", "+PONG\r\n"))
+  val r = redisConnect(fake)
+  assertEq(r.ping(), Ok("PONG"))
+  assertEq(r.close(), Ok(()))
+  assert(!r.isOpen)
+  val after = r.ping()
+  assertEq(redisKind(after), "closed")
+  assertEq(after.err.get.message, "the Redis client is closed")
+  assertEq(r.close(), Ok(()))
+  assertEq(redisKind(r.pipeline(p -> p.command("PING"))), "closed")
+  assertEq(fake.connections.load(), 1)
+
+@test("scans follow the cursor across pages, empty ones too, and end at a failure")
+redisScans()
+  val fake = redisScript(
+    ("HELLO 3", redisHello3),
+    ("SCAN 0 MATCH * COUNT 100", "*2\r\n$2\r\n17\r\n*2\r\n$1\r\na\r\n$1\r\nb\r\n"),
+    ("SCAN 17 MATCH * COUNT 100", "*2\r\n$2\r\n23\r\n*0\r\n"),
+    ("SCAN 23 MATCH * COUNT 100", "*2\r\n$1\r\n0\r\n*1\r\n$1\r\nc\r\n"),
+    ("SCAN 0 MATCH user:* COUNT 5", "*2\r\n$1\r\n0\r\n*0\r\n"),
+    ("SCAN 0 MATCH * COUNT 100", "*2\r\n$1\r\n9\r\n*1\r\n$1\r\nx\r\n"),
+    ("SCAN 9 MATCH * COUNT 100", "-ERR invalid cursor\r\n"),
+    ("HSCAN h 0 MATCH * COUNT 100", "*2\r\n$1\r\n0\r\n*4\r\n$1\r\nf\r\n$1\r\n1\r\n$1\r\ng\r\n$1\r\n2\r\n"),
+    ("SSCAN s 0 MATCH * COUNT 100", "*2\r\n$1\r\n0\r\n~2\r\n$1\r\np\r\n$1\r\nq\r\n"),
+    ("ZSCAN z 0 MATCH * COUNT 100", "*2\r\n$1\r\n0\r\n*4\r\n$1\r\nm\r\n$3\r\n1.5\r\n$1\r\nn\r\n,2\r\n"),
+    ("SCAN 0 MATCH * COUNT 100", "+not a page\r\n")
+  )
+  val r = redisConnect(fake)
+  assertEq(r.scan().toVector, Vector(Ok("a"), Ok("b"), Ok("c")))
+  assertEq(r.scan("user:*", 5).toVector, Vector.empty[Result[string, RedisError]]())
+  val failing = r.scan().toVector
+  assertEq(failing.length, 2)
+  assertEq(failing(0), Ok("x"))
+  assertEq(redisKind(failing(1)), "server ERR")
+  assertEq(r.hscan("h").toVector, Vector(Ok(("f", "1")), Ok(("g", "2"))))
+  assertEq(r.sscan("s").toVector, Vector(Ok("p"), Ok("q")))
+  assertEq(r.zscan("z").toVector, Vector(Ok(("m", 1.5)), Ok(("n", 2.0))))
+  assertEq(r.scan().toVector.map(x -> redisKind(x)), Vector("unexpected"))
+
+@test("a subscriber receives what is published, keeping messages that come before a confirmation")
+redisSubscribe3()
+  val fake = redisScript(
+    ("HELLO 3", redisHello3),
+    (
+      "SUBSCRIBE news sport",
+      ">3\r\n+subscribe\r\n+news\r\n:1\r\n>3\r\n+message\r\n+news\r\n$5\r\nearly\r\n>3\r\n+subscribe\r\n+sport\r\n:2\r\n"
+    ),
+    (
+      "PSUBSCRIBE n*",
+      ">3\r\n+psubscribe\r\n+n*\r\n:3\r\n>4\r\n+pmessage\r\n+n*\r\n+nba\r\n$4\r\ndunk\r\n>3\r\n+message\r\n+sport\r\n$9\r\ngoal 😀\r\n"
+    ),
+    ("UNSUBSCRIBE news", ">3\r\n+unsubscribe\r\n+news\r\n:2\r\n>3\r\n+message\r\n+sport\r\n$4\r\nlate\r\n"),
+    ("PUNSUBSCRIBE", ">3\r\n+punsubscribe\r\n+n*\r\n:1\r\n")
+  )
+  val s = redisOk(Subscriber.connect("127.0.0.1", fake.port))
+  assertEq(s.subscribe("news", "sport"), Ok(()))
+  assertEq(s.psubscribe("n*"), Ok(()))
+  assertEq(s.channels, Vector("news", "sport"))
+  assertEq(s.patterns, Vector("n*"))
+  val early = redisOk(s.receive())
+  assertEq(early, PubSubMessage("news", "early".utf8.toArraySeq, None))
+  assertEq(early.text, "early")
+  assertEq(s.receive(), Ok(PubSubMessage("nba", "dunk".utf8.toArraySeq, Some("n*"))))
+  assertEq(redisOk(s.receive()).text, "goal 😀")
+  assertEq(fake.connections.load(), 1)
+  val started = monotonic()
+  assertEq(s.receive(millis(100)), Ok(None))
+  assert((monotonic() - started).micros >= 90000)
+  assertEq(s.receive(Duration.Zero), Ok(None))
+  assertEq(s.unsubscribe("news"), Ok(()))
+  assertEq(s.channels, Vector("sport"))
+  assertEq(redisOk(s.receive()).text, "late")
+  assertEq(s.punsubscribe(), Ok(()))
+  assertEq(s.patterns, Vector.empty[string]())
+  assertEq(s.receive(millis(50)), Ok(None))
+  // Subscribing to nothing sends nothing.
+  assertEq(s.subscribe(), Ok(()))
+  assertEq(
+    fake.commands(),
+    Vector("HELLO 3", "SUBSCRIBE news sport", "PSUBSCRIBE n*", "UNSUBSCRIBE news", "PUNSUBSCRIBE")
+  )
+  assertEq(s.close(), Ok(()))
+  assertEq(redisKind(s.receive()), "closed")
+
+@test("a RESP2 subscriber reads its arrays as RESP3's pushes")
+redisSubscribe2()
+  val fake = redisScript(
+    ("SUBSCRIBE a", "*3\r\n$9\r\nsubscribe\r\n$1\r\na\r\n:1\r\n*3\r\n$7\r\nmessage\r\n$1\r\na\r\n$3\r\none\r\n"),
+    (
+      "PSUBSCRIBE b?",
+      "*3\r\n$10\r\npsubscribe\r\n$2\r\nb?\r\n:2\r\n*4\r\n$8\r\npmessage\r\n$2\r\nb?\r\n$2\r\nbx\r\n$3\r\ntwo\r\n"
+    )
+  )
+  val s = redisOk(Subscriber.connect("127.0.0.1", fake.port, RedisOptions(protocol = 2)))
+  assertEq(s.subscribe("a"), Ok(()))
+  assertEq(s.psubscribe("b?"), Ok(()))
+  assertEq(s.receive(), Ok(PubSubMessage("a", "one".utf8.toArraySeq, None)))
+  assertEq(s.receive(), Ok(PubSubMessage("bx", "two".utf8.toArraySeq, Some("b?"))))
+
+@test("a subscriber's messages as an iterator, ending at a failure it keeps")
+redisSubscriberIterator()
+  val fake = redisScript(
+    ("HELLO 3", redisHello3),
+    (
+      "SUBSCRIBE c",
+      ">3\r\n+subscribe\r\n+c\r\n:1\r\n>3\r\n+message\r\n+c\r\n$1\r\n1\r\n>3\r\n+message\r\n+c\r\n$1\r\n2\r\n>3\r\n+message\r\n+c\r\n$1\r\n3\r\n<close>"
+    )
+  )
+  val s = redisOk(Subscriber.connect("127.0.0.1", fake.port, RedisOptions(reconnectAttempts = 0)))
+  assertEq(s.subscribe("c"), Ok(()))
+  var got = Vector.empty[string]()
+  for m in s.messages() do got = got :+ m.text
+  assertEq(got, Vector("1", "2", "3"))
+  assertEq(s.lastFailure.map(e -> e is ConnectionClosed(_)), Some(true))
+
+@test("a subscriber whose connection breaks is subscribed again on a new one")
+redisSubscriberReconnect()
+  val fake = redisFake(
+    redisSteps(
+      Vector(
+        Vector(
+          ("HELLO 3", redisHello3),
+          ("SUBSCRIBE a", ">3\r\n+subscribe\r\n+a\r\n:1\r\n"),
+          ("PSUBSCRIBE p*", ">3\r\n+psubscribe\r\n+p*\r\n:2\r\n>3\r\n+message\r\n+a\r\n$6\r\nbefore\r\n<close>")
+        ),
+        Vector(
+          ("HELLO 3", redisHello3),
+          ("SUBSCRIBE a", ">3\r\n+subscribe\r\n+a\r\n:1\r\n>3\r\n+message\r\n+a\r\n$5\r\nafter\r\n"),
+          ("PSUBSCRIBE p*", ">3\r\n+psubscribe\r\n+p*\r\n:2\r\n")
+        )
+      )
+    )
+  )
+  val s = redisOk(Subscriber.connect("127.0.0.1", fake.port, RedisOptions(reconnectDelay = millis(5))))
+  assertEq(s.subscribe("a"), Ok(()))
+  assertEq(s.psubscribe("p*"), Ok(()))
+  assertEq(redisOk(s.receive()).text, "before")
+  assertEq(redisOk(s.receive()).text, "after")
+  assertEq(fake.connections.load(), 2)
+  assertEq(s.channels, Vector("a"))
+  assert(s.isOpen)
+
+@test("a subscriber sent something not RESP makes its connection again, and one over the limits too")
+redisSubscriberMalformed()
+  val fake = redisFake(
+    redisSteps(
+      Vector(
+        Vector(("HELLO 3", redisHello3), ("SUBSCRIBE a", ">3\r\n+subscribe\r\n+a\r\n:1\r\n?bad\r\n")),
+        Vector(
+          ("HELLO 3", redisHello3),
+          ("SUBSCRIBE a", ">3\r\n+subscribe\r\n+a\r\n:1\r\n>3\r\n+message\r\n+a\r\n$99\r\n")
+        ),
+        Vector(
+          ("HELLO 3", redisHello3),
+          ("SUBSCRIBE a", ">3\r\n+subscribe\r\n+a\r\n:1\r\n>3\r\n+message\r\n+a\r\n$4\r\nfine\r\n")
+        )
+      )
+    )
+  )
+  val s = redisOk(
+    Subscriber.connect(
+      "127.0.0.1",
+      fake.port,
+      RedisOptions(reconnectDelay = millis(5), limits = RespLimits(maxBulkBytes = 50))
+    )
+  )
+  assertEq(s.subscribe("a"), Ok(()))
+  assertEq(redisOk(s.receive()).text, "fine")
+  assertEq(fake.connections.load(), 3)
+
+@test("a subscription the server refuses is its error, and is not recorded")
+redisSubscribeRefused()
+  val fake = redisScript(
+    ("HELLO 3", redisHello3),
+    ("SUBSCRIBE secret", "-NOPERM this user has no permissions to access the 'secret' channel\r\n")
+  )
+  val s = redisOk(Subscriber.connect("127.0.0.1", fake.port))
+  assertEq(redisKind(s.subscribe("secret")), "server NOPERM")
+  assertEq(s.channels, Vector.empty[string]())
+
+@test("a pool lends connections to many threads, at most its size, and lets a broken one go")
+redisPool()
+  val counted = Atomic(0)
+  val fake = redisFake((_, _, words) -> words(0) match
+    "HELLO" -> Some(redisHello3)
+    "INCR" ->
+      sleep(millis(2))
+      Some(s":${counted.add(1)}\r\n")
+    "BREAK" -> None
+    _ -> Some("-ERR unexpected\r\n"))
+  val pool = Redis.pool("127.0.0.1", fake.port, maxSize = 3)
+  val done = Atomic(0)
+  scope(sc ->
+    for _ in 0 ..< 30
+      sc.spawn(() ->
+        if pool.use(r -> r.incr("n")) is Ok(Ok(_)) then _ = done.add(1)))
+  assertEq(done.load(), 30)
+  assertEq(counted.load(), 30)
+  assert(fake.connections.load() <= 3)
+  val before = fake.connections.load()
+  // A connection broken while lent is closed, not lent again; the next call gets a new one.
+  assertEq(pool.use(r -> redisKind(r.command("BREAK"))), Ok("closed"))
+  scope(sc ->
+    for _ in 0 ..< 6 do sc.spawn(() -> _ = pool.use(r -> r.incr("n"))))
+  assertEq(counted.load(), 36)
+  assert(fake.connections.load() <= before + 1)
+  pool.close()
+
+@test("TLS: a connection to a server with a certificate the client trusts, and one it does not")
+redisTls()
+  val fixture = (name: string) ->
+    val here = "tests/fixtures/tls/" + name
+    fs.readText(if fs.exists(here) then here else "../" + here).ok.get
+  val identity = TlsServer.of(fixture("localhost.pem"), fixture("localhost.key")).ok.get
+  val fake = redisFake(redisSteps(Vector(Vector(("HELLO 3", redisHello3), ("PING", "+PONG\r\n")))), Some(identity))
+  val trusting = RedisOptions(tls = Some(TlsClient().trust(fixture("ca.pem"))))
+  val r = redisOk(Redis.connect("localhost", fake.port, trusting))
+  assertEq(r.ping(), Ok("PONG"))
+  assertEq(r.protocol, 3)
+  // The certificate names `localhost`; connecting by address checks it against `tlsHost`.
+  val byAddress = RedisOptions(tls = Some(TlsClient().trust(fixture("ca.pem"))), tlsHost = Some("localhost"))
+  assertEq(redisOk(Redis.connect("127.0.0.1", fake.port, byAddress)).ping(), Ok("PONG"))
+  assertEq(
+    redisKind(Redis.connect("localhost", fake.port, RedisOptions(tls = Some(TlsClient())))),
+    "certificate refused"
+  )
+  // TLS to a server that speaks none fails, as does plain text to a TLS server.
+  val plain = redisScript(("HELLO 3", redisHello3))
+  assertEq(redisKind(Redis.connect("127.0.0.1", plain.port, trusting)), "tls failed")
+  assertEq(
+    redisKind(
+      Redis.connect("127.0.0.1", fake.port, RedisOptions(connectTimeout = seconds(2), timeout = seconds(2)))
+    ) != "ok",
+    true
+  )
+
+@test(should_trap: "Redis speaks 2 and 3")
+redisBadProtocol() = _ = RedisOptions(protocol = 4)
+
+@test(should_trap: "numbered from zero")
+redisBadDatabase() = _ = RedisOptions(database = -1)
+
+@test(should_trap: "at least zero")
+redisBadAttempts() = _ = RedisOptions(reconnectAttempts = -1)

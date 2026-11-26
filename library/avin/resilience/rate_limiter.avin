@@ -1,0 +1,111 @@
+module avin.resilience
+
+// Rate limiting for any work, not only a server's requests: a token bucket for each key, a call
+// taking a token and one finding the bucket empty told how long until the next comes. Buckets are
+// kept by a key, and a bucket full again is forgotten, since a new one would be the same, so the
+// memory held follows the keys in use now and never passes a bound. The HTTP middleware of
+// `avin.net.http` is this limiter keyed by the client.
+
+import avin.threads.{Context, Mutex, sleep}
+import avin.time.{Duration, monotonic}
+
+// A token bucket for each key: `burst` tokens to begin with and at most, filled again at `rate`
+// tokens every `per`, so a key may take `burst` tokens at once and `rate` every `per` after that. At
+// most `maxKeys` buckets are held: making one more first forgets every bucket full again, and where
+// none is, the one nearest to full, the one whose forgetting changes least. A rate, a burst or a
+// `maxKeys` below one traps, and so does a `per` too short to give each of `rate` tokens a whole
+// microsecond. The time is read from `clock`, and `acquire` waits with `pause`.
+//
+//     val outbound = RateLimiter(10, seconds(1))
+//     if outbound.acquire() then send(message)
+class RateLimiter(
+    val rate: int,
+    val per: Duration,
+    val burst: int = rate,
+    val maxKeys: int = 10000,
+    private val clock: Clock = monotonic,
+    private val pause: Pause = sleep
+): Sendable
+  if rate < 1 then fail(s"a rate of $rate tokens: it is at least one")
+  if burst < 1 then fail(s"a burst of $burst tokens: it is at least one")
+  if maxKeys < 1 then fail(s"a limit of $maxKeys keys: it is at least one")
+  if per.micros < long(rate) then fail(s"$rate tokens every $per: each token needs at least a microsecond")
+
+  // The time between one token and the next, in microseconds.
+  private val interval: long = per.micros / long(rate)
+
+  // How far ahead of now a bucket's next token may be due and still leave a token to take: a bucket
+  // of `burst` tokens is empty once its last is spent, `burst` intervals' filling away.
+  private val slack: long = interval * long(burst - 1)
+
+  private val buckets = Mutex(Buckets())
+
+  // Takes a token from the bucket of `key`: `Ok` where there was one, and `Err` of how long until the
+  // next comes where there was none. It never waits.
+  admit(key: string) -> Result[unit, Duration]
+    val now = clock().micros
+    val i = interval
+    val s = slack
+    val most = maxKeys
+    val waitMicros = buckets.with(b -> b.take(key, now, i, s, most))
+    if waitMicros == 0 then Ok(()) else Err(Duration(waitMicros))
+
+  // `admit` of the one bucket a limiter used without keys keeps, the key `""`.
+  admit() -> Result[unit, Duration] = admit("")
+
+  // Takes a token from the bucket of `key`, waiting for one to come where there is none, and answers
+  // `true` once it has. Where the calling code runs under a deadline (`withDeadline`) and the next
+  // token comes no sooner than the deadline, it answers `false` at once rather than wait for nothing.
+  // Waiters take no place in a queue: a token goes to the first to ask once it has come.
+  acquire(key: string) -> bool
+    while true
+      admit(key) match
+        Ok(()) -> return true
+        Err(wait) ->
+          if !beforeDeadline(wait) then return false
+          pause(wait)
+    false
+
+  // `acquire` of the bucket `""`.
+  acquire() -> bool = acquire("")
+
+  // How many buckets are held now.
+  size -> int = buckets.with(b -> b.due.size)
+
+// Whether a wait of `d` ends before the calling thread's deadline, every wait doing so where there is
+// none.
+private beforeDeadline(d: Duration) -> bool = Context.current().remaining() match
+  Some(left) -> d < left
+  None -> true
+
+// Every bucket held, each kept as the time its next token is due, on the clock's microseconds: a
+// bucket whose time has come is full, the burst's worth of tokens being due before it.
+private class Buckets()
+  var due = HashMap.empty[string, long]()
+
+  // Takes a token from `k`'s bucket at `now`, answering zero, or answers how many microseconds until
+  // it has one.
+  take(k: string, now: long, interval: long, slack: long, maxKeys: int) -> long
+    val held = due.get(k)
+    val next = held match
+      Some(t) -> if t > now then t else now
+      None -> now
+    if next - now > slack then return next - now - slack
+    if held.isEmpty && due.size >= maxKeys then makeRoom(now)
+    due = due.updated(k, next + interval)
+    0
+
+  // Forgets every bucket full again by `now`, or, where none is, the one nearest to full.
+  private makeRoom(now: long)
+    val kept = due.filter((_, t) -> t > now)
+    if kept.size < due.size
+      due = kept
+      return
+    var nearest: Option[(string, long)] = None
+    for (k, t) in due
+      nearest match
+        Some((_, n)) -> if t < n then nearest = Some((k, t))
+        None -> nearest = Some((k, t))
+    nearest match
+      Some((k, _)) -> due = due.removed(k)
+      None -> ()

@@ -1,0 +1,161 @@
+// expect: exit 0
+// The HTTPS server's `handshakeTimeout`, the bound on the whole of a connection's TLS handshake from
+// its acceptance: a client trickling its ClientHello a byte at a time, faster than `readTimeout` but
+// slower than the bound, is closed unanswered at about the bound, as is a client silent from the
+// start, which `readTimeout` alone would hold longer; with one connection at most, the next HTTPS
+// client, waiting behind a trickler, is served once the trickler is cut; a normal HTTPS request is
+// served; the bound covers the handshake alone, not the requests after it, and not a plain HTTP
+// server; a bound of zero is no limit, a trickler then cut by `readTimeout` only once it stops; and a
+// bound of a microsecond refuses every handshake.
+import avin.fs
+import avin.io.IoError
+import avin.net.{StreamReader, StreamWriter, TcpServer, TcpStream}
+import avin.net.http
+import avin.net.http.{Request, Response, ServerRequest}
+import avin.net.tls.{TlsClient, TlsServer, TlsStream}
+import avin.threads.{Atomic, sleep, spawn}
+import avin.time
+import avin.time.{Duration, micros, millis, monotonic}
+
+ok[T](r: Result[T, IoError]) -> T = r match
+  Ok(v) -> v
+  Err(e) -> fail(e.message)
+
+// A test certificate or key, from the repository root or from `compiler/`.
+fixture(name: string) -> string
+  val here = "tests/fixtures/tls/" + name
+  ok(fs.readText(if fs.exists(here) then here else "../" + here))
+
+trusting() -> TlsClient = TlsClient().trust(fixture("ca.pem"))
+
+served(r: ServerRequest) -> Response = Response.text(200, s"served ${r.target}")
+
+started(
+    handshakeTimeout: Duration,
+    readTimeout: Duration = time.seconds(5),
+    maxConnections: int = 1024
+) -> TcpServer =
+  ok(
+    http.serve(
+      "127.0.0.1",
+      0,
+      served,
+      maxConnections,
+      readTimeout = readTimeout,
+      tls = Some(TlsServer(fixture("localhost.pem"), fixture("localhost.key"))),
+      handshakeTimeout = handshakeTimeout
+    )
+  )
+
+// The first bytes of a TLS record carrying a ClientHello of 512 bytes, then the hello's own bytes:
+// the server waits for the whole record before it can answer anything.
+hello() -> Array[byte]
+  val head = [22, 3, 1, 2, 0, 1, 0, 1, 252, 3, 3]
+  Array.tabulate(512 + 5, i -> if i < head.length then byte(head(i)) else byte(0))
+
+// Writes `bytes` a byte at a time, `every` apart, the first at once, the first `count` of them at
+// most, until a write fails or `stop` is set.
+trickle(w: StreamWriter, bytes: Array[byte], count: int, every: Duration, stop: Atomic[bool])
+  for i in 0 ..< count
+    if i > 0 then sleep(every)
+    if stop.load() then return
+    if w.write(bytes.slice(i, i + 1)).isErr then return
+
+// How the server ended a connection: closed, by its end or a reset, or answered with bytes.
+ending(r: StreamReader) -> string = r.read(1024) match
+  Ok(got) -> if got.length == 0 then "closed" else "answered"
+  Err(_) -> "closed"
+
+// A raw client trickling `count` bytes of a ClientHello, `every` apart: how the server ended it, and
+// how long after the connection that took.
+trickled(server: TcpServer, count: int, every: Duration) -> (string, Duration)
+  val start = monotonic()
+  val (r, w) = ok(TcpStream.connect("127.0.0.1", server.port())).split()
+  ok(r.setTimeout(time.seconds(10)))
+  val stop = Atomic(false)
+  val writer = spawn(() -> trickle(w, hello(), count, every, stop))
+  val how = ending(r)
+  val took = monotonic() - start
+  stop.store(true)
+  _ = writer.join()
+  _ = r.close()
+  (how, took)
+
+within(took: Duration, lo: Duration, hi: Duration) -> bool = lo <= took < hi
+
+fetched(server: TcpServer, target: string) -> string =
+  http.send(Request("GET", s"https://localhost:${server.port()}$target").withTls(trusting())) match
+    Ok(response) -> s"${response.status} ${string.fromUtf8Lossy(response.body)}"
+    Err(e) -> s"failed: ${e.message}"
+
+main()
+  val bound = millis(500)
+  val late = time.seconds(3)
+
+  // Trickled a byte every 50 ms, far faster than `readTimeout` (five seconds), the ClientHello is
+  // cut at about the bound, without an answer.
+  val strict = started(bound)
+  val (how, took) = trickled(strict, 517, millis(50))
+  println(s"a trickled ClientHello: $how, within the bound: ${within(took, bound, late)}")
+
+  // A client sending nothing at all is cut at the bound too, not at `readTimeout`.
+  val silent = ok(TcpStream.connect("127.0.0.1", strict.port()))
+  ok(silent.setTimeout(time.seconds(10)))
+  val quiet = monotonic()
+  val said = silent.read(1024) match
+    Ok(got) -> if got.length == 0 then "closed" else "answered"
+    Err(_) -> "closed"
+  println(s"a silent client: $said, within the bound: ${within(monotonic() - quiet, bound, late)}")
+  _ = silent.close()
+
+  // A normal HTTPS request is served, and the server goes on serving after the cuts.
+  println(fetched(strict, "/normal"))
+
+  // The bound covers the handshake alone: a connection quiet for longer than it once the handshake
+  // is done, then sending its request, is served.
+  val tls = TlsStream.connect("localhost", strict.port(), trusting()) match
+    Ok(s) -> s
+    Err(e) -> fail(e.message)
+  ok(tls.setTimeout(time.seconds(10)))
+  sleep(millis(800))
+  ok(tls.writeText("GET /after HTTP/1.1\r\nHost: t\r\nConnection: close\r\n\r\n"))
+  println(s"after the handshake: ${ok(tls.readLine()).getOrElse("")}")
+  _ = tls.close()
+  strict.shutdown()
+
+  // One connection at most: a client trickling its ClientHello holds it until the bound, and then
+  // the HTTPS client waiting behind it is served.
+  val single = started(bound, maxConnections = 1)
+  val (r, w) = ok(TcpStream.connect("127.0.0.1", single.port())).split()
+  ok(r.setTimeout(time.seconds(10)))
+  val stop = Atomic(false)
+  val writer = spawn(() -> trickle(w, hello(), 517, millis(50), stop))
+  sleep(millis(100))
+  val start = monotonic()
+  val next = fetched(single, "/next")
+  println(s"behind the trickler: $next, soon: ${monotonic() - start < late}")
+  println(s"the trickler: ${ending(r)}")
+  stop.store(true)
+  _ = writer.join()
+  _ = r.close()
+  single.shutdown()
+
+  // A bound of zero is no limit: a ClientHello trickled for over a second (each wait well inside a
+  // `readTimeout` of 400 ms) is not cut until it stops and a wait outlasts `readTimeout`.
+  val unbounded = started(Duration.Zero, readTimeout = millis(400))
+  val (endless, lasted) = trickled(unbounded, 24, millis(50))
+  println(s"no bound: $endless, after the trickle stopped: ${within(lasted, millis(1150), time.seconds(4))}")
+  println(fetched(unbounded, "/unbounded"))
+  unbounded.shutdown()
+
+  // A bound of a microsecond is spent before the first wait: every handshake is refused.
+  val tiny = started(micros(1))
+  println(s"a microsecond: ${fetched(tiny, "/tiny").startsWith("failed")}")
+  tiny.shutdown()
+
+  // A plain HTTP server has no handshake, and the bound does not reach it.
+  val plain = ok(http.serve("127.0.0.1", 0, served, handshakeTimeout = micros(1)))
+  http.send(Request("GET", s"http://127.0.0.1:${plain.port()}/plain")) match
+    Ok(response) -> println(s"plain: ${response.status} ${string.fromUtf8Lossy(response.body)}")
+    Err(e) -> println(s"plain failed: ${e.message}")
+  plain.shutdown()

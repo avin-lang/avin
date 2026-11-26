@@ -1,0 +1,61 @@
+// expect: exit 0
+// Large sparse files mapped: a 200 MB file and one of 5 GiB, whose offsets past `int`'s range are
+// reached by `long` ones, read and written through the mapping and checked through the file. Only the
+// pages touched are read, so the program stays small whatever the file's length.
+import avin.fs
+import avin.io.IoError
+
+impl[T] Result[T, IoError]
+  get() -> T = self match
+    Ok(v) -> v
+    Err(e) -> fail(s"unexpected $e")
+
+bytesOf(text: string) -> Array[byte] = Array.tabulate(text.byteLength, i -> text.byteAt(i))
+
+text(b: Array[byte]) -> string = string.fromUtf8Lossy(b)
+
+main()
+  val dir = fs.createTempDir("avin-mapped-large").get()
+  // 200 MB, written only near the end.
+  val mid = dir + "/mid"
+  val big: long = 200000000
+  val f = fs.createUpdate(mid).get()
+  _ = f.writeAt(big - 4, bytesOf("tail")).get()
+  _ = f.close()
+  val m = fs.mapFile(mid).get()
+  println(m.length == big)
+  println(text(m.slice(big - 4, big)))
+  println(s"${m(0)} ${m(100000000)} ${m(big - 5)}")
+  _ = m.close()
+  // Written through a writable mapping in the middle, read back through the file.
+  val w = fs.mapFileMutable(mid).get()
+  w.writeAt(123456789, bytesOf("middle"))
+  w(0) = byte(int('S'))
+  _ = w.flush().get()
+  _ = w.close()
+  val back = fs.open(mid).get()
+  println(text(back.readAt(123456789, 6).get()))
+  println(text(back.readAt(0, 1).get()))
+  _ = back.close()
+  // 5 GiB: an offset above 4 GiB, past what an `int` holds.
+  val huge = dir + "/huge"
+  val far: long = 5368709120
+  val g = fs.createUpdate(huge).get()
+  _ = g.setLength(far + 16).get()
+  _ = g.close()
+  val hm = fs.mapFileMutable(huge).get()
+  println(hm.length == far + 16)
+  hm.writeAt(far, bytesOf("far away"))
+  hm(far + 15) = byte(int('!'))
+  _ = hm.flush().get()
+  println(text(hm.slice(far, far + 8)))
+  println(s"${hm(far - 1)} ${hm(2147483648)} ${hm(4294967296)}")
+  _ = hm.close()
+  val hr = fs.mapFile(huge).get()
+  println(text(hr.slice(far, far + 8)))
+  println(hr(far + 15))
+  _ = hr.close()
+  val check = fs.open(huge).get()
+  println(text(check.readAt(far, 8).get()))
+  _ = check.close()
+  _ = fs.removeDirAll(dir).get()

@@ -1,0 +1,60 @@
+// expect: exit 0
+// Forms over the loopback: the client sends an urlencoded form with `withForm` and a multipart one
+// with `withMultipart`, the server reads them with `form()` and `multipart()` behind routes whose
+// handlers end with `?`, so a body of the wrong type is answered `415`, a malformed one `400`, one
+// over the multipart limits `413`, and one over the server's own body limit `413` before any
+// handler runs.
+import avin.io.IoError
+import avin.net.http
+
+import avin.net.http.{
+  HttpError, Multipart, MultipartLimits, Part, Request, Response, Route, Router, ServerRequest, ToResponse
+}
+
+ok[T](r: Result[T, IoError]) -> T = r match
+  Ok(v) -> v
+  Err(e) -> fail(e.message)
+
+login(r: ServerRequest) -> Result[Response, ToResponse]
+  val form = r.form()?
+  Ok(Response.text(200, s"user=${form.value("user").getOrElse("-")} tags=${form.values("tag")}"))
+
+upload(r: ServerRequest) -> Result[Response, ToResponse]
+  val form = r.multipart(MultipartLimits(maxParts = 3))?
+  val described = form.parts.map(p -> s"${p.name}:${p.filename.getOrElse("-")}:${p.contentType}:${p.body.length}")
+  Ok(Response.text(200, s"title=${form.field("title").getOrElse("-")} $described"))
+
+describe(r: Result[Response, HttpError]) -> string = r match
+  Ok(res) -> s"${res.status} ${res.text.trim}"
+  Err(e) -> s"error: ${e.message}"
+
+main()
+  val router = Router([Route.post("/login", login), Route.post("/upload", upload)])
+  val server = ok(http.serve("127.0.0.1", 0, router.handle, maxBodyBytes = 4096))
+  val base = s"http://127.0.0.1:${server.port()}"
+
+  val toLogin = Request("POST", s"$base/login")
+  println(describe(http.send(toLogin.withForm([("user", "zoë"), ("tag", "a b"), ("tag", "c&d")]))))
+  println(describe(http.send(toLogin.withForm(Vector.empty[(string, string)]()))))
+  println(
+    describe(http.send(toLogin.withBody("user=%zz").withHeader("Content-Type", "application/x-www-form-urlencoded")))
+  )
+  println(describe(http.send(toLogin.withBody("user=x").withHeader("Content-Type", "text/plain"))))
+  println(describe(http.send(toLogin.withBody("user=x"))))
+
+  val parts = [
+    Part.field("title", "Report ✓"),
+    Part.file("doc", "../../r.bin", "application/octet-stream", Array(byte(0), byte(13), byte(10), byte(45), byte(45)))
+  ]
+  val toUpload = Request("POST", s"$base/upload")
+  println(describe(http.send(toUpload.withMultipart(Multipart(parts)))))
+  println(describe(http.send(toUpload.withMultipart(Multipart(parts), "fixed boundary"))))
+  println(describe(http.send(toUpload.withMultipart(Multipart(parts ++ parts)))))
+  println(describe(http.send(toUpload.withForm([("title", "x")]))))
+  println(
+    describe(http.send(toUpload.withBody("--b\r\n").withHeader("Content-Type", "multipart/form-data; boundary=b")))
+  )
+  println(describe(http.send(toUpload.withBody("x").withHeader("Content-Type", "multipart/form-data"))))
+  val big = Multipart([Part.file("doc", "big", "application/octet-stream", Array.fill(5000, byte(1)))])
+  println(describe(http.send(toUpload.withMultipart(big))))
+  server.stop()

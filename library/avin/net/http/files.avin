@@ -1,0 +1,341 @@
+module avin.net.http
+
+// Static files: a handler serving the files under a directory, each with its type, an `ETag` and a
+// `Last-Modified`, answering conditional requests with `304` and `412`, a single byte range with
+// `206` and an unsatisfiable one with `416`, and streaming the body from the file so a large file
+// never sits in memory whole.
+
+import avin.fs
+import avin.fs.File
+import avin.io.{IoError, PermissionDenied}
+import avin.net.Url
+import avin.time.{now, parseHttpDate}
+
+// The content types of files, chosen by the extension of a file's name, compared without regard to
+// case: `app.JS` is `text/javascript; charset=utf-8`. A name with no extension, or one the table does
+// not know, has the `fallback` type. A type is sent as the table gives it, so a text type says its
+// charset there. `MimeTypes.standard` knows the types of the web; `with` extends a table.
+class MimeTypes(private val types: HashMap[string, string], val fallback: string = "application/octet-stream"): Sendable
+  checkType(fallback)
+
+  // The type of the file `name`, by its extension: the text after the last `.` of its last
+  // segment, where that `.` is not the segment's first character.
+  typeOf(name: string) -> string = extensionOf(name) match
+    Some(e) -> types.get(e).getOrElse(fallback)
+    None -> fallback
+
+  // The type of files of the extension `extension` (without its `.`), `None` where the table does
+  // not know it.
+  get(extension: string) -> Option[string] = types.get(extension.toLower)
+
+  // The table with files of `extension` having the type `contentType`, in place of any type it gave
+  // them. An extension that is empty or holds a `.` or `/`, or a type holding a line break, traps.
+  with(extension: string, contentType: string) -> MimeTypes
+    if extension.isEmpty || extension.contains(".") || extension.contains("/") then fail(
+      s"`$extension` is not a file extension"
+    )
+    checkType(contentType)
+    MimeTypes(types.updated(extension.toLower, contentType), fallback)
+
+  // The table with `contentType` for the names it does not know.
+  withFallback(contentType: string) -> MimeTypes = MimeTypes(types, contentType)
+
+object MimeTypes
+  // The types of the files a web site serves: its pages, styles, scripts, data, images, fonts,
+  // audio, video and archives: `fs.contentTypes`, the table `fs.contentTypeOfName` reads. Every
+  // `text/` type says `charset=utf-8`.
+  val standard: MimeTypes = MimeTypes(fs.contentTypes)
+
+// A type is a header's value, so it holds no line break.
+private checkType(contentType: string)
+  if contentType.isEmpty || contentType.indexWhere(c -> c == '\r' || c == '\n') >= 0 then fail(
+    s"`$contentType` is not a content type"
+  )
+
+// The extension of the last segment of `name`, lower-cased, where it has one.
+private extensionOf(name: string) -> Option[string]
+  val file = name.slice(name.lastIndexOf("/") + 1, name.byteLength)
+  val dot = file.lastIndexOf(".")
+  if dot <= 0 || dot == file.byteLength - 1 then None else Some(file.slice(dot + 1, file.byteLength).toLower)
+
+// A handler serving the files under the directory `root` for `GET` and `HEAD`; any other method is
+// answered `405` with `Allow: GET, HEAD`. Mounted by `at(prefix)`, the path after the prefix names
+// the file; used as a handler of its own, the whole path does.
+//
+// A file is answered `200` with its type from `types`, its length, `Accept-Ranges: bytes`, a weak
+// `ETag` made from its size and modification time, its `Last-Modified`, and `Cache-Control` where
+// `cacheControl` gives one; its body is read from the file `chunkBytes` at a time as it is sent, so
+// memory does not grow with the file. Conditional requests are answered as RFC 9110 §13.2.2 orders
+// them: `If-Match`, then `If-Unmodified-Since` where there is no `If-Match`, failing with `412`; then
+// `If-None-Match`, then `If-Modified-Since` where there is no `If-None-Match`, answered `304` with no
+// body. A `GET` with a `Range` of one byte range is answered `206` with that range and its
+// `Content-Range`, unless an `If-Range` says the file changed; a range starting past the end is
+// answered `416` with `Content-Range: bytes */length`; a `Range` that is malformed, of another unit
+// or of several ranges is ignored and the whole file sent.
+//
+// A path naming a directory without a final `/` is redirected there with `301`; a directory is
+// answered with its `index` file where it has one, otherwise with a listing of its entries where
+// `listing`, otherwise `404`. A path is refused `400` where a segment is `.` or `..` or holds a `/`,
+// a `\` or a NUL, written plainly or escaped; a name beginning with `.` is not served (`404`) unless
+// `dotfiles`; a file reached through a link that leads outside the root is refused `403` unless
+// `linksOutside`; anything that is neither a file nor a directory is `404`. The answers for error
+// statuses are rendered by `errors`. A `chunkBytes` less than one traps.
+class FileServer(
+    val root: string,
+    val index: Option[string] = Some("index.html"),
+    val listing: bool = false,
+    val dotfiles: bool = false,
+    val linksOutside: bool = false,
+    val cacheControl: Option[string] = None,
+    val types: MimeTypes = MimeTypes.standard,
+    val chunkBytes: int = 65536,
+    private val errors: ErrorPage = plainError
+): Sendable
+  if chunkBytes < 1 then fail(s"a chunk of $chunkBytes bytes: a chunk is at least one byte")
+  if cacheControl is Some(c)
+    if c.indexWhere(ch -> ch == '\r' || ch == '\n') >= 0 then fail(s"the Cache-Control `$c` holds a line break")
+
+  // A `GET` route at `prefix` and below serving the directory, the path after `prefix` naming the
+  // file: `at("/static")` serves `/static/app.css` from `root/app.css`, and `at("/")` the whole
+  // path. A prefix not beginning with `/`, or other than `/` ending with one, traps.
+  at(prefix: string) -> Route =
+    Route.get(if prefix == "/" then "/*path" else joined(prefix, "/*path"), r -> handle(r))
+
+  // The answer to `request`.
+  handle(request: ServerRequest) -> Response
+    if request.method != "GET" && request.method != "HEAD"
+      return rendered(errors, 405).withHeader("Allow", "GET, HEAD")
+    val asked = request.segments.drop(mountDepth(request.route))
+    val names = Buffer[string]()
+    for s in asked
+      if s == "." || s == ".." || s.contains("/") || s.contains("\\") || s.contains("\u0000")
+        return rendered(errors, 400)
+      if s.startsWith(".") && !dotfiles then return rendered(errors, 404)
+      if !s.isEmpty then names.addOne(s)
+    val wantsDir = request.path.endsWith("/")
+    val base = fs.canonicalize(root) match
+      Ok(b) -> b
+      Err(_) -> return rendered(errors, 404)
+    val file = resolved(base, fs.join(base +: names.toVector)) match
+      Ok(f) -> f
+      Err(status) -> return rendered(errors, status)
+    val meta = fs.metadata(file) match
+      Ok(m) -> m
+      Err(e) -> return rendered(errors, statusOf(e))
+    if meta.isDir
+      if !wantsDir then return redirected(request.target)
+      if index is Some(name)
+        resolved(base, fs.join(file, name)) match
+          Ok(page) ->
+            fs.metadata(page) match
+              Ok(m) -> if m.isFile then return served(request, page, m)
+              Err(_) -> ()
+          Err(403) -> return rendered(errors, 403)
+          Err(_) -> ()
+      if listing then return listed(request, file)
+      return rendered(errors, 404)
+    if !meta.isFile || wantsDir then return rendered(errors, 404)
+    served(request, file, meta)
+
+  // `path` with its links resolved, refused `403` where that leads outside `base` and links outside
+  // are not followed, or answered with the status its failure calls for.
+  private resolved(base: string, path: string) -> Result[string, int]
+    val found = fs.canonicalize(path).mapErr(statusOf)?
+    if linksOutside || found == base || found.startsWith(if base.endsWith("/") then base else base + "/") then Ok(found)
+    else Err(403)
+
+  // The answer to `request` for the file `file`, whose metadata is `meta`.
+  private served(request: ServerRequest, file: string, meta: fs.Metadata) -> Response
+    val size = meta.size
+    val tag = s"W/\"${size.toRadix(16)}-${meta.modified.epochMicros.toRadix(16)}\""
+    val seconds = meta.modified.epochSeconds
+    val dated = MinHttpSecond <= seconds <= MaxHttpSecond
+    val lastModified = if dated then Some(meta.modified.toHttpDate()) else None
+    val headers = Buffer[(string, string)]()
+    headers.addOne(("ETag", tag))
+    if lastModified is Some(d) then headers.addOne(("Last-Modified", d))
+    if cacheControl is Some(c) then headers.addOne(("Cache-Control", c))
+    preconditions(request, tag, if dated then Some(seconds) else None) match
+      Failed -> return rendered(errors, 412)
+      Unchanged -> return withAll(Response.empty(304), headers)
+      Proceed -> ()
+    headers.addOne(("Accept-Ranges", "bytes"))
+    val contentType = types.typeOf(file)
+    val asked = if request.method == "GET" && rangeHolds(request, tag, if dated then Some(seconds) else None)
+      request.header("Range") match
+        Some(r) -> rangeOf(r, size)
+        None -> Whole
+    else Whole
+    val (status, start, length) = asked match
+      Whole -> (200, long(0), size)
+      Span(first, last) -> (206, first, last - first + 1)
+      Unsatisfiable ->
+        return withAll(rendered(errors, 416), headers.toVector :+ ("Content-Range", s"bytes */$size"))
+    if status == 206 then headers.addOne(("Content-Range", s"bytes $start-${start + length - 1}/$size"))
+    if request.method == "HEAD" then return withAll(Response.stream(status, contentType, length, _ -> ()), headers)
+    val opened = fs.open(file) match
+      Ok(f) -> f
+      Err(e) -> return rendered(errors, statusOf(e))
+    if start > 0 && opened.seek(start).isErr
+      _ = opened.close()
+      return rendered(errors, 500)
+    val chunk = chunkBytes
+    withAll(Response.stream(status, contentType, length, w -> copied(opened, w, length, chunk)), headers)
+
+  // A listing of the directory `dir` as an HTML page, a link for each entry, a directory's name
+  // ending in `/`; names beginning with `.` are left out unless `dotfiles`.
+  private listed(request: ServerRequest, dir: string) -> Response
+    val names = fs.listDir(dir) match
+      Ok(n) -> n
+      Err(e) -> return rendered(errors, statusOf(e))
+    val title = escapedHtml(request.path)
+    val page = StringWriter()
+    page.write(s"<!DOCTYPE html>\n<html>\n<head><meta charset=\"utf-8\"><title>$title</title></head>\n<body>\n")
+    page.write(s"<h1>$title</h1>\n<ul>\n")
+    for name in names
+      if name.startsWith(".") && !dotfiles then continue
+      val shown = if fs.isDir(fs.join(dir, name)) then name + "/" else name
+      page.write(s"<li><a href=\"${escapedHtml(Url.encode(name))}${if shown.endsWith("/") then "/" else ""}\">")
+      page.write(s"${escapedHtml(shown)}</a></li>\n")
+    page.write("</ul>\n</body>\n</html>\n")
+    Response.html(200, page.text)
+
+// The earliest and latest seconds an HTTP-date can write, 0000-01-01 and 9999-12-31T23:59:59.
+private val MinHttpSecond: long = -62167219200
+private val MaxHttpSecond: long = 253402300799
+
+// What a request's preconditions decide.
+private data Precondition
+  Proceed
+  Unchanged
+  Failed
+
+// What part of a file a request's `Range` asks for.
+private data Asked
+  Whole
+  Span(first: long, last: long)
+  Unsatisfiable
+
+// The number of the request path's segments a route's `/*name` pattern mounted the server below.
+private mountDepth(route: Option[string]) -> int = route match
+  Some(pattern) ->
+    val parts = pattern.split("/").drop(1)
+    if !parts.isEmpty && isTail(parts(parts.length - 1)) then parts.length - 1 else 0
+  None -> 0
+
+// The status a failure to reach a file answers: `403` where it may not be read, else `404`.
+private statusOf(e: IoError) -> int = e.kind match
+  PermissionDenied -> 403
+  _ -> 404
+
+// `response` with `headers` added.
+private withAll(response: Response, headers: Iterable[(string, string)]) -> Response
+  var r = response
+  for (name, value) in headers
+    r = r.withHeader(name, value)
+  r
+
+// A `301` to `target`'s path with a `/` added, its query kept. A path beginning with several `/`
+// keeps one, so the `Location` cannot be read as another host's.
+private redirected(given: string) -> Response
+  var target = given
+  while target.startsWith("//")
+    target = target.slice(1, target.byteLength)
+  val q = target.indexOf("?")
+  val location = if q < 0 then target + "/" else target.slice(0, q) + "/" + target.slice(q, target.byteLength)
+  Response.empty(301).withHeader("Location", location)
+
+// RFC 9110 §13.2.2's steps 1 to 4 for a file of the entity tag `tag` last changed in the second
+// `changed`, where it has a date.
+private preconditions(request: ServerRequest, tag: string, changed: Option[long]) -> Precondition
+  request.header("If-Match") match
+    Some(v) -> if !tagsMatch(v, tag, true) then return Failed
+    None ->
+      if request.header("If-Unmodified-Since") is Some(v)
+        if (changed, parseHttpDate(v)) is (Some(c), Ok(d)) && c > d.epochSeconds then return Failed
+  request.header("If-None-Match") match
+    Some(v) -> if tagsMatch(v, tag, false) then return Unchanged
+    None ->
+      if request.header("If-Modified-Since") is Some(v)
+        if (changed, parseHttpDate(v)) is (Some(c), Ok(d)) && c <= d.epochSeconds then return Unchanged
+  Proceed
+
+// Whether the list of entity tags `field`, or `*`, matches `tag`: by the strong comparison, under
+// which a weak tag matches nothing, where `strong`, else by the weak, which ignores `W/`.
+private tagsMatch(field: string, tag: string, strong: bool) -> bool
+  if field.trim == "*" then return true
+  for t in field.split(",")
+    val one = t.trim
+    if strong
+      if !one.startsWith("W/") && !tag.startsWith("W/") && one == tag then return true
+    else if one.stripPrefix("W/") == tag.stripPrefix("W/") then return true
+  false
+
+// Whether a request's `Range` is to be honoured: always without an `If-Range`; with one, where its
+// entity tag matches `tag` strongly (a weak tag never does), or its date is exactly the file's
+// `Last-Modified` and that is a strong validator, at least a second before now.
+private rangeHolds(request: ServerRequest, tag: string, changed: Option[long]) -> bool =
+  request.header("If-Range") match
+    None -> true
+    Some(v) ->
+      val given = v.trim
+      if given.startsWith("\"") || given.startsWith("W/") then tagsMatch(given, tag, true)
+      else (changed, parseHttpDate(given)) match
+        (Some(c), Ok(d)) -> c == d.epochSeconds && c < now().epochSeconds
+        _ -> false
+
+// What the `Range` field `field` asks of a file of `size` bytes. Only the unit `bytes` and a single
+// range are honoured; anything else is the whole file.
+private rangeOf(field: string, size: long) -> Asked
+  val eq = field.indexOf("=")
+  if eq < 0 || !field.slice(0, eq).trim.equalsIgnoreCase("bytes") then return Whole
+  val specs = field.slice(eq + 1, field.byteLength).split(",").map(s -> s.trim).filter(s -> !s.isEmpty)
+  if specs.length != 1 then return Whole
+  val spec = specs(0)
+  val dash = spec.indexOf("-")
+  if dash < 0 then return Whole
+  val from = spec.slice(0, dash)
+  val to = spec.slice(dash + 1, spec.byteLength)
+  if from.isEmpty
+    val suffix = digitsOf(to) match
+      Some(n) -> n
+      None -> return Whole
+    if suffix == 0 then return Unsatisfiable
+    if size == 0 then return Whole
+    return Span(if suffix >= size then 0 else size - suffix, size - 1)
+  val first = digitsOf(from) match
+    Some(n) -> n
+    None -> return Whole
+  val last = if to.isEmpty then long.MaxValue else digitsOf(to) match
+    Some(n) -> n
+    None -> return Whole
+  if last < first then return Whole
+  if first >= size then return Unsatisfiable
+  Span(first, if last >= size then size - 1 else last)
+
+// The number `text` writes in decimal digits alone, held at `long.MaxValue` where it is larger;
+// `None` where it is empty or holds anything else.
+private digitsOf(text: string) -> Option[long]
+  if text.isEmpty || !text.forall(c -> '0' <= c <= '9') then return None
+  var n: long = 0
+  for i in 0 ..< text.byteLength
+    val d = long(int(text.byteAt(i)) - int('0'))
+    n = if n > (long.MaxValue - d) / 10 then long.MaxValue else n * 10 + d
+  Some(n)
+
+// Writes `length` bytes of `file` from its position through `w`, `chunk` at a time, stopping early
+// where the file ends or a write fails, and closes the file.
+private copied(file: File, w: BodyWriter, length: long, chunk: int)
+  var left = length
+  while left > 0
+    val want = if left < long(chunk) then int(left) else chunk
+    val got = file.read(want) match
+      Ok(b) -> b
+      Err(_) -> break
+    if got.length == 0 || w.write(got).isErr then break
+    left -= long(got.length)
+  _ = file.close()
+
+// `text` with `&`, `<`, `>`, `"` and `'` written as HTML's character references.
+private escapedHtml(text: string) -> string =
+  text.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;").replace("\"", "&quot;").replace("'", "&#39;")

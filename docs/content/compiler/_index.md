@@ -1229,7 +1229,12 @@ by a function of its own, which is the program's.
 an actor's start, its messages and its `stopping` blocks through `avin_rt_actor_guarded`, which
 records in the context a return point (`_setjmp`), the shadow stack's top, the caller site, the
 owner and the count of regions in doubt, and calls the closure through the closure runner. Every
-trap entry point first offers the trap there: with a return point recorded and no region in doubt
+trap entry point first drops the frames of the code that trapped from the shadow stack, before
+anything that may wait: the thread goes on from the recorded top where the trap is contained and
+from no frame where it stops the program, and the context keeps the reason, a root of every
+collection, in their place (a trap is no collection point, so those frames may hold slots not yet
+stored to, which a collection made while the trap is reported or the exit hooks run must not read).
+Then it offers the trap to the return point: with a return point recorded and no region in doubt
 entered since, the runtime flushes standard output, reports `avin: trap in Counter#3: <reason> at
 <place>`, puts the recorded words back and returns to the turn (`_longjmp`), the reason, an Avin
 string, stored in the array the library passed before anything is allocated. The regions in doubt
@@ -1272,7 +1277,9 @@ the slot's last occupant ended. A value is stored to its slot where it is made, 
 that needs a slot lives in it. The frame is not cleared on entry: only a slot the collector could read
 before the function has stored to it on some path is set to null, and a slot whose reference has died
 still holds a valid reference, since its object has been kept alive by that same slot at every
-collection since. A function with no reference live across a collection point has **no frame** at
+collection since. A trap is not a collection point, though the runtime waits as it reports one:
+the frames of the trapping code are dropped first (above), so no collection reads them. A function
+with no reference live across a collection point has **no frame** at
 all, so a leaf that only reads fields, or one whose branches only read fields and trap, pushes
 nothing.
 

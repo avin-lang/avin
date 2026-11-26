@@ -6,6 +6,7 @@ module avin.net.http
 // new one otherwise; either way the handler finds it in the request's `X-Request-Id` and the client
 // in the response's.
 
+import avin.log.Logger
 import avin.random.SecureRandom
 import avin.time.{Duration, monotonic}
 
@@ -53,6 +54,54 @@ accessLog(
     ids: @sendable () -> string = newRequestId
 ) -> (Handler) -> Handler = next -> request -> logged(next, request, sink, format, clock, ids)
 
+// The access log writing through `logger`: for each request an `Info` record `request` whose fields
+// are its `id`, `method`, `path`, `status`, `bytes`, `micros` and `remote`, a length or an address not
+// known left out, in the logger's own format, after the logger's own fields. The request id
+// is found and passed on as the other `accessLog` does it; where the logger leaves out `Info` records,
+// no record is made.
+accessLog(
+    logger: Logger,
+    clock: Clock = monotonic,
+    ids: @sendable () -> string = newRequestId
+) -> (Handler) -> Handler = next -> request -> recorded(next, request, logger, clock, ids)
+
+private recorded(
+    next: Handler,
+    request: ServerRequest,
+    logger: Logger,
+    clock: Clock,
+    ids: @sendable () -> string
+) -> Response
+  val start = clock()
+  val (inner, id) = identified(request, ids)
+  val response = answeredWith(next(inner), id)
+  val took = clock() - start
+  logger.info("request", requestFields(request, response, took, id))
+  response
+
+private requestFields(request: ServerRequest, response: Response, took: Duration, id: string) -> Vector[(string, Any)]
+  val known: Vector[(string, Any)] = [
+    ("id", id),
+    ("method", request.method),
+    ("path", request.path),
+    ("status", response.status)
+  ]
+  val bytes: Vector[(string, Any)] = bodyLength(response).map(n -> ("bytes", (n: Any))).toVector
+  val micros: Vector[(string, Any)] = [("micros", took.micros)]
+  val remote: Vector[(string, Any)] = request.remote.map(r -> ("remote", (r: Any))).toVector
+  known ++ bytes ++ micros ++ remote
+
+// The request passed on, carrying its id, and the id: the request's own where `isRequestId` takes it,
+// a new one from `ids` otherwise.
+private identified(request: ServerRequest, ids: @sendable () -> string) -> (ServerRequest, string)
+  val given = request.header(RequestIdHeader).filter(isRequestId)
+  val id = given.getOrElse(ids())
+  (if given.isDefined then request else request.withHeaderReplaced(RequestIdHeader, id), id)
+
+// The response carrying the request id `id`, unless the handler gave it one of its own.
+private answeredWith(response: Response, id: string) -> Response =
+  if response.header(RequestIdHeader).isDefined then response else response.withHeader(RequestIdHeader, id)
+
 private logged(
     next: Handler,
     request: ServerRequest,
@@ -62,15 +111,9 @@ private logged(
     ids: @sendable () -> string
 ) -> Response
   val start = clock()
-  val given = request.header(RequestIdHeader).filter(isRequestId)
-  val id = given.getOrElse(ids())
-  val inner = if given.isDefined then request else request.withHeaderReplaced(RequestIdHeader, id)
-  val response = next(inner)
+  val (inner, id) = identified(request, ids)
+  val answered = answeredWith(next(inner), id)
   val took = clock() - start
-  val answered = if response.header(RequestIdHeader).isDefined then response else response.withHeader(
-    RequestIdHeader,
-    id
-  )
   sink(logLine(format, request, answered, took, id))
   answered
 
