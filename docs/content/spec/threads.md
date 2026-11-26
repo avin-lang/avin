@@ -576,8 +576,14 @@ parked on a lock, a condition, a channel or a join, blocked on standard input, o
 output or standard error where they lead to a full pipe, its own trap report included, never holds up
 a collection. A lightweight thread waiting for standard input from a pipe, a socket or a terminal
 parks and leaves its worker to the others; that wait is not a cancellation point.
-A Sysl binding [declared `blocking`](/spec/sysl-bindings/#calls-that-wait) does the same. A thread
-waiting for a mutex takes it in turn: the mutex goes to the thread that has waited longest. A thread
+A Sysl binding [declared `blocking`](/spec/sysl-bindings/#calls-that-wait) does the same. A free
+mutex is taken by whichever thread asks first: a thread that finds it busy spins for a moment and then
+parks, and letting it go wakes the thread that has waited longest, which competes for it with any
+thread asking meanwhile, so that threads taking a mutex in turn never wait for a parked thread to be
+scheduled. **No thread is overtaken for ever**: a thread that has waited longer than about a
+millisecond is handed the mutex directly once it is first in line, so a stream of other threads
+taking it cannot keep that thread out. Waiters are not served strictly in the order they came; a
+[pool](#pools) serves its own waiters in that order. A thread
 taking a lock it already holds traps at once. A program whose threads, `main` among them, all wait for
 each other stops with a [deadlock report](#deadlock); threads that wait for each other while another
 still runs sleep for ever.

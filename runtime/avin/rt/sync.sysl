@@ -13,13 +13,63 @@ import sysl.time.monotonic
 // A thread that waits is safe for the collector while it waits, so it holds up no collection however
 // long it sleeps.
 //
-// A lock is handed straight to the oldest thread waiting for it when it is let go, so a thread waiting
-// for a busy lock is never overtaken for ever.
+// A lock is one word, `state`: `LockHeld` while a thread holds it, `LockParked` while a thread is on
+// its queue, and `LockWoken` while a thread that will try for it again is awake. A thread takes a
+// free lock with one compare-and-set and lets go of one nobody waits for with another, never touching
+// the queue. A thread that finds the lock busy spins for up to `LockSpinMicros`, since a critical
+// section is often over sooner than a park and a wake, and then parks on the queue. Letting go of a
+// lock with waiters wakes the oldest, which then competes for the lock with any thread that comes for
+// it meanwhile: the lock is not reserved for it, so a stream of threads taking and letting go of the
+// lock never waits for a parked thread to be scheduled. A woken waiter that loses parks again at the
+// front of the queue, so the oldest waiter stays first. Where the first waiter has waited longer than
+// `LockFairAfter` since it first found the lock busy, the lock is handed to it instead, holding it as
+// it wakes, so no thread is overtaken for ever; a lock hands itself over at most once every
+// `LockFairAfter`, so that a lock whose waiters have all waited long does not fall back to handing
+// itself from thread to thread at every release, each hand-over a parked thread to schedule.
+//
+// `LockWoken` belongs to one thread at a time: a thread letting the lock go sets it as it wakes a
+// waiter, and a spinning thread sets it where waiters are parked, each with a compare-and-set from
+// clear, and the thread that set it, or was woken under it, clears it as it takes the lock or parks.
+// While it is set, letting the lock go wakes nobody, since a thread that will try for it is already
+// awake; so the lock never has two threads woken for it at once, and a lock let go with waiters
+// parked always has a thread awake to take it.
+//
+// `LockParked` is set, and the queue changed, only under the queue's guard, and only while the lock is
+// held, so a thread letting go of a lock whose `LockParked` is set, and not `LockWoken`, takes the
+// guard and sees every waiter.
 
-/** The payload of a lock: whether a thread holds it, and the threads waiting to. */
+/** The payload of a lock: its state, the threads waiting to take it, and when it may next be handed
+ * to a waiter, in microseconds of the monotonic clock, under the queue's guard. */
 struct ParkLock
     waiting: WaitQueue
-    held: bool
+    state: Atomic[u32]
+    fair_at: long
+
+/** A lock's `state` while a thread holds it. */
+const LockHeld: u32 = 1
+/** A lock's `state` while a thread is parked on its queue. */
+const LockParked: u32 = 2
+/** A lock's `state` while a thread that will try for it again is awake: woken, or spinning. */
+const LockWoken: u32 = 4
+
+/** How long a thread that finds a lock busy spins before it parks, in microseconds: long enough for a
+ * short critical section to end, and short beside the slice a lightweight thread runs for, so a
+ * spinning thread holds its worker for no longer than a few switches would take. */
+const LockSpinMicros: long = 10
+
+/** How many times a spinning thread looks at the lock between readings of the clock. */
+const LockSpinsPerLook: i32 = 32
+
+/** How long a waiter may be overtaken, in microseconds: the first waiter, once it has waited longer
+ * than this since it first found the lock busy, is handed the lock by the next thread to let it go,
+ * where the lock has not been handed over in the last `LockFairAfter` either. */
+const LockFairAfter: long = 1000
+
+/** A free lock, which threads waiting for it wait on as `kind`. */
+new_park_lock(kind: u32) -> ParkLock = ParkLock(new_wait_queue_for(kind), Atomic(0), 0)
+
+/** Whether a thread holds the lock `l`. */
+park_lock_held(l: *ParkLock) -> bool = (l.state.load() & LockHeld) != 0
 
 /** The payload of a condition: the threads waiting to be notified. */
 struct ParkCondition
@@ -45,7 +95,7 @@ struct Holding
 lock_new(ctx: *Context) -> *u8
     val p = allocate(ctx, &lock_descriptor)
     val l: *ParkLock = ptr_cast(p)
-    *l = ParkLock(new_wait_queue_for(WaitsOnLock), false)
+    *l = new_park_lock(WaitsOnLock)
     published(p)
 
 /** Takes the lock `p`, waiting, safe for the collector, while another thread holds it. */
@@ -54,42 +104,84 @@ lock_acquire(ctx: *Context, p: *u8)
     enter_doubt(ctx)
     take_lock(ctx, p)
 
-// Takes the lock `p`: at once where it is free, and otherwise as the oldest waiter, from the thread
-// that lets it go.
+// Takes the lock `p`: at once where it is free, and otherwise once it comes free or is handed over.
 private take_lock(ctx: *Context, p: *u8)
     val l: *ParkLock = ptr_cast(p)
-    if take_free(l) then return
+    if l.state.cas(0, LockHeld) == 0 then return
     var r = Holding(Frame(ctx.top, 1), p, null)
     ctx.top = &r.frame
-    await_lock(ctx, l)
+    take_contended(ctx, l)
     ctx.top = r.frame.prev
 
-/** Takes the lock `l`, which is not on the collected heap: at once where it is free, and otherwise as
- * the oldest waiter, from the thread that lets it go. A lightweight thread waiting for it parks. */
+/** Takes the lock `l`, which is not on the collected heap: at once where it is free, and otherwise once
+ * it comes free or is handed over. A lightweight thread waiting for it parks. */
 hold_park_lock(ctx: *Context, l: *ParkLock)
-    if !take_free(l) then await_lock(ctx, l)
+    if l.state.cas(0, LockHeld) != 0 then take_contended(ctx, l)
 
 /** Takes the lock `l`, which is not on the collected heap, where it is free, answering whether it
- * did; never waits. */
+ * did; never waits. A lock free with threads still parked on it is taken too. */
 try_hold_park_lock(l: *ParkLock) -> bool
-    if take_free(l) then return true
-    l.waiting.guard.unlock()
-    false
+    loop
+        val s = l.state.load()
+        if (s & LockHeld) != 0 then return false
+        if l.state.cas(s, s | LockHeld) == s then return true
 
-// Takes the lock `l` where it is free, answering whether it did; otherwise answers false holding its
-// guard, for `await_lock`.
-private take_free(l: *ParkLock) -> bool
-    l.waiting.guard.lock()
-    if l.held then return false
-    l.held = true
-    l.waiting.guard.unlock()
-    true
+// Takes the lock `l`, which was busy a moment ago: spins for up to `LockSpinMicros`, then parks on its
+// queue until a thread letting it go wakes it, and spins and tries again, until it takes the lock or
+// is handed it. `woken` says whether this thread is the one `LockWoken` stands for, which it claims
+// while it spins where waiters are parked, and is given when it is woken. The time it first parked is
+// kept across its tries, and a thread woken that loses the lock parks again at the front of the queue,
+// so that once it has waited longer than `LockFairAfter` the lock is handed to it.
+private take_contended(ctx: *Context, l: *ParkLock)
+    var woken = false
+    var since: long = 0
+    var spins: i32 = 0
+    var spin_until = now_micros() + LockSpinMicros
+    loop
+        val s = l.state.load()
+        if (s & LockHeld) == 0
+            val taken = if woken then (s | LockHeld) & ~LockWoken else s | LockHeld
+            if l.state.cas(s, taken) == s then return
+            continue
+        if spins >= 0
+            if !woken && (s & LockParked) != 0
+                // With waiters parked, one thread spins for the lock at a time: the one that claims
+                // `LockWoken`. Every other parks at once rather than add to the traffic on the lock.
+                if (s & LockWoken) != 0
+                    spins = -1
+                    continue
+                if l.state.cas(s, s | LockWoken) == s then woken = true
+                continue
+            spin_hint()
+            spins += 1
+            if spins % LockSpinsPerLook == 0 && now_micros() >= spin_until then spins = -1
+            continue
+        l.waiting.guard.lock()
+        if !mark_parked(l, woken)
+            l.waiting.guard.unlock()
+            continue
+        woken = false
+        val again = since != 0
+        if !again then since = now_micros()
+        val w = waiter_of(ctx)
+        w.since = since
+        if again then enqueue_first(&l.waiting, w) else enqueue(&l.waiting, w)
+        _ = wait_on(ctx, &l.waiting, w, 0)
+        if w.handed then return
+        woken = true
+        spins = 0
+        spin_until = now_micros() + LockSpinMicros
 
-// Waits, holding the guard of the lock `l`, until the thread that lets `l` go hands it over.
-private await_lock(ctx: *Context, l: *ParkLock)
-    val w = waiter_of(ctx)
-    enqueue(&l.waiting, w)
-    _ = wait_on(ctx, &l.waiting, w, 0)
+// Under the guard of the lock `l`: sets `LockParked` where the lock is held, answering whether it is,
+// so a thread about to park on it is sure to be woken by the one letting it go; where the thread is
+// the one `LockWoken` stands for (`woken`), it clears `LockWoken` in the same step, since it is no
+// longer awake to take the lock.
+private mark_parked(l: *ParkLock, woken: bool) -> bool
+    loop
+        val s = l.state.load()
+        if (s & LockHeld) == 0 then return false
+        val marked = if woken then (s | LockParked) & ~LockWoken else s | LockParked
+        if marked == s || l.state.cas(s, marked) == s then return true
 
 /** Lets the lock `p` go, which the calling thread holds. */
 @export("avin_rt_lock_release")
@@ -105,15 +197,53 @@ lock_release(ctx: *Context, p: *u8)
 lock_release_holding(ctx: *Context, p: *u8)
     let_lock_go(p)
 
-// Lets the lock `p` go: to the oldest thread waiting for it, which then holds it, or free.
+// Lets the lock `p` go, as `let_park_lock_go` does.
 private let_lock_go(p: *u8) = let_park_lock_go(ptr_cast(p))
 
-/** Lets the lock `l` go, which the calling thread holds: to the oldest thread waiting for it, which
- * then holds it, or free. */
+/** Lets the lock `l` go, which the calling thread holds: free, waking the first thread waiting for it
+ * to try for it again, or, where that thread has waited longer than `LockFairAfter` and the lock has
+ * not been handed over in the last `LockFairAfter`, to that thread, which then holds it. Where a
+ * thread that will try for it is awake already (`LockWoken`), or none waits, the lock is only let go. */
 let_park_lock_go(l: *ParkLock)
+    if l.state.cas(LockHeld, 0) == LockHeld then return
+    if let_go_waking_nobody(l) then return
     l.waiting.guard.lock()
-    if !wake_one(&l.waiting) then l.held = false
+    val w = l.waiting.head
+    if w == null
+        // `LockParked` is never set with the queue empty; were it, the lock is let go and the mark cleared.
+        loop
+            val s = l.state.load()
+            if l.state.cas(s, s & ~(LockHeld | LockParked)) == s then break
+        l.waiting.guard.unlock()
+        return
+    val parked = if w.next == null then 0u32 else LockParked
+    val now = now_micros()
+    val handed = now - w.since > LockFairAfter && now >= l.fair_at
+    loop
+        val s = l.state.load()
+        if !handed && (s & LockWoken) != 0
+            // A spinning thread claimed the wake meanwhile; it takes the lock, and nobody is woken.
+            if l.state.cas(s, s & ~LockHeld) == s
+                l.waiting.guard.unlock()
+                return
+            continue
+        val kept = s & ~(LockHeld | LockParked)
+        val after = if handed then kept | LockHeld | parked else kept | LockWoken | parked
+        if l.state.cas(s, after) == s then break
+    unlink_waiter(&l.waiting, w)
+    if handed then l.fair_at = now + LockFairAfter
+    w.handed = handed
+    // A wait for a lock has no time limit and no cancellation, so nothing but this wake ends it.
+    _ = wake_waiter(w)
     l.waiting.guard.unlock()
+
+// Lets the lock `l` go where no thread is parked on it, or one that will try for it is awake already,
+// answering whether it did; otherwise leaves it held, for the caller to wake a waiter.
+private let_go_waking_nobody(l: *ParkLock) -> bool
+    loop
+        val s = l.state.load()
+        if (s & LockParked) != 0 && (s & LockWoken) == 0 then return false
+        if l.state.cas(s, s & ~LockHeld) == s then return true
 
 /** A new condition, with no thread waiting on it. */
 @export("avin_rt_condition_new")
