@@ -4,7 +4,7 @@
 // its own effect in the middle of a flush, which finishes that flush and tells nothing after; and an
 // actor failing inside an effect, restarted with a fresh graph, the failed flush's later effects never
 // run.
-import avin.actors.{ActorRef, Restart, spawn as spawnActor}
+import avin.actors.{ActorRef, Restart, failure, spawn as spawnActor}
 import avin.reactive.{Atom, Graph, Port}
 import avin.threads.{Atomic, Channel, Thread, spawn}
 import avin.time
@@ -82,20 +82,27 @@ rxActorStops()
   val got = collector.ask(r -> RxReport(r), timeout = time.seconds(10)).await()
   assertEq(got, Ok([0, 2, 4, 10]))
 
-// Fails, from an effect, on a reading of 13, before the effect that tells runs in that flush.
+// Fails, from an effect, on a reading of 13, before the effect that tells runs in that flush. The
+// effect that fails tells -1 from its cleanup, which runs before each run after the first and when
+// it is disposed; `stopping` tells -100 where it runs after a failure.
 actor RxFragile(sink: ActorRef[RxCollectMsg], starts: Channel[int]) receives RxSensorMsg
   val g = Graph()
   val value = g.atom(0)
   val doubled = value.map(v -> v * 2)
-  _ = g.effect(get -> if get(doubled) == 26 then fail("a reading of 13"))
+  _ = g.effect(get ->
+    get.onCleanup(() -> sink.tell(RxValue(-1)))
+    if get(doubled) == 26 then fail("a reading of 13"))
   _ = g.effect(get -> sink.tell(RxValue(get(doubled))))
   starts.send(1)
   receive
     RxReading(v) -> value.set(v)
   stopping
     g.dispose()
+    if failure() is Some(_) then sink.tell(RxValue(-100))
 
-@test("an actor failing inside an effect restarts with a fresh graph, and the failed flush's later effects never run")
+@test(
+  "an actor failing inside an effect restarts with a fresh graph: the failed flush's later effects never run, and the effect that trapped is cleaned up in stopping"
+)
 rxActorRestarts()
   val collector = spawnActor(RxCollector())
   val starts = Channel[int]()
@@ -107,9 +114,36 @@ rxActorRestarts()
   assertEq(starts.receive(), Some(1))
   var got: Vector[int] = []
   var tries = 0
-  while got.length < 4 && tries < 1000
+  while got.length < 9 && tries < 1000
     got = collector.ask(r -> RxReport(r), timeout = time.seconds(10)).await() match
       Ok(v) -> v
       Err(_) -> []
     tries += 1
-  assertEq(got, [0, 2, 0, 8])
+  assertEq(got, [0, -1, 2, -1, -1, -100, 0, -1, 8])
+
+// Stops when told, disposing its graph in `stopping`, where `failure()` answers `None`.
+actor RxQuiet(sink: ActorRef[RxCollectMsg]) receives RxSensorMsg
+  val g = Graph()
+  val value = g.atom(0)
+  _ = g.effect(get ->
+    val v = get(value)
+    get.onCleanup(() -> sink.tell(RxValue(-v - 1))))
+  receive
+    RxReading(v) ->
+      value.set(v)
+      if v == 5 then stop()
+  stopping
+    g.dispose()
+    if failure() is None then sink.tell(RxValue(100))
+
+@test(
+  "an actor stopped without a failure disposes its graph in stopping, running each cleanup once, and failure() is None"
+)
+rxActorQuietStop()
+  val collector = spawnActor(RxCollector())
+  val quiet = spawnActor(RxQuiet(collector))
+  quiet.tell(RxReading(5))
+  _ = quiet.ended().await()
+  assertEq(failure(), None)
+  val got = collector.ask(r -> RxReport(r), timeout = time.seconds(10)).await()
+  assertEq(got, Ok([-1, -6, 100]))

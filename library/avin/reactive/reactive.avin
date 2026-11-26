@@ -35,6 +35,7 @@ module avin.reactive
 //   thread writes to an atom through a `Port`, which is sendable; the owner applies what has arrived
 //   with `drain` or `awaitWrites`.
 
+import avin.actors.failure
 import avin.collections.mutable.LinkedSet
 import avin.threads.{Atomic, Channel, Mutex}
 import avin.time.Duration
@@ -57,6 +58,16 @@ private class Core()
   val queue = Deque[Effect]()
   val wake = Channel[unit](1)
   val ports = LinkedSet[Drainable]()
+  // The derived values computing and the effects running now, innermost last.
+  val active = Buffer[Node]()
+
+  // Ends what a trap stopped part-way: every computation under way, and the flush and batches.
+  unwind()
+    for n in active do n.unwound()
+    active.clear()
+    flushing = false
+    batching = 0
+    computing = 0
 
   tick() -> long
     clock += 1
@@ -98,6 +109,9 @@ private abstract class Node
   // The first observer has arrived, or the last has left.
   mounted() -> unit
   unmounted() -> unit
+
+  // A trap stopped its computation part-way.
+  unwound() -> unit
 
   observe(target: Node)
     val first = targets.isEmpty
@@ -182,6 +196,7 @@ class Atom[T](private val core: Core, private var value: T): Readable[T]
   override stale() = ()
   override mounted() = ()
   override unmounted() = ()
+  override unwound() = ()
   override current() -> T = value
   override get() -> T = value
   override map[U](f: (T) -> U) -> Derived[U] = Derived(core, get -> f(get(self)))
@@ -239,7 +254,9 @@ class Derived[T](private val core: Core, private val compute: (Get) -> T): Reada
     val reads = Reads(core)
     running = true
     core.computing += 1
+    core.active.append(self)
     val v = compute(Get(reads, None))
+    _ = core.active.remove(core.active.length - 1)
     core.computing -= 1
     running = false
     reads.open = false
@@ -265,6 +282,9 @@ class Derived[T](private val core: Core, private val compute: (Get) -> T): Reada
 
   override unmounted()
     for s in sources do s.unobserve(self)
+
+  override unwound()
+    running = false
 
 // What a computation or an effect's body reads with: `get(node)` is the node's value, recorded as a
 // source. In an effect's body it also registers what to do before the next run (`onCleanup`) and makes
@@ -337,6 +357,8 @@ class Effect(private val core: Core, private val body: (Get) -> unit, private va
   override refresh() = ()
   override mounted() = ()
   override unmounted() = ()
+  override unwound()
+    running = false
 
   override stale()
     if queued || disposed then return
@@ -364,7 +386,9 @@ class Effect(private val core: Core, private val body: (Get) -> unit, private va
     last = Some(thisRun)
     val before = core.clock
     running = true
+    core.active.append(self)
     body(Get(reads, Some(thisRun)))
+    _ = core.active.remove(core.active.length - 1)
     running = false
     reads.open = false
     hasRun = true
@@ -598,8 +622,13 @@ class Graph()
   // Disposes every effect, scope and port, newest first. The atoms keep their values and may still
   // be read; writing to one traps. Disposed while effects run, the flush under way runs none of the
   // effects still waiting. Disposing it again does nothing.
+  //
+  // In an actor's `stopping` block after a trap (`avin.actors.failure()` answers the reason), the
+  // computations the trap stopped part-way are taken to have ended: an effect whose body trapped is
+  // disposed as any other, its cleanups run, and a flush or a batch the trap left under way is over.
   dispose()
     if core.disposed then return
     core.disposed = true
+    if failure().isDefined then core.unwind()
     root.close()
     core.queue.clear()
