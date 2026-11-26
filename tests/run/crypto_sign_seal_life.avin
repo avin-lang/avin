@@ -1,0 +1,35 @@
+// expect: exit 0
+// Keys, signatures and sealed messages living through many collections: each round makes a key of
+// every kind, signs and checks a message, seals and opens one under each cipher, and keeps a few of
+// the results across later rounds, so what a key holds and what a binding answered survive the
+// collector moving on around them.
+import avin.crypto.{Ed25519Key, EcP256Key, EcP384Key, Ed25519, EcdsaP256Sha256, EcdsaP384Sha384}
+import avin.crypto.{PrivateKey, generatePrivateKey, privateKeyFromPem, Aes128Gcm, Aes256Gcm, ChaCha20Poly1305}
+import avin.crypto.{hkdfSha256, sha384, hmacSha1}
+import avin.encoding.toHex
+
+main()
+  val kept = Buffer[(PrivateKey, Vector[byte], Vector[byte])]()
+  var good = 0
+  for round in 0 ..< 30
+    for (kind, scheme) in [(Ed25519Key, Ed25519), (EcP256Key, EcdsaP256Sha256), (EcP384Key, EcdsaP384Sha384)]
+      val key = generatePrivateKey(kind)
+      val again = privateKeyFromPem(key.toPem()).getOrElse(fail("the key read back"))
+      val message = s"round $round ${"x".repeat(round * 37)}".bytes
+      val signature = again.sign(scheme, message).getOrElse(Vector())
+      if key.publicKey.verify(scheme, message, signature).getOrElse(false) then good += 1
+      if round % 10 == 0 then kept.addOne((key, message, signature))
+    for aead in [Aes128Gcm, Aes256Gcm, ChaCha20Poly1305]
+      val k = aead.generateKey()
+      val secret = hkdfSha256(k.toBytes(), Vector(), s"round $round".bytes, 64)
+      val sealed = k.seal(secret, sha384(secret))
+      if k.open(sealed, sha384(secret)).getOrElse(Vector()) == secret then good += 1
+  var still = 0
+  for (key, message, signature) in kept
+    val scheme = key.kind match
+      Ed25519Key -> Ed25519
+      EcP256Key -> EcdsaP256Sha256
+      _ -> EcdsaP384Sha384
+    if key.publicKey.verify(scheme, message, signature).getOrElse(false) then still += 1
+  println(s"$good of 180 checked, $still of ${kept.length} kept still check")
+  println(toHex(hmacSha1("key", "The quick brown fox jumps over the lazy dog")))

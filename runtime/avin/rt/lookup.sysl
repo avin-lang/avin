@@ -104,8 +104,9 @@ private var lookup_held: Atomic[u64] = Atomic(0)
 
 /** Every address `host` and `port` resolve to, as `sysl.net.resolve` answers them, made on a helper
  * thread: a cancellation of the calling thread ends its wait and answers the cancellation's error,
- * which the library stops the thread at. */
-resolve_host(host: string, port: int) -> Result[Buf[Address], IoError]
+ * which the library stops the thread at. Where `limit_ms` is positive, a wait that lasts that many
+ * milliseconds abandons the lookup, as a cancellation does, and fails as timed out. */
+resolve_host(host: string, port: int, limit_ms: int) -> Result[Buf[Address], IoError]
     if is_numeric_host(host) then return resolve(host, port)
     if host.bytes.len > HostMost then return Err(from_errno(NotFoundCode))
     var ends: [2]i32 = [-1, -1]
@@ -139,8 +140,12 @@ resolve_host(host: string, port: int) -> Result[Buf[Address], IoError]
             return answer
         val fd = lookup_slots[i].read_fd
         lookup_lock.unlock()
-        wait_for_fd_as(fd, Readable, 0, WaitsOnLookup) match
-            Ok(_) -> ()
+        wait_for_fd_as(fd, Readable, limit_ms, WaitsOnLookup) match
+            Ok(true) -> ()
+            Ok(false) ->
+                if limit_ms > 0
+                    abandon(i)
+                    return Err(timed_out_error())
             Err(e) ->
                 abandon(i)
                 return Err(e)

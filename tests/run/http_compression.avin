@@ -10,7 +10,7 @@ import avin.compress.{Decoder, Gzip, TooLarge, Zlib, compress, decompress, gunzi
 import avin.io.{IoError, Reader}
 import avin.net.{TcpServer, TcpStream}
 import avin.net.http
-import avin.net.http.{Compression, Decoding, Request, Response, Route, Router, ServerRequest}
+import avin.net.http.{Client, Compression, Decoding, Request, Response, Route, Router, ServerRequest}
 import avin.time
 
 ok[T](r: Result[T, IoError]) -> T = r match
@@ -58,6 +58,10 @@ val router = Router(
       for i in 0 ..< 3
         _ = e.send(s"event $i ${"data ".repeat(100)}"))),
     Route.post("/echo", r -> Response.text(200, s"${r.header("Content-Encoding")} ${r.text}")),
+    // A redirect whose own body is large enough to be compressed, to `/big`.
+    Route.get("/moved", _ -> Response.text(302, big).withHeader("Location", "/big")),
+    // A body the handler compressed itself, which the middleware leaves as it is.
+    Route.get("/packed", _ -> Response.bytes(200, gzip(big.utf8), "text/plain").withHeader("Content-Encoding", "gzip")),
     Route.post("/upload", upload).streaming()
   ]
 )
@@ -174,6 +178,38 @@ main()
     _ -> "another answer"
   println(s"client limit: $tooLarge ${limited.mapErr(e -> e.message).map(r -> r.status)}")
   println(s"client limit met: ${http.send(Request("GET", s"$base/big").withDecoding(2400)).map(r -> r.body.length)}")
+
+  // A pooled client: bodies decompressed whole and streamed, a redirect followed, all on one kept
+  // connection, each compressed body read to its end before the connection is used again.
+  val client = Client()
+  println(s"pooled: ${client.send(Request("GET", s"$base/big")).map(r -> r.text == big)}")
+  val read = client.stream(Request("GET", s"$base/stream"), r ->
+    val out = Buffer[byte]()
+    loop
+      val got = r.body.read(7).unwrap()
+      if got.length == 0 then break
+      out.addAll(got)
+    s"${r.header("Content-Encoding")} ${r.header("Content-Length")} ${textOf(out.toArray()) == pieces.mkString("")} ${r.body.isComplete}")
+  println(s"pooled stream: ${read.unwrap()}")
+  println(s"pooled redirect: ${client.send(Request("GET", s"$base/moved")).map(r -> s"${r.status} ${r.text == big}")}")
+  val packedOne = client.send(Request("GET", s"$base/packed")).unwrap()
+  println(s"pooled, compressed by the handler: ${packedOne.text == big} ${packedOne.header("Content-Encoding")}")
+  val headed = client.send(Request("HEAD", s"$base/packed")).unwrap()
+  println(s"pooled HEAD: ${headed.header("Content-Encoding")} ${headed.body.length}")
+  val afterAll = client.stats()
+  println(s"pooled connections: opened ${afterAll.opened}, reused ${afterAll.reused}")
+  // A stream left partly read closes its connection, and the next request opens another.
+  _ = client.stream(Request("GET", s"$base/stream"), r -> r.body.read(5))
+  _ = client.send(Request("GET", s"$base/big"))
+  println(s"after a partial read: opened ${client.stats().opened}")
+  // The client's maxResponseBytes counts the decompressed bytes, not the 52 that came.
+  println(
+    s"pooled limit: ${Client(maxResponseBytes = 100).send(Request("GET", s"$base/big")).mapErr(e -> e.message).map(r -> r.status)}"
+  )
+  println(
+    s"pooled raw: ${client.send(Request("GET", s"$base/big").withoutDecoding()).map(r -> r.header("Content-Encoding"))}"
+  )
+  client.close()
 
   // On the wire: Content-Encoding, Vary and the new length; HEAD is left as it is.
   val wire = exchange(server, get("/big", "Accept-Encoding: gzip\r\n"))

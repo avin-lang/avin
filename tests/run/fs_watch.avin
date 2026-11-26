@@ -1,0 +1,187 @@
+// expect: exit 0
+// `watch` with readings made by `check` alone, on a ticks channel nobody sends to, so each step's
+// events are exactly the changes made since the last: files and directories created, modified
+// (size, time, permissions), removed and renamed, a path that changes what it is, a directory gaining
+// entries, a watch that is not recursive, a watched file, a watched root that goes and comes back,
+// several and overlapping roots, links never followed, Unicode names, and the order of a reading's
+// events.
+import avin.fs
+import avin.fs.WatchEvent
+import avin.fs.Watcher
+import avin.threads.Channel
+import avin.time.{Instant, epochMicros}
+
+shown(dir: string, e: WatchEvent) -> string
+  val at = (p: string) -> fs.relativeTo(p, dir).getOrElse(p)
+  val slash = (d: bool) -> if d then "/" else ""
+  e match
+    fs.Created(p, d) -> s"+${at(p)}${slash(d)}"
+    fs.Modified(p, d) -> s"~${at(p)}${slash(d)}"
+    fs.Removed(p, d) -> s"-${at(p)}${slash(d)}"
+    fs.Renamed(f, t, d) -> s"${at(f)}->${at(t)}${slash(d)}"
+    fs.Overflowed(n) -> s"overflowed at $n"
+
+// The events waiting on `w`, shown from `dir`.
+drained(w: Watcher, dir: string) -> string
+  val out = Buffer[string]()
+  var more = true
+  while more
+    w.events.tryReceive() match
+      Some(e) -> out.addOne(shown(dir, e))
+      None -> more = false
+  out.toVector.mkString(" ")
+
+// A reading now: how many events it sent, and what they were.
+look(w: Watcher, dir: string) -> string
+  val n = w.check()
+  val got = drained(w, dir)
+  s"${n.map(k -> k.toString()).getOrElse("ended")}: $got"
+
+// A watch read by `check` alone.
+watched(paths: Vector[string], recursive: bool = true, maxEntries: int = 100000) -> Watcher =
+  fs.watch(paths, Channel[Instant](), recursive = recursive, maxEntries = maxEntries).getOrElse(fail("no watch"))
+
+main()
+  val dir = fs.createTempDir("avin-watch").getOrElse(fail("no directory"))
+  val at = (rel: string) -> fs.join(dir, rel)
+  val t = at("t")
+  _ = fs.createDir(t)
+  val w = watched(Vector(t))
+  val step = (what: string) -> println(s"$what | ${look(w, t)}")
+
+  step("nothing changed")
+  step("again")
+
+  _ = fs.writeText(at("t/a.txt"), "one")
+  step("file created")
+  _ = fs.writeText(at("t/a.txt"), "three")
+  step("file grown")
+  _ = fs.writeText(at("t/a.txt"), "THREE")
+  _ = fs.setModified(at("t/a.txt"), epochMicros(1000000))
+  step("same size, time set")
+  _ = fs.setPermissions(at("t/a.txt"), 0o600)
+  step("file permissions")
+  step("nothing since")
+
+  _ = fs.createDir(at("t/sub"))
+  _ = fs.writeText(at("t/sub/b.txt"), "b")
+  step("directory with a file")
+  _ = fs.writeText(at("t/sub/c.txt"), "cc")
+  step("directory gains an entry")
+  _ = fs.remove(at("t/sub/c.txt"))
+  step("directory loses an entry")
+  _ = fs.setPermissions(at("t/sub"), 0o700)
+  step("directory permissions")
+
+  _ = fs.rename(at("t/a.txt"), at("t/a2.txt"))
+  step("file renamed")
+  _ = fs.rename(at("t/a2.txt"), at("t/sub/a2.txt"))
+  step("file moved into a directory")
+  _ = fs.rename(at("t/sub"), at("t/sub2"))
+  step("directory renamed")
+
+  _ = fs.writeText(at("t/x.txt"), "x")
+  step("x created")
+  _ = fs.remove(at("t/x.txt"))
+  _ = fs.writeText(at("t/y.txt"), "a different file")
+  step("one removed, another created")
+
+  _ = fs.writeText(at("t/gone.txt"), "")
+  _ = fs.remove(at("t/gone.txt"))
+  step("created and removed between readings")
+
+  _ = fs.remove(at("t/y.txt"))
+  _ = fs.createDir(at("t/y.txt"))
+  step("a file becomes a directory")
+  _ = fs.removeDir(at("t/y.txt"))
+  _ = fs.writeText(at("t/y.txt"), "")
+  step("and a file again")
+
+  _ = fs.writeText(at("t/old.txt"), "old")
+  _ = fs.writeText(at("t/new.txt"), "newer")
+  step("two files")
+  _ = fs.rename(at("t/new.txt"), at("t/old.txt"))
+  step("one renamed onto the other")
+  _ = fs.remove(at("t/old.txt"))
+  step("the survivor removed")
+
+  _ = fs.writeText(at("t/b"), "")
+  _ = fs.writeText(at("t/a-c"), "")
+  _ = fs.writeText(at("t/A"), "")
+  _ = fs.writeText(at("t/文件"), "")
+  _ = fs.writeText(at("t/é.txt"), "")
+  _ = fs.writeText(at("t/.hidden"), "")
+  step("several at once, in code-point order")
+
+  _ = fs.createDirAll(at("t/deep/er/est"))
+  _ = fs.writeText(at("t/deep/er/est/z"), "")
+  step("deep")
+  _ = fs.removeDirAll(at("t/deep"))
+  step("deep removed")
+
+  _ = fs.createDir(at("outside"))
+  _ = fs.symlink(at("outside"), at("t/link"))
+  step("a link to a directory outside")
+  _ = fs.writeText(at("outside/o.txt"), "")
+  step("the link is not followed")
+  _ = fs.remove(at("t/link"))
+  _ = fs.symlink(at("nowhere"), at("t/link"))
+  step("the link replaced, dangling")
+  _ = fs.removeDirAll(at("t/sub2"))
+  step("a directory removed with what it holds")
+
+  println("-- the watched root goes and comes back")
+  _ = fs.removeDirAll(t)
+  step("root removed")
+  step("still gone")
+  _ = fs.createDir(t)
+  _ = fs.writeText(at("t/back"), "")
+  step("root back")
+  println(w.isClosed)
+  println(w.close())
+  println(w.isClosed)
+  println(look(w, t))
+  println(w.close())
+  println(w.events.receive())
+
+  println("-- not recursive")
+  _ = fs.createDir(at("flat"))
+  _ = fs.createDir(at("flat/d"))
+  val f = watched(Vector(at("flat")), recursive = false)
+  _ = fs.writeText(at("flat/d/below"), "")
+  _ = fs.writeText(at("flat/top"), "")
+  println(look(f, at("flat")))
+  _ = fs.setPermissions(at("flat/d"), 0o700)
+  _ = fs.createDir(at("flat/d/e"))
+  println(look(f, at("flat")))
+  _ = f.close()
+
+  println("-- a watched file")
+  _ = fs.writeText(at("single"), "1")
+  val s = watched(Vector(at("single")))
+  _ = fs.writeText(at("single"), "22")
+  println(look(s, dir))
+  _ = fs.remove(at("single"))
+  println(look(s, dir))
+  _ = fs.writeText(at("single"), "333")
+  println(look(s, dir))
+  _ = s.close()
+
+  println("-- several roots, one inside another")
+  _ = fs.createDirAll(at("r1/in"))
+  _ = fs.createDir(at("r2"))
+  val m = watched(Vector(at("r1"), at("r1/in"), at("r2")))
+  _ = fs.writeText(at("r1/in/f"), "")
+  _ = fs.writeText(at("r2/g"), "")
+  println(look(m, dir))
+  _ = m.close()
+
+  println("-- an empty list of paths")
+  val none = watched(Vector())
+  println(look(none, dir))
+  _ = none.close()
+
+  println("-- a path that is not there")
+  println(fs.watch(Vector(at("r1"), at("missing")), Channel[Instant]()).map(_ -> "watching").mapErr(e -> e.kind))
+  println(fs.watch(Vector(at("missing"))).map(_ -> "watching").mapErr(e -> e.kind))
+  _ = fs.removeDirAll(dir)

@@ -1,0 +1,90 @@
+// expect: exit 0
+// env: AVIN_GC_STRESS=0
+// A file far larger than the memory a request may take is streamed from the file as it is sent: a
+// 64 MiB file arrives whole and intact, byte for byte, read by a raw client a piece at a time, and a
+// range from its middle arrives exactly, while the server's resident memory grows by much less than
+// the file. The collector runs as usual here, since stress would collect at each of the chunk's
+// allocations and the file is large.
+import avin.fs
+import avin.io.IoError
+import avin.net.TcpStream
+import avin.net.http
+import avin.net.http.{FileServer, Router}
+import avin.process
+import avin.time
+
+ok[T, E: Error](r: Result[T, E]) -> T = r match
+  Ok(v) -> v
+  Err(e) -> fail(e.message)
+
+val Mib = 1048576
+
+// The byte at `offset` of the file: a pattern that differs from one position to the next.
+byteAt(offset: long) -> byte = byte(int(offset % 251))
+
+// What arrives for `request`: the head's first line, and the body's length and how many of its bytes
+// were the file's at their offsets from `start`, with the most resident memory seen while reading.
+fetched(port: int, request: string, start: long) -> (string, long, long, long)
+  val c = ok(TcpStream.connect("127.0.0.1", port))
+  ok(c.setTimeout(time.seconds(60)))
+  ok(c.writeText(request))
+  val head = Buffer[byte]()
+  var body = Array.empty[byte]()
+  while true
+    val more = ok(c.read(4096))
+    if more.length == 0 then break
+    head.addAll(more)
+    val text = string.fromUtf8Lossy(head.toArray())
+    val end = text.indexOf("\r\n\r\n")
+    if end >= 0
+      body = head.toArray().slice(end + 4, head.length)
+      break
+  val status = string.fromUtf8Lossy(head.toArray()).split("\r\n")(0)
+  var length: long = 0
+  var right: long = 0
+  var peak: long = 0
+  var piece = body
+  while true
+    if piece.length == 0
+      piece = ok(c.read(65536))
+      if piece.length == 0 then break
+    for i in 0 ..< piece.length
+      if piece(i) == byteAt(start + length + long(i)) then right += 1
+    length += long(piece.length)
+    if length % long(8 * Mib) < long(piece.length)
+      val now = ok(process.residentBytes(process.pid()))
+      if now > peak then peak = now
+    piece = Array.empty[byte]()
+  _ = c.close()
+  (status, length, right, peak)
+
+main()
+  val top = ok(fs.tempDir("avin-files-large"))
+  val file = fs.join(top.path, "big.bin")
+  val out = ok(fs.create(file))
+  for k in 0 ..< 64
+    val first = long(k) * long(Mib)
+    ok(out.write(Array.tabulate(Mib, i -> byteAt(first + long(i)))))
+  ok(out.close())
+  val size = ok(fs.size(file))
+  println(s"file: ${size / long(Mib)} MiB")
+  val server = ok(http.serve("127.0.0.1", 0, Router([FileServer(top.path).at("/")]).handle))
+  val before = ok(process.residentBytes(process.pid()))
+  val (status, length, right, peak) = fetched(
+    server.port(),
+    "GET /big.bin HTTP/1.1\r\nHost: t\r\nConnection: close\r\n\r\n",
+    0
+  )
+  println(s"whole: $status, ${length / long(Mib)} MiB, intact: ${right == size}")
+  val growth = peak - before
+  println(s"memory grew by less than 16 MiB: ${growth < long(16 * Mib)}")
+  if growth >= long(16 * Mib) then println(s"  grew by ${growth / long(Mib)} MiB")
+  val from = long(30 * Mib) + 7
+  val (rs, rl, rr, _) = fetched(
+    server.port(),
+    s"GET /big.bin HTTP/1.1\r\nHost: t\r\nRange: bytes=$from-${from + long(3 * Mib) - 1}\r\nConnection: close\r\n\r\n",
+    from
+  )
+  println(s"range: $rs, ${rl / long(Mib)} MiB, intact: ${rr == rl && rl == long(3 * Mib)}")
+  server.shutdown()
+  ok(top.close())

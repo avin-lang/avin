@@ -1,0 +1,161 @@
+// expect: exit 0
+// `fs.copy` of one file or link: the bytes (empty, every byte value, sizes around the copy's read
+// size, Unicode), `replace` both ways (over a file, a link, a dangling link, a directory), the nine
+// `rwx` bits always carried and the setuid bit and the modification time only with `attributes`,
+// `followLinks` both ways (to a file, to a directory, dangling, a relative target kept as written), a
+// file onto itself, `createParents`, and every refusal (a directory, a FIFO, a device, a missing
+// source or parent, an unreadable source, a read-only destination), each leaving no new file behind.
+import avin.fs
+import avin.io.IoError
+import avin.process.Command
+import avin.time
+
+var root = ""
+
+say(line: Any)
+  println(if root == "" then s"$line" else s"$line".replace(root, "DIR"))
+
+// `ok`, or the error's sentence.
+outcome(r: Result[unit, IoError]) -> string = r match
+  Ok(_) -> "ok"
+  Err(e) -> e.message
+
+// The names in `dir` that a copy left on the way: none, whatever failed.
+debris(dir: string) -> int = fs.listDir(dir).map(names -> names.count(n -> n.contains(".pending-"))).getOrElse(-1)
+
+perm(file: string) -> string = fs.linkMetadata(file).map(m -> f"0o${m.permissions}%o").getOrElse("none")
+
+kindOf(file: string) -> string = fs.linkMetadata(file).map(m -> s"${m.kind}").getOrElse("absent")
+
+main()
+  val dir = fs.createTempDir("avin-fs-copy") match
+    Ok(d) -> d
+    Err(e) ->
+      say(s"no directory: $e")
+      return
+  root = dir
+  // A file is copied whole and the source stays as it was.
+  _ = fs.writeText(dir + "/a", "alpha")
+  say(outcome(fs.copy(dir + "/a", dir + "/b")))
+  say(s"${fs.readText(dir + "/a")} ${fs.readText(dir + "/b")} ${fs.isSameFile(dir + "/a", dir + "/b")}")
+  // An empty file, every byte value, and sizes on each side of the read size.
+  _ = fs.writeText(dir + "/empty", "")
+  say(outcome(fs.copy(dir + "/empty", dir + "/empty2")))
+  say(fs.readBytes(dir + "/empty2").map(b -> b.length))
+  val all = Array.tabulate(256, i -> byte(i))
+  _ = fs.writeBytes(dir + "/all", all)
+  _ = fs.copy(dir + "/all", dir + "/all2")
+  say(fs.readBytes(dir + "/all2").map(b -> b == all))
+  for n in [65535, 65536, 65537, 200_003]
+    val big = Array.tabulate(n, i -> byte(i % 251))
+    _ = fs.writeBytes(dir + "/big", big)
+    say(s"$n ${outcome(fs.copy(dir + "/big", dir + "/big2"))} ${fs.readBytes(dir + "/big2").map(b -> b == big)}")
+  // Unicode in the names and the contents.
+  _ = fs.writeText(dir + "/naïve ☃.txt", "snow ☃ and 𝄞")
+  say(outcome(fs.copy(dir + "/naïve ☃.txt", dir + "/copie é.txt")))
+  say(fs.readText(dir + "/copie é.txt"))
+  // `replace = true` replaces a longer file, and replaces a link at `to` rather than writing through it.
+  _ = fs.writeText(dir + "/old", "old contents, longer than the new")
+  say(outcome(fs.copy(dir + "/a", dir + "/old")))
+  say(fs.readText(dir + "/old"))
+  _ = fs.writeText(dir + "/linked", "the link's target")
+  _ = fs.symlink(dir + "/linked", dir + "/alink")
+  say(outcome(fs.copy(dir + "/a", dir + "/alink")))
+  say(s"${kindOf(dir + "/alink")} ${fs.readText(dir + "/alink")} ${fs.readText(dir + "/linked")}")
+  // A hard link to the replaced file keeps the old contents: the entry is replaced, not the file.
+  _ = fs.writeText(dir + "/h1", "first")
+  _ = Command("ln", dir + "/h1", dir + "/h2").run()
+  _ = fs.copy(dir + "/a", dir + "/h1")
+  say(s"${fs.readText(dir + "/h1")} ${fs.readText(dir + "/h2")}")
+  // `replace = false`: made where nothing is, refused where anything is, a dangling link included.
+  say(outcome(fs.copy(dir + "/a", dir + "/fresh", replace = false)))
+  say(fs.readText(dir + "/fresh"))
+  _ = fs.writeText(dir + "/kept", "kept")
+  say(outcome(fs.copy(dir + "/a", dir + "/kept", replace = false)))
+  say(fs.readText(dir + "/kept"))
+  _ = fs.symlink(dir + "/nowhere", dir + "/dangling")
+  say(outcome(fs.copy(dir + "/a", dir + "/dangling", replace = false)))
+  say(kindOf(dir + "/dangling"))
+  say(outcome(fs.copy(dir + "/a", dir + "/a", replace = false)))
+  // A directory at `to` is refused either way, and so is one at `from`.
+  _ = fs.createDir(dir + "/adir")
+  say(outcome(fs.copy(dir + "/a", dir + "/adir")))
+  say(outcome(fs.copy(dir + "/a", dir + "/adir", replace = false)))
+  say(outcome(fs.copy(dir + "/adir", dir + "/adir2")))
+  say(fs.exists(dir + "/adir2"))
+  // A file onto itself, by its own name or another, changes nothing.
+  say(outcome(fs.copy(dir + "/a", dir + "/a")))
+  say(fs.readText(dir + "/a"))
+  _ = fs.writeText(dir + "/same", "same")
+  _ = Command("ln", dir + "/same", dir + "/same2").run()
+  say(outcome(fs.copy(dir + "/same", dir + "/same2")))
+  say(s"${fs.readText(dir + "/same2")} ${fs.isSameFile(dir + "/same", dir + "/same2")}")
+  _ = fs.symlink(dir + "/same", dir + "/tosame")
+  say(outcome(fs.copy(dir + "/tosame", dir + "/same")))
+  say(fs.readText(dir + "/same"))
+  // Missing things.
+  say(outcome(fs.copy(dir + "/missing", dir + "/x")))
+  say(outcome(fs.copy(dir + "/a", dir + "/no/such/x")))
+  say(outcome(fs.copy(dir + "/a", dir + "/made/on/the/way", createParents = true)))
+  say(fs.readText(dir + "/made/on/the/way"))
+  say(outcome(fs.copy(dir + "/a", dir + "/a/below", createParents = true)))
+  // The nine `rwx` bits come along; the setuid bit and the time only with `attributes`.
+  _ = fs.writeText(dir + "/private", "secret")
+  _ = fs.setPermissions(dir + "/private", 0o640)
+  _ = fs.copy(dir + "/private", dir + "/private2")
+  say(perm(dir + "/private2"))
+  _ = fs.setPermissions(dir + "/private", 0o4700)
+  _ = fs.copy(dir + "/private", dir + "/plain")
+  _ = fs.copy(dir + "/private", dir + "/exact", attributes = true)
+  say(s"${perm(dir + "/plain")} ${perm(dir + "/exact")}")
+  val past = time.epochSeconds(1_000_000_000)
+  _ = fs.setModified(dir + "/private", past)
+  _ = fs.copy(dir + "/private", dir + "/plain")
+  _ = fs.copy(dir + "/private", dir + "/exact", attributes = true)
+  say(s"${fs.modified(dir + "/plain").map(t -> t == past)} ${fs.modified(dir + "/exact").map(t -> t == past)}")
+  say(fs.metadata(dir + "/exact").map(m -> m.accessed == past))
+  // Replacing a file gives the copy the source's bits, not those of the file it replaces.
+  _ = fs.setPermissions(dir + "/kept", 0o600)
+  _ = fs.setPermissions(dir + "/a", 0o644)
+  _ = fs.copy(dir + "/a", dir + "/kept")
+  say(perm(dir + "/kept"))
+  // A link is followed by default: the copy is a regular file holding the target's bytes.
+  _ = fs.symlink("linked", dir + "/relative")
+  say(outcome(fs.copy(dir + "/relative", dir + "/followed")))
+  say(s"${kindOf(dir + "/followed")} ${fs.readText(dir + "/followed")}")
+  // `followLinks = false` copies the link, its relative target kept as written.
+  say(outcome(fs.copy(dir + "/relative", dir + "/relcopy", followLinks = false)))
+  say(s"${kindOf(dir + "/relcopy")} ${fs.readLink(dir + "/relcopy")} ${fs.readText(dir + "/relcopy")}")
+  say(outcome(fs.copy(dir + "/dangling", dir + "/dangling2", followLinks = false)))
+  say(s"${kindOf(dir + "/dangling2")} ${fs.readLink(dir + "/dangling2")}")
+  say(outcome(fs.copy(dir + "/dangling", dir + "/dangling3")))
+  say(outcome(fs.copy(dir + "/relative", dir + "/kept", followLinks = false, replace = false)))
+  say(outcome(fs.copy(dir + "/relative", dir + "/kept", followLinks = false)))
+  say(s"${kindOf(dir + "/kept")} ${fs.readLink(dir + "/kept")}")
+  say(outcome(fs.copy(dir + "/relative", dir + "/adir", followLinks = false)))
+  // A link to a directory is a directory when followed, and a link when not.
+  _ = fs.symlink(dir + "/adir", dir + "/dirlink")
+  say(outcome(fs.copy(dir + "/dirlink", dir + "/dirlink2")))
+  say(outcome(fs.copy(dir + "/dirlink", dir + "/dirlink3", followLinks = false)))
+  say(s"${kindOf(dir + "/dirlink3")} ${fs.isDir(dir + "/dirlink3")}")
+  // A FIFO and a device are refused before anything is opened, so nothing waits.
+  say(Command("mkfifo", dir + "/fifo").run().map(s -> s.isSuccess))
+  say(outcome(fs.copy(dir + "/fifo", dir + "/fifo2")))
+  say(outcome(fs.copy("/dev/null", dir + "/null2")))
+  say(s"${fs.exists(dir + "/fifo2")} ${fs.exists(dir + "/null2")}")
+  // An unreadable source and a read-only destination fail and leave no file behind.
+  _ = fs.writeText(dir + "/locked", "locked")
+  _ = fs.setPermissions(dir + "/locked", 0o000)
+  say(outcome(fs.copy(dir + "/locked", dir + "/unlocked")))
+  say(fs.exists(dir + "/unlocked"))
+  _ = fs.createDir(dir + "/sealed")
+  _ = fs.writeText(dir + "/sealed/inside", "inside")
+  _ = fs.setPermissions(dir + "/sealed", 0o500)
+  say(outcome(fs.copy(dir + "/a", dir + "/sealed/new")))
+  say(outcome(fs.copy(dir + "/a", dir + "/sealed/inside")))
+  say(outcome(fs.copy(dir + "/a", dir + "/sealed/inside", replace = false)))
+  say(fs.readText(dir + "/sealed/inside"))
+  _ = fs.setPermissions(dir + "/sealed", 0o700)
+  say(s"${debris(dir)} ${debris(dir + "/sealed")} ${debris(dir + "/made/on/the")}")
+  _ = fs.setPermissions(dir + "/locked", 0o600)
+  say(fs.removeDirAll(dir))

@@ -7921,6 +7921,11 @@ private signature(c: *Checker, unit: usize, module_name: string, f: &Function, o
         elif name == "holds_handles"
             if module_name != "avin.actors" then c.note(unit, f.name_span, s"`$name` is an intrinsic of `avin.actors`")
             elif params.len() != 1 || !(*result.unwrap_or(Unit) is Bool) then c.note(unit, f.name_span, s"intrinsic `$name` takes one value and answers a `bool`")
+        // The same, counting only the handles a type shows, not what a function, `Any` or a trait may
+        // hide: the threads', for a channel's values and a lock's.
+        elif name == "shows_handles"
+            if module_name != "avin.threads" then c.note(unit, f.name_span, s"`$name` is an intrinsic of `avin.threads`")
+            elif params.len() != 1 || !(*result.unwrap_or(Unit) is Bool) then c.note(unit, f.name_span, s"intrinsic `$name` takes one value and answers a `bool`")
         // A field's initializer that leaves the field zero, `[T]() -> T`, the core library's.
         elif name == "field_unset"
             if module_name != CoreModule then c.note(unit, f.name_span, s"`$name` is an intrinsic of the core library")
@@ -9550,6 +9555,28 @@ private made_sendable(c: *Checker, root: usize, e: &TExpr) -> bool
                 _ -> false
         _ -> false
 
+// Whether `e` is a method value whose receiver is held in a local of no name before the closure
+// capturing it.
+private is_method_value(c: *Checker, root: usize, e: &TExpr) -> bool
+    e.kind match
+        Block(items) ->
+            if items.len() != 2 || !(items[1].kind is FunctionValue(_, _)) then return false
+            items[0].kind match
+                Let(x, _) -> x < c.locals[root].len() && c.locals[root][x].name == ""
+                _ -> false
+        _ -> false
+
+// What of `e` goes with it to another thread: a method value's closure without the receiver
+// expression, which runs where the value is made, and anything else whole. A receiver that is a
+// local or a parameter is kept, so an error names it; its value is what the closure carries.
+private sent_part(c: *Checker, root: usize, e: &TExpr) -> &TExpr
+    if is_method_value(c, root, e)
+        if e.kind is Block(items)
+            if items[0].kind is Let(_, value)
+                if value.kind is Local(_) || value.kind is Param(_) then return e
+            return items[1]
+    e
+
 /** `e`, or the argument it stands for where it is a local holding one evaluated before the call. */
 private held_value(e: &TExpr, held: *Buf[HeldArgument]) -> &TExpr
     if e.kind is Local(x)
@@ -9632,7 +9659,10 @@ private is_match_function_literal(c: *Checker, e: &TExpr) -> bool
 private first_send_problem(c: *Checker, root: usize, e: &TExpr, mark: int, k: usize, held: *Buf[HeldArgument]) -> Option[string]
     var uses: Buf[SendUse] = buf()
     var bound: Buf[usize] = buf()
-    collect_send_uses(c, e, &uses, &bound, held)
+    // A method value's receiver is evaluated where the value is made, so what the receiver expression
+    // uses stays here; what the closure carries is the receiver's value, held in a local of no name
+    // and checked by its type.
+    collect_send_uses(c, sent_part(c, root, e), &uses, &bound, held)
     for u in uses
         if !u.param && contains_index(bound, u.index) then continue
         var seen: Buf[usize] = buf()
@@ -9694,6 +9724,8 @@ private send_use_problem(c: *Checker, root: usize, u: SendUse, mark: int, k: usi
                     // `val` to make it sendable.
                     if has_states(c.classes[id]) then return Some(s"it uses the state of the actor `${held[ActorClassPrefix.bytes.len..]}`, which only the actor's own code reaches; copy what it needs into a `val` first")
                     return Some(s"it uses the state of the actor `${held[ActorClassPrefix.bytes.len..]}`, ${nested_reason(why)}")
+            // The local of no name holds a method value's receiver.
+            if name == "" then return Some(s"it carries its receiver, ${quoted_type(ty)}, ${nested_reason(why)}")
             Some(s"it uses `$name`, ${quoted_type(ty)}, ${nested_reason(why)}")
         _ -> None
 
@@ -9884,7 +9916,7 @@ private scan_thread_bodies(c: *Checker, id: usize, root: usize, e: &TExpr, k: us
             c.note(c.symbols[id].unit, e.span, s"a `match` function passed for a type argument bounded by `Sendable` may run on another thread, which shares the program's module-level state, but $why")
         return
     if made_sendable(c, root, e)
-        if module_state_path(c, e, k, direct) is Some(why)
+        if module_state_path(c, sent_part(c, root, e), k, direct) is Some(why)
             c.note(c.symbols[id].unit, e.span, s"${sendable_made(c, c.symbols[id].unit, e)} may run on another thread, which shares the program's module-level state, but $why")
         if e.kind is Block(items)
             if items.len() == 2 then scan_thread_bodies(c, id, root, items[0], k, direct, held)
@@ -9912,7 +9944,7 @@ private thread_body_arguments(c: *Checker, id: usize, root: usize, f: usize, arg
         val arg = held_value(args[i], held)
         // A function made as a `@sendable` one is checked where it is made.
         if made_sendable(c, root, arg) then continue
-        if module_state_path(c, arg, k, direct) is Some(why)
+        if module_state_path(c, sent_part(c, root, arg), k, direct) is Some(why)
             val what = s"what is passed for `${c.symbols[f].param_names[i]}` of `${c.symbols[f].name}`"
             // What an `@isolating` argument makes leaves isolated, so code outside must not reach it
             // through module-level state.
@@ -22618,6 +22650,24 @@ private choose_among(c: *Checker, at: Span, name_span: Span, name: string, signa
             val fit = fits_call(c, bound_signatures[k], bindings[k], args, typed, written)
             if !bound_signatures[k].variadic && fit then fixed_fits = true
             if !untupling[k] && fit then direct_fits = true
+    // A collection literal checked by itself took its elements' own types, `{"a": "x"}` a
+    // `Map[string, string]`. Where no candidate takes it so, it is tried against each candidate's
+    // parameter instead, as it would be checked against a single function's, so it becomes the
+    // `Map[string, Param]` the one candidate it can be asks for.
+    if !any_fits(c, bound_signatures, bindings, args, typed, written)
+        var retried = false
+        for j in 0..<args.len()
+            if typed[j] is Some(_) && collection_literal(argument_value(args[j]))
+                typed[j] = None
+                trials.push(j)
+                retried = true
+        if retried
+            fixed_fits = false
+            direct_fits = false
+            for k in 0..<bound.len()
+                val fit = fits_call(c, bound_signatures[k], bindings[k], args, typed, written)
+                if !bound_signatures[k].variadic && fit then fixed_fits = true
+                if !untupling[k] && fit then direct_fits = true
     var considered: Buf[bool] = buf()
     for k in 0..<bound.len()
         considered.push(!(fixed_fits && bound_signatures[k].variadic) && !(direct_fits && untupling[k]) && fits_call(c, bound_signatures[k], bindings[k], args, typed, written))
@@ -25148,6 +25198,14 @@ private holds_literal(e: &Expr) -> bool
                 if holds_literal(a.value) then return true
             false
         _ -> false
+
+/** Whether `e` is a sequence, set or map literal, whose elements take their types from what is
+ * expected of it where something is. */
+private collection_literal(e: &Expr) -> bool = e.kind match
+    ListLit(_) -> true
+    SetLit(_) -> true
+    MapLit(_, _) -> true
+    _ -> false
 
 /** Whether `e` is made of number literals alone: a literal, or an operation or an `if` whose operands
  * or branches are, as `1_000_000_000_000 + 2001` is. Its type comes wholly from context. */

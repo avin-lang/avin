@@ -11,8 +11,8 @@ module avin.net.http
 
 import avin.compress.Format
 import avin.io.{IoError, TimedOut}
-import avin.net.{ByteStream, TcpServer, TcpStream, Url}
-import avin.net.tls.{TlsServer, TlsStream}
+import avin.net.{ByteStream, KeepAlive, ListenOptions, TcpOptions, TcpServer, TcpStream, Url}
+import avin.net.tls.{TlsServer, TlsSource, TlsStream}
 import avin.threads.{Atomic, Mutex}
 import avin.time.{Duration, Instant, millis, monotonic, now, seconds}
 
@@ -234,6 +234,36 @@ class ServerRequest(
     Some(BodyDecoding(format))
   )
 
+  // The request with `address` as its client's address, `remote`.
+  withRemote(address: Option[string]) -> ServerRequest =
+    ServerRequest(method, target, headers, body, version, params, address, route, server, values, source)
+
+  // The request without any header of `name`, compared without regard to case.
+  withHeaderRemoved(name: string) -> ServerRequest = ServerRequest(
+    method,
+    target,
+    headers.filter(h -> !h.0.equalsIgnoreCase(name)),
+    body,
+    version,
+    params,
+    remote,
+    route,
+    server,
+    values,
+    source
+  )
+
+  // What the `TrustedProxies` middleware learned from a trusted proxy: the connection's peer, and
+  // the client's address, scheme and host. `None` where the request did not come through that
+  // middleware from a trusted proxy.
+  forwarding -> Option[Forwarding] = value[Forwarding]()
+
+  // The scheme the client used, `http` or `https`, as a trusted proxy reported it; `None` where none did.
+  scheme -> Option[string] = forwarding.flatMap(f -> f.scheme)
+
+  // The host the client used: as a trusted proxy reported it, or else the request's `Host` header.
+  host -> Option[string] = forwarding.flatMap(f -> f.host).orElse(header("Host"))
+
   // The request carrying `value` as its `T`, so a middleware hands what it learned to the handlers
   // inside it: a user it authenticated, a request id. The type is the key, compared exactly as a
   // type pattern compares a generic type's arguments: a value handed on as a `T` replaces the one of
@@ -332,6 +362,8 @@ class Route(val method: string, val pattern: string, val handler: Handler, val s
   // The pattern's segments.
   private val parts: Vector[string] = pattern.split("/").drop(1)
 
+  if parts.dropRight(1).exists(isTail) then fail(s"the route pattern `$pattern` has a `*name` segment before its last")
+
   // The parameters the pattern binds where it matches `segments`, `None` where it does not.
   matches(segments: Vector[string]) -> Option[Vector[(string, string)]] = bound(parts, segments)
 
@@ -403,7 +435,8 @@ private joined(prefix: string, pattern: string) -> string
 
 // A handler that chooses another by a request's method and path, trying its routes in order. A
 // pattern is a path whose segments are matched one for one with the request's decoded segments, a
-// segment written `:name` matching any one that is not empty and binding it to `name`. A `GET` route
+// segment written `:name` matching any one that is not empty and binding it to `name`, and a last
+// segment written `*name` matching the rest of the path, binding it to `name`. A `GET` route
 // answers `HEAD` too, where no `HEAD` route matches. A path no route matches is answered `404`, and
 // one that routes match for other methods only `405`, with an `Allow` header naming them; `errors`
 // renders the two.
@@ -449,15 +482,26 @@ class Router(private val routes: Vector[Route], private val errors: ErrorPage = 
           None -> ()
     None
 
-// The parameters `pattern` binds where it matches `segments`, `None` where it does not.
+// Whether a pattern's segment is `*name`, which matches the rest of a path.
+private isTail(part: string) -> bool = part.startsWith("*") && part.byteLength > 1
+
+// The parameters `pattern` binds where it matches `segments`, `None` where it does not. A last
+// segment `*name` matches the rest of the path, none of it or several segments, binding them to
+// `name` joined by `/`.
 private bound(pattern: Vector[string], segments: Vector[string]) -> Option[Vector[(string, string)]]
-  if pattern.length != segments.length then return None
+  val tail = !pattern.isEmpty && isTail(pattern(pattern.length - 1))
+  val fixed = if tail then pattern.length - 1 else pattern.length
+  if tail && segments.length < fixed then return None
+  if !tail && pattern.length != segments.length then return None
   val params = Buffer[(string, string)]()
-  for (p, s) in pattern.zip(segments)
+  for (p, s) in pattern.take(fixed).zip(segments)
     if p.startsWith(":") && p.byteLength > 1
       if s.isEmpty then return None
       params.addOne((p.slice(1, p.byteLength), s))
     else if p != s then return None
+  if tail
+    val last = pattern(fixed)
+    params.addOne((last.slice(1, last.byteLength), segments.drop(fixed).mkString("/")))
   Some(params.toVector)
 
 // Serves HTTP/1.1 on `host` and `port`, as `TcpServer.start` listens, answering each request by
@@ -465,18 +509,24 @@ private bound(pattern: Vector[string], segments: Vector[string]) -> Option[Vecto
 // a request is read may last `readTimeout`, each wait while a response is written `writeTimeout`,
 // and the wait for the next request on a connection kept alive `idleTimeout`, after which it is
 // closed; and the whole of a request, its line, headers and body, must arrive within
-// `requestTimeout` of its first byte, else it is answered `408` and the connection closed; zero
-// takes a limit away. A request line may be at most `maxHeaderBytes` long, and the request line and
-// headers together as long; a body may be at most `maxBodyBytes`. A `maxHeaderBytes` less than one,
-// a `maxBodyBytes` or `maxConnections` less than zero or one, or a negative `requestTimeout`, traps.
-// With `tls`, the server speaks HTTPS: each connection begins with a TLS handshake presenting its
-// certificate, each of the handshake's waits lasting at most `readTimeout`, and a connection
-// whose handshake fails is closed. A handler that traps on a TLS connection has it closed without an
+// `requestTimeout` of its first byte, and its line and headers within `headerTimeout`, counted from
+// the connection's acceptance for its first request (so a client that never sends is closed then)
+// and from its first byte for a later one, else it is answered `408` and the connection closed;
+// zero takes a limit away. A request line may be at most `maxHeaderBytes` long, and the request
+// line and headers together as long, in at most `maxHeaders` header lines; a body may be at most
+// `maxBodyBytes`. A `maxHeaderBytes` or `maxHeaders` less than one, a `maxBodyBytes` or
+// `maxConnections` less than zero or one, or a negative `requestTimeout`, `headerTimeout` or
+// `handshakeTimeout`, traps. With `tls`, the server speaks HTTPS: each connection begins with a TLS
+// handshake presenting its certificate, each of the handshake's waits lasting at most `readTimeout`
+// and the whole of it, from the connection's acceptance, at most `handshakeTimeout`; a connection
+// whose handshake fails or runs out of time is closed unanswered, freeing its place among
+// `maxConnections`. A handler that traps on a TLS connection has it closed without an
 // answer, since the answer would have to go through the connection's TLS, which ended with the
 // handler; so does one that traps while it streams a response, whose head is already sent. The
 // answers the server makes itself for an error status are rendered by `errors`. Each response
 // carries a `Date` header, the time it is sent as an HTTP-date, unless the handler gave one or `date`
-// is false; the `101` answer of an upgrade carries none. A request `streamsBody` answers true for,
+// is false; the `101` answer of an upgrade carries none. The server listens with the socket options
+// `listen`, `ServerListen` unless given others. A request `streamsBody` answers true for,
 // asked once its head is read, is handed to `handler` with its body unread, which `handler` reads
 // through `ServerRequest.bodyReader` under the same `readTimeout` and `requestTimeout`, within the
 // limit it gives there rather than `maxBodyBytes`; an `Expect: 100-continue` is answered `100
@@ -486,6 +536,14 @@ private bound(pattern: Vector[string], segments: Vector[string]) -> Option[Vecto
 // body left unread is read and dropped where at most 64 KiB of it is left and the response is not
 // streamed; otherwise, or where the client was never told to continue, the connection is closed after
 // the response, so no byte of the body is read as a request.
+//
+// Each TLS handshake takes the settings `tls` holds as it begins, so a `ReloadableTlsServer`
+// reloaded while the server runs changes the certificate the connections accepted after it present
+// and leaves those already open as they were. A `TlsServer` that accepts no application protocol of
+// its own accepts `http/1.1` by ALPN.
+//
+// With `metrics`, the server counts every request it reads, answers or refuses there, a handler's
+// trap among them.
 serve(
     host: string,
     port: int,
@@ -496,16 +554,18 @@ serve(
     idleTimeout: Duration = seconds(5),
     maxHeaderBytes: int = 16384,
     maxBodyBytes: int = 1048576,
-    tls: Option[TlsServer] = None,
+    tls: Option[TlsSource] = None,
     errors: ErrorPage = plainError,
     date: bool = true,
     requestTimeout: Duration = seconds(60),
-    streamsBody: @sendable (ServerRequest) -> bool = bufferedBodies
+    handshakeTimeout: Duration = seconds(10),
+    listen: ListenOptions = ServerListen,
+    streamsBody: @sendable (ServerRequest) -> bool = bufferedBodies,
+    headerTimeout: Duration = seconds(10),
+    maxHeaders: int = 100,
+    metrics: Option[ServerMetrics] = None
 ) -> Result[TcpServer, IoError]
-  if maxHeaderBytes < 1 then fail(s"a header limit of $maxHeaderBytes bytes: it is at least one")
-  if maxBodyBytes < 0 then fail(s"a body limit of $maxBodyBytes bytes: it is at least zero")
-  if requestTimeout.isNegative then fail(s"a request timeout of $requestTimeout: it is at least zero")
-  val s = Settings(
+  val s = checkedSettings(
     readTimeout,
     writeTimeout,
     idleTimeout,
@@ -513,39 +573,86 @@ serve(
     maxHeaderBytes,
     maxBodyBytes,
     errors,
-    Streaming(),
-    if date then Some(DateHeader()) else None,
-    streamsBody
+    date,
+    streamsBody,
+    headerTimeout,
+    maxHeaders,
+    metrics
   )
+  if handshakeTimeout.isNegative then fail(s"a handshake timeout of $handshakeTimeout: it is at least zero")
   tls match
     None -> TcpServer.start(
       host,
       port,
-      (stream, server) -> converse(stream, server, handler, s),
+      (stream, server) -> converse(stream, server, handler, s, stream.hash()),
       maxConnections,
-      failed = stream -> if !s.streaming.release(stream) then refuse(stream, 500, s)
+      listen = listen,
+      failed = stream ->
+        s.flights.abandon(stream.hash())
+        if !s.streaming.release(stream) then refuse(stream, 500, s)
     )
     Some(identity) -> TcpServer.start(
       host,
       port,
-      (stream, server) -> secured(stream, server, handler, s, identity),
+      (stream, server) -> secured(stream, server, handler, s, identity, handshakeTimeout),
       maxConnections,
-      failed = stream -> _ = stream.close()
+      listen = listen,
+      failed = stream ->
+        s.flights.abandon(stream.hash())
+        _ = stream.close()
     )
 
-// A connection served over TLS: the handshake, then its requests as `converse` serves them.
-private secured(tcp: TcpStream, server: TcpServer, handler: Handler, s: Settings, identity: TlsServer)
-  if tcp.setTimeout(s.readTimeout).isErr then return
-  TlsStream.server(tcp, identity) match
-    Ok(stream) ->
-      converse(stream, server, handler, s, false)
-      // The conversation is over; a close notice the client never reads changes nothing.
-      _ = stream.close()
-    Err(_) -> ()
+// Serves HTTP/1.1 at the Unix socket `path`, as `TcpServer.startUnix` listens there with `backlog`
+// and `replacing`, for a server that a proxy on the same machine talks to: everything else is as
+// `serve` does it, but with no TLS, which a connection that never leaves the machine does not need. A
+// request's `remote` is `None`, a Unix connection having no address.
+serveUnix(
+    path: string,
+    handler: Handler,
+    maxConnections: int = 1024,
+    readTimeout: Duration = seconds(30),
+    writeTimeout: Duration = seconds(30),
+    idleTimeout: Duration = seconds(5),
+    maxHeaderBytes: int = 16384,
+    maxBodyBytes: int = 1048576,
+    errors: ErrorPage = plainError,
+    date: bool = true,
+    requestTimeout: Duration = seconds(60),
+    backlog: int = 128,
+    replacing: bool = false,
+    streamsBody: @sendable (ServerRequest) -> bool = bufferedBodies,
+    headerTimeout: Duration = seconds(10),
+    maxHeaders: int = 100,
+    metrics: Option[ServerMetrics] = None
+) -> Result[TcpServer, IoError]
+  val s = checkedSettings(
+    readTimeout,
+    writeTimeout,
+    idleTimeout,
+    requestTimeout,
+    maxHeaderBytes,
+    maxBodyBytes,
+    errors,
+    date,
+    streamsBody,
+    headerTimeout,
+    maxHeaders,
+    metrics
+  )
+  TcpServer.startUnix(
+    path,
+    (stream, server) -> converse(stream, server, handler, s, stream.hash()),
+    maxConnections,
+    backlog = backlog,
+    replacing = replacing,
+    failed = stream ->
+      s.flights.abandon(stream.hash())
+      if !s.streaming.release(stream) then refuse(stream, 500, s)
+  )
 
-// The limits a server was started with, the error page it renders its own answers by, the
-// connections streaming a response, and the source of its `Date` header where it sends one.
-private data Settings(
+// The settings of a server, each limit first checked: a `maxHeaderBytes` or `maxHeaders` less than
+// one, a `maxBodyBytes` less than zero or a negative `requestTimeout` or `headerTimeout` traps.
+private checkedSettings(
     readTimeout: Duration,
     writeTimeout: Duration,
     idleTimeout: Duration,
@@ -553,13 +660,115 @@ private data Settings(
     maxHeaderBytes: int,
     maxBodyBytes: int,
     errors: ErrorPage,
+    date: bool,
+    streamsBody: @sendable (ServerRequest) -> bool,
+    headerTimeout: Duration,
+    maxHeaders: int,
+    metrics: Option[ServerMetrics]
+) -> Settings
+  if maxHeaderBytes < 1 then fail(s"a header limit of $maxHeaderBytes bytes: it is at least one")
+  if maxBodyBytes < 0 then fail(s"a body limit of $maxBodyBytes bytes: it is at least zero")
+  if requestTimeout.isNegative then fail(s"a request timeout of $requestTimeout: it is at least zero")
+  if headerTimeout.isNegative then fail(s"a header timeout of $headerTimeout: it is at least zero")
+  if maxHeaders < 1 then fail(s"a limit of $maxHeaders headers: it is at least one")
+  Settings(
+    readTimeout,
+    writeTimeout,
+    idleTimeout,
+    requestTimeout,
+    headerTimeout,
+    maxHeaderBytes,
+    maxHeaders,
+    maxBodyBytes,
+    errors,
+    Streaming(),
+    if date then Some(DateHeader()) else None,
+    streamsBody,
+    metrics,
+    Flights()
+  )
+
+// The socket options `serve` listens with unless given others: the listener's defaults, and each
+// connection sending every write at once, since a response is written in pieces a client waits on
+// whole, and probed once idle for a minute, so one whose client vanished, a stream of events or a
+// WebSocket above all, which no idle timeout ends, is found out within two minutes.
+val ServerListen: ListenOptions = ListenOptions(connections = TcpOptions(noDelay = true, keepAlive = Some(KeepAlive())))
+
+// A connection served over TLS: the handshake, under the settings `identity` holds as it begins and
+// done within `handshake` in all, then its requests as `converse` serves them.
+private secured(
+    tcp: TcpStream,
+    server: TcpServer,
+    handler: Handler,
+    s: Settings,
+    identity: TlsSource,
+    handshake: Duration
+)
+  if tcp.setTimeout(s.readTimeout).isErr then return
+  TlsStream.server(tcp, forHttp(identity.current), handshake) match
+    Ok(stream) ->
+      converse(stream, server, handler, s, tcp.hash(), false)
+      // The conversation is over; a close notice the client never reads changes nothing.
+      _ = stream.close()
+    Err(_) -> ()
+
+// `server`, accepting `http/1.1` by ALPN where it accepts no application protocol of its own.
+private forHttp(server: TlsServer) -> TlsServer =
+  if server.protocols.isEmpty then server.offer(["http/1.1"]) else server
+
+// The limits a server was started with, the error page it renders its own answers by, the
+// connections streaming a response, the source of its `Date` header where it sends one, and the
+// metrics it keeps where it keeps them, with the requests they count as in flight.
+private data Settings(
+    readTimeout: Duration,
+    writeTimeout: Duration,
+    idleTimeout: Duration,
+    requestTimeout: Duration,
+    headerTimeout: Duration,
+    maxHeaderBytes: int,
+    maxHeaders: int,
+    maxBodyBytes: int,
+    errors: ErrorPage,
     streaming: Streaming,
     date: Option[DateHeader],
-    streamsBody: @sendable (ServerRequest) -> bool
+    streamsBody: @sendable (ServerRequest) -> bool,
+    metrics: Option[ServerMetrics],
+    flights: Flights
 )
 
 // The `streamsBody` of a server whose every request has its body read before its handler is called.
 bufferedBodies(request: ServerRequest) -> bool = false
+
+// The requests a server's metrics count as in flight, by the hash of their connection, so a handler
+// that traps has its request counted as answering `500` when its connection fails. Two connections
+// sharing a hash only share a list: the one that fails finishes the other's request too, early.
+private class Flights(): Sendable
+  private val held = Mutex(HeldFlights())
+
+  // Holds `f` while the connection `key` answers it.
+  hold(key: long, f: InFlight) = held.with(
+    h -> h.flights = h.flights.updated(key, h.flights.getOrElse(key, Vector.empty[InFlight]()) :+ f)
+  )
+
+  // Lets `f` go, answered.
+  release(key: long, f: InFlight) = held.with(h ->
+    h.flights.get(key) match
+      Some(v) ->
+        val rest = v.filter(g -> !(g === f))
+        h.flights = if rest.isEmpty then h.flights.removed(key) else h.flights.updated(key, rest)
+      None -> ())
+
+  // The connection `key` failed: each request it held is counted as answering `500`.
+  abandon(key: long)
+    val left = held.with(h ->
+      val v = h.flights.getOrElse(key, Vector.empty[InFlight]())
+      h.flights = h.flights.removed(key)
+      v)
+    for f in left
+      _ = f.finish(500)
+
+private class HeldFlights()
+  var flights = HashMap.empty[long, Vector[InFlight]]()
 
 // The date a server's responses carry, as the text of a `Date` header: the HTTP-date of the clock's
 // now, formatted once for each second and handed to every connection that asks within it. The latest
@@ -614,20 +823,31 @@ private data Refusal
 
 // One connection's requests, read and answered in turn until it is not kept alive, its peer ends it,
 // or it waits for a request longer than its limit. Where `marks`, a connection streaming a response
-// is held in `s.streaming` while it does.
-private converse(stream: ByteStream, server: TcpServer, handler: Handler, s: Settings, marks: bool = true)
+// is held in `s.streaming` while it does. Where the server keeps metrics, each request read is in
+// flight, held under `key`, until its response is written.
+private converse(stream: ByteStream, server: TcpServer, handler: Handler, s: Settings, key: long, marks: bool = true)
   val input = Incoming(stream)
-  var limit = s.readTimeout
+  // A new connection's first request, its line and headers, is due `headerTimeout` after the
+  // connection was accepted, so the wait for its first byte is no longer than that either; a later
+  // one's is due `headerTimeout` after its own first byte, the idle wait before it `idleTimeout`'s.
+  val accepted = monotonic()
+  var first = true
+  var limit = soonest(s.readTimeout, s.headerTimeout)
   while input.awaits(limit, server)
     limit = s.idleTimeout
-    input.begin(s.requestTimeout)
+    input.begin(s.requestTimeout, s.headerTimeout, if first then accepted else monotonic())
+    first = false
     val (request, source) = readRequest(input, stream, server, s) match
       Ok(r) -> r
       Err(Quietly) -> return
       Err(Answer(status)) ->
+        if s.metrics is Some(m) then m.rejected(status)
         refuse(stream, status, s)
         return
+    val flight = s.metrics.map(m -> m.started(request.method))
+    if flight is Some(f) then s.flights.hold(key, f)
     if server.isStopping()
+      landed(flight, key, 503, s)
       refuse(stream, 503, s)
       return
     val response = handler(request)
@@ -635,13 +855,20 @@ private converse(stream: ByteStream, server: TcpServer, handler: Handler, s: Set
     if source is Some(b)
       b.refusal match
         Some(Answer(status)) ->
+          landed(flight, key, status, s)
           refuse(stream, status, s)
           return
-        Some(Quietly) -> return
+        Some(Quietly) ->
+          // The body broke off, so no answer can be read: counted as the client's fault.
+          landed(flight, key, 400, s)
+          return
         None -> ()
     if response.upgraded is Some(upgrade)
       // The bytes after the request are its body's, not the other protocol's.
-      if source.exists(b -> !b.ended) then return
+      if source.exists(b -> !b.ended)
+        landed(flight, key, 400, s)
+        return
+      landed(flight, key, 101, s)
       upgradedOut(stream, server, response, upgrade, input.rest(), s, marks)
       return
     // Whether the body has been read to its end, so what follows on the connection is a request.
@@ -667,11 +894,18 @@ private converse(stream: ByteStream, server: TcpServer, handler: Handler, s: Set
         )
         if marks then _ = s.streaming.release(stream)
         going
+    landed(flight, key, response.status, s)
     if !kept
       // A body left unread is still arriving; the connection is shut gently, so the answer is not
       // lost to a reset.
       if !whole && source.forall(b -> b.refusal.isEmpty) then lingered(stream)
       return
+
+// Counts the request `flight` is, where the server keeps metrics, as answered `status`.
+private landed(flight: Option[InFlight], key: long, status: int, s: Settings)
+  if flight is Some(f)
+    s.flights.release(key, f)
+    _ = f.finish(status)
 
 // Sends the `101` of `response` and hands the connection to `upgrade`, with the bytes the client sent
 // after its request, which were read ahead; the connection is no longer HTTP's, so the server reads
@@ -832,14 +1066,22 @@ private class Incoming(private val stream: ByteStream)
   private var ahead: Array[byte] = Array.empty[byte]()
   private var at = 0
   // When the request being read began, on the monotonic clock, and how long it may take in all;
-  // a zero budget is no limit.
+  // and when its line and headers are due, `Duration.Zero` once they are read or where there is no
+  // such limit. A zero budget is no limit.
   private var started = Duration.Zero
   private var budget = Duration.Zero
+  private var headersDue = Duration.Zero
 
-  // Begins a request, which must be read whole within `limit` from now; zero is no limit.
-  begin(limit: Duration)
+  // Begins a request, which must be read whole within `limit` from now, and its line and headers
+  // within `headers` of `from`, a time on the monotonic clock no later than now; zero is no limit.
+  begin(limit: Duration, headers: Duration, from: Duration)
     started = monotonic()
     budget = limit
+    headersDue = if headers > Duration.Zero then from + headers else Duration.Zero
+
+  // The request's line and headers are read; only its whole bound is left.
+  headersRead()
+    headersDue = Duration.Zero
 
   // Whether a byte is waiting, or arrives within `limit`. The wait is the connection's idle one,
   // through `server.idle`, so a server that stops ends it at once and it answers false.
@@ -855,22 +1097,28 @@ private class Incoming(private val stream: ByteStream)
         true
       _ -> false
 
-  // The next line without its terminator, `\r\n` or a bare `\n`, holding at most `room` bytes:
-  // a longer one is answered `tooLong`.
+  // The next line without its terminator, `\r\n`, holding at most `room` bytes: a longer one is
+  // answered `tooLong`. A line ended by a bare `\n`, or holding a control character other than a
+  // tab (a NUL, a bare `\r`, DEL among them), is answered `400`, as RFC 9112 lets a server do, so
+  // no two readers of one request can frame it differently.
   line(limit: Duration, room: int, tooLong: int) -> Result[string, Refusal]
     val out = Buffer[byte]()
+    var cr = false
     loop
       while at < ahead.length
         val b = ahead(at)
         at += 1
-        if b == byte(int('\n'))
-          val bytes = out.toArray()
-          val n = bytes.length
-          return Ok(
-            string.fromUtf8Lossy(if n > 0 && bytes(n - 1) == byte(int('\r')) then bytes.slice(0, n - 1) else bytes)
-          )
-        if out.length >= room then return Err(Answer(tooLong))
-        out.addOne(b)
+        val code = int(b) & 255
+        if code == int('\n')
+          if !cr then return Err(Answer(400))
+          return Ok(string.fromUtf8Lossy(out.toArray()))
+        if cr || code == 127 || (code < 32 && code != int('\t') && code != int('\r'))
+          return Err(Answer(400))
+        if code == int('\r')
+          cr = true
+        else
+          if out.length >= room then return Err(Answer(tooLong))
+          out.addOne(b)
       fill(limit)?
     Err(Quietly)
 
@@ -900,10 +1148,15 @@ private class Incoming(private val stream: ByteStream)
   // or failed ends the connection quietly.
   private fill(limit: Duration) -> Result[unit, Refusal]
     var wait = limit
+    val clock = monotonic()
     if budget > Duration.Zero
-      val left = budget - (monotonic() - started)
+      val left = budget - (clock - started)
       if left <= Duration.Zero then return Err(Answer(408))
-      if wait <= Duration.Zero || left < wait then wait = left
+      wait = soonest(wait, left)
+    if headersDue > Duration.Zero
+      val left = headersDue - clock
+      if left <= Duration.Zero then return Err(Answer(408))
+      wait = soonest(wait, left)
     if stream.setTimeout(wait).isErr then return Err(Quietly)
     stream.read(8192) match
       Ok(got) ->
@@ -913,6 +1166,10 @@ private class Incoming(private val stream: ByteStream)
         Ok(())
       Err(IoError(TimedOut, _, _)) -> Err(Answer(408))
       Err(_) -> Err(Quietly)
+
+// The nearer of two time limits, where zero or less is none.
+private soonest(a: Duration, b: Duration) -> Duration =
+  if a <= Duration.Zero then b else if b <= Duration.Zero || a < b then a else b
 
 // One request: its request line, its headers and its body, or, where `s.streamsBody` answers true for
 // its head, its body's source, left on the connection.
@@ -930,6 +1187,7 @@ private readRequest(
     if room <= 0 then return Err(Answer(400))
     first = input.line(s.readTimeout, room, 414)?
   room -= first.byteLength + 2
+  if first.indexOf('\t') >= 0 then return Err(Answer(400))
   val words = first.split(" ")
   if words.length != 3 then return Err(Answer(400))
   val method = words(0)
@@ -941,7 +1199,7 @@ private readRequest(
   if targetOf(target).isEmpty then return Err(Answer(400))
   val headers = Buffer[(string, string)]()
   loop
-    if room <= 0 then return Err(Answer(431))
+    if room < 0 then return Err(Answer(431))
     val line = input.line(s.readTimeout, room, 431)?
     room -= line.byteLength + 2
     if line.isEmpty then break
@@ -951,10 +1209,17 @@ private readRequest(
     if colon <= 0 then return Err(Answer(400))
     val name = line.slice(0, colon)
     if name.indexWhere(c -> !isTokenChar(c)) >= 0 then return Err(Answer(400))
+    if headers.length >= s.maxHeaders then return Err(Answer(431))
     headers.addOne((name, line.slice(colon + 1, line.byteLength).trim))
+  input.headersRead()
   val all = headers.toVector
   val hosts = all.count(h -> h.0.equalsIgnoreCase("Host"))
   if hosts > 1 || (version == "HTTP/1.1" && hosts == 0) then return Err(Answer(400))
+  // A body's framing read two ways is how one request is smuggled inside another: a
+  // `Transfer-Encoding` in HTTP/1.0, which knows none, or in two field lines, of which a reader
+  // taking only one would see another coding, is refused (RFC 9112 section 6.1).
+  val codings = all.count(h -> h.0.equalsIgnoreCase("Transfer-Encoding"))
+  if codings > 1 || (codings == 1 && version == "HTTP/1.0") then return Err(Answer(400))
   val framing = framingOf(all)?
   val continues = headerIn(all, "Expect").isDefined && version == "HTTP/1.1"
   val head = ServerRequest(method, target, all, version = version, remote = stream.remoteAddress, server = Some(server))

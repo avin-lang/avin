@@ -1,0 +1,562 @@
+module avin.net.redis
+
+// RESP, the protocol a Redis server speaks, in both its versions: RESP3, which `HELLO 3` turns on, and
+// RESP2, which every server speaks from the start. A `Value` is one reply, or one part of one; `encode`
+// writes a value the way a server sends it, and `encodeCommand` a command the way a client does, as
+// an array of blob strings. A `RespParser` reads values out of bytes as they arrive, a piece at a time,
+// and checks every length and every nesting against its `RespLimits`, so a server that sends too much,
+// too deep, or something that is not RESP, is refused before the bytes it claims are held.
+
+// One RESP value. A server's reply is one, and so is every element of an aggregate one.
+data Value
+  // `+text`: a line of text with no CR or LF in it, `OK` for one.
+  SimpleString(text: string)
+  // `$length`: bytes, any bytes at all; a stored value or a key.
+  BlobString(bytes: ArraySeq[byte])
+  // `=length`: text with its format, `txt` or `mkd`, the three letters before its `:`.
+  VerbatimString(format: string, text: string)
+  // `-text`: an error, its first word its code: `ERR`, `WRONGTYPE`, `NOAUTH`.
+  SimpleError(text: string)
+  // `!length`: an error whose text may hold CR and LF.
+  BlobError(text: string)
+  // `:number`: a whole number that fits a `long`.
+  Number(value: long)
+  // `,number`: a floating-point number, `inf`, `-inf` and `nan` among them.
+  Double(value: real)
+  // `(number`: a whole number of any size.
+  BigNumber(value: BigInt)
+  // `#t` or `#f`.
+  Boolean(value: bool)
+  // `_`, and RESP2's `$-1` and `*-1`: no value.
+  Null
+  // `*count`: values in order.
+  ArrayValue(items: Vector[Value])
+  // `%count`: pairs of a key and its value, in the order the server sent them.
+  MapValue(entries: Vector[(Value, Value)])
+  // `~count`: values with no order and no repeats.
+  SetValue(items: Vector[Value])
+  // `>count`: data the server sends on its own, not as the reply to a command: a message to a
+  // subscribed channel, an invalidated key. Its first item names its kind.
+  Push(items: Vector[Value])
+  // `|count`: a value with the attributes the server sent before it, pairs of a key and a value
+  // saying something about it, such as how popular a key is.
+  Attributed(attributes: Vector[(Value, Value)], value: Value)
+
+impl Value
+  // The text of a simple string, a verbatim string, or a blob string whose bytes are UTF-8; `None`
+  // for any other value.
+  asText -> Option[string] = self match
+    SimpleString(t) -> Some(t)
+    VerbatimString(_, t) -> Some(t)
+    BlobString(b) -> string.fromUtf8(b.toArray()).ok
+    Attributed(_, v) -> v.asText
+    _ -> None
+
+  // The bytes of a blob string, or the UTF-8 of a simple or verbatim string's text; `None` for any
+  // other value.
+  asBytes -> Option[Array[byte]] = self match
+    BlobString(b) -> Some(b.toArray())
+    SimpleString(t) -> Some(t.utf8)
+    VerbatimString(_, t) -> Some(t.utf8)
+    Attributed(_, v) -> v.asBytes
+    _ -> None
+
+  // A number, or a string that writes one in decimal, as RESP2 sends some numbers; `None` otherwise.
+  asLong -> Option[long] = self match
+    Number(n) -> Some(n)
+    BlobString(_) -> asText.flatMap(t -> t.toLongOption())
+    SimpleString(t) -> t.toLongOption()
+    Attributed(_, v) -> v.asLong
+    _ -> None
+
+  // A double, a number, or a string that writes one, as RESP2 sends every double (`inf`, `-inf`
+  // and `nan` included); `None` otherwise.
+  asReal -> Option[real] = self match
+    Double(x) -> Some(x)
+    Number(n) -> Some(n.toReal)
+    BlobString(_) -> asText.flatMap(t -> realOf(t))
+    SimpleString(t) -> realOf(t)
+    Attributed(_, v) -> v.asReal
+    _ -> None
+
+  // A boolean, or RESP2's `1` and `0` for one; `None` otherwise.
+  asBool -> Option[bool] = self match
+    Boolean(b) -> Some(b)
+    Number(1) -> Some(true)
+    Number(0) -> Some(false)
+    Attributed(_, v) -> v.asBool
+    _ -> None
+
+  // The items of an array, a set or a push; `None` for any other value, `Null` included.
+  asItems -> Option[Vector[Value]] = self match
+    ArrayValue(xs) -> Some(xs)
+    SetValue(xs) -> Some(xs)
+    Push(xs) -> Some(xs)
+    Attributed(_, v) -> v.asItems
+    _ -> None
+
+  // The entries of a map, or of an array of even length read as keys and values in turn, which is
+  // how RESP2 sends a map; `None` otherwise.
+  asEntries -> Option[Vector[(Value, Value)]] = self match
+    MapValue(es) -> Some(es)
+    ArrayValue(xs) if xs.length % 2 == 0 -> Some(pairedUp(xs))
+    Attributed(_, v) -> v.asEntries
+    _ -> None
+
+  // Whether it is `Null`, attributes aside.
+  isNull -> bool = self match
+    Null -> true
+    Attributed(_, v) -> v.isNull
+    _ -> false
+
+  // Whether it is an error, a simple or a blob one, attributes aside.
+  isError -> bool = self match
+    SimpleError(_) -> true
+    BlobError(_) -> true
+    Attributed(_, v) -> v.isError
+    _ -> false
+
+  // The value without the attributes sent before it, at its top level.
+  plain -> Value = self match
+    Attributed(_, v) -> v.plain
+    _ -> self
+
+// The items of `xs`, of even length, as keys and values in turn.
+pairedUp(xs: Vector[Value]) -> Vector[(Value, Value)] = Vector.tabulate(xs.length / 2, i -> (xs(2 * i), xs(2 * i + 1)))
+
+// The number a double's text writes: RESP3's `inf`, `-inf` and `nan`, and a decimal fraction with an
+// optional exponent; `None` for anything else, white space included.
+realOf(text: string) -> Option[real] = text match
+  "inf" -> Some(real.PositiveInfinity)
+  "+inf" -> Some(real.PositiveInfinity)
+  "-inf" -> Some(real.NegativeInfinity)
+  "nan" -> Some(real.NaN)
+  "-nan" -> Some(real.NaN)
+  _ -> if text.isEmpty || !text.forall(c -> isRealChar(c)) then None else text.toRealOption()
+
+private isRealChar(c: char) -> bool = '0' <= c <= '9' || c == '.' || c == '-' || c == '+' || c == 'e' || c == 'E'
+
+// The limits a `RespParser` holds a server to, each a count it may reach and not pass:
+// - `maxBulkBytes`, the bytes of one blob string, blob error or verbatim string, and of all the chunks
+//   of one streamed string together; 512 MiB by default, the most a Redis server stores in one;
+// - `maxDepth`, how deep aggregates nest, a value with no aggregate around it being at depth zero and
+//   the items of a top-level array at depth one; 64 by default;
+// - `maxAggregateLength`, the items of one array, set or push, or the pairs of one map or one set of
+//   attributes; 16777216 by default;
+// - `maxLineBytes`, the bytes of a line, a simple string's or error's, a number's, or a length's,
+//   without its CRLF; 1 MiB by default.
+// A limit below one traps.
+class RespLimits(
+    val maxBulkBytes: int = 536870912,
+    val maxDepth: int = 64,
+    val maxAggregateLength: int = 16777216,
+    val maxLineBytes: int = 1048576
+): Sendable
+  private val checked = respLimitsChecked(maxBulkBytes, maxDepth, maxAggregateLength, maxLineBytes)
+
+private respLimitsChecked(bulk: int, depth: int, aggregate: int, line: int) -> bool
+  if bulk < 1 then fail(s"a RESP bulk limit of $bulk bytes: it is at least one")
+  if depth < 1 then fail(s"a RESP depth limit of $depth: it is at least one")
+  if aggregate < 1 then fail(s"a RESP aggregate limit of $aggregate: it is at least one")
+  if line < 1 then fail(s"a RESP line limit of $line bytes: it is at least one")
+  true
+
+// Why bytes are not RESP, or are RESP past a limit. Each names the offset, in the bytes the parser
+// was given since it was made, where the trouble starts.
+data RespError
+  // Not RESP: a type byte RESP has no type for, a number that is not one, a line with a bare CR or LF
+  // in it, a length that is negative, a string not followed by CRLF.
+  Malformed(text: string, at: long)
+  // A string, or a line, longer than its limit allows.
+  TooLong(what: string, length: long, limit: int, at: long)
+  // Aggregates nested deeper than `limit`.
+  TooDeep(limit: int, at: long)
+  // An aggregate with more items, or pairs, than `limit`.
+  TooMany(length: long, limit: int, at: long)
+
+impl Error for RespError
+  message -> string = self match
+    Malformed(text, at) -> s"not RESP at byte $at: $text"
+    TooLong(what, length, limit, at) -> s"a RESP $what of $length bytes at byte $at is longer than the limit of $limit"
+    TooDeep(limit, at) -> s"RESP aggregates nested deeper than $limit at byte $at"
+    TooMany(length, limit, at) -> s"a RESP aggregate of $length at byte $at is longer than the limit of $limit"
+
+impl Display for RespError
+  display(out: Writer, spec: FormatSpec) = out.writeField(message, spec)
+
+// A growing run of bytes, written at its end.
+private class ByteSink()
+  private var data: Array[byte] = Array.fill(64, byte(0))
+  private var count = 0
+
+  length -> int = count
+
+  // Makes room for `n` more bytes.
+  private room(n: int)
+    if count + n <= data.length then return
+    var size = data.length * 2
+    while size < count + n do size *= 2
+    val grown = Array.fill(size, byte(0))
+    data.copyTo(grown, 0, 0, count)
+    data = grown
+
+  add(b: byte)
+    room(1)
+    data(count) = b
+    count += 1
+
+  addAll(bytes: Array[byte])
+    room(bytes.length)
+    bytes.copyTo(data, count, 0, bytes.length)
+    count += bytes.length
+
+  addText(text: string) = addAll(text.utf8)
+
+  // A line's bytes and its CRLF.
+  addLine(text: string)
+    addText(text)
+    add(byte(13))
+    add(byte(10))
+
+  toArray() -> Array[byte] = data.slice(0, count)
+
+// `value` as a server sends it, RESP3's form of every type; `Null` is `_`, a RESP3 null. A simple
+// string or error with a CR or LF in its text traps, since RESP has no way to send one; so does a
+// verbatim string whose format is not three bytes.
+encode(value: Value) -> Array[byte]
+  val out = ByteSink()
+  encodeInto(out, value)
+  out.toArray()
+
+// `value` as RESP2 sends it: what RESP2 has no type for written in the type it uses instead, a
+// double, a big number and a verbatim string as a blob string, a boolean as `1` or `0`, a map as an
+// array of its keys and values in turn, a set and a push as an array, a null as `$-1`; attributes,
+// which RESP2 has no way to send, are left out.
+encodeResp2(value: Value) -> Array[byte]
+  val out = ByteSink()
+  encodeResp2Into(out, value)
+  out.toArray()
+
+// A command as a client sends it: an array of blob strings, the command's name and its arguments.
+encodeCommand(args: Vector[string]) -> Array[byte]
+  val out = ByteSink()
+  commandInto(out, args.map(a -> a.utf8))
+  out.toArray()
+
+// A command whose arguments are bytes, which may be anything.
+encodeCommandBytes(args: Vector[Array[byte]]) -> Array[byte]
+  val out = ByteSink()
+  commandInto(out, args)
+  out.toArray()
+
+private commandInto(out: ByteSink, args: Vector[Array[byte]])
+  out.addLine(s"*${args.length}")
+  for a in args do blobInto(out, a)
+
+// A blob string of `text`'s UTF-8.
+blobOf(text: string) -> Value = BlobString(text.utf8.toArraySeq)
+
+private lineText(kind: string, text: string) -> string
+  if text.contains("\r") || text.contains("\n") then fail(s"a RESP $kind holds a CR or LF: ${debug(text)}")
+  text
+
+// A double's text: `inf`, `-inf`, `nan`, or the number written as `display` writes it.
+doubleText(x: real) -> string =
+  if x.isNaN then "nan" else if x == real.PositiveInfinity then "inf" else if x == real.NegativeInfinity then "-inf" else s"$x"
+
+private encodeInto(out: ByteSink, value: Value) -> unit = value match
+  SimpleString(t) -> out.addLine("+" + lineText("simple string", t))
+  SimpleError(t) -> out.addLine("-" + lineText("simple error", t))
+  BlobString(b) -> blobInto(out, b.toArray())
+  BlobError(t) ->
+    out.addLine(s"!${t.byteLength}")
+    out.addLine(t)
+  VerbatimString(f, t) ->
+    if f.byteLength != 3 then fail(s"a verbatim string's format is three bytes, not ${debug(f)}")
+    out.addLine(s"=${t.byteLength + 4}")
+    out.addLine(s"$f:$t")
+  Number(n) -> out.addLine(s":$n")
+  Double(x) -> out.addLine("," + doubleText(x))
+  BigNumber(n) -> out.addLine(s"($n")
+  Boolean(b) -> out.addLine(if b then "#t" else "#f")
+  Null -> out.addLine("_")
+  ArrayValue(xs) -> aggregateInto(out, "*", xs)
+  SetValue(xs) -> aggregateInto(out, "~", xs)
+  Push(xs) -> aggregateInto(out, ">", xs)
+  MapValue(es) -> pairsInto(out, "%", es)
+  Attributed(attrs, v) ->
+    pairsInto(out, "|", attrs)
+    encodeInto(out, v)
+
+private blobInto(out: ByteSink, bytes: Array[byte])
+  out.addLine(s"$$${bytes.length}")
+  out.addAll(bytes)
+  out.addLine("")
+
+private aggregateInto(out: ByteSink, kind: string, xs: Vector[Value])
+  out.addLine(s"$kind${xs.length}")
+  for x in xs do encodeInto(out, x)
+
+private pairsInto(out: ByteSink, kind: string, es: Vector[(Value, Value)])
+  out.addLine(s"$kind${es.length}")
+  for (k, v) in es
+    encodeInto(out, k)
+    encodeInto(out, v)
+
+private encodeResp2Into(out: ByteSink, value: Value) -> unit = value match
+  SimpleString(t) -> out.addLine("+" + lineText("simple string", t))
+  SimpleError(t) -> out.addLine("-" + lineText("simple error", t))
+  BlobError(t) -> out.addLine("-" + lineText("error", t))
+  BlobString(b) -> blobInto(out, b.toArray())
+  VerbatimString(_, t) -> blobInto(out, t.utf8)
+  Number(n) -> out.addLine(s":$n")
+  Double(x) -> blobInto(out, doubleText(x).utf8)
+  BigNumber(n) -> blobInto(out, s"$n".utf8)
+  Boolean(b) -> out.addLine(if b then ":1" else ":0")
+  Null -> out.addLine("$-1")
+  ArrayValue(xs) -> resp2Items(out, xs)
+  SetValue(xs) -> resp2Items(out, xs)
+  Push(xs) -> resp2Items(out, xs)
+  MapValue(es) ->
+    out.addLine(s"*${es.length * 2}")
+    for (k, v) in es
+      encodeResp2Into(out, k)
+      encodeResp2Into(out, v)
+  Attributed(_, v) -> encodeResp2Into(out, v)
+
+private resp2Items(out: ByteSink, xs: Vector[Value])
+  out.addLine(s"*${xs.length}")
+  for x in xs do encodeResp2Into(out, x)
+
+// A step of parsing: the value parsed and the offset just past it, or `None` where the bytes end
+// before the value does.
+private type Parsed = Option[(Value, int)]
+
+// Reads RESP values, RESP3's and RESP2's alike, out of bytes fed to it as they arrive. `feed` adds
+// bytes; `next` answers the next whole value and takes its bytes, or `None` where the value is not
+// all there yet, so the caller feeds it more and asks again. Each length is checked against `limits`
+// as it is read, before the bytes it claims arrive. A failure is final: once `next` has answered an
+// `Err`, it answers the same one every time, since what follows bytes that are not RESP cannot be
+// read. Streamed strings (`$?`, then `;length` chunks ending with `;0`) and streamed aggregates (`*?`,
+// `%?`, `~?`, `>?`, ending with `.`) are read whole, as the value they make.
+class RespParser(val limits: RespLimits = RespLimits())
+  private var data: Array[byte] = Array.fill(256, byte(0))
+  private var start = 0
+  private var end = 0
+  // Bytes taken before `start`'s byte zero, so offsets name the whole stream.
+  private var taken: long = 0
+  private var failure: Option[RespError] = None
+
+  // How many bytes are fed and not yet taken by a value.
+  buffered -> int = end - start
+
+  // Adds `bytes` after the ones fed before.
+  feed(bytes: Array[byte])
+    val n = bytes.length
+    if n == 0 then return
+    if end + n > data.length
+      val live = end - start
+      if live + n <= data.length && start >= data.length / 2
+        data.copyTo(data, 0, start, live)
+      else
+        var size = data.length * 2
+        while size < live + n do size *= 2
+        val grown = Array.fill(size, byte(0))
+        data.copyTo(grown, 0, start, live)
+        data = grown
+      taken += long(start)
+      start = 0
+      end = live
+    bytes.copyTo(data, end, 0, n)
+    end += n
+
+  // The next whole value, its bytes taken; `None` where it has not all arrived.
+  next() -> Result[Option[Value], RespError]
+    if failure is Some(e) then return Err(e)
+    if start == end then return Ok(None)
+    valueAt(start, 0) match
+      Ok(Some((v, past))) ->
+        start = past
+        if start == end
+          taken += long(start)
+          start = 0
+          end = 0
+        Ok(Some(v))
+      Ok(None) -> Ok(None)
+      Err(e) ->
+        failure = Some(e)
+        Err(e)
+
+  private offset(i: int) -> long = taken + long(i)
+
+  private byteAt(i: int) -> int = int(data(i))
+
+  // The offset of the CR of the line starting at `p`, or `None` where its CRLF has not arrived.
+  private lineEnd(p: int) -> Result[Option[int], RespError]
+    var i = p
+    while i < end
+      val b = byteAt(i)
+      if b == int('\r')
+        if i + 1 == end then return checkedLine(p, i, None)
+        if byteAt(i + 1) != int('\n') then return Err(Malformed("a CR not followed by LF", offset(i)))
+        return checkedLine(p, i, Some(i))
+      if b == int('\n') then return Err(Malformed("an LF not after a CR", offset(i)))
+      if i - p >= limits.maxLineBytes then return Err(TooLong("line", long(i - p + 1), limits.maxLineBytes, offset(p)))
+      i += 1
+    Ok(None)
+
+  private checkedLine(p: int, cr: int, found: Option[int]) -> Result[Option[int], RespError] =
+    if cr - p > limits.maxLineBytes then Err(
+      TooLong("line", long(cr - p), limits.maxLineBytes, offset(p))
+    ) else Ok(found)
+
+  private textOf(from: int, until: int) -> string = string.fromUtf8Lossy(data.slice(from, until))
+
+  // The value whose type byte is at `p`, at `depth` aggregates deep.
+  private valueAt(p: int, depth: int) -> Result[Parsed, RespError]
+    if p >= end then return Ok(None)
+    val kind = char(byteAt(p))
+    if !"$!=*~>%|+-:,(#_".contains(kind.toString())
+      return Err(Malformed(s"no RESP type begins with byte ${byteAt(p)}", offset(p)))
+    if kind == '$' || kind == '!' || kind == '='
+      return blobAt(p, kind)
+    if kind == '*' || kind == '~' || kind == '>' || kind == '%' || kind == '|'
+      return aggregateAt(p, kind, depth)
+    val cr = lineEnd(p + 1)? match
+      Some(c) -> c
+      None -> return Ok(None)
+    val past = cr + 2
+    val text = textOf(p + 1, cr)
+    kind match
+      '+' -> Ok(Some((SimpleString(text), past)))
+      '-' -> Ok(Some((SimpleError(text), past)))
+      ':' -> text.toLongOption() match
+        Some(n) if text.byteLength > 0 && text != "+" -> Ok(Some((Number(n), past)))
+        _ -> Err(Malformed(s"a number that is not one: ${debug(text)}", offset(p)))
+      ',' -> realOf(text) match
+        Some(x) -> Ok(Some((Double(x), past)))
+        None -> Err(Malformed(s"a double that is not one: ${debug(text)}", offset(p)))
+      '(' -> bigOf(text) match
+        Some(n) -> Ok(Some((BigNumber(n), past)))
+        None -> Err(Malformed(s"a big number that is not one: ${debug(text)}", offset(p)))
+      '#' -> text match
+        "t" -> Ok(Some((Boolean(true), past)))
+        "f" -> Ok(Some((Boolean(false), past)))
+        _ -> Err(Malformed(s"a boolean that is neither t nor f: ${debug(text)}", offset(p)))
+      '_' -> if text.isEmpty then Ok(Some((Null, past))) else Err(
+        Malformed(s"a null with text after it: ${debug(text)}", offset(p))
+      )
+      _ -> Err(Malformed(s"no RESP type begins with byte ${byteAt(p)}", offset(p)))
+
+  // The length on the line at `p`, its type byte skipped: `Some(n)`, `-1` for RESP2's null, or `-2`
+  // for `?`, a streamed value's; `None` where the line has not all arrived. The offset past the line
+  // comes with it.
+  private lengthAt(p: int, streamable: bool) -> Result[Option[(long, int)], RespError]
+    val cr = lineEnd(p + 1)? match
+      Some(c) -> c
+      None -> return Ok(None)
+    val text = textOf(p + 1, cr)
+    if text == "-1" then return Ok(Some((-1, cr + 2)))
+    if text == "?" && streamable then return Ok(Some((-2, cr + 2)))
+    if text.isEmpty || text.byteLength > 18 || !text.forall(c -> '0' <= c <= '9')
+      return Err(Malformed(s"a length that is not one: ${debug(text)}", offset(p)))
+    Ok(Some((text.toLong(), cr + 2)))
+
+  private blobAt(p: int, kind: char) -> Result[Parsed, RespError]
+    val (n, body) = lengthAt(p, kind == '$')? match
+      Some(found) -> found
+      None -> return Ok(None)
+    if n == -1
+      if kind == '$' then return Ok(Some((Null, body)))
+      return Err(Malformed("a negative length", offset(p)))
+    if n == -2 then return streamedBlobAt(p, body)
+    val what = if kind == '$' then "blob string" else if kind == '!' then "blob error" else "verbatim string"
+    if n > long(limits.maxBulkBytes) then return Err(TooLong(what, n, limits.maxBulkBytes, offset(p)))
+    val len = int(n)
+    if end - body < len + 2 then return Ok(None)
+    if byteAt(body + len) != int('\r') || byteAt(body + len + 1) != int('\n')
+      return Err(Malformed(s"a $what not followed by CRLF", offset(body + len)))
+    val past = body + len + 2
+    if kind == '$' then return Ok(Some((BlobString(data.slice(body, body + len).toArraySeq), past)))
+    if kind == '!' then return Ok(Some((BlobError(textOf(body, body + len)), past)))
+    if len < 4 || byteAt(body + 3) != int(':')
+      return Err(Malformed("a verbatim string without its three-byte format and `:`", offset(body)))
+    Ok(Some((VerbatimString(textOf(body, body + 3), textOf(body + 4, body + len)), past)))
+
+  // A streamed string's chunks, from `q`, each `;length` and its bytes, the last `;0`.
+  private streamedBlobAt(p: int, from: int) -> Result[Parsed, RespError]
+    val out = ByteSink()
+    var q = from
+    while true
+      if q >= end then return Ok(None)
+      if byteAt(q) != int(';') then return Err(Malformed("a streamed string's chunk without its `;`", offset(q)))
+      val (n, body) = lengthAt(q, false)? match
+        Some(found) -> found
+        None -> return Ok(None)
+      if n < 0 then return Err(Malformed("a negative length", offset(q)))
+      if n == 0 then return Ok(Some((BlobString(out.toArray().toArraySeq), body)))
+      if long(out.length) + n > long(limits.maxBulkBytes)
+        return Err(TooLong("streamed string", long(out.length) + n, limits.maxBulkBytes, offset(p)))
+      val len = int(n)
+      if end - body < len + 2 then return Ok(None)
+      if byteAt(body + len) != int('\r') || byteAt(body + len + 1) != int('\n')
+        return Err(Malformed("a streamed string's chunk not followed by CRLF", offset(body + len)))
+      out.addAll(data.slice(body, body + len))
+      q = body + len + 2
+    Ok(None)
+
+  private aggregateAt(p: int, kind: char, depth: int) -> Result[Parsed, RespError]
+    val (n, body) = lengthAt(p, kind != '|')? match
+      Some(found) -> found
+      None -> return Ok(None)
+    if n == -1
+      if kind == '*' then return Ok(Some((Null, body)))
+      return Err(Malformed("a negative length", offset(p)))
+    if depth + 1 > limits.maxDepth then return Err(TooDeep(limits.maxDepth, offset(p)))
+    if n > long(limits.maxAggregateLength) then return Err(TooMany(n, limits.maxAggregateLength, offset(p)))
+    val pairs = kind == '%' || kind == '|'
+    val items = Buffer[Value]()
+    var q = body
+    var counted: long = 0
+    while n == -2 || counted < n
+      if n == -2
+        if q >= end then return Ok(None)
+        if byteAt(q) == int('.')
+          val cr = lineEnd(q + 1)? match
+            Some(c) -> c
+            None -> return Ok(None)
+          if cr != q + 1 then return Err(Malformed("a streamed aggregate's end with text after its `.`", offset(q)))
+          if pairs && items.length % 2 != 0 then return Err(
+            Malformed("a streamed map ending between a key and its value", offset(q))
+          )
+          q = cr + 2
+          break
+        if counted >= long(limits.maxAggregateLength) then return Err(
+          TooMany(counted + 1, limits.maxAggregateLength, offset(p))
+        )
+      val (v, past) = valueAt(q, depth + 1)? match
+        Some(found) -> found
+        None -> return Ok(None)
+      items.append(v)
+      q = past
+      if !pairs || items.length % 2 == 0 then counted += 1
+    val xs = items.toVector
+    val made = kind match
+      '*' -> ArrayValue(xs)
+      '~' -> SetValue(xs)
+      '>' -> Push(xs)
+      _ -> MapValue(pairedUp(xs))
+    if kind != '|' then return Ok(Some((made, q)))
+    val attributes = made match
+      MapValue(es) -> es
+      _ -> Vector.empty[(Value, Value)]()
+    val (v, past) = valueAt(q, depth)? match
+      Some(found) -> found
+      None -> return Ok(None)
+    Ok(Some((Attributed(attributes, v), past)))
+
+// A big number's text: an optional `-` or `+` and at least one decimal digit, nothing else.
+private bigOf(text: string) -> Option[BigInt]
+  val digits = if text.startsWith("-") || text.startsWith("+") then text.drop(1) else text
+  if digits.isEmpty || !digits.forall(c -> '0' <= c <= '9') then return None
+  BigInt.parse(if text.startsWith("+") then digits else text)

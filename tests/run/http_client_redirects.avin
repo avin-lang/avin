@@ -1,0 +1,95 @@
+// expect: exit 0
+// A `Client`'s redirects against `http.serve`: a chain, relative and absolute, on one kept
+// connection; a loop, followed to the limit and the next redirect answered; a limit of zero; each
+// status's method and body (`303` asks with `GET`, a `HEAD` staying one, `301` and `302` turn only a
+// `POST` into a `GET`, `307` and `308` send the same again), the headers that describe a dropped
+// body going with it; credentials and a given `Host` kept for the same origin and dropped for
+// another; and a redirect with no `Location`, one that is not a URL and one to a scheme the client
+// does not speak. The module's `send` follows five.
+import avin.io.IoError
+import avin.net.http
+import avin.net.http.{Client, HttpError, Request, Response, ServerRequest}
+import avin.threads.Atomic
+
+ok[T](r: Result[T, IoError]) -> T = r match
+  Ok(v) -> v
+  Err(e) -> fail(e.message)
+
+// What the request asked, as a server saw it.
+echo(r: ServerRequest) -> string
+  val shown = [
+    "Authorization", "Cookie", "Content-Type", "X-Kept", "Host"
+  ].map(n -> s"$n=${r.header(n).getOrElse("-")}")
+  s"${r.method} ${r.target} [${string.fromUtf8Lossy(r.body)}] ${shown.mkString(" ")}"
+
+moved(status: int, location: string) -> Response = Response.empty(status).withHeader("Location", location)
+
+describe(r: Result[Response, HttpError], port: int, other: int) -> string = r match
+  Ok(res) ->
+    val text = s"${res.status} ${res.header("Location").getOrElse("")} ${res.text}"
+    text.replace(port.toString(), "PORT").replace(other.toString(), "OTHER")
+  Err(e) -> s"error: ${e.message}"
+
+main()
+  val hits = Atomic(0)
+  val elsewhere = ok(http.serve("127.0.0.1", 0, r -> Response.text(200, echo(r))))
+  val other = elsewhere.port()
+  val server = ok(http.serve("127.0.0.1", 0, r ->
+    _ = hits.add(1)
+    val path = r.target.split("?")(0)
+    if path.startsWith("/loop") then moved(302, "/loop")
+    elif path.startsWith("/status/")
+      moved(path.slice(8, path.byteLength).toInt(), "/echo")
+    else path match
+      "/a" -> moved(302, "b?from=a")
+      "/b" -> moved(301, s"http://127.0.0.1:${r.header("Host").getOrElse("").split(":")(1)}/c")
+      "/c" -> moved(307, "/echo")
+      "/away" -> moved(302, s"http://127.0.0.1:$other/echo")
+      "/nowhere" -> Response.empty(302)
+      "/bad" -> moved(302, "http://[::1")
+      "/ftp" -> moved(302, "ftp://example.com/")
+      _ -> Response.text(200, echo(r))))
+  val port = server.port()
+  val base = s"http://127.0.0.1:$port"
+  val show = (r: Result[Response, HttpError]) -> println(describe(r, port, other))
+
+  // A chain of three on one connection.
+  val client = Client()
+  show(client.get(s"$base/a"))
+  println(s"chain: ${hits.load()} requests, ${client.stats().opened} connection")
+
+  // A loop: the limit followed, then the redirect is the answer.
+  hits.store(0)
+  show(Client(maxRedirects = 3).get(s"$base/loop"))
+  println(s"loop: ${hits.load()} requests")
+  hits.store(0)
+  show(Client(maxRedirects = 0).get(s"$base/loop"))
+  println(s"none followed: ${hits.load()} request")
+  hits.store(0)
+  show(http.get(s"$base/loop"))
+  println(s"the module's: ${hits.load()} requests")
+
+  // Each status's method and body.
+  for status in [301, 302, 303, 307, 308]
+    for method in ["POST", "PUT", "HEAD"]
+      val request = Request(method, s"$base/status/$status").withBody("data").withHeader("Content-Type", "text/plain")
+      client.send(request) match
+        Ok(res) -> println(s"$status $method -> ${res.status} ${res.text.replace(port.toString(), "PORT")}")
+        Err(e) -> println(s"$status $method -> error: ${e.message}")
+  show(client.send(Request("DELETE", s"$base/status/303")))
+
+  // Credentials and a given `Host`: kept for the same origin, dropped for another.
+  val secret = Request("GET", s"$base/c")
+    .withHeader("Authorization", "Bearer token")
+    .withHeader("Cookie", "id=1")
+    .withHeader("X-Kept", "yes")
+  show(client.send(secret))
+  show(client.send(Request("GET", s"$base/away").withHeaders(secret.headers)))
+  show(client.send(Request("GET", s"$base/away").withHeader("Host", s"127.0.0.1:$port")))
+
+  // Redirects that are not followed, or cannot be.
+  show(client.get(s"$base/nowhere"))
+  show(client.get(s"$base/bad"))
+  show(client.get(s"$base/ftp"))
+  server.stop()
+  elsewhere.stop()

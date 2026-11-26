@@ -1,0 +1,418 @@
+// `avin.html`: each escaper against the OWASP XSS cheat sheet's vectors, Unicode and the empty text;
+// `safeUrl` against the spellings browsers read as a scheme; and `html"…"` writing each hole for the
+// place it stands in, refusing every place no escaping makes safe, and building pages from nested
+// templates.
+import avin.html.{Html, escapeHtml, escapeAttribute, escapeJs, jsString, safeUrl}
+import avin.net.http.Response
+
+// Each input escaped by `escape`, checked together so every mismatch is reported.
+htmlEscapesAll(escape: (string) -> string, cases: Vector[(string, string)])
+  val wrong = Buffer[string]()
+  for (text, expected) in cases
+    val actual = escape(text)
+    if actual != expected then wrong.addOne(s"$text: expected $expected, found $actual")
+  assertEq(wrong.toVector, Vector.empty[string]())
+
+// The reason `Html.render` gives for the template `parts` with `args`, or `ok` and its markup.
+htmlRendered(parts: Vector[string], args: Vector[Display]) -> string = Html.render(parts, args) match
+  Ok(h) -> s"ok ${h.text}"
+  Err(why) -> why
+
+// Each template, as its parts and one argument, rendered or refused, checked together.
+htmlRendersAll(value: Display, cases: Vector[(Vector[string], string)])
+  val wrong = Buffer[string]()
+  for (parts, expected) in cases
+    val actual = htmlRendered(parts, Vector(value))
+    if actual != expected then wrong.addOne(s"${parts.mkString("$")}: expected $expected, found $actual")
+  assertEq(wrong.toVector, Vector.empty[string]())
+
+@test("escapeHtml writes the five special characters as references and keeps every other")
+escapeHtmlCharacters()
+  htmlEscapesAll(
+    escapeHtml,
+    [
+      ("", ""),
+      ("plain text", "plain text"),
+      ("&", "&amp;"),
+      ("<", "&lt;"),
+      (">", "&gt;"),
+      ("\"", "&quot;"),
+      ("'", "&#39;"),
+      ("&amp;", "&amp;amp;"),
+      ("a < b && c > d", "a &lt; b &amp;&amp; c &gt; d"),
+      ("`=/\\", "`=/\\"),
+      ("tab\tnew\nline\r", "tab\tnew\nline\r"),
+      ("café 日本 \u{1F600}", "café 日本 \u{1F600}"),
+      ("<é>", "&lt;é&gt;"),
+      ("\u{1F600}&\u{1F600}", "\u{1F600}&amp;\u{1F600}")
+    ]
+  )
+
+@test("escapeHtml defuses the OWASP cheat sheet's vectors in text and quoted attributes")
+escapeHtmlVectors()
+  htmlEscapesAll(
+    escapeHtml,
+    [
+      ("<script>alert('XSS')</script>", "&lt;script&gt;alert(&#39;XSS&#39;)&lt;/script&gt;"),
+      ("\"><script>alert(1)</script>", "&quot;&gt;&lt;script&gt;alert(1)&lt;/script&gt;"),
+      ("'><img src=x onerror=alert(1)>", "&#39;&gt;&lt;img src=x onerror=alert(1)&gt;"),
+      ("<svg/onload=alert(1)>", "&lt;svg/onload=alert(1)&gt;"),
+      ("<IMG SRC=\"javascript:alert('XSS');\">", "&lt;IMG SRC=&quot;javascript:alert(&#39;XSS&#39;);&quot;&gt;"),
+      ("</textarea><script>x</script>", "&lt;/textarea&gt;&lt;script&gt;x&lt;/script&gt;"),
+      ("<!--", "&lt;!--"),
+      ("&#60;script&#62;", "&amp;#60;script&amp;#62;")
+    ]
+  )
+
+@test("escapeHtml answers its argument itself when nothing needs escaping")
+escapeHtmlUnchanged()
+  val text = "nothing to escape é"
+  assertEq(escapeHtml(text), text)
+
+@test("escapeAttribute writes every ASCII character but letters and digits as a hex reference")
+escapeAttributeCharacters()
+  htmlEscapesAll(
+    escapeAttribute,
+    [
+      ("", ""),
+      ("abcXYZ019", "abcXYZ019"),
+      (" ", "&#x20;"),
+      ("a b", "a&#x20;b"),
+      ("&<>\"'", "&#x26;&#x3C;&#x3E;&#x22;&#x27;"),
+      ("=`", "&#x3D;&#x60;"),
+      ("\t\n", "&#x09;&#x0A;"),
+      ("-_.", "&#x2D;&#x5F;&#x2E;"),
+      ("x onmouseover=alert(1)", "x&#x20;onmouseover&#x3D;alert&#x28;1&#x29;"),
+      ("日本\u{1F600}", "日本\u{1F600}"),
+      ("é ", "é&#x20;"),
+      ("\u0000", "&#x00;"),
+      ("\u007f", "&#x7F;")
+    ]
+  )
+
+@test("escapeJs leaves only ASCII letters and digits and writes everything else as an escape")
+escapeJsCharacters()
+  htmlEscapesAll(
+    escapeJs,
+    [
+      ("", ""),
+      ("abcXYZ019", "abcXYZ019"),
+      ("'", "\\x27"),
+      ("\"", "\\x22"),
+      ("`", "\\x60"),
+      ("\\", "\\x5C"),
+      ("${x}", "\\x24\\x7Bx\\x7D"),
+      ("</script>", "\\x3C\\x2Fscript\\x3E"),
+      ("<!--", "\\x3C\\x21\\x2D\\x2D"),
+      ("a b", "a\\x20b"),
+      ("\n\r\t", "\\x0A\\x0D\\x09"),
+      ("\u0000", "\\x00"),
+      ("\u007f", "\\x7F"),
+      ("é", "\\u00E9"),
+      ("  ", "\\u2028\\u2029"),
+      ("﻿", "\\uFEFF"),
+      ("\u{1F600}", "\\uD83D\\uDE00"),
+      ("\u{10000}", "\\uD800\\uDC00"),
+      ("\u{10FFFF}", "\\uDBFF\\uDFFF"),
+      ("');alert(1);//", "\\x27\\x29\\x3Balert\\x281\\x29\\x3B\\x2F\\x2F")
+    ]
+  )
+
+@test("jsString is escapeJs's text in double quotes")
+jsStringLiteral()
+  assertEq(jsString(""), "\"\"")
+  assertEq(jsString("a'b"), "\"a\\x27b\"")
+  assertEq(jsString("\"; alert(1); \""), "\"\\x22\\x3B\\x20alert\\x281\\x29\\x3B\\x20\\x22\"")
+
+@test("safeUrl keeps relative URLs and the http, https, mailto and tel schemes")
+safeUrlKept()
+  htmlEscapesAll(
+    safeUrl,
+    [
+      ("", ""),
+      ("https://example.com/a?b=1&c=2#d", "https://example.com/a?b=1&c=2#d"),
+      ("http://example.com", "http://example.com"),
+      ("HTTPS://EXAMPLE.COM", "HTTPS://EXAMPLE.COM"),
+      ("mailto:ann@example.com", "mailto:ann@example.com"),
+      ("tel:+15550100", "tel:+15550100"),
+      ("//example.com/x", "//example.com/x"),
+      ("/a/b:c", "/a/b:c"),
+      ("a/b:c", "a/b:c"),
+      ("?q=a:b", "?q=a:b"),
+      ("#x:y", "#x:y"),
+      ("page.html", "page.html"),
+      ("javascript&colon;alert(1)", "javascript&colon;alert(1)"),
+      ("jav&#x09;ascript:alert(1)", "jav&#x09;ascript:alert(1)"),
+      ("日本/x", "日本/x")
+    ]
+  )
+
+@test("safeUrl refuses every other scheme, however a browser would still read it")
+safeUrlRefused()
+  val no = "about:invalid#unsafe-url"
+  htmlEscapesAll(
+    safeUrl,
+    [
+      ("javascript:alert(1)", no),
+      ("JavaScript:alert(1)", no),
+      ("JAVASCRIPT:alert(1)", no),
+      (" javascript:alert(1)", no),
+      ("\u0001 javascript:alert(1)", no),
+      ("\tjava\nscr\ript:alert(1)", no),
+      ("java\tscript:alert(1)", no),
+      ("javascript\n:alert(1)", no),
+      ("java&script:alert(1)", no),
+      ("java script:alert(1)", no),
+      ("data:text/html;base64,PHNjcmlwdD5hbGVydCgxKTwvc2NyaXB0Pg==", no),
+      ("DATA:image/png;base64,AAAA", no),
+      ("vbscript:msgbox(1)", no),
+      ("ftp://example.com", no),
+      ("file:///etc/passwd", no),
+      ("foo:bar", no),
+      (":", no),
+      ("https\u0000:x", no),
+      ("é:x", no)
+    ]
+  )
+
+@test("a hole in an element's text is escaped, and an Html hole is written as it is")
+templateText()
+  val evil = "<script>alert('x')</script>"
+  assertEq(html"<p>$evil</p>".text, "<p>&lt;script&gt;alert(&#39;x&#39;)&lt;/script&gt;</p>")
+  assertEq(html"$evil".text, "&lt;script&gt;alert(&#39;x&#39;)&lt;/script&gt;")
+  assertEq(html"<b>${Html("<i>i</i>")}</b>".text, "<b><i>i</i></b>")
+  assertEq(html"<td>${42}</td><td>${-1.5}</td><td>${true}</td>".text, "<td>42</td><td>-1.5</td><td>true</td>")
+  assertEq(html"".text, "")
+  assertEq(html"no holes &amp; <br>".text, "no holes &amp; <br>")
+  assertEq(html"<p>café ${"日<本"}</p>".text, "<p>café 日&lt;本</p>")
+  assertEq(html"a < b: $evil".text, "a < b: &lt;script&gt;alert(&#39;x&#39;)&lt;/script&gt;")
+  assertEq(
+    html"<textarea>$evil</textarea><title>$evil</title>".text,
+    s"<textarea>${escapeHtml(evil)}</textarea><title>${escapeHtml(evil)}</title>"
+  )
+
+@test("a template's escapes are decoded, and `$$` is a dollar sign")
+templateEscapes()
+  val x = "<"
+  assertEq(html"<a title=\"$x\">\t$$1</a>".text, "<a title=\"&lt;\">\t$1</a>")
+  assertEq(html"é\n$x".text, "é\n&lt;")
+  assertEq(html"$"$x$"".text, "\"&lt;\"")
+  val block = html"""
+    <p>
+      $x
+    </p>
+    """
+  assertEq(block.text, "<p>\n  &lt;\n</p>\n")
+  val joined = html"""
+    <p>\
+    $x</p>
+    """
+  assertEq(joined.text, "<p>&lt;</p>\n")
+
+@test("templates nest, and Html.join joins their markup")
+templateNesting()
+  val items = ["<one>", "two & three"]
+  val list = html"<ul>${Html.join(items.map(i -> html"<li>$i</li>"))}</ul>"
+  assertEq(list.text, "<ul><li>&lt;one&gt;</li><li>two &amp; three</li></ul>")
+  assertEq(Html.join([Html("a"), Html("b")], Html("<br>")).text, "a<br>b")
+  assertEq(Html.join([]).text, "")
+  assertEq(Html.empty.text, "")
+  assertEq(Html.escaped("<&>").text, "&lt;&amp;&gt;")
+  val page = html"<html><body>$list</body></html>"
+  assertEq(page.text, "<html><body><ul><li>&lt;one&gt;</li><li>two &amp; three</li></ul></body></html>")
+  assertEq(s"$page", page.text)
+  assertEq(Html("x"), Html("x"))
+
+@test("a hole in a quoted attribute value is escaped, an Html hole too")
+templateAttributes()
+  val evil = "\" onclick=\"alert(1)"
+  assertEq(html"<a title=\"$evil\">t</a>".text, "<a title=\"&quot; onclick=&quot;alert(1)\">t</a>")
+  val single = "' onclick='alert(1)"
+  assertEq(html"<a title='$single'>t</a>".text, "<a title='&#39; onclick=&#39;alert(1)'>t</a>")
+  assertEq(html"<a title=\"${Html("<b>")}\">t</a>".text, "<a title=\"&lt;b&gt;\">t</a>")
+  assertEq(
+    html"<a title = \"x $evil y\" class=\"c\">t</a>".text,
+    "<a title = \"x &quot; onclick=&quot;alert(1) y\" class=\"c\">t</a>"
+  )
+  assertEq(html"<input value=\"$evil\"/>".text, "<input value=\"&quot; onclick=&quot;alert(1)\"/>")
+  assertEq(html"<a title=\"é$evil\">t</a>".text, "<a title=\"é&quot; onclick=&quot;alert(1)\">t</a>")
+  assertEq(html"<a data-x=\"$single\">t</a>".text, "<a data-x=\"&#39; onclick=&#39;alert(1)\">t</a>")
+
+@test("a hole beginning a URL attribute passes through safeUrl, and one after its text is percent-encoded")
+templateUrls()
+  val bad = "javascript:alert(1)"
+  assertEq(html"<a href=\"$bad\">l</a>".text, "<a href=\"about:invalid#unsafe-url\">l</a>")
+  assertEq(html"<a HREF=\"$bad\">l</a>".text, "<a HREF=\"about:invalid#unsafe-url\">l</a>")
+  assertEq(html"<a href=' $bad'>l</a>".text, "<a href=' about:invalid#unsafe-url'>l</a>")
+  assertEq(html"<img src=\"$bad\">".text, "<img src=\"about:invalid#unsafe-url\">")
+  assertEq(html"<form action=\"$bad\"></form>".text, "<form action=\"about:invalid#unsafe-url\"></form>")
+  assertEq(
+    html"<button formaction=\"$bad\">b</button>".text,
+    "<button formaction=\"about:invalid#unsafe-url\">b</button>"
+  )
+  assertEq(
+    html"<svg><a xlink:href=\"$bad\">l</a></svg>".text,
+    "<svg><a xlink:href=\"about:invalid#unsafe-url\">l</a></svg>"
+  )
+  assertEq(html"<a href=\"${Html(bad)}\">l</a>".text, "<a href=\"about:invalid#unsafe-url\">l</a>")
+  val good = "https://example.com/?a=1&b=\"2\""
+  assertEq(html"<a href=\"$good\">l</a>".text, "<a href=\"https://example.com/?a=1&amp;b=&quot;2&quot;\">l</a>")
+  val q = "a b&c=d/é"
+  assertEq(html"<a href=\"/search?q=$q\">s</a>".text, "<a href=\"/search?q=a%20b%26c%3Dd%2F%C3%A9\">s</a>")
+  assertEq(html"<a href=\"/u/$bad\">s</a>".text, "<a href=\"/u/javascript%3Aalert%281%29\">s</a>")
+  assertEq(html"<a href=\"${"/a"}${"b c"}\">s</a>".text, "<a href=\"/ab%20c\">s</a>")
+  assertEq(html"<a title=\"$bad\">t</a>".text, "<a title=\"javascript:alert(1)\">t</a>")
+  val reference = "jav&#x09;ascript:alert(1)"
+  assertEq(html"<a href=\"$reference\">l</a>".text, "<a href=\"jav&amp;#x09;ascript:alert(1)\">l</a>")
+
+@test("a hole in a script or an event handler is a whole string literal")
+templateScripts()
+  val evil = "</script><script>alert(1)</script>"
+  assertEq(
+    html"<script>var n = $evil;</script>".text,
+    "<script>var n = \"\\x3C\\x2Fscript\\x3E\\x3Cscript\\x3Ealert\\x281\\x29\\x3C\\x2Fscript\\x3E\";</script>"
+  )
+  assertEq(html"<SCRIPT type=\"module\">f(${1})</SCRIPT >".text, "<SCRIPT type=\"module\">f(\"1\")</SCRIPT >")
+  val quote = "');alert(1);//"
+  assertEq(
+    html"<button onclick=\"go($quote)\">b</button>".text,
+    "<button onclick=\"go(&quot;\\x27\\x29\\x3Balert\\x281\\x29\\x3B\\x2F\\x2F&quot;)\">b</button>"
+  )
+  assertEq(
+    html"<b onmouseover='f($quote)'>b</b>".text,
+    "<b onmouseover='f(&quot;\\x27\\x29\\x3Balert\\x281\\x29\\x3B\\x2F\\x2F&quot;)'>b</b>"
+  )
+  assertEq(html"<script>a</script><p>$evil</p>".text, s"<script>a</script><p>${escapeHtml(evil)}</p>")
+  assertEq(
+    html"<script>if (a </scriptx) b($quote)</script>".text,
+    s"<script>if (a </scriptx) b(${jsString(quote)})</script>"
+  )
+  assertEq(html"<script>x = \"</scr\" + $quote</script>".text, s"<script>x = \"</scr\" + ${jsString(quote)}</script>")
+  assertEq(html"<script>f(é, $quote)</script>".text, s"<script>f(é, ${jsString(quote)})</script>")
+
+@test("the content of a raw text element ends only at its own end tag")
+templateRawText()
+  val x = "<x>"
+  assertEq(html"<style>p { color: red }</style><p>$x</p>".text, "<style>p { color: red }</style><p>&lt;x&gt;</p>")
+  assertEq(html"<xmp><b></xmp><p>$x</p>".text, "<xmp><b></xmp><p>&lt;x&gt;</p>")
+  assertEq(html"<!-- a comment > -- -->$x".text, "<!-- a comment > -- -->&lt;x&gt;")
+  assertEq(html"<!doctype html><p>$x</p>".text, "<!doctype html><p>&lt;x&gt;</p>")
+  assertEq(html"<?xml version=\"1.0\"?>$x".text, "<?xml version=\"1.0\"?>&lt;x&gt;")
+  assertEq(html"</p>$x".text, "</p>&lt;x&gt;")
+  assertEq(html"<br/>$x".text, "<br/>&lt;x&gt;")
+  assertEq(html"<a title=\"a>b\" class='c>d'>$x</a>".text, "<a title=\"a>b\" class='c>d'>&lt;x&gt;</a>")
+  assertEq(html"<a hidden>$x</a>".text, "<a hidden>&lt;x&gt;</a>")
+  assertEq(html"<a hidden class=c>$x</a>".text, "<a hidden class=c>&lt;x&gt;</a>")
+
+@test("a hole where no escaping makes it safe is refused with the reason")
+templateRefusals()
+  val x = "x"
+  val tag = "an `html` template's hole names a tag"
+  val inTag = "an `html` template's hole stands inside a tag, where only a quoted attribute value takes one"
+  htmlRendersAll(
+    x,
+    [
+      (["<", ">"], tag),
+      (["</", ">"], tag),
+      (["<a", ">"], tag),
+      (["<a ", ">"], inTag),
+      (["<a title=\"t\" ", ">"], inTag),
+      (["<a ", "=\"v\">"], inTag),
+      (["<a ti", "tle=\"v\">"], inTag),
+      (["<a title ", ">"], inTag),
+      (["<a title=", ">"], "an `html` template's hole is the unquoted value of `title`; write the value in quotes"),
+      (["<a title = ", ">"], "an `html` template's hole is the unquoted value of `title`; write the value in quotes"),
+      (["<a title=v", ">"], "an `html` template's hole is the unquoted value of `title`; write the value in quotes"),
+      (["<!-- ", " -->"], "an `html` template's hole stands in a comment"),
+      (["<!-", "->"], "an `html` template's hole stands in a comment"),
+      (["<!doctype ", ">"], "an `html` template's hole stands in a declaration such as `<!doctype>`"),
+      (["<?", "?>"], "an `html` template's hole stands in a declaration such as `<!doctype>`"),
+      (["<style>", "</style>"], "an `html` template's hole stands in a `<style>` element, whose content is not escaped"),
+      (
+        ["<NoScript>", "</noscript>"],
+        "an `html` template's hole stands in a `<noscript>` element, whose content is not escaped"
+      ),
+      (
+        ["<iframe>", "</iframe>"],
+        "an `html` template's hole stands in a `<iframe>` element, whose content is not escaped"
+      ),
+      (["<plaintext>", ""], "an `html` template's hole stands after `<plaintext>`"),
+      (
+        ["<p style=\"color: ", "\">p</p>"],
+        "an `html` template's hole stands in a `style` attribute, whose value is not escaped"
+      ),
+      (
+        ["<iframe srcdoc=\"", "\"></iframe>"],
+        "an `html` template's hole stands in a `srcdoc` attribute, whose value is a document of its own"
+      ),
+      (
+        ["<script>f('", "')</script>"],
+        "an `html` template's hole in a script stands inside quotes; write it bare, as it becomes a whole string literal"
+      ),
+      (
+        ["<script>f(\"", "\")</script>"],
+        "an `html` template's hole in a script stands inside quotes; write it bare, as it becomes a whole string literal"
+      ),
+      (
+        ["<script>f(`", "`)</script>"],
+        "an `html` template's hole in a script stands inside quotes; write it bare, as it becomes a whole string literal"
+      ),
+      (
+        ["<a onclick=\"f('", "')\">a</a>"],
+        "an `html` template's hole in the event handler `onclick` stands inside quotes; write it bare, as it becomes a whole string literal"
+      )
+    ]
+  )
+  assertEq(
+    htmlRendered(["<script>", "</script>"], [Html("<b>")]),
+    "an `html` template's hole in a script is `Html`, which is trusted as markup, not as script"
+  )
+  assertEq(
+    htmlRendered(["<b onclick=\"", "\">b</b>"], [Html("<b>")]),
+    "an `html` template's hole in the event handler `onclick` is `Html`, which is trusted as markup, not as script"
+  )
+
+@test("a template that ends anywhere but in an element's text, or whose script holds `<!--`, is refused")
+templateEnds()
+  val ends = "an `html` template ends inside a tag"
+  assertEq(htmlRendered(["<a"], []), ends)
+  assertEq(htmlRendered(["<a href=\"x"], []), ends)
+  assertEq(htmlRendered(["<a href='x"], []), ends)
+  assertEq(htmlRendered(["<"], []), ends)
+  assertEq(htmlRendered(["</a"], []), ends)
+  assertEq(
+    htmlRendered(["<a ", ""], [Html("")]),
+    "an `html` template's hole stands inside a tag, where only a quoted attribute value takes one"
+  )
+  assertEq(htmlRendered(["<script>x"], []), "an `html` template ends inside a `<script>` element")
+  assertEq(htmlRendered(["<script>x</script"], []), ends)
+  assertEq(htmlRendered(["<style>"], []), "an `html` template ends inside a `<style>` element")
+  assertEq(htmlRendered(["<!-- x"], []), "an `html` template ends inside a comment")
+  assertEq(htmlRendered(["<!doctype html"], []), "an `html` template ends inside a declaration such as `<!doctype>`")
+  assertEq(htmlRendered(["<?php"], []), "an `html` template ends inside a declaration such as `<!doctype>`")
+  assertEq(htmlRendered(["<plaintext>"], []), "an `html` template ends after `<plaintext>`")
+  assertEq(
+    htmlRendered(["<script><!-- <script></script>", "</script>"], ["x"]),
+    "an `html` template's script holds `<!--`, which changes where the browser ends the script"
+  )
+  assertEq(htmlRendered(["a", "b"], []), "an interpolator was given 0 arguments for 2 parts")
+  assertEq(htmlRendered(["a"], ["x"]), "an interpolator was given 1 arguments for 1 parts")
+  assertEq(htmlRendered(["<p>", "</p>"], ["<"]), "ok <p>&lt;</p>")
+
+@test("Response.html sends Html markup as it stands, as UTF-8 HTML")
+templateResponse()
+  val name = "<é>"
+  val r = Response.html(200, html"<p>$name</p>")
+  assertEq(r.status, 200)
+  assertEq(r.header("content-type"), Some("text/html; charset=utf-8"))
+  assertEq(r.text, "<p>&lt;é&gt;</p>")
+  assertEq(r.body.length, 17)
+  assertEq(Response.html(404, Html.empty).text, "")
+
+@test("a large template renders every hole")
+templateLarge()
+  val rows = Vector.tabulate(2000, i -> html"<tr><td>$i</td><td title=\"${s"<$i>"}\">${"&".repeat(3)}</td></tr>")
+  val table = html"<table>${Html.join(rows)}</table>"
+  assertEq(rows.length, 2000)
+  assert(table.text.startsWith("<table><tr><td>0</td><td title=\"&lt;0&gt;\">&amp;&amp;&amp;</td></tr>"))
+  assert(table.text.endsWith("<tr><td>1999</td><td title=\"&lt;1999&gt;\">&amp;&amp;&amp;</td></tr></table>"))

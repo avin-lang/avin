@@ -33,7 +33,7 @@ Microsoft or the Visual Studio Code project.*
 The extension is not published to the Marketplace. Build the `.vsix` (see *Development*), then:
 
 ```
-code --install-extension avin-0.1.0.vsix
+code --install-extension avin-0.1.1.vsix
 ```
 
 or use *Extensions: Install from VSIX...* in the command palette.
@@ -52,6 +52,14 @@ and takes a while.
 
 If the server cannot be started, the extension says so once and highlighting keeps working. Changing
 either setting restarts the server, and so does *Avin: Restart Language Server*.
+
+## Restricted Mode
+
+In a folder VS Code does not yet trust, the extension stays on: highlighting, comment toggling,
+bracket pairing and indentation work for `.avin` and `.lavin` files. The language server runs the
+`avin` executable, so it does not start until you trust the folder; it starts at that moment, with no
+reload. The settings `avin.server.path` and `avin.server.repository` are ignored while the folder is
+untrusted, and no error is shown for the missing server.
 
 ## Settings
 

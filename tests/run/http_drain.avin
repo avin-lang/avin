@@ -1,0 +1,89 @@
+// expect: exit 0
+// A graceful drain of a real server: on `Terminate` sent to the program, readiness fails at once
+// (while the server still accepts, through the grace), then the server stops accepting, and a request
+// in flight finishes with its answer; the drain reports clean. A request still running past the
+// deadline makes the drain report that it did not finish, and the request is still answered. A server
+// stopped by other code is drained without a signal, `drain` alone works without a signal or health, and a
+// signal that cannot be watched is an error.
+import avin.io.IoError
+import avin.net.http
+import avin.net.http.{Health, Response, Route, Router}
+import avin.process
+import avin.signal
+import avin.threads.{Thread, sleep, spawn}
+import avin.time.{millis, monotonic, seconds}
+
+ok[T](r: Result[T, IoError]) -> T = r match
+  Ok(v) -> v
+  Err(e) -> fail(e.message)
+
+describe(r: Result[Response, http.HttpError]) -> string = r match
+  Ok(res) -> s"${res.status} ${res.text.trim}"
+  Err(_) -> "refused"
+
+serveWith(health: Health, napMillis: long) -> avin.net.TcpServer
+  val napper = Route.get("/nap", _ ->
+    sleep(millis(napMillis))
+    Response.text(200, "nap done"))
+  ok(http.serve("127.0.0.1", 0, Router(napper +: health.routes()).handle))
+
+main()
+  // A signal while a request is in flight.
+  val h = http.health()
+  val server = serveWith(h, 700)
+  val base = s"http://127.0.0.1:${server.port()}"
+  println(describe(http.get(s"$base/readyz")))
+  val inflight = spawn(() -> describe(http.get(s"$base/nap")))
+  val raiser = spawn(() ->
+    sleep(millis(150))
+    _ = process.signal(process.pid(), signal.Terminate)
+    ())
+  // During the grace (300 ms after the signal) the server still answers, and says it is not ready.
+  val probe = spawn(() ->
+    sleep(millis(300))
+    describe(http.get(s"$base/readyz")))
+  val began = monotonic().micros
+  val clean = ok(http.drainOnSignal(server, Some(h), deadline = seconds(5), grace = millis(300)))
+  val took = (monotonic().micros - began) / 1000
+  println(clean)
+  println(h.isReady())
+  println(inflight.join())
+  println(probe.join())
+  raiser.join()
+  println(took >= 500)
+  println(took < 3000)
+  println(server.connections())
+  println(describe(http.get(s"$base/readyz")))
+
+  // A request that outlasts the deadline: not clean, and still answered.
+  val h2 = http.health()
+  val slow = serveWith(h2, 900)
+  val base2 = s"http://127.0.0.1:${slow.port()}"
+  val late = spawn(() -> describe(http.get(s"$base2/nap")))
+  sleep(millis(150))
+  val t2 = monotonic().micros
+  println(http.drain(slow, Some(h2), deadline = millis(200)))
+  println((monotonic().micros - t2) / 1000 < 800)
+  println(h2.isReady())
+  println(late.join())
+  slow.join()
+
+  // Stopped by other code: the signal wait ends and the drain is clean; no health is fine.
+  val third = serveWith(http.health(), 10)
+  val stopper = spawn(() ->
+    sleep(millis(100))
+    third.stop()
+    ())
+  println(ok(http.drainOnSignal(third)))
+  stopper.join()
+
+  // `drain` with nothing in flight, and again on a drained server.
+  val fourth = serveWith(http.health(), 10)
+  println(http.drain(fourth))
+  println(http.drain(fourth))
+
+  // Signals that cannot be watched are an error, and the server is left as it was.
+  val fifth = serveWith(http.health(), 10)
+  println(http.drainOnSignal(fifth, signals = [signal.Kill]).isErr)
+  println(fifth.isStopping())
+  println(http.drain(fifth))

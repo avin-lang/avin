@@ -1,0 +1,78 @@
+// expect: exit 0
+// A trap in an actor's code drops that code's frames before anything that may let a collection run,
+// so a collection meanwhile never reads a slot the code had not yet stored to. `Counter`'s receive
+// keeps `replyTo` in a slot only the `Total` arm stores, and the `Fail` arm traps before any store,
+// with whatever an earlier turn left on the stack in that slot; the churners and the asks collect
+// over and over while each trap is reported and the routee restarts. Then a `Refuser` fails sixty
+// times with a reason made as it fails, which stays intact until it is reported, and the answers of
+// all of them are exact.
+import avin.actors.{ActorRef, Restart, RoundRobin, Router, spawn}
+import avin.threads.Promise
+import avin.time
+
+data Job
+  Add(n: int)
+  Fail
+  Total(replyTo: ActorRef[string])
+
+actor Counter receives Job
+  var total = 0
+
+  receive
+    Add(n) -> total += n
+    Fail -> total = total / (total - total)
+    Total(replyTo) -> replyTo.tell(s"$self holds $total")
+
+total(router: ActorRef[Job]) -> string = router.ask(r -> Total(r), timeout = time.seconds(30)).await() match
+  Ok(s) -> s
+  Err(e) -> e.message
+
+data Refusal
+  Refuse(n: int)
+  Count(done: Promise[int])
+
+actor Refuser receives Refusal
+  var seen = 0
+
+  receive
+    Refuse(n) ->
+      seen += 1
+      fail(s"refused message $n, with $seen seen since the restart before")
+    Count(done) -> done.complete(seen)
+
+data Churn
+  Work(rounds: int, done: Promise[int])
+
+actor Churner receives Churn
+  receive
+    Work(rounds, done) ->
+      var sum = 0
+      for i in 0 ..< rounds
+        val parts = (0 ..< 4).map(k -> s"$k:$i").toVector
+        sum += parts.mkString(",").charCount
+      done.complete(sum)
+
+main()
+  val churners = (0 ..< 3).map(_ -> spawn(Churner())).toVector
+  val worked = churners.map(c ->
+    val p = Promise[int]()
+    c.tell(Work(300, p))
+    p
+  )
+  val router = Router.pool(2, Counter(), RoundRobin, onFailure = Restart(1000, time.hours(1)))
+  var answers = 0
+  for round in 0 ..< 60
+    router.tell(Add(round))
+    router.tell(Add(1))
+    router.tell(Fail)
+    if total(router).endsWith(" holds 0") then answers += 1
+    if total(router).endsWith(" holds 0") then answers += 1
+  println(s"$answers totals of a fresh routee")
+  println(total(router))
+  println(total(router))
+  val refuser = spawn(Refuser(), onFailure = Restart(1000, time.hours(1)))
+  for n in 0 ..< 60 do refuser.tell(Refuse(n))
+  val counted = Promise[int]()
+  refuser.tell(Count(counted))
+  println(counted.future.await())
+  println(worked.map(p -> p.future.await()).mkString(" "))

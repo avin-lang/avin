@@ -1,0 +1,142 @@
+// expect: exit 0
+// `watch`'s bounds and its ways of being driven: `maxEntries` at its boundary, an `Err` at the start
+// and an `Overflowed` event that ends the watch later; a full events channel holding the watcher back
+// until a receiver drains it, at a capacity of one and of none; `close` while the watcher waits to
+// send; readings on a ticks channel and the watch ending when it closes; readings on the clock, waited
+// for by receiving; and a directory that cannot be listed keeping what the last reading found. The
+// mode is set with `chmod`; where the program runs as a user the mode does not bind, the events are
+// the same.
+import avin.fs
+import avin.fs.WatchEvent
+import avin.fs.Watcher
+import avin.threads.{Channel, spawn}
+import avin.time.{Instant, millis, now}
+
+shown(dir: string, e: WatchEvent) -> string
+  val at = (p: string) -> fs.relativeTo(p, dir).getOrElse(p)
+  val slash = (d: bool) -> if d then "/" else ""
+  e match
+    fs.Created(p, d) -> s"+${at(p)}${slash(d)}"
+    fs.Modified(p, d) -> s"~${at(p)}${slash(d)}"
+    fs.Removed(p, d) -> s"-${at(p)}${slash(d)}"
+    fs.Renamed(f, t, d) -> s"${at(f)}->${at(t)}${slash(d)}"
+    fs.Overflowed(n) -> s"overflowed at $n"
+
+drained(w: Watcher, dir: string) -> string
+  val out = Buffer[string]()
+  var more = true
+  while more
+    w.events.tryReceive() match
+      Some(e) -> out.addOne(shown(dir, e))
+      None -> more = false
+  out.toVector.mkString(" ")
+
+look(w: Watcher, dir: string) -> string
+  val n = w.check()
+  val got = drained(w, dir)
+  s"${n.map(k -> k.toString()).getOrElse("ended")}: $got"
+
+// The next event, waited for.
+next(w: Watcher, dir: string) -> string = w.events.receive().map(e -> shown(dir, e)).getOrElse("None")
+
+main()
+  val dir = fs.createTempDir("avin-watch-limits").getOrElse(fail("no directory"))
+  val at = (rel: string) -> fs.join(dir, rel)
+
+  println("-- maxEntries")
+  _ = fs.createDir(at("m"))
+  _ = fs.writeText(at("m/1"), "")
+  _ = fs.writeText(at("m/2"), "")
+  println(fs.watch(Vector(at("m")), Channel[Instant](), maxEntries = 2).map(_ -> "watching").mapErr(e -> e.kind))
+  println(fs.watch(Vector(at("m")), Channel[Instant](), maxEntries = 2).map(_ -> "").mapErr(e -> e.operation))
+  println(fs.watch(Vector(at("m")), maxEntries = 1).map(_ -> "watching").mapErr(e -> e.kind))
+  _ = fs.createDir(at("m/d"))
+  _ = fs.writeText(at("m/d/below"), "")
+  println(fs.watch(Vector(at("m")), Channel[Instant](), maxEntries = 4).map(_ -> "watching").mapErr(e -> e.kind))
+  val flat = fs.watch(
+    Vector(at("m")),
+    Channel[Instant](),
+    recursive = false,
+    maxEntries = 4
+  ).getOrElse(fail("no watch"))
+  _ = fs.writeText(at("m/d/further"), "")
+  println(look(flat, at("m")))
+  _ = flat.close()
+  _ = fs.removeDirAll(at("m/d"))
+  val w = fs.watch(Vector(at("m")), Channel[Instant](), maxEntries = 3).getOrElse(fail("no watch"))
+  println(look(w, at("m")))
+  println(w.isClosed)
+  _ = fs.writeText(at("m/3"), "")
+  println(look(w, at("m")))
+  println(w.events.receive())
+  println(w.isClosed)
+  println(look(w, at("m")))
+  println(w.close())
+
+  println("-- a full events channel")
+  for capacity in Vector(1, 0)
+    _ = fs.createDir(at(s"c$capacity"))
+    val c = fs.watch(Vector(at(s"c$capacity")), Channel[Instant](), capacity = capacity).getOrElse(fail("no watch"))
+    _ = fs.writeText(at(s"c$capacity/x"), "")
+    _ = fs.writeText(at(s"c$capacity/y"), "")
+    _ = fs.writeText(at(s"c$capacity/z"), "")
+    val checking = spawn(() -> c.check())
+    println(s"$capacity: ${next(c, at(s"c$capacity"))} ${next(c, at(s"c$capacity"))} ${next(c, at(s"c$capacity"))}")
+    println(checking.join())
+    _ = c.close()
+
+  println("-- closed while waiting to send")
+  _ = fs.createDir(at("s"))
+  val s = fs.watch(Vector(at("s")), Channel[Instant](), capacity = 0).getOrElse(fail("no watch"))
+  _ = fs.writeText(at("s/x"), "")
+  val stuck = spawn(() -> s.check())
+  println(s.close())
+  println(stuck.join().getOrElse(0))
+  println(s.isClosed)
+  println(s.events.receive())
+
+  println("-- ticks")
+  _ = fs.createDir(at("t"))
+  val ticks = Channel[Instant](0)
+  val t = fs.watch(Vector(at("t")), ticks).getOrElse(fail("no watch"))
+  _ = fs.createDir(at("t/a"))
+  ticks.send(now())
+  println(next(t, at("t")))
+  println(look(t, at("t")))
+  _ = fs.createDir(at("t/b"))
+  ticks.send(now())
+  ticks.send(now())
+  println(drained(t, at("t")))
+  ticks.close()
+  println(t.events.receive())
+  println(t.isClosed)
+  println(t.check())
+  println(t.close())
+
+  println("-- the clock")
+  _ = fs.createDir(at("k"))
+  val k = fs.watch(Vector(at("k")), interval = millis(5)).getOrElse(fail("no watch"))
+  _ = fs.createDir(at("k/a"))
+  println(next(k, at("k")))
+  _ = fs.removeDir(at("k/a"))
+  println(next(k, at("k")))
+  println(k.close())
+  println(k.events.receive())
+
+  println("-- a directory that cannot be listed")
+  _ = fs.createDirAll(at("u/locked"))
+  _ = fs.writeText(at("u/locked/kept"), "")
+  _ = fs.createDir(at("u/late"))
+  _ = fs.writeText(at("u/late/inside"), "")
+  _ = fs.setPermissions(at("u/late"), 0)
+  val u = fs.watch(Vector(at("u")), Channel[Instant]()).getOrElse(fail("no watch"))
+  _ = fs.setPermissions(at("u/locked"), 0)
+  println(look(u, at("u")))
+  println(look(u, at("u")))
+  _ = fs.setPermissions(at("u/locked"), 0o755)
+  println(look(u, at("u")))
+  val binds = fs.listDir(at("u/late")).isErr
+  _ = fs.setPermissions(at("u/late"), 0o755)
+  if binds then println(look(u, at("u"))) else println("mode does not bind")
+  _ = u.close()
+  _ = fs.removeDirAll(dir)

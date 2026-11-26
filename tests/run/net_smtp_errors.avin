@@ -1,0 +1,328 @@
+// expect: exit 0
+// `avin.net.smtp`'s failures, each against a scripted server: refusals at the greeting, MAIL FROM,
+// RCPT TO, DATA and after the data, each with its code and whether it is transient (4xx) or
+// permanent (5xx), the transaction reset after one and the session still usable; AUTH refused,
+// not offered, or about to go in the clear; STARTTLS required and not offered, and bytes injected
+// after its reply; SIZE, SMTPUTF8 and 8BITMIME missing; replies that are not replies; a server that
+// closes; servers that stall at the greeting, in the middle of a reply sent a line at a time, after
+// the data and in a TLS handshake, each timed out; hostile servers sending an endless line or an
+// endless reply; and arguments that would inject a command, refused before anything is sent.
+import avin.io.{ConnectionReset, IoError, Other, TimedOut}
+import avin.net.{TcpListener, TcpStream}
+import avin.net.tls
+import avin.net.mail.{Mailbox, Message}
+import avin.net.smtp.{ImplicitTls, Rejected, SmtpClient, SmtpError, SmtpSession, Tls, Transport, Unencrypted}
+import avin.threads.{Thread, sleep, spawn}
+import avin.time.{Duration, epochSeconds, millis, seconds}
+
+ok[T](r: Result[T, IoError]) -> T = r match
+  Ok(v) -> v
+  Err(e) -> fail(s"unexpected error: ${e.message}")
+
+// The server's end of a connection, logging the client's lines.
+class Peer(val conn: TcpStream)
+  val log = Buffer[string]()
+
+  // The client's next line, `(closed)` once it has gone.
+  hear() -> string
+    val line = conn.readLine() match
+      Ok(Some(l)) -> l
+      _ -> "(closed)"
+    log += "C: " + line
+    line
+
+  // Every line until the client has gone.
+  hearRest()
+    while hear() != "(closed)"
+      ()
+
+  // The client's data, up to its `.` line.
+  hearData()
+    var line = hear()
+    while line != "." && line != "(closed)"
+      line = hear()
+
+  // Says `text`, its lines joined with CR LF; a client that has gone is no matter.
+  say(text: string)
+    _ = conn.writeText(text.replace("\n", "\r\n") + "\r\n")
+
+  // MAIL FROM, two RCPT TO and DATA each answered, DATA with `data`.
+  envelope(data: string)
+    for _ in 0 ..< 3
+      hear()
+      say("250 ok")
+    hear()
+    say(data)
+
+// A listener's port and the thread serving its one connection by `script`, answering the client's
+// lines as logged.
+serving(script: @sendable (Peer) -> unit) -> (int, Thread[Vector[string]])
+  val listener = ok(TcpListener.bind("127.0.0.1", 0))
+  val port = listener.port()
+  val server = spawn(() ->
+    val tcp = ok(listener.accept())
+    _ = listener.close()
+    ok(tcp.setTimeout(seconds(20)))
+    val p = Peer(tcp)
+    script(p)
+    _ = tcp.close()
+    p.log.toVector)
+  (port, server)
+
+// An error as its variant, its code and its class.
+described(e: SmtpError) -> string
+  val kind = e match
+    Rejected(c, r) -> s"Rejected($c, ${r.code}, ${r.enhanced}, ${r.text.replace("\n", "|")})"
+    Transport(io) -> s"Transport(${kindOf(io)})"
+    Tls(tls.Transport(io)) -> s"Tls(Transport(${kindOf(io)}))"
+    other -> other.message
+  s"$kind transient=${e.transient} permanent=${e.permanent} code=${e.code}"
+
+// An I/O error's kind, without the port a message names.
+kindOf(e: IoError) -> string = e.kind match
+  TimedOut -> "TimedOut"
+  ConnectionReset -> "ConnectionReset"
+  Other(text) -> s"Other($text)"
+  _ -> "another kind"
+
+outcome[T](r: Result[T, SmtpError]) -> string = r match
+  Ok(_) -> "ok"
+  Err(e) -> described(e)
+
+// The greeting, and `extensions` as the reply to EHLO.
+greet(p: Peer, extensions: string)
+  p.say("220 fake")
+  p.hear()
+  p.say(extensions)
+
+plain(port: int) -> SmtpClient = SmtpClient("127.0.0.1", port, security = Unencrypted)
+
+quick(port: int, command: Duration, data: Duration) -> SmtpClient =
+  SmtpClient("127.0.0.1", port, security = Unencrypted, commandTimeout = command, dataTimeout = data)
+
+withUser(port: int, clear: bool) -> SmtpClient =
+  SmtpClient("127.0.0.1", port, security = Unencrypted, user = "u", password = "p", authWithoutTls = clear)
+
+message() -> Message = Message(
+  Mailbox("ada@example.com"),
+  to = [Mailbox("bob@example.com"), Mailbox("nobody@example.com")],
+  subject = "s",
+  text = Some("t"),
+  date = Some(epochSeconds(0)),
+  messageId = Some("m@x")
+)
+
+// Runs `client`'s open and then `after` on the session, printing each outcome and the server's log.
+attempt(title: string, server: Thread[Vector[string]], client: SmtpClient, after: (SmtpSession) -> string)
+  println(s"== $title")
+  client.open() match
+    Ok(s) ->
+      println(after(s))
+      s.close()
+    Err(e) -> println(s"open: ${described(e)}")
+  for line in server.join() do println("  " + line)
+
+// Two sends in a session, the second after whatever the first left.
+twice(x: SmtpSession) -> string
+  val first = outcome(x.send(message()))
+  s"$first; then ${outcome(x.send(message()))}"
+
+main()
+  // Refused at the greeting, permanently and for now.
+  for code in ["554 5.3.2 no service", "421 4.3.2 try later"]
+    val (p, s) = serving(peer -> peer.say(code))
+    attempt(s"greeting $code", s, plain(p), x -> "")
+
+  // MAIL FROM refused for now: the transaction is reset and the session goes on to send.
+  val (p1, s1) = serving(p ->
+    greet(p, "250 fake")
+    p.hear()
+    p.say("451 4.3.0 busy")
+    p.hear()
+    p.say("250 reset")
+    p.envelope("354 go")
+    p.hearData()
+    p.say("250 queued")
+    p.hearRest())
+  attempt("MAIL FROM refused, then a retry", s1, plain(p1), twice)
+
+  // One recipient of two refused: the whole message is refused and the transaction reset.
+  val (p2, s2) = serving(p ->
+    greet(p, "250 fake")
+    p.hear()
+    p.say("250 ok")
+    p.hear()
+    p.say("250 ok")
+    p.hear()
+    p.say("550 5.1.1 no such user")
+    p.hear()
+    p.say("250 reset")
+    p.hearRest())
+  attempt("RCPT TO refused", s2, plain(p2), x -> outcome(x.send(message())))
+
+  // DATA refused; the message refused after its data; a 421 closes the session.
+  val (p3, s3) = serving(p ->
+    greet(p, "250 fake")
+    p.envelope("554 5.5.1 no valid recipients")
+    p.hear()
+    p.say("250 reset")
+    p.hearRest())
+  attempt("DATA refused", s3, plain(p3), x -> outcome(x.send(message())))
+
+  val (p4, s4) = serving(p ->
+    greet(p, "250 fake")
+    p.envelope("354 go")
+    p.hearData()
+    p.say("552-5.3.4 message too big\n552 5.3.4 for this mailbox")
+    p.envelope("354 go")
+    p.hearData()
+    p.say("250 queued")
+    p.hearRest())
+  attempt("the message refused after its data, then sent", s4, plain(p4), twice)
+
+  val (p5, s5) = serving(p ->
+    greet(p, "250 fake")
+    p.hear()
+    p.say("421 4.4.2 closing")
+    p.hearRest())
+  attempt("421 closes the session", s5, plain(p5), twice)
+
+  // AUTH: refused, not offered, no mechanism the client speaks, and a password kept from the clear.
+  val (p6, s6) = serving(p ->
+    greet(p, "250-fake\n250 AUTH PLAIN")
+    p.hear()
+    p.say("535 5.7.8 bad credentials")
+    p.hearRest())
+  attempt("AUTH refused", s6, withUser(p6, true), x -> "")
+
+  val (p7, s7) = serving(p ->
+    greet(p, "250 fake")
+    p.hearRest())
+  attempt("AUTH not offered", s7, withUser(p7, true), x -> "")
+
+  val (p8, s8) = serving(p ->
+    greet(p, "250-fake\n250 AUTH CRAM-MD5")
+    p.hearRest())
+  attempt("no mechanism the client speaks", s8, withUser(p8, true), x -> "")
+
+  val (p9, s9) = serving(p ->
+    greet(p, "250-fake\n250 AUTH PLAIN")
+    p.hearRest())
+  attempt("a password in the clear", s9, withUser(p9, false), x -> "")
+
+  // STARTTLS required and not offered; bytes sent after its reply.
+  val (p10, s10) = serving(p ->
+    greet(p, "250-fake\n250 SIZE 10")
+    p.hearRest())
+  attempt("STARTTLS not offered", s10, SmtpClient("127.0.0.1", p10), x -> "")
+
+  val (p11, s11) = serving(p ->
+    greet(p, "250-fake\n250 STARTTLS")
+    p.hear()
+    p.say("220 go ahead\n250-injected\n250 AUTH PLAIN")
+    p.hearRest())
+  attempt("bytes injected after STARTTLS's reply", s11, SmtpClient("127.0.0.1", p11), x -> "")
+
+  // What the server lacks for a message: room, SMTPUTF8, 8BITMIME.
+  val (p12, s12) = serving(p ->
+    greet(p, "250-fake\n250 SIZE 100")
+    p.hearRest())
+  attempt("SIZE, SMTPUTF8, 8BITMIME", s12, plain(p12), x ->
+    val big = outcome(x.send(message()))
+    val utf8 = outcome(x.send(Message(Mailbox("ü@example.com"), to = [Mailbox("b@example.com")])))
+    val eight = outcome(x.sendData("a@example.com", ["b@example.com"], "é".utf8))
+    s"$big\n$utf8\n$eight")
+
+  // Replies that are not replies.
+  for bad in ["hello", "25", "2x0 x", "199 low", "600 high", "250x", "250-a\n251 b"]
+    val (p, s) = serving(peer ->
+      peer.say("220 fake")
+      peer.hear()
+      peer.say(bad)
+      peer.hearRest())
+    attempt(s"reply `${bad.replace("\n", "\\n")}`", s, plain(p), x -> "")
+
+  // A server that closes, and a session used after its failure.
+  val (p13, s13) = serving(p ->
+    greet(p, "250 fake")
+    p.hear())
+  attempt("the server closes", s13, plain(p13), x ->
+    val first = twice(x)
+    s"$first; reset ${outcome(x.reset())}")
+
+  // Stalls, each timed out: at the greeting; a reply sent a line at a time, each line within the
+  // limit and the whole beyond it; after the data; in a TLS handshake.
+  val (p14, s14) = serving(p ->
+    sleep(millis(1500))
+    p.hearRest())
+  attempt("a silent greeting", s14, quick(p14, millis(300), millis(300)), x -> "")
+
+  val (p15, s15) = serving(p ->
+    for i in 0 ..< 10
+      p.say(s"220-line $i")
+      sleep(millis(100))
+    p.say("220 done")
+    p.hearRest())
+  attempt("a reply a line at a time", s15, quick(p15, millis(450), millis(450)), x -> "")
+
+  val (p16, s16) = serving(p ->
+    greet(p, "250 fake")
+    p.envelope("354 go")
+    p.hearData()
+    sleep(millis(1500))
+    p.hearRest())
+  attempt("no reply after the data", s16, quick(p16, seconds(5), millis(300)), x -> outcome(x.send(message())))
+
+  // The server reads nothing, so its log stays empty of the client's handshake.
+  val (p17, s17) = serving(p -> sleep(millis(1500)))
+  attempt(
+    "a TLS handshake that never answers",
+    s17,
+    SmtpClient("localhost", p17, security = ImplicitTls, connectTimeout = millis(300)),
+    x -> ""
+  )
+
+  // Hostile servers: an endless line, an endless reply; and a long line within the limit.
+  val (p18, s18) = serving(p ->
+    _ = p.conn.writeText("220 " + "x".repeat(1000000))
+    p.hearRest())
+  attempt("an endless line", s18, plain(p18), x -> "")
+
+  val (p19, s19) = serving(p ->
+    p.say("220 fake")
+    p.hear()
+    val many = Buffer[string]()
+    for i in 0 ..< 5000 do many += s"250-EXTENSION$i"
+    p.say(many.mkString("\n") + "\n250 end")
+    p.hearRest())
+  attempt("an endless reply", s19, plain(p19), x -> "")
+
+  val (p20, s20) = serving(p ->
+    p.say("220 fake")
+    p.hear()
+    p.say("250 " + "y".repeat(996))
+    p.hear()
+    p.say("221 bye"))
+  attempt("a line of 1000 bytes, the limit", s20, plain(p20), x -> outcome(x.quit()))
+
+  // Arguments that would inject a command are refused before anything is sent.
+  val (p21, s21) = serving(p ->
+    greet(p, "250 fake")
+    p.hear()
+    p.say("221 bye"))
+  attempt("arguments", s21, plain(p21), x ->
+    val lines = Buffer[string]()
+    lines += outcome(x.sendData("a@example.com", ["b@example.com\r\nRCPT TO:<evil@example.com>"], "x".utf8))
+    lines += outcome(x.sendData("a@example.com>\r\nRCPT TO:<evil@example.com", ["b@example.com"], "x".utf8))
+    lines += outcome(x.sendData("a@example.com", ["<b@example.com>"], "x".utf8))
+    lines += outcome(x.sendData("a@example.com", Vector.empty[string](), "x".utf8))
+    lines += outcome(x.sendData("a@example.com", ["b@example.com"], ("z".repeat(999) + "\r\n").utf8))
+    lines += outcome(
+      x.send(Message(Mailbox("a@example.com"), to = [Mailbox("b@example.com")], subject = "x\r\nBcc: e@x"))
+    )
+    lines += outcome(x.quit())
+    lines.mkString("\n"))
+
+  println("== a bad EHLO name")
+  println(outcome(SmtpClient("127.0.0.1", 1, helo = "two words").open()))
+  println(outcome(SmtpClient("127.0.0.1", 1, helo = "").open()))

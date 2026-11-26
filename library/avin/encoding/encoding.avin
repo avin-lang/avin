@@ -2,7 +2,8 @@ module avin.encoding
 
 // Bytes written as text and text read back as bytes, as RFC 4648 defines them: hexadecimal, base64
 // with its `=` padding, base64url, the URL- and filename-safe alphabet written without padding, and
-// base32, written padded, unpadded or in lower case.
+// base32, written padded, unpadded or in lower case; and quoted-printable, as RFC 2045 defines it for
+// a mail body (below `toQuotedPrintable`).
 //
 //     println(toBase64("hello"))
 //     println(fromBase64("aGVsbG8="))
@@ -257,3 +258,97 @@ toBase32Lower(text: string) -> string = encode32(text.utf8, true, false)
 // The bytes base32 `text` spells: upper or lower case (also mixed), padded to a multiple of eight or
 // not padded at all; an empty text is no bytes.
 fromBase32(text: string) -> Result[Vector[byte], DecodeError] = decode32(text.utf8)
+
+// The upper-case hexadecimal digit of `n`, from 0 to 15, as its code.
+private upperDigit(n: int) -> byte
+upperDigit(n < 10) = byte(int('0') + n)
+upperDigit(n) = byte(int('A') + n - 10)
+
+// Whether `codes` hold a CR LF line break at `i`.
+private breakAt(codes: Array[byte], i: int) -> bool =
+  i + 1 < codes.length && int(codes(i)) == 13 && int(codes(i + 1)) == 10
+
+// `bytes` in quoted-printable, as `toQuotedPrintable` says, a soft break never inside an `=XX`.
+private encodeQp(bytes: Array[byte]) -> string
+  val n = bytes.length
+  val out = Buffer[byte]()
+  var column = 0
+  var i = 0
+  while i < n
+    if breakAt(bytes, i)
+      out += byte(13)
+      out += byte(10)
+      column = 0
+      i += 2
+    else
+      val b = int(bytes(i))
+      val lineEnd = i + 1 == n || breakAt(bytes, i + 1)
+      val plain = (33 <= b <= 126 && b != int('=')) || ((b == 32 || b == 9) && !lineEnd)
+      val width = if plain then 1 else 3
+      // The last character of a line may fill it; any other leaves room for a soft break's `=`.
+      if column + width > (if lineEnd then 76 else 75)
+        out += byte(int('='))
+        out += byte(13)
+        out += byte(10)
+        column = 0
+      if plain
+        out += bytes(i)
+      else
+        out += byte(int('='))
+        out += upperDigit(b >> 4)
+        out += upperDigit(b & 15)
+      column += width
+      i += 1
+  ascii(out.toArray())
+
+// `bytes` in quoted-printable (RFC 2045 § 6.7), for a mail body: a CR LF in them is a line break of
+// the text, written as one; printable ASCII but `=` is written as itself, a space or tab too except
+// at the end of a line; every other byte, a lone CR or LF included, is written `=XX` with upper-case
+// digits; and lines are broken with a soft break, `=` CR LF, so that none is longer than 76
+// characters. Every character of the result is ASCII.
+toQuotedPrintable(bytes: Vector[byte]) -> string = encodeQp(bytes.toArray())
+
+// The UTF-8 bytes of `text` in quoted-printable.
+toQuotedPrintable(text: string) -> string = encodeQp(text.utf8)
+
+// Whether the code is a space or a tab.
+private blank(c: int) -> bool = c == 32 || c == 9
+
+// The bytes quoted-printable `text` spells, read as RFC 2045 § 6.7 says a decoder reads them: `=XX`
+// is the byte with those hexadecimal digits (either case); `=` followed by spaces or tabs and then a
+// line break (CR LF or LF alone) or the end of the text is a soft break and stands for nothing; spaces
+// and tabs just before a line break or the end are dropped, being what a mail relay may have added;
+// every other character is itself. An `=` followed by anything else is `BadCharacter` at the `=`, and
+// one with a single digit before the end is `Truncated`.
+fromQuotedPrintable(text: string) -> Result[Vector[byte], DecodeError]
+  val codes = text.utf8
+  val n = codes.length
+  val out = Buffer[byte]()
+  var i = 0
+  while i < n
+    val c = int(codes(i))
+    if c == int('=')
+      var j = i + 1
+      while j < n && blank(int(codes(j))) do j += 1
+      if j == n then i = n
+      elif breakAt(codes, j) then i = j + 2
+      elif int(codes(j)) == 10 then i = j + 1
+      elif j > i + 1 then return Err(BadCharacter(i))
+      elif i + 2 >= n then return Err(if hexValue(int(codes(i + 1))) < 0 then BadCharacter(i) else Truncated(n))
+      else
+        val hi = hexValue(int(codes(i + 1)))
+        val lo = hexValue(int(codes(i + 2)))
+        if hi < 0 || lo < 0 then return Err(BadCharacter(i))
+        out += byte(hi * 16 + lo)
+        i += 3
+    elif blank(c)
+      var j = i
+      while j < n && blank(int(codes(j))) do j += 1
+      val trailing = j == n || breakAt(codes, j) || int(codes(j)) == 10
+      if !trailing
+        for k in i ..< j do out += codes(k)
+      i = j
+    else
+      out += codes(i)
+      i += 1
+  Ok(out.toVector)
