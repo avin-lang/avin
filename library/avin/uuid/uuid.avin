@@ -11,13 +11,49 @@ module avin.uuid
 // unsigned bytes, the first the most significant, and may be handed to another thread, so it is
 // a key of a `Map` or a `Set` as it stands. `Uuid.random()` makes a version 4 identifier from
 // `SecureRandom`; one that arrives as text is read with `Uuid.parse`, which answers `None` for text
-// that is not one rather than trapping, since the text came from outside.
+// that is not one rather than trapping, since the text came from outside. `Uuid.v7()` makes a version 7
+// identifier, stamped with the clock and ordered as made, the kind to use as a database key.
 
 import avin.encoding.toHex
 import avin.random.SecureRandom
 
+import avin.threads.Atomic
+import avin.time.{Instant, epochMillis, now}
+
 // The sixteen bytes as two words, the first eight in `high`, the most significant byte uppermost.
 data Uuid(high: long, low: long)
+
+// The 48 bits a version 7 identifier keeps its Unix milliseconds in.
+private val MillisMask: long = 0xFFFFFFFFFFFF
+
+// The counter of one millisecond is the 12 bits `rand_a` holds; a fresh millisecond starts it at a
+// random value below 2048, leaving 2048 identifiers of headroom before it carries.
+private val CounterBits: long = 12
+
+// The `high` word of a version 7 identifier made of `stamp`, which is the 48-bit milliseconds above the
+// 12-bit counter in one number.
+private v7High(stamp: long) -> long = ((stamp >> 12) << 16) | 0x7000 | (stamp & 0xFFF)
+
+// Version 7 identifiers that sort in the order they are made, from one thread or many (RFC 9562
+// section 6.2, method 1: a 12-bit counter in `rand_a`, started at a random value for each new
+// millisecond, with the 62 bits of `rand_b` random). The last stamp, milliseconds and counter in one
+// number, is held in one `Atomic` and advanced by compare-and-set, so there is no lock. Where the clock
+// shows the same millisecond as the last identifier, or an earlier one, the stamp is incremented
+// instead: the counter counts up, and a counter that overflows carries into the milliseconds. So an
+// identifier is always above the one before it; when the clock steps back, the timestamp bits stay at
+// the last value until the clock catches up.
+class UuidGenerator
+  private val last = Atomic[long](0)
+
+  // The next identifier, given the clock's reading `at`; it is above every identifier this generator
+  // made before, whatever `at` is. An instant before 1970 or after the year 10889 reads as the
+  // nearest instant the 48 bits hold.
+  next(at: Instant) -> Uuid
+    val ms = at.epochMillis.max(0).min(MillisMask)
+    val r = SecureRandom.nextBytes(10).toVector
+    val start = (ms << CounterBits) | (long((int(r(0)) << 8 | int(r(1))) & 0x7FF))
+    val stamp = last.update(seen -> if start > seen then start else (seen + 1) & ((MillisMask << CounterBits) | 0xFFF))
+    Uuid(v7High(stamp), (word(r, 2) & 0x3FFFFFFFFFFFFFFF) | long.MinValue)
 
 // The value of the hexadecimal digit `b`, or -1 where `b` is not one; either case is a digit.
 private digitValue(b: int) -> int =
@@ -42,6 +78,9 @@ private compareWords(a: long, b: long) -> int =
 // The variant a leading three bits stand for: 0 for 0xx, 2 for 10x, 6 for 110 and 7 for 111.
 private variantOf(top: int) -> int = if top < 4 then 0 elif top < 6 then 2 else top
 
+// The sequence `Uuid.v7()` draws from.
+private val shared: UuidGenerator = UuidGenerator()
+
 object Uuid
   // The identifier of all zero bits, and the one of all one bits.
   val Nil: Uuid = Uuid(0, 0)
@@ -55,6 +94,23 @@ object Uuid
     b(8) = byte((int(b(8)) & 0x3F) | 0x80)
     val v = b.toVector
     Uuid(word(v, 0), word(v, 8))
+
+  // A new version 7 identifier: the wall clock's Unix milliseconds in the first 48 bits, then the
+  // version, a counter and random bits. Identifiers made in one process sort in the order they were
+  // made, strictly, from any thread and whatever the clock does (see `UuidGenerator`).
+  v7() -> Uuid = shared.next(now())
+
+  // A version 7 identifier stamped `at`, for tests and backfills. It carries no counter (12 random
+  // bits fill `rand_a`), so it does not order against others made for the same millisecond, and
+  // it does not touch the sequence `v7()` keeps. An instant before 1970 or after the year 10889
+  // reads as the nearest instant the 48 bits hold.
+  v7At(at: Instant) -> Uuid
+    val ms = at.epochMillis.max(0).min(MillisMask)
+    val r = SecureRandom.nextBytes(10).toVector
+    Uuid(
+      v7High(ms << CounterBits | long((int(r(0)) << 8 | int(r(1))) & 0xFFF)),
+      (word(r, 2) & 0x3FFFFFFFFFFFFFFF) | long.MinValue
+    )
 
   // The identifier of sixteen bytes, the first the most significant, or `None` where there are not
   // sixteen.
@@ -91,6 +147,10 @@ impl Uuid
   // The variant: 2 for the layout RFC 9562 describes (bits `10`), 0 for the reserved earlier layout
   // (`0`), 6 for the one reserved for Microsoft (`110`) and 7 for the one reserved for later (`111`).
   variant() -> int = variantOf(int((low >> 61) & 7))
+
+  // The instant a version 7 identifier was stamped, to the millisecond; `None` for any other version.
+  timestamp() -> Option[Instant] =
+    if version() == 7 then Some(epochMillis((high >> 16) & MillisMask)) else None
 
 impl Ord for Uuid
   compare(other: Uuid) -> int =

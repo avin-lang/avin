@@ -1,0 +1,241 @@
+module avin.net.redis
+
+// Publish and subscribe: a `Subscriber` is a connection of its own that subscribes to channels and
+// patterns and receives what is published to them, as `PubSubMessage`s, by `receive` or as an
+// iterator. A connection that breaks is made again, every channel and pattern subscribed to again;
+// what was published while it was down is not received.
+
+import avin.io.{IoError, TimedOut}
+import avin.threads.sleep
+import avin.time.{Duration, monotonic}
+
+// A message published to `channel`, received because the subscriber subscribed to the channel, or to
+// `pattern`, which matched it. `payload` is the message's bytes; `text` reads them.
+data PubSubMessage(channel: string, payload: ArraySeq[byte], pattern: Option[string])
+
+impl PubSubMessage
+  // The payload as text, each ill-formed UTF-8 run replaced with U+FFFD.
+  text -> string = string.fromUtf8Lossy(payload.toArray())
+
+// A connection subscribed to channels and patterns, made by `Subscriber.connect`. A subscribed
+// connection carries nothing but subscriptions, so it is not a `Redis`; publish on one of those. It
+// belongs to the code that made it.
+class Subscriber(
+    private val host: string,
+    private val port: int,
+    val options: RedisOptions,
+    private var link: Option[Connection]
+)
+  private var closed = false
+  private val waiting = Deque[PubSubMessage]()
+  private var subscribed = Vector.empty[string]()
+  private var patterned = Vector.empty[string]()
+  private var failure: Option[RedisError] = None
+  // Connections broken in a row with nothing received on them.
+  private var strikes = 0
+
+  // The channels it is subscribed to, in the order it subscribed.
+  channels -> Vector[string] = subscribed
+
+  // The patterns it is subscribed to, in the order it subscribed.
+  patterns -> Vector[string] = patterned
+
+  // Whether the subscriber is open and its connection unbroken.
+  isOpen -> bool = !closed && link.isDefined
+
+  // Subscribes to `channels`, and answers once the server has confirmed each; a message that
+  // arrives meanwhile is kept for `receive`.
+  subscribe(channels: string*) -> Result[unit, RedisError]
+    if channels.isEmpty then return Ok(())
+    val c = ready()?
+    joined(c, "SUBSCRIBE", channels)?
+    for ch in channels do if !subscribed.contains(ch) then subscribed = subscribed :+ ch
+    Ok(())
+
+  // Subscribes to the channels matching each of `patterns` (`news.*`), as `subscribe` does.
+  psubscribe(patterns: string*) -> Result[unit, RedisError]
+    if patterns.isEmpty then return Ok(())
+    val c = ready()?
+    joined(c, "PSUBSCRIBE", patterns)?
+    for p in patterns do if !patterned.contains(p) then patterned = patterned :+ p
+    Ok(())
+
+  // Unsubscribes from `channels`, or from every channel where none is given. A message already on
+  // its way may still be received.
+  unsubscribe(channels: string*) -> Result[unit, RedisError]
+    subscribed = if channels.isEmpty then Vector.empty[string]() else subscribed.filter(ch -> !channels.contains(ch))
+    left("UNSUBSCRIBE", channels)
+
+  // Unsubscribes from `patterns`, or from every pattern where none is given.
+  punsubscribe(patterns: string*) -> Result[unit, RedisError]
+    patterned = if patterns.isEmpty then Vector.empty[string]() else patterned.filter(p -> !patterns.contains(p))
+    left("PUNSUBSCRIBE", patterns)
+
+  // The next message, waiting for it as long as it takes: the connection's own timeout does not end
+  // the wait. A connection that breaks is made again and subscribed again, as `options` allows;
+  // where it cannot be, or the subscriber is closed, the failure is the answer.
+  receive() -> Result[PubSubMessage, RedisError]
+    while true
+      receiving(Duration.Zero) match
+        Ok(Some(m)) -> return Ok(m)
+        Ok(None) -> ()
+        Err(e) -> return Err(e)
+    Err(ConnectionClosed("unreachable"))
+
+  // The next message, waiting at most `timeout`; `None` where none came in that time, and at once
+  // for a timeout of zero or less where no message is kept.
+  receive(timeout: Duration) -> Result[Option[PubSubMessage], RedisError]
+    if waiting.nonEmpty then return Ok(Some(waiting.removeHead()))
+    val deadline = monotonic().micros + timeout.micros
+    while true
+      val left = deadline - monotonic().micros
+      if left <= 0 then return Ok(None)
+      if receiving(Duration(left))? is Some(m) then return Ok(Some(m))
+    Ok(None)
+
+  // The messages as they arrive, each `receive()`'s answer, until a failure, which ends it; `failure`
+  // says what that was.
+  messages() -> Iterator[PubSubMessage] = Received(self)
+
+  // The failure that ended `messages()`, if one has.
+  lastFailure -> Option[RedisError] = failure
+
+  // Closes the connection; `receive` afterwards answers `ConnectionClosed`. Closing again does nothing.
+  close() -> Result[unit, RedisError]
+    closed = true
+    if link is Some(c) then c.close()
+    link = None
+    Ok(())
+
+  noteFailure(e: RedisError) = failure = Some(e)
+
+  // Sends a subscribing command and waits for the server to confirm each of `names`.
+  private joined(c: Connection, command: string, names: Vector[string]) -> Result[unit, RedisError]
+    val kind = command.toLower
+    val sent = Vector(command) ++ names
+    guarded(c, c.send(encodeCommand(sent)))?
+    var pending = names
+    while pending.nonEmpty
+      val v = guarded(c, c.reply())?
+      replyResult(v)?
+      if messageIn(v) is Some(m) then waiting.append(m)
+      frame(v) match
+        Some((k, Some(name))) if k == kind -> pending = pending.filter(n -> n != name)
+        _ -> ()
+    Ok(())
+
+  private left(command: string, names: Vector[string]) -> Result[unit, RedisError]
+    if closed then return Err(ConnectionClosed("the Redis subscriber is closed"))
+    link match
+      Some(c) -> guarded(c, c.send(encodeCommand(Vector(command) ++ names)))
+      None -> Ok(())
+
+  // One wait for what the connection brings, at most `limit`, zero for no limit: a kept message
+  // first; a confirmation, a pong or a reply the subscriber does not ask for is `None`, as is a wait
+  // whose time ran out, which leaves what part of a frame arrived for the next wait to finish.
+  private receiving(limit: Duration) -> Result[Option[PubSubMessage], RedisError]
+    if waiting.nonEmpty then return Ok(Some(waiting.removeHead()))
+    val c = ready()?
+    // Making the connection again subscribes again, which may keep a message.
+    if waiting.nonEmpty then return Ok(Some(waiting.removeHead()))
+    _ = c.stream.setTimeout(limit)
+    val got = c.reply()
+    _ = c.stream.setTimeout(options.timeout)
+    got match
+      Ok(v) ->
+        strikes = 0
+        replyResult(v)?
+        Ok(messageIn(v))
+      Err(ConnectionFailed(IoError(TimedOut, _, _))) if limit.micros > 0 -> Ok(None)
+      Err(e) ->
+        if !breaks(e) then return Err(e)
+        broke(c)
+        // A connection that broke is made again by the next wait, unless as many have broken in a
+        // row, with nothing received between, as there are attempts to make one.
+        strikes += 1
+        if strikes > options.reconnectAttempts then Err(e) else Ok(None)
+
+  private guarded[T](c: Connection, r: Result[T, RedisError]) -> Result[T, RedisError]
+    if r is Err(e) && breaks(e) then broke(c)
+    r
+
+  private broke(c: Connection)
+    c.close()
+    link = None
+
+  // The connection, made again and subscribed again where it broke.
+  private ready() -> Result[Connection, RedisError]
+    if closed then return Err(ConnectionClosed("the Redis subscriber is closed"))
+    if link is Some(c) then return Ok(c)
+    if options.reconnectAttempts == 0
+      return Err(ConnectionClosed(s"the connection to $host:$port broke, and reconnecting is off"))
+    var delay = options.reconnectDelay
+    var last = ConnectionClosed(s"the connection to $host:$port broke")
+    for attempt in 0 ..< options.reconnectAttempts
+      if attempt > 0
+        sleep(delay)
+        delay = if delay.micros * 2 > options.maxReconnectDelay.micros then options.maxReconnectDelay else Duration(
+          delay.micros * 2
+        )
+      connectWith(host, port, options) match
+        Ok(c) ->
+          link = Some(c)
+          val again = (if subscribed.nonEmpty then joined(c, "SUBSCRIBE", subscribed) else Ok(())).flatMap(_ ->
+            if patterned.nonEmpty then joined(c, "PSUBSCRIBE", patterned) else Ok(()))
+          again match
+            Ok(_) -> return Ok(c)
+            Err(ServerError(code, text)) -> return Err(ServerError(code, text))
+            Err(e) -> last = e
+        Err(ServerError(code, text)) -> return Err(ServerError(code, text))
+        Err(e) -> last = e
+    Err(last)
+
+object Subscriber
+  // A subscriber connected to the server at `host` and `port`, subscribed to nothing yet.
+  connect(host: string, port: int = 6379, options: RedisOptions = RedisOptions()) -> Result[Subscriber, RedisError]
+    val c = connectWith(host, port, options)?
+    Ok(Subscriber(host, port, options, Some(c)))
+
+// The kind of a frame the server sends a subscriber, lower-cased, and its second item where it is
+// text: `("message", Some(channel))`, `("subscribe", Some(channel))`, `("pong", …)`. RESP3 sends each
+// as a push, RESP2 as an array.
+private frame(v: Value) -> Option[(string, Option[string])] = v.plain match
+  Push(xs) if xs.nonEmpty -> xs(0).asText.map(k -> (k.toLower, if xs.length > 1 then xs(1).asText else None))
+  ArrayValue(xs) if xs.nonEmpty -> xs(0).asText.map(k -> (k.toLower, if xs.length > 1 then xs(1).asText else None))
+  _ -> None
+
+// The message a frame carries: `message`, `channel`, `payload`, or `pmessage`, `pattern`, `channel`,
+// `payload`; `smessage`, a sharded channel's, as `message`.
+private messageIn(v: Value) -> Option[PubSubMessage]
+  val xs = v.plain.asItems?
+  val kind = xs(0).asText?.toLower
+  if (kind == "message" || kind == "smessage") && xs.length == 3
+    return Some(PubSubMessage(xs(1).asText?, payloadOf(xs(2))?, None))
+  if kind == "pmessage" && xs.length == 4
+    return Some(PubSubMessage(xs(2).asText?, payloadOf(xs(3))?, Some(xs(1).asText?)))
+  None
+
+private payloadOf(v: Value) -> Option[ArraySeq[byte]] = v.plain match
+  BlobString(b) -> Some(b)
+  other -> other.asBytes.map(b -> b.toArraySeq)
+
+// The messages of a subscriber, until a failure.
+private class Received(private val s: Subscriber): Iterator[PubSubMessage]
+  private var nextOne: Option[PubSubMessage] = None
+  private var ended = false
+
+  override hasNext() -> bool
+    if nextOne.isDefined then return true
+    if ended then return false
+    s.receive() match
+      Ok(m) -> nextOne = Some(m)
+      Err(e) ->
+        s.noteFailure(e)
+        ended = true
+    nextOne.isDefined
+
+  override next() -> PubSubMessage
+    if !hasNext() then fail("no more messages: the subscriber failed or was closed")
+    val m = nextOne.get
+    nextOne = None
+    m

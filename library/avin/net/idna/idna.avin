@@ -1,0 +1,517 @@
+module avin.net.idna
+
+// Internationalized domain names: a name written in any script, such as `bücher.example`, and the
+// ASCII form the Domain Name System carries, `xn--bcher-kva.example`, in which each label beyond
+// ASCII is written in Punycode (RFC 3492) after the prefix `xn--`.
+//
+// `toAscii` and `toUnicode` process a name as UTS #46 (Unicode IDNA Compatibility Processing)
+// defines, non-transitionally, with the checks the WHATWG URL standard sets: each character is
+// mapped (upper case to lower case, fullwidth and compatibility forms to their plain letters, the
+// ideographic full stop `。` to `.`, and a few characters, such as the soft hyphen, removed), the
+// result put in normalization form NFC and split into labels at `.`, a label beginning `xn--`
+// decoded from Punycode, and each label checked. `ß`, `ς` and the zero-width joiners are kept as
+// they are (non-transitional processing) rather than turned into `ss`, `σ` and nothing. The tables
+// are those of Unicode 17.0.0, the version the library normalizes with.
+//
+// A name is refused, with the first error found, where a label holds a character UTS #46 disallows
+// (a space or a control character does not count as one unless `useStd3AsciiRules` is set), begins
+// with a combining mark, is in Punycode that does not decode to a valid label, breaks the joiner
+// rules (`checkJoiners`), or, in a name holding a right-to-left label, breaks the bidirectional rules
+// of RFC 5893 (`checkBidi`). `checkHyphens` adds the rule that a label neither begins nor ends with
+// `-` nor has `--` in its third and fourth places, and `verifyDnsLength` the lengths DNS allows: each
+// label of 1 to 63 characters, the name of at most 253 not counting a final `.`. A label beyond ASCII,
+// or written in Punycode, of more than `MaxLabelLength` code points is refused whatever the flags
+// say: Punycode's work grows with the square of a label's length, and DNS has no use for a label
+// past 63.
+//
+//     idna.toAscii("Bücher.example") == Ok("xn--bcher-kva.example")
+//     idna.toUnicode("xn--bcher-kva.example") == Ok("bücher.example")
+
+// Why a domain name could not be processed. `label` is the index, from 0, of the label found wrong
+// among the labels of the mapped name.
+data IdnaError
+  // A character UTS #46 disallows, an ignored or mapped one written in Punycode, or, with
+  // `useStd3AsciiRules`, an ASCII character other than a lower-case letter, a digit and `-`.
+  Disallowed(label: int)
+  // A label beginning `xn--` that is not Punycode, or decodes to nothing, to ASCII only, to text not
+  // in normalization form NFC, or to a label itself beginning `xn--`.
+  BadPunycode(label: int)
+  // With `checkHyphens`, a label beginning or ending with `-`, or with `-` in its third and fourth
+  // places.
+  Hyphens(label: int)
+  // A label beginning with a combining mark.
+  LeadingMark(label: int)
+  // A zero-width joiner or non-joiner where the joiner rules of RFC 5892 do not allow one.
+  Joiners(label: int)
+  // A label breaking the bidirectional rules of RFC 5893, in a name holding a right-to-left label.
+  Bidi(label: int)
+  // A label too long, past `MaxLabelLength` or, with `verifyDnsLength`, empty or past 63 characters.
+  LabelLength(label: int)
+  // With `verifyDnsLength`, a name empty or past 253 characters.
+  DomainLength
+
+impl Error for IdnaError
+  // A sentence saying what is wrong and where, for a message to a person.
+  message -> string = self match
+    Disallowed(l) -> s"a disallowed character in label $l"
+    BadPunycode(l) -> s"invalid Punycode in label $l"
+    Hyphens(l) -> s"a hyphen where one is not allowed in label $l"
+    LeadingMark(l) -> s"a combining mark beginning label $l"
+    Joiners(l) -> s"a zero-width joiner not allowed in label $l"
+    Bidi(l) -> s"mixed directions not allowed in label $l"
+    LabelLength(l) -> s"label $l is empty or too long"
+    DomainLength -> "the domain name is empty or too long"
+
+// Why text could not be encoded in Punycode or decoded from it.
+data PunycodeError
+  // Text to decode with a character that is not ASCII before its last `-`, a character after it
+  // that is not a digit of the encoding (a letter or a digit), or that ends in the middle of a
+  // number. `at` is the byte offset of the character, or the text's length.
+  InvalidInput(at: int)
+  // A number past the range of `int`: text to decode that no encoder writes, or text to encode with
+  // so many characters before a high code point that its numbers do not fit.
+  Overflow
+  // Text to decode that gives a value that is not a Unicode scalar value, or is an ASCII one.
+  InvalidCodePoint(value: int)
+
+impl Error for PunycodeError
+  // A sentence saying what is wrong and where, for a message to a person.
+  message -> string = self match
+    InvalidInput(at) -> s"not Punycode at index $at"
+    Overflow -> "a Punycode number out of range"
+    InvalidCodePoint(v) -> s"Punycode decodes to an invalid code point $v"
+
+// The most code points a label beyond ASCII, or written in Punycode, may hold.
+val MaxLabelLength: int = 1024
+
+// The domain name in ASCII: processed as UTS #46 defines, each label beyond ASCII written as `xn--`
+// and its Punycode, or the first error found. The defaults are the WHATWG URL standard's: hyphens
+// anywhere, the joiner and bidirectional rules checked, every ASCII character allowed, and no length
+// rule other than `MaxLabelLength`.
+toAscii(
+    domain: string,
+    checkHyphens: bool = false,
+    checkBidi: bool = true,
+    checkJoiners: bool = true,
+    useStd3AsciiRules: bool = false,
+    verifyDnsLength: bool = false
+) -> Result[string, IdnaError]
+  val labels = processed(domain, Checks(checkHyphens, checkBidi, checkJoiners, useStd3AsciiRules))?
+  val written = Buffer[string]()
+  var index = 0
+  for label in labels
+    if isAsciiText(label)
+      written.addOne(label)
+    else
+      encodePunycode(label) match
+        Ok(p) -> written.addOne("xn--" + p)
+        Err(_) -> return Err(LabelLength(index))
+    index += 1
+  if verifyDnsLength
+    var total = 0
+    for k in 0 ..< written.length
+      val n = written(k).byteLength
+      if n == 0 || n > 63 then return Err(LabelLength(k))
+      total += n + 1
+    // The final label's dot is not counted, nor is a root label's.
+    if total - 1 > 253 then return Err(DomainLength)
+  Ok(written.mkString("."))
+
+// The domain name in Unicode: processed as UTS #46 defines, each label written in Punycode decoded,
+// or the first error found. The checks are those `toAscii` makes, other than the lengths DNS allows.
+toUnicode(
+    domain: string,
+    checkHyphens: bool = false,
+    checkBidi: bool = true,
+    checkJoiners: bool = true,
+    useStd3AsciiRules: bool = false
+) -> Result[string, IdnaError] =
+  processed(
+    domain,
+    Checks(checkHyphens, checkBidi, checkJoiners, useStd3AsciiRules)
+  ).map(labels -> labels.mkString("."))
+
+// The text in Punycode (RFC 3492): its ASCII characters as they are, then `-` where there were any,
+// then the other characters' positions and code points as digits. `encodePunycode("bücher")` is
+// `Ok("bcher-kva")`, and `encodePunycode("abc")` is `Ok("abc-")`. Text whose numbers do not fit in an `int` (more
+// than about two thousand characters before a high code point) is `Overflow`.
+encodePunycode(text: string) -> Result[string, PunycodeError]
+  val input = text.chars.map(c -> int(c))
+  val out = StringWriter()
+  var basic = 0
+  for c in input
+    if c < 0x80
+      out.writeChar(char(c))
+      basic += 1
+  var handled = basic
+  if basic > 0 then out.write("-")
+  var n = InitialN
+  var delta = 0
+  var bias = InitialBias
+  while handled < input.length
+    var m = 0x110000
+    for c in input
+      if n <= c < m then m = c
+    if m - n > (MaxInt - delta) / (handled + 1) then return Err(Overflow)
+    delta += (m - n) * (handled + 1)
+    n = m
+    for c in input
+      if c < n
+        if delta == MaxInt then return Err(Overflow)
+        delta += 1
+      elif c == n
+        var q = delta
+        var k = Base
+        loop
+          val t = threshold(k, bias)
+          if q < t then break
+          out.writeChar(digitChar(t + (q - t) % (Base - t)))
+          q = (q - t) / (Base - t)
+          k += Base
+        out.writeChar(digitChar(q))
+        bias = adapt(delta, handled + 1, handled == basic)
+        delta = 0
+        handled += 1
+    if delta == MaxInt then return Err(Overflow)
+    delta += 1
+    n += 1
+  Ok(out.text)
+
+// The text Punycode encodes (RFC 3492), or why it is not Punycode: the ASCII characters before its
+// last `-` as they are, and the code points the digits after it insert among them. A digit is a
+// letter, of either case, or a decimal digit. `decodePunycode("bcher-kva")` is `Ok("bücher")`.
+decodePunycode(text: string) -> Result[string, PunycodeError]
+  val size = text.byteLength
+  val dash = text.lastIndexOf("-")
+  val output = Buffer[int]()
+  var at = 0
+  if dash > 0
+    while at < dash
+      val b = int(text.byteAt(at))
+      if b >= 0x80 then return Err(InvalidInput(at))
+      output.addOne(b)
+      at += 1
+    at = dash + 1
+  var n = InitialN
+  var i = 0
+  var bias = InitialBias
+  while at < size
+    val oldI = i
+    var w = 1
+    var k = Base
+    loop
+      if at >= size then return Err(InvalidInput(size))
+      val digit = digitValue(int(text.byteAt(at)))
+      if digit < 0 then return Err(InvalidInput(at))
+      at += 1
+      if digit > (MaxInt - i) / w then return Err(Overflow)
+      i += digit * w
+      val t = threshold(k, bias)
+      if digit < t then break
+      if w > MaxInt / (Base - t) then return Err(Overflow)
+      w *= Base - t
+      k += Base
+    val count = output.length + 1
+    bias = adapt(i - oldI, count, oldI == 0)
+    if i / count > MaxInt - n then return Err(Overflow)
+    n += i / count
+    i = i % count
+    if n < 0x80 || n > 0x10ffff || 0xd800 <= n <= 0xdfff then return Err(InvalidCodePoint(n))
+    output.insert(i, n)
+    i += 1
+  val out = StringWriter()
+  for c in output do out.writeChar(char(c))
+  Ok(out.text)
+
+private val MaxInt: int = 2147483647
+private val Base: int = 36
+private val TMin: int = 1
+private val TMax: int = 26
+private val Skew: int = 38
+private val Damp: int = 700
+private val InitialBias: int = 72
+private val InitialN: int = 128
+
+private threshold(k: int, bias: int) -> int = if k <= bias then TMin elif k >= bias + TMax then TMax else k - bias
+
+// The bias for the next number, from the last one's size (RFC 3492 §6.1).
+private adapt(delta: int, points: int, first: bool) -> int
+  var d = if first then delta / Damp else delta / 2
+  d += d / points
+  var k = 0
+  while d > ((Base - TMin) * TMax) / 2
+    d = d / (Base - TMin)
+    k += Base
+  k + (Base - TMin + 1) * d / (d + Skew)
+
+// The digit of the encoding with value `v`: `a` to `z` for 0 to 25, `0` to `9` for 26 to 35.
+private digitChar(v: int) -> char = if v < 26 then char(int('a') + v) else char(int('0') + v - 26)
+
+// The value of a digit of the encoding, either case; -1 for any other byte.
+private digitValue(b: int) -> int
+  if int('a') <= b <= int('z') then return b - int('a')
+  if int('A') <= b <= int('Z') then return b - int('A')
+  if int('0') <= b <= int('9') then return b - int('0') + 26
+  -1
+
+// The checks a caller asked for, beside those UTS #46 always makes.
+private data Checks(hyphens: bool, bidi: bool, joiners: bool, std3: bool)
+
+// The labels of the domain name, mapped, normalized, decoded from Punycode and checked.
+private processed(domain: string, checks: Checks) -> Result[Vector[string], IdnaError]
+  val labels = mapped(domain).normalize(Nfc).split(".")
+  val result = Buffer[string]()
+  val points = Buffer[Vector[int]]()
+  for index in 0 ..< labels.length
+    val label = labels(index)
+    var text = label
+    var decoded = false
+    if label.startsWith("xn--")
+      if !isAsciiText(label) then return Err(BadPunycode(index))
+      if label.byteLength - 4 > MaxLabelLength then return Err(LabelLength(index))
+      text = decodePunycode(label.slice(4, label.byteLength)) match
+        Ok(t) -> t
+        Err(_) -> return Err(BadPunycode(index))
+      if text.isEmpty || isAsciiText(text) || !text.isNormalized(Nfc) || text.startsWith("xn--") then return Err(
+        BadPunycode(index)
+      )
+      decoded = true
+    val codes = text.chars.map(c -> int(c))
+    if !isAsciiText(text) && codes.length > MaxLabelLength then return Err(LabelLength(index))
+    checkLabel(codes, index, checks)?
+    result.addOne(text)
+    points.addOne(codes)
+  if checks.bidi && isBidiDomain(points)
+    for index in 0 ..< points.length
+      if !satisfiesBidi(points(index)) then return Err(Bidi(index))
+  Ok(result.toVector)
+
+// Whether any label holds a right-to-left character or an Arabic digit.
+private isBidiDomain(labels: Buffer[Vector[int]]) -> bool
+  for codes in labels
+    for c in codes
+      if c >= 0x80
+        val b = bidiClass(c)
+        if b == BidiR || b == BidiAL || b == BidiAN then return true
+  false
+
+// The validity criteria of UTS #46 §4.1 other than the bidirectional rule, which needs every label.
+private checkLabel(codes: Vector[int], index: int, checks: Checks) -> Result[unit, IdnaError]
+  val n = codes.length
+  if n == 0 then return Ok(())
+  if checks.hyphens
+    if codes(0) == int('-') || codes(n - 1) == int('-') then return Err(Hyphens(index))
+    if n >= 4 && codes(2) == int('-') && codes(3) == int('-') then return Err(Hyphens(index))
+  if codes(0) >= 0x80 && isMark(char(codes(0))) then return Err(LeadingMark(index))
+  for c in codes
+    if c < 0x80
+      if checks.std3 && !(int('a') <= c <= int('z') || int('0') <= c <= int('9') || c == int('-')) then return Err(
+        Disallowed(index)
+      )
+    elif mappingKind(c) != KindValid
+      return Err(Disallowed(index))
+  if checks.joiners
+    for k in 0 ..< n
+      val c = codes(k)
+      if c == ZeroWidthNonJoiner
+        if !(k > 0 && isVirama(codes(k - 1))) && !joinsAround(codes, k) then return Err(Joiners(index))
+      elif c == ZeroWidthJoiner
+        if !(k > 0 && isVirama(codes(k - 1))) then return Err(Joiners(index))
+  Ok(())
+
+private val ZeroWidthNonJoiner: int = 0x200c
+private val ZeroWidthJoiner: int = 0x200d
+
+// Whether the non-joiner at `k` stands between a character joining to the right (`L` or `D`) and one
+// joining to the left (`R` or `D`), each perhaps behind transparent characters (`T`): RFC 5892 A.1.
+private joinsAround(codes: Vector[int], k: int) -> bool
+  var before = k - 1
+  while before >= 0 && joiningType(codes(before)) == JoinT do before -= 1
+  if before < 0 then return false
+  val left = joiningType(codes(before))
+  if left != JoinL && left != JoinD then return false
+  var after = k + 1
+  while after < codes.length && joiningType(codes(after)) == JoinT do after += 1
+  if after >= codes.length then return false
+  val right = joiningType(codes(after))
+  right == JoinR || right == JoinD
+
+// Whether a label satisfies the six rules of RFC 5893 §2. An empty label does.
+private satisfiesBidi(codes: Vector[int]) -> bool
+  if codes.isEmpty then return true
+  val first = bidiClass(codes(0))
+  var last = codes.length - 1
+  while last > 0 && bidiClass(codes(last)) == BidiNSM do last -= 1
+  val end = bidiClass(codes(last))
+  if first == BidiR || first == BidiAL
+    var european = false
+    var arabic = false
+    for c in codes
+      val b = bidiClass(c)
+      if b == BidiL || b == BidiOther then return false
+      if b == BidiEN then european = true
+      if b == BidiAN then arabic = true
+    if european && arabic then return false
+    return end == BidiR || end == BidiAL || end == BidiEN || end == BidiAN
+  if first != BidiL then return false
+  for c in codes
+    val b = bidiClass(c)
+    if b == BidiR || b == BidiAL || b == BidiAN || b == BidiOther then return false
+  end == BidiL || end == BidiEN
+
+@sysl("sysl.unicode.is_mark")
+private isMark(c: char) -> bool
+
+// The domain name with each character mapped by the table: kept, removed, or replaced.
+private mapped(domain: string) -> string
+  if isAsciiText(domain) && domain.indexWhere(c -> 'A' <= c <= 'Z') < 0 then return domain
+  val table = MappingTable
+  val out = StringWriter()
+  for ch in domain.chars
+    val c = int(ch)
+    if c < 0x80
+      out.writeChar(if 'A' <= ch <= 'Z' then char(c - int('A') + int('a')) else ch)
+    else
+      val run = runOf(table.starts, c)
+      val kind = table.kinds(run)
+      if kind == KindValid || kind == KindDisallowed
+        out.writeChar(ch)
+      elif kind == KindOffset
+        out.writeChar(char(c + table.extra(run)))
+      elif kind == KindSequence
+        val at = table.extra(run)
+        for k in 1 .. table.targets(at) do out.writeChar(char(table.targets(at + k)))
+  out.text
+
+private val KindValid: int = 0
+private val KindIgnored: int = 1
+private val KindDisallowed: int = 2
+private val KindSequence: int = 3
+private val KindOffset: int = 4
+
+// The status the mapping table gives a code point beyond ASCII: valid, ignored, disallowed, or how it
+// is mapped.
+private mappingKind(c: int) -> int
+  val table = MappingTable
+  table.kinds(runOf(table.starts, c))
+
+private val BidiL: int = 0
+private val BidiR: int = 1
+private val BidiAL: int = 2
+private val BidiAN: int = 3
+private val BidiEN: int = 4
+private val BidiNSM: int = 10
+private val BidiOther: int = 11
+
+private val JoinL: int = 1
+private val JoinD: int = 2
+private val JoinR: int = 3
+private val JoinT: int = 4
+
+// The bidirectional class of a code point, among those RFC 5893 names (`BidiOther` for the rest, such
+// as a space or a control character, which no label of a name with a right-to-left label may hold).
+private bidiClass(c: int) -> int = propertyOf(c) & 15
+
+private joiningType(c: int) -> int = (propertyOf(c) >> 4) & 7
+
+private isVirama(c: int) -> bool = (propertyOf(c) & 128) != 0
+
+private propertyOf(c: int) -> int
+  val table = PropertyTable
+  table.values(runOf(table.starts, c))
+
+// The index of the run holding `c`: the last whose start is at most `c`.
+private runOf(starts: ArraySeq[int], c: int) -> int
+  var low = 0
+  var high = starts.length
+  while low < high
+    val middle = (low + high) / 2
+    if starts(middle) <= c then low = middle + 1 else high = middle
+  low - 1
+
+// The mapping table decoded: where each run starts, its kind, and for a mapped run its offset or the
+// index in `targets` of its sequence's length, which the sequence follows. Nothing writes the
+// `ArraySeq`s once made, so every thread may read them.
+private class MappingRuns(
+    val starts: ArraySeq[int],
+    val kinds: ArraySeq[int],
+    val extra: ArraySeq[int],
+    val targets: ArraySeq[int]
+): Sendable
+
+// The property table decoded: where each run starts, and its value.
+private class PropertyRuns(val starts: ArraySeq[int], val values: ArraySeq[int]): Sendable
+
+private lazy val MappingTable: MappingRuns = decodeMappingRuns()
+
+private lazy val PropertyTable: PropertyRuns = decodePropertyRuns()
+
+private decodeMappingRuns() -> MappingRuns
+  val numbers = decodedNumbers(IdnaMappingRuns)
+  val starts = Buffer[int]()
+  val kinds = Buffer[int]()
+  val extra = Buffer[int]()
+  val targets = Buffer[int]()
+  var at = 0
+  var k = 0
+  while k < numbers.length
+    val length = numbers(k)
+    val kind = numbers(k + 1)
+    k += 2
+    starts.addOne(at)
+    kinds.addOne(kind)
+    if kind == KindOffset
+      extra.addOne(unzigzag(numbers(k)))
+      k += 1
+    elif kind == KindSequence
+      extra.addOne(targets.length)
+      val count = numbers(k)
+      targets.addOne(count)
+      k += 1
+      var before = at
+      for _ in 0 ..< count
+        before += unzigzag(numbers(k))
+        targets.addOne(before)
+        k += 1
+    else
+      extra.addOne(0)
+    at += length
+  MappingRuns(starts.toArraySeq, kinds.toArraySeq, extra.toArraySeq, targets.toArraySeq)
+
+private decodePropertyRuns() -> PropertyRuns
+  val numbers = decodedNumbers(IdnaPropertyRuns)
+  val count = numbers.length / 2
+  val starts = Array.fill(count, 0)
+  val values = Array.fill(count, 0)
+  var at = 0
+  for k in 0 ..< count
+    starts(k) = at
+    at += numbers(2 * k)
+    values(k) = numbers(2 * k + 1)
+  PropertyRuns(starts.toArraySeq, values.toArraySeq)
+
+// The numbers a table's text writes, in base 32, a digit to a character: `0`–`9`, `A`–`Z`, `a`–`z`,
+// `-` and `_` are 0 to 63, and those from 32 on are followed by more digits of the same number.
+private decodedNumbers(text: string) -> Buffer[int]
+  val numbers = Buffer[int]()
+  var n = 0
+  for k in 0 ..< text.byteLength
+    val b = int(text.byteAt(k))
+    val d = if int('0') <= b <= int('9') then b - int('0') elif int('A') <= b <= int('Z') then b - int(
+      'A'
+    ) + 10 elif int('a') <= b <= int('z') then b - int('a') + 36 elif b == int('-') then 62 else 63
+    if d >= 32
+      n = n * 32 + d - 32
+    else
+      numbers.addOne(n * 32 + d)
+      n = 0
+  numbers
+
+// Whether every character of `s` is ASCII.
+private isAsciiText(s: string) -> bool
+  for i in 0 ..< s.byteLength
+    if (s.byteAt(i) & 0x80) != 0 then return false
+  true
+
+// A signed number from its zigzag form: 0, 1, 2, 3 … are 0, -1, 1, -2 ….
+private unzigzag(z: int) -> int = if z % 2 == 0 then z / 2 else -(z + 1) / 2

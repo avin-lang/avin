@@ -1,0 +1,128 @@
+// expect: exit 0
+// `fs.move` between two file systems, where no rename reaches: a file and a tree (a link and a
+// directory of its own bits inside) copied with their bits and times and then removed from the source, in
+// both directions; `replace` both ways onto what is there; a failure while copying leaving the
+// destination as it was and the source whole; a failure while removing the source reported as
+// `finish moving` with the destination complete. The second file system is a small disk image
+// attached under the test's directory on macOS, and `/dev/shm` elsewhere; a machine with neither
+// prints a different first line and fails.
+import avin.fs
+import avin.io.IoError
+import avin.process
+import avin.process.Command
+import avin.time
+
+var hereRoot = ""
+var thereRoot = ""
+
+// The line with the two directories written `HERE` and `THERE`, the second first, as it may lie inside
+// the first.
+say(line: Any)
+  val text = s"$line"
+  val shown = if thereRoot == "" then text else text.replace(thereRoot, "THERE")
+  println(if hereRoot == "" then shown else shown.replace(hereRoot, "HERE"))
+
+outcome(r: Result[unit, IoError]) -> string = r match
+  Ok(_) -> "ok"
+  Err(e) -> e.message
+
+perm(file: string) -> string = fs.linkMetadata(file).map(m -> f"0o${m.permissions}%o").getOrElse("none")
+
+device(p: string) -> long = fs.metadata(p).map(m -> m.device).getOrElse(-1)
+
+quiet(c: Command) -> bool = c.errorsToOutput().output().isOk
+
+// A directory on a file system other than `here`'s, and whether it is a mounted image to detach.
+other(here: string) -> Option[(string, bool)]
+  if process.os() == process.MacOS
+    val image = here + "/other.dmg"
+    val mount = here + "/other"
+    if !quiet(
+      Command("hdiutil", "create", "-size", "8m", "-fs", "HFS+", "-volname", "avinmove", image)
+    ) then return None
+    _ = fs.createDir(mount)
+    if !quiet(Command("hdiutil", "attach", "-nobrowse", "-mountpoint", mount, image)) then return None
+    return Some((mount, true))
+  val shm = s"/dev/shm/avin-fs-move-devices-${process.pid()}"
+  if fs.isDir("/dev/shm") && device("/dev/shm") != device(here) && fs.createDir(shm).isOk
+    return Some((shm, false))
+  None
+
+main()
+  val here = fs.createTempDir("avin-fs-move-devices") match
+    Ok(d) -> d
+    Err(e) ->
+      println(s"no directory: $e")
+      return
+  hereRoot = here
+  val (there, image) = other(here) match
+    Some(found) -> found
+    None ->
+      println("no second file system")
+      _ = fs.removeDirAll(here)
+      return
+  thereRoot = there
+  say(device(here) != device(there))
+  // A file moves across with its contents, bits and time, and leaves the source.
+  val past = time.epochSeconds(1_000_000_000)
+  _ = fs.writeText(here + "/a", "alpha")
+  _ = fs.setPermissions(here + "/a", 0o640)
+  _ = fs.setModified(here + "/a", past)
+  say(outcome(fs.move(here + "/a", there + "/a")))
+  say(
+    s"${fs.exists(here + "/a")} ${fs.readText(there + "/a")} ${perm(there + "/a")} ${fs.modified(there + "/a").map(t -> t == past)}"
+  )
+  // And back the other way.
+  say(outcome(fs.move(there + "/a", here + "/back")))
+  say(s"${fs.exists(there + "/a")} ${fs.readText(here + "/back")} ${perm(here + "/back")}")
+  // A tree moves across: links stay links, a directory keeps its bits, times come along.
+  val tree = here + "/tree"
+  _ = fs.writeText(tree + "/top.txt", "top", createParents = true)
+  _ = fs.writeText(tree + "/ro/inside", "inside", createParents = true)
+  _ = fs.symlink("top.txt", tree + "/link")
+  _ = fs.setModified(tree + "/ro/inside", past)
+  _ = fs.setPermissions(tree + "/ro", 0o750)
+  say(outcome(fs.move(tree, there + "/tree")))
+  say(
+    s"${fs.exists(tree)} ${fs.readText(there + "/tree/top.txt")} ${fs.readLink(there + "/tree/link")} ${perm(there + "/tree/ro")}"
+  )
+  say(s"${fs.readText(there + "/tree/ro/inside")} ${fs.modified(there + "/tree/ro/inside").map(t -> t == past)}")
+  // `replace = true` replaces a file across; a full directory is refused and nothing moves.
+  _ = fs.writeText(here + "/b", "new")
+  _ = fs.writeText(there + "/b", "old, and longer")
+  say(outcome(fs.move(here + "/b", there + "/b")))
+  say(s"${fs.exists(here + "/b")} ${fs.readText(there + "/b")}")
+  _ = fs.writeText(here + "/d/x", "x", createParents = true)
+  say(outcome(fs.move(here + "/d", there + "/tree")))
+  say(s"${fs.readText(here + "/d/x")} ${fs.exists(there + "/tree/x")}")
+  // `replace = false` across: made where nothing is, refused where anything is, for a file (whose
+  // hard link cannot cross) and a directory alike.
+  _ = fs.writeText(here + "/c", "c")
+  say(outcome(fs.move(here + "/c", there + "/b", replace = false)))
+  say(s"${fs.readText(here + "/c")} ${fs.readText(there + "/b")}")
+  say(outcome(fs.move(here + "/c", there + "/c", replace = false)))
+  say(s"${fs.exists(here + "/c")} ${fs.readText(there + "/c")}")
+  say(outcome(fs.move(here + "/d", there + "/tree", replace = false)))
+  say(outcome(fs.move(here + "/d", there + "/d", replace = false)))
+  say(s"${fs.exists(here + "/d")} ${fs.readText(there + "/d/x")}")
+  // A failure while copying: the destination is left as it was and the source is whole.
+  _ = fs.writeText(here + "/e/fine", "fine", createParents = true)
+  _ = fs.writeText(here + "/e/locked", "locked")
+  _ = fs.setPermissions(here + "/e/locked", 0o000)
+  say(outcome(fs.move(here + "/e", there + "/e")))
+  say(
+    s"${fs.exists(there + "/e")} ${fs.readText(here + "/e/fine")} ${fs.listDir(there).map(n -> n.count(x -> x.contains(".pending-")))}"
+  )
+  _ = fs.setPermissions(here + "/e/locked", 0o600)
+  // A failure while removing the source: the destination is complete, and the error says so.
+  _ = fs.writeText(here + "/f/sealed/s", "s", createParents = true)
+  _ = fs.setPermissions(here + "/f/sealed", 0o500)
+  say(outcome(fs.move(here + "/f", there + "/f")))
+  say(s"${fs.readText(there + "/f/sealed/s")} ${fs.readText(here + "/f/sealed/s")}")
+  _ = fs.setPermissions(here + "/f/sealed", 0o700)
+  _ = fs.setPermissions(there + "/f/sealed", 0o755)
+  if image
+    say(quiet(Command("hdiutil", "detach", there)))
+  else
+    say(fs.removeDirAll(there).isOk)
+  say(fs.removeDirAll(here))

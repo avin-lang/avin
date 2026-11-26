@@ -1,0 +1,230 @@
+module avin.toml
+
+// TOML 1.0 documents: `parse` reads one into a `Toml` value, a table of keys and values, with the line
+// and column of anything wrong in it; `render` writes a value back as TOML text; and `derives
+// TomlEncoder, TomlDecoder` gives a program's own types an encoder and a decoder written for their
+// fields, so a configuration file is read straight into the type that holds it.
+//
+//     data Server(host: string, port: int = 8080) derives TomlDecoder
+//
+//     val server = toml.decode[Server]("host = \"example.org\"\nport = 9000\n")
+//
+// The date-time kinds are avin.time's types: an offset date-time is a `Zoned` in its offset's fixed
+// zone, a local date-time a `DateTime`, a local date a `Date` and a local time a `Time`. A time keeps
+// microseconds, so digits of a second's fraction beyond the sixth are cut off, as TOML allows.
+
+import avin.time.{Date, DateTime, Time, Zoned}
+
+// A TOML value. A table keeps its keys in the order the text first wrote them, each once; an
+// integer is a `long`, as TOML's integers are 64 bits; a float is a `real`, an infinity and a NaN
+// included.
+data Toml
+  Str(value: string)
+  Integer(value: long)
+  Float(value: real)
+  Bool(value: bool)
+  OffsetDateTime(value: Zoned)
+  LocalDateTime(value: DateTime)
+  LocalDate(value: Date)
+  LocalTime(value: Time)
+  Arr(items: Vector[Toml])
+  Table(members: Vector[(string, Toml)])
+
+// Making values: `Toml.table(("name", Toml.str("avin")), ("port", Toml.num(8080)))`.
+object Toml
+  // A table of the members given, in that order.
+  table(members: (string, Toml)*) -> Toml = Table(members)
+
+  // An array of the values given, in that order.
+  arr(items: Toml*) -> Toml = Arr(items)
+
+  // A string value.
+  str(value: string) -> Toml = Str(value)
+
+  // An integer value.
+  num(value: int) -> Toml = Integer(long(value))
+
+  // An integer value.
+  num(value: long) -> Toml = Integer(value)
+
+  // A float value.
+  num(value: real) -> Toml = Float(value)
+
+impl Toml
+  isTable -> bool = self is Table(_)
+
+  asBool -> Option[bool] = self match
+    Bool(b) -> Some(b)
+    _ -> None
+
+  // An integer's value.
+  asLong -> Option[long] = self match
+    Integer(n) -> Some(n)
+    _ -> None
+
+  // An integer's value, where it fits an `int`.
+  asInt -> Option[int]
+    val n = asLong?
+    if long(-2147483647) - 1 <= n <= 2147483647 then Some(int(n)) else None
+
+  // A float's value, or an integer's rounded to the nearest `real`.
+  asReal -> Option[real] = self match
+    Float(x) -> Some(x)
+    Integer(n) -> Some(real(n))
+    _ -> None
+
+  asString -> Option[string] = self match
+    Str(s) -> Some(s)
+    _ -> None
+
+  // An offset date-time's value.
+  asZoned -> Option[Zoned] = self match
+    OffsetDateTime(z) -> Some(z)
+    _ -> None
+
+  // A local date-time's value.
+  asDateTime -> Option[DateTime] = self match
+    LocalDateTime(dt) -> Some(dt)
+    _ -> None
+
+  // A local date's value.
+  asDate -> Option[Date] = self match
+    LocalDate(d) -> Some(d)
+    _ -> None
+
+  // A local time's value.
+  asTime -> Option[Time] = self match
+    LocalTime(t) -> Some(t)
+    _ -> None
+
+  // An array's elements.
+  asVector -> Option[Vector[Toml]] = self match
+    Arr(items) -> Some(items)
+    _ -> None
+
+  // A table's members, in their order.
+  asMembers -> Option[Vector[(string, Toml)]] = self match
+    Table(members) -> Some(members)
+    _ -> None
+
+  // The value of a table's key `key`; None where there is no such key or this is not a table.
+  get(key: string) -> Option[Toml] = self match
+    Table(members) ->
+      for (name, value) in members
+        if name == key then return Some(value)
+      None
+    _ -> None
+
+  // An array's element at `index`; None where it is outside the array or this is not an array.
+  get(index: int) -> Option[Toml] = self match
+    Arr(items) -> if 0 <= index < items.length then Some(items(index)) else None
+    _ -> None
+
+  // The value at the end of `keys`, each a key of the table before it: `at(["server", "port"])` is
+  // what `[server] port = …` gives. None where any of them is missing or not a table.
+  at(keys: Vector[string]) -> Option[Toml]
+    var value = self
+    for k in keys
+      value = value.get(k)?
+    Some(value)
+
+  // As `get(key)`, and a trap naming the key where there is no such key.
+  apply(key: string) -> Toml
+    if get(key) is Some(value) then return value
+    fail(s"no key \"$key\" in this TOML value")
+
+  // As `get(index)`, and a trap naming the index where there is no such element.
+  apply(index: int) -> Toml
+    if get(index) is Some(value) then return value
+    fail(s"no element $index in this TOML value")
+
+  // Whether a table has the key `key`.
+  has(key: string) -> bool = get(key).isDefined
+
+  // A table's keys, in their order; empty for any other value.
+  keys -> Vector[string] = self match
+    Table(members) -> members.map(m -> m.0)
+    _ -> Vector.empty[string]()
+
+  // The number of an array's elements or a table's keys; 0 for any other value.
+  size -> int = self match
+    Arr(items) -> items.length
+    Table(members) -> members.length
+    _ -> 0
+
+  // A table with `key` set to `value`: replaced in place where the table has it, added at the end
+  // where it has not. Any other value is returned as it is.
+  with(key: string, value: Toml) -> Toml = self match
+    Table(members) ->
+      var k = 0
+      while k < members.length
+        if members(k).0 == key then return Table(members.updated(k, (key, value)))
+        k += 1
+      Table(members :+ (key, value))
+    _ -> self
+
+  // What kind of value this is, with its article, for a message: `an integer`, `a table`.
+  kind -> string = self match
+    Str(_) -> "a string"
+    Integer(_) -> "an integer"
+    Float(_) -> "a float"
+    Bool(_) -> "a boolean"
+    OffsetDateTime(_) -> "an offset date-time"
+    LocalDateTime(_) -> "a local date-time"
+    LocalDate(_) -> "a local date"
+    LocalTime(_) -> "a local time"
+    Arr(_) -> "an array"
+    Table(_) -> "a table"
+
+// A value displays as its TOML text: a table as a document, any other value as it is written after
+// a key's `=`.
+impl Display for Toml
+  display(out: Writer, spec: FormatSpec) = out.writeField(render, spec)
+
+impl Debug for Toml
+  debug(out: Writer, spec: FormatSpec) = out.writeField(render, spec)
+
+// Why a text is not TOML, or why a value is not the type it was decoded as. `line` and `column`
+// (counted in characters, from 1) place it in the text, and `offset` is its byte offset; a value
+// decoded from a `Toml` tree has no place, and its line is 0. `path` names the key or the element at
+// fault in a decoded value.
+data TomlError(message: string, line: long, column: long, offset: long, path: List[PathStep] = [])
+
+// One step of a path into a document: a table's key, or an array's index.
+data PathStep
+  Key(name: string)
+  Index(at: int)
+
+impl TomlError
+  // The error with the key `name` in front of its path, as the decoder of the table holding the
+  // value at fault adds it.
+  inField(name: string) -> TomlError = TomlError(message, line, column, offset, Key(name) :: path)
+
+  // The error with the element `i` in front of its path.
+  atIndex(i: int) -> TomlError = TomlError(message, line, column, offset, Index(i) :: path)
+
+  // The path written out: keys joined by `.`, an index in brackets, so `servers[2].port`; empty
+  // where the error is at the document's top.
+  pathText() -> string
+    val out = StringWriter()
+    var first = true
+    for step in path
+      step match
+        Key(name) ->
+          if !first then out.writeChar('.')
+          out.write(name)
+        Index(i) -> out.write(s"[$i]")
+      first = false
+    out.text
+
+// An error displays as its path, where it has one, its message and its place: `the key "port" is
+// defined twice at line 3, column 1`; `server.port: expected an integer, found a string`.
+impl Error for TomlError
+
+impl Display for TomlError
+  display(out: Writer, spec: FormatSpec)
+    val place = if path.isEmpty then "" else s"${pathText()}: "
+    out.writeField(if line == 0 then s"$place$message" else s"$place$message at line $line, column $column", spec)
+
+// An error of a value being encoded or decoded, which has no place in text.
+private valueError(message: string) -> TomlError = TomlError(message, 0, 0, 0)

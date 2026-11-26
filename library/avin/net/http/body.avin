@@ -1,0 +1,193 @@
+module avin.net.http
+
+// Request bodies read as they arrive. A handler whose route takes its body as a stream
+// (`Route.streaming()`, with `serve(…, streamsBody = router.streamsBody)`) is called once the
+// request's head is read, its body still on the connection, and reads it through
+// `ServerRequest.bodyReader(maxBytes)`, a piece at a time, under the server's `readTimeout` and
+// `requestTimeout` and the limit it gives. A body the server cannot take, malformed, over the limit or
+// too slow, fails the read and is answered by the server, as a buffered one is.
+
+import avin.io.{IoError, Other, Reader, TimedOut}
+import avin.net.ByteStream
+
+// How a request's headers frame its body.
+private data BodyFraming
+  // No body: neither a `Content-Length` nor a `Transfer-Encoding`, or a length of zero.
+  NoBody
+  // Exactly `length` bytes, more than zero.
+  Announced(length: long)
+  // `Transfer-Encoding: chunked`.
+  ChunkCoded
+
+// The limit a streamed body is read within unless the handler gives another: 100 MiB.
+val streamedBodyLimit: long = 104857600
+
+// The body of a request read as it arrives, through `read`: an `io.Reader`, so whatever reads a
+// reader, `json.decode` or a copy into a file, reads an upload without holding it whole. `read(max)`
+// answers up to `max` bytes, waiting for at least one, and an empty array once the body has ended,
+// its chunked framing and trailers included. It fails, and every read after it fails the same way,
+// where the body is longer than `maxBytes` (a `Content-Length` over it fails the first read, before
+// any of the body is asked for), where its chunked framing is malformed, where a wait lasts past the
+// server's `readTimeout` or the request's past its `requestTimeout`, and where the client ends the
+// connection before the body ends. Of a streamed request, the readers `bodyReader` answers share the
+// body, each reading on where the last left off; of a buffered one, each reads the body held from its
+// start. A reader is read on the handler's own thread.
+class BodyReader(
+    private val source: Option[BodySource],
+    private val held: Array[byte],
+    private val maxBytes: long
+): Reader
+  if maxBytes < 0 then fail(s"a body limit of $maxBytes bytes: it is at least zero")
+  private var at = 0
+
+  // Up to `max` bytes of the body, `max` being at least one, or an empty array at its end.
+  override read(max: int) -> Result[Array[byte], IoError]
+    if max < 1 then fail(s"a read of $max bytes: it is at least one")
+    source match
+      Some(s) -> s.read(max, maxBytes)
+      None ->
+        if long(held.length) > maxBytes then return Err(tooLong(maxBytes))
+        val end = if held.length - at > max then at + max else held.length
+        val out = held.slice(at, end)
+        at = end
+        Ok(out)
+
+  // The body's length where its headers give it: its `Content-Length`, zero where it has no body, and
+  // `None` for a chunked one, whose length is known only at its end.
+  length -> Option[long] = source match
+    Some(s) -> s.framing match
+      NoBody -> Some(0)
+      Announced(n) -> Some(n)
+      ChunkCoded -> None
+    None -> Some(long(held.length))
+
+  // The rest of the body, read to its end within the limit.
+  readAll() -> Result[Array[byte], IoError]
+    val out = Buffer[byte]()
+    loop
+      val got = read(65536)?
+      if got.length == 0 then return Ok(out.toArray())
+      out.addAll(got)
+    Ok(out.toArray())
+
+// The failure of a body longer than `limit`.
+private tooLong(limit: long) -> IoError =
+  IoError(Other(s"it is longer than its limit of $limit bytes"), "read", "the request body")
+
+// A streamed request's body on its connection: how it is framed, how much of it has been read, and
+// why it failed where it did. The server keeps it beside the request, so once the handler is done it
+// knows whether the body was read to its end, whether a failure is to be answered, and whether a
+// `100 Continue` the client waits for was ever sent.
+private class BodySource(
+    private val input: Incoming,
+    private val stream: ByteStream,
+    private val s: Settings,
+    val framing: BodyFraming,
+    private val expects: bool
+)
+  // Whether the body has been read to its end.
+  var ended = framing is NoBody
+  // Why the body failed, where it did: the status the server answers it with, or none.
+  var refusal: Option[Refusal] = None
+  // Whether the client was told `100 Continue`.
+  var continued = false
+  private var fault: Option[IoError] = None
+  private var started = false
+  private var consumed: long = 0
+  // The bytes left of the body's length, or of the chunk being read.
+  private var left: long = framing match
+    Announced(n) -> n
+    _ -> 0
+  // Whether the line end after a chunk's bytes is still to be read.
+  private var chunkEnd = false
+
+  // Up to `max` bytes, within `limit` bytes in all.
+  read(max: int, limit: long) -> Result[Array[byte], IoError]
+    if fault is Some(e) then return Err(e)
+    if ended then return Ok(Array.empty[byte]())
+    if !started
+      started = true
+      if framing is Announced(n) && n > limit then return failed(Answer(413), limit)
+      if expects
+        sayContinue(stream, s) match
+          Ok(_) -> continued = true
+          Err(r) -> return failed(r, limit)
+    framing match
+      Announced(n) ->
+        if n > limit then return failed(Answer(413), limit)
+        val got = piece(max, limit)?
+        if left == 0 then ended = true
+        Ok(got)
+      ChunkCoded ->
+        if chunkEnd
+          input.line(s.readTimeout, 1, 400) match
+            Ok(end) -> if !end.isEmpty then return failed(Answer(400), limit)
+            Err(r) -> return failed(r, limit)
+          chunkEnd = false
+        if left == 0
+          val line = input.line(s.readTimeout, 1024, 400) match
+            Ok(l) -> l
+            Err(r) -> return failed(r, limit)
+          val semicolon = line.indexOf(';')
+          val size = chunkSize((if semicolon >= 0 then line.slice(0, semicolon) else line).trim) match
+            Some(n) -> n
+            None -> return failed(Answer(400), limit)
+          if size == 0
+            var room = s.maxHeaderBytes
+            loop
+              val trailer = input.line(s.readTimeout, room, 431) match
+                Ok(t) -> t
+                Err(r) -> return failed(r, limit)
+              if trailer.isEmpty
+                ended = true
+                return Ok(Array.empty[byte]())
+              room -= trailer.byteLength + 2
+              if room <= 0 then return failed(Answer(431), limit)
+          if consumed + size > limit then return failed(Answer(413), limit)
+          left = size
+        val got = piece(max, limit)?
+        if left == 0 then chunkEnd = true
+        Ok(got)
+      NoBody -> Ok(Array.empty[byte]())
+
+  // Up to `max` bytes of what is left of the length or the chunk.
+  private piece(max: int, limit: long) -> Result[Array[byte], IoError]
+    val want = if long(max) < left then max else int(left)
+    input.some(want, s.readTimeout) match
+      Ok(got) ->
+        left -= long(got.length)
+        consumed += long(got.length)
+        Ok(got)
+      Err(r) -> failed(r, limit)
+
+  // Records why the body failed, and answers its failure.
+  private failed(r: Refusal, limit: long) -> Result[Array[byte], IoError]
+    val e = r match
+      Answer(413) -> tooLong(limit)
+      Answer(408) -> IoError(TimedOut, "read", "the request body")
+      Answer(431) -> IoError(Other("its trailers are longer than their limit"), "read", "the request body")
+      Answer(_) -> IoError(Other("its chunked framing is malformed"), "read", "the request body")
+      Quietly -> IoError(Other("the connection ended before it did"), "read", "the request body")
+    refusal = Some(r)
+    fault = Some(e)
+    Err(e)
+
+  // Reads and drops what is left of the body where at most `most` bytes are, so the connection can
+  // carry the next request; answers whether the body was read to its end. A body that failed, one
+  // longer than that, and one whose client still waits for a `100 Continue`, which will not send it,
+  // are not read.
+  drained(most: long) -> bool
+    if fault.isDefined then return false
+    if ended then return true
+    if expects && !continued then return false
+    if framing is Announced(_) && left > most then return false
+    val until = consumed + most
+    loop
+      read(65536, until) match
+        Ok(got) -> if got.length == 0 then return true
+        Err(_) -> return false
+    false
+
+// How much of a streamed body the server reads and drops after a handler that left it unread, to
+// keep the connection for the next request; past it the connection is closed.
+private val drainBytes: long = 65536

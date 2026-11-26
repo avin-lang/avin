@@ -1,0 +1,347 @@
+// expect: exit 0
+// Request bodies streamed to the handlers that ask for them: `Route.streaming()` with
+// `serve(…, streamsBody = router.streamsBody)` hands the handler its request with the body unread,
+// read through `bodyReader(maxBytes)` a piece at a time, by `Content-Length` or chunked, while the
+// routes that did not ask keep the buffered body and its `maxBodyBytes`. Hostile clients: bad chunk
+// sizes and framing, bodies over the handler's limit (before any `100 Continue`, and chunked as they
+// grow), a client slower than `readTimeout` and one slower than `requestTimeout`, a client that stops
+// mid-body, and requests pipelined after a body the handler read partly or not at all, short enough
+// to drop or too long, so that no byte of a body is ever read as a request. A failed body is answered
+// by the server whatever the handler answered; `Expect: 100-continue` is answered only where the
+// handler reads; a multipart upload is read a part at a time; and a streamed response can echo the
+// streamed body.
+import avin.io.IoError
+import avin.net.{StreamWriter, TcpServer, TcpStream}
+import avin.net.http
+import avin.net.http.{BodyReader, MultipartLimits, Multipart, Part, Response, Route, Router, ServerRequest}
+import avin.threads.{Atomic, sleep, spawn}
+import avin.time
+import avin.time.{Duration, millis, monotonic}
+
+ok[T](r: Result[T, IoError]) -> T = r match
+  Ok(v) -> v
+  Err(e) -> fail(e.message)
+
+// The last failure a handler met reading its body, and how many requests reached `/evil`.
+val lastError: Atomic[string] = Atomic("")
+val evil: Atomic[int] = Atomic(0)
+
+// Reads the body `size` bytes at a time within `limit`, answering how much and in how many pieces, or
+// the failure, which it records and then answers 200 as if nothing were wrong.
+counted(r: ServerRequest) -> Response
+  val limit = r.queryAs[long]("limit", long(104857600)).getOrElse(long(0))
+  val size = r.queryAs[int]("size", 7).getOrElse(7)
+  val reader = r.bodyReader(limit)
+  var total: long = 0
+  var pieces = 0
+  var sum = 0
+  loop
+    reader.read(size) match
+      Ok(got) ->
+        if got.length == 0 then break
+        if got.length > size then return Response.text(500, "a piece over its size")
+        total += long(got.length)
+        pieces += 1
+        for b in got
+          sum = (sum + int(b)) % 65521
+      Err(e) ->
+        lastError.store(e.message)
+        return Response.text(200, "ignored")
+  val shape = if long(pieces) * long(size) >= total then "" else " (too few pieces)"
+  Response.text(200, s"read $total bytes$shape, sum $sum, streamed ${r.bodyStreamed}")
+
+// Reads at most `n` bytes of the body and answers how many it took.
+partial(r: ServerRequest) -> Response
+  val n = r.queryAs[int]("n", 0).getOrElse(0)
+  val reader = r.bodyReader()
+  var took = 0
+  while took < n
+    val got = ok(reader.read(n - took))
+    if got.length == 0 then break
+    took += got.length
+  Response.text(200, s"took $took")
+
+// Reads the body as multipart, a part at a time, a file's body in pieces of at most 1000 bytes.
+upload(r: ServerRequest) -> Response
+  val limit = r.queryAs[int]("limit", 10485760).getOrElse(0)
+  val parts = r.multipartReader(MultipartLimits(maxBytes = limit)) match
+    Ok(m) -> m
+    Err(e) -> return e.toResponse()
+  val out = StringWriter()
+  loop
+    val head = parts.next() match
+      Ok(Some(h)) -> h
+      Ok(None) -> break
+      Err(e) ->
+        lastError.store(e.message)
+        return e.toResponse()
+    var n = 0
+    var pieces = 0
+    loop
+      val got = parts.read(1000) match
+        Ok(g) -> g
+        Err(e) -> return e.toResponse()
+      if got.length == 0 then break
+      n += got.length
+      pieces += 1
+    val shape = if pieces * 1000 >= n && (n == 0) == (pieces == 0) then "" else " (pieces wrong)"
+    out.write(s"${head.name}:${head.filename.getOrElse("-")}:${head.contentType}:$n$shape ")
+  Response.text(200, out.text.trim)
+
+// A streamed response writing back the streamed body it reads.
+echo(r: ServerRequest) -> Response
+  val reader = r.bodyReader()
+  Response.stream(200, "application/octet-stream", reader.length.getOrElse(0), w ->
+    loop
+      val got = reader.read(5) match
+        Ok(g) -> g
+        Err(_) -> break
+      if got.length == 0 then break
+      if w.write(got).isErr then break)
+
+val router = Router(
+  [
+    Route.post("/count", counted).streaming(),
+    Route.post("/partial", partial).streaming(),
+    Route.post("/none", _ -> Response.text(201, "unread")).streaming(),
+    Route.post("/upload", upload).streaming(),
+    Route.post("/echo", echo).streaming(),
+    Route.get("/stream-get", r -> Response.text(200, s"get ${r.bodyStreamed} ${r.bodyReader().length}")).streaming(),
+    Route.post("/buffered", r -> Response.text(200, s"buffered ${r.body.length} ${r.bodyStreamed}")),
+    Route.get("/hello", _ -> Response.text(200, "hello")),
+    Route.get("/evil", _ ->
+      _ = evil.add(1)
+      Response.text(200, "evil"))
+  ]
+)
+
+started() -> TcpServer = ok(
+  http.serve(
+    "127.0.0.1",
+    0,
+    router.handle,
+    readTimeout = millis(400),
+    maxBodyBytes = 16,
+    date = false,
+    requestTimeout = time.seconds(1),
+    streamsBody = router.streamsBody
+  )
+)
+
+// Everything the server sends until it closes, or until a read fails or waits five seconds.
+rest(c: TcpStream) -> string
+  val out = Buffer[byte]()
+  loop
+    c.read(65536) match
+      Ok(got) ->
+        if got.length == 0 then break
+        out.addAll(got)
+      Err(_) -> break
+  string.fromUtf8Lossy(out.toArray()).replace("\r\n", "|")
+
+open(server: TcpServer) -> TcpStream
+  val c = ok(TcpStream.connect("127.0.0.1", server.port()))
+  ok(c.setTimeout(time.seconds(5)))
+  c
+
+// Sends `text` at once and answers all the server sends back before it closes.
+exchange(server: TcpServer, text: string) -> string
+  val c = open(server)
+  _ = c.writeText(text)
+  rest(c)
+
+post(target: string, body: string, extra: string = "") -> string =
+  s"POST $target HTTP/1.1\r\nHost: t\r\nContent-Length: ${body.byteLength}\r\n${extra}\r\n$body"
+
+chunked(target: string, chunks: string, extra: string = "") -> string =
+  s"POST $target HTTP/1.1\r\nHost: t\r\nTransfer-Encoding: chunked\r\n${extra}\r\n$chunks"
+
+val closing: string = "Connection: close\r\n"
+
+// Writes `head` at once, then `tail` a byte at a time, `every` apart, until all is sent, a write
+// fails or `stop` is set.
+trickle(w: StreamWriter, head: string, tail: string, every: Duration, stop: Atomic[bool]) -> bool
+  if w.writeText(head).isErr then return false
+  for c in tail.chars
+    sleep(every)
+    if stop.load() then return false
+    if w.writeText(c.toString()).isErr then return false
+  true
+
+// What a client trickling `tail` after `head` is answered, and whether it came within `lo` and `hi`.
+slowly(server: TcpServer, head: string, tail: string, every: Duration, lo: Duration, hi: Duration) -> string
+  val (r, w) = ok(TcpStream.connect("127.0.0.1", server.port())).split()
+  ok(r.setTimeout(time.seconds(10)))
+  val stop = Atomic(false)
+  val start = monotonic()
+  val writer = spawn(() -> trickle(w, head, tail, every, stop))
+  val line = ok(r.readLine()).getOrElse("")
+  val took = monotonic() - start
+  stop.store(true)
+  _ = writer.join()
+  s"$line, within the bound: ${lo <= took < hi}"
+
+main()
+  val server = started()
+  // A body of a length and a chunked one, read in pieces of at most seven bytes; one of no body.
+  val digits = "0123456789".repeat(10)
+  println(exchange(server, post("/count", digits, closing)))
+  println(
+    exchange(
+      server,
+      chunked(
+        "/count",
+        "a;ext=1\r\n0123456789\r\n1E\r\n012345678901234567890123456789\r\n0\r\nX-Trailer: t\r\n\r\n",
+        closing
+      )
+    )
+  )
+  println(exchange(server, post("/count?size=1", "", closing)))
+  println(exchange(server, "GET /stream-get HTTP/1.1\r\nHost: t\r\nConnection: close\r\n\r\n"))
+  println(exchange(server, "POST /count HTTP/1.0\r\nContent-Length: 3\r\n\r\nabc"))
+  // A large body read whole; a buffered route on the same server keeps its 16-byte limit.
+  println(exchange(server, post("/count?size=65536", "x".repeat(300000), closing)))
+  println(exchange(server, post("/buffered", "sixteen bytes!!!", closing)))
+  println(exchange(server, post("/buffered", "seventeen bytes!!", closing)))
+  // Bad chunk sizes and framing: each answered 400 whatever the handler answered, and closed.
+  for size in ["zz", "", "-1", "1x", " ", "0x5"]
+    println(s"size `$size`: ${exchange(server, chunked("/count", s"$size\r\nabcde\r\n0\r\n\r\n"))}")
+  println(exchange(server, chunked("/count", s"${"1".repeat(1100)}\r\nabcde\r\n0\r\n\r\n")))
+  println(exchange(server, chunked("/count", "3\r\nabcX\r\n0\r\n\r\n")))
+  println(exchange(server, chunked("/count", "3\r\nabc")))
+  println(exchange(server, chunked("/count", s"3\r\nabc\r\n0\r\nX-Long: ${"t".repeat(20000)}\r\n\r\n")))
+  // A chunk size past any body: refused as over the limit rather than read.
+  println(exchange(server, chunked("/count", "FFFFFFFFFFFFFFFFFFFFFFFF\r\nabc\r\n0\r\n\r\n")))
+  // Over the handler's limit: a length over it at the first read, before any of it is asked for; a
+  // body exactly at it is read; a chunked body as it passes it.
+  println(exchange(server, post("/count?limit=9", digits.slice(0, 10))))
+  println(exchange(server, post("/count?limit=10", digits.slice(0, 10), closing)))
+  println(exchange(server, chunked("/count?limit=5", "3\r\nabc\r\n3\r\ndef\r\n0\r\n\r\n")))
+  println(exchange(server, chunked("/count?limit=6", "3\r\nabc\r\n3\r\ndef\r\n0\r\n\r\n", closing)))
+  println(s"last error: ${lastError.load()}")
+  // `Expect: 100-continue`: told to go on only by a handler that reads, and never over the limit.
+  val asks = open(server)
+  ok(
+    asks.writeText(
+      "POST /count HTTP/1.1\r\nHost: t\r\nExpect: 100-continue\r\nContent-Length: 5\r\nConnection: close\r\n\r\n"
+    )
+  )
+  println(s"expecting: ${ok(asks.readLine()).getOrElse("")}")
+  _ = asks.readLine()
+  ok(asks.writeText("hello"))
+  println(s"then: ${rest(asks)}")
+  println(exchange(server, "POST /none HTTP/1.1\r\nHost: t\r\nExpect: 100-continue\r\nContent-Length: 5\r\n\r\n"))
+  println(
+    exchange(server, "POST /count?limit=4 HTTP/1.1\r\nHost: t\r\nExpect: 100-continue\r\nContent-Length: 5\r\n\r\n")
+  )
+  // A client slower than `readTimeout` (400 ms) between two bytes, and one trickling its body faster
+  // than that but slower than `requestTimeout` (one second): each answered 408 at about its bound.
+  println(
+    slowly(
+      server,
+      "POST /count HTTP/1.1\r\nHost: t\r\nContent-Length: 2\r\n\r\na",
+      "",
+      millis(50),
+      millis(350),
+      time.seconds(3)
+    )
+  )
+  println(
+    slowly(
+      server,
+      "POST /count HTTP/1.1\r\nHost: t\r\nContent-Length: 100\r\n\r\n",
+      "b".repeat(100),
+      millis(50),
+      millis(900),
+      time.seconds(3)
+    )
+  )
+  println(
+    slowly(
+      server,
+      "POST /count HTTP/1.1\r\nHost: t\r\nTransfer-Encoding: chunked\r\n\r\n",
+      "1\r\nb\r\n".repeat(30),
+      millis(50),
+      millis(900),
+      time.seconds(3)
+    )
+  )
+  // A client that stops mid-body: the handler's read fails, and the connection is closed unanswered.
+  val stops = open(server)
+  ok(stops.writeText("POST /count HTTP/1.1\r\nHost: t\r\nContent-Length: 100\r\n\r\n0123456789"))
+  ok(stops.shutdownOutput())
+  println(s"stopped mid-body: `${rest(stops)}`, ${lastError.load()}")
+  val stopsChunked = open(server)
+  ok(stopsChunked.writeText("POST /count HTTP/1.1\r\nHost: t\r\nTransfer-Encoding: chunked\r\n\r\n5\r\nab"))
+  ok(stopsChunked.shutdownOutput())
+  println(s"stopped mid-chunk: `${rest(stopsChunked)}`, ${lastError.load()}")
+  // Pipelined after a body read partly or not at all: the rest of a short body is dropped and the
+  // next request answered; a body holding a request is never read as one.
+  println(
+    exchange(server, post("/partial?n=3", "0123456789") + "GET /hello HTTP/1.1\r\nHost: t\r\nConnection: close\r\n\r\n")
+  )
+  println(
+    exchange(
+      server,
+      chunked(
+        "/partial?n=4",
+        "3\r\nabc\r\n3\r\ndef\r\n0\r\n\r\n"
+      ) + "GET /hello HTTP/1.1\r\nHost: t\r\nConnection: close\r\n\r\n"
+    )
+  )
+  val smuggled = "GET /evil HTTP/1.1\r\nHost: t\r\n\r\n"
+  println(exchange(server, post("/none", smuggled) + "GET /hello HTTP/1.1\r\nHost: t\r\nConnection: close\r\n\r\n"))
+  println(
+    exchange(
+      server,
+      chunked(
+        "/none",
+        s"${smuggled.byteLength.toRadix(16)}\r\n$smuggled\r\n0\r\n\r\n"
+      ) + "GET /hello HTTP/1.1\r\nHost: t\r\nConnection: close\r\n\r\n"
+    )
+  )
+  // A body longer than the server drops: the connection closes after the answer, and the request
+  // after it, in the body or past it, is never served.
+  val lengthy = "x".repeat(70000) + smuggled
+  println(exchange(server, post("/none", lengthy) + smuggled).slice(0, 80))
+  println(exchange(server, post("/partial?n=10", lengthy) + smuggled).slice(0, 80))
+  println(s"evil served: ${evil.load()}")
+  // A multipart upload read a part at a time; over its limit it is refused before it is read.
+  val file = Array.tabulate(100000, i -> byte(i % 251))
+  val form = Multipart([Part.field("title", "Hi"), Part.file("doc", "a.bin", "application/octet-stream", file)])
+  val c = open(server)
+  val head = s"POST /upload HTTP/1.1\r\nHost: t\r\nContent-Type: ${form.contentType("bnd")}\r\nContent-Length: ${form.encoded("bnd").length}\r\nConnection: close\r\n\r\n"
+  ok(c.writeText(head))
+  ok(c.write(form.encoded("bnd")))
+  println(rest(c))
+  val small = open(server)
+  ok(
+    small.writeText(
+      s"POST /upload?limit=1000 HTTP/1.1\r\nHost: t\r\nContent-Type: ${form.contentType("bnd")}\r\nContent-Length: ${form.encoded("bnd").length}\r\n\r\n"
+    )
+  )
+  println(rest(small))
+  println(
+    exchange(
+      server,
+      post(
+        "/upload",
+        "--bnd\r\nContent-Disposition: form-data; name=a\r\n\r\n1\r\n--bnd--",
+        "Content-Type: text/plain\r\n" + closing
+      )
+    )
+  )
+  println(
+    exchange(
+      server,
+      post(
+        "/upload",
+        "--bnd\r\nContent-Disposition: form-data; name=a\r\n\r\n1\r\n",
+        s"Content-Type: ${form.contentType("bnd")}\r\n" + closing
+      )
+    )
+  )
+  println(s"last error: ${lastError.load()}")
+  // A streamed response echoing the streamed body it reads, the connection closed after it.
+  println(exchange(server, post("/echo", "echo me, piece by piece")))
+  server.shutdown()

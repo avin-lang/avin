@@ -434,7 +434,9 @@ A [Sysl handle](/spec/sysl-bindings/#handles) is the exception: it belongs to on
 and a use by any other code traps. The handles a thread's body or a future's body reaches move to
 it when it starts, and are in transit, for the next code to use them, once it returns, before a
 future's value is published, so its awaiter may use them at once; an actor
-will own its handles across every message, whichever thread runs it.
+will own its handles across every message, whichever thread runs it. A value sent on a channel has
+its handles in transit from the send, for the receiver, and a lock's value has them in transit
+between its bodies (below).
 
 ## Synchronization
 
@@ -453,7 +455,14 @@ will own its handles across every message, whichever thread runs it.
   there, in a module-level collection or in an object's field would let the program change it later
   without the lock. A body reads such a `var` through a local read before it. For a sendable
   value, `get()` reads it, `set(v)` replaces it and `update(f)` replaces it with `f` of it
-  under the lock, giving back the new value. A mutex is not reentrant: a thread that takes one it
+  under the lock, giving back the new value. The [Sysl handles](/spec/sysl-bindings/#handles) the
+  value reaches, an open file or a connection, belong to whichever thread holds the lock: they are
+  in transit once the mutex is made and whenever a body ends or waits on the mutex's condition, and
+  the first body to use one takes it, so any thread may write a file a mutex keeps. Only the handles
+  the value's type shows are handed on — the value itself, or what its fields, a tuple's parts or a
+  collection's elements are declared to be — and a type that shows none costs nothing for this, the
+  compiler knowing it of the type; a handle reached only through a function value, an `Any` or a
+  trait's object stays where it was, and another thread's use of it traps. A mutex is not reentrant: a thread that takes one it
   already holds, from inside a body, would wait for ever, so it traps instead.
 - **`Condition`**, made by a mutex's `condition()` and waited for inside that mutex's `with`; like
   its mutex, it is sendable.

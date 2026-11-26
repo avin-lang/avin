@@ -1,0 +1,515 @@
+module avin.net.smtp
+
+// A client of SMTP (RFC 5321), the protocol that hands mail to a server, with the extensions a
+// sending program needs: STARTTLS (RFC 3207), AUTH PLAIN and LOGIN (RFC 4954), SIZE (RFC 1870),
+// 8BITMIME (RFC 6152) and SMTPUTF8 (RFC 6531).
+//
+//     val client = SmtpClient("smtp.example.com", user = "ada", password = secret)
+//     client.send(message)?
+//
+// Secure by default: a connection is upgraded with STARTTLS, and a server that does not offer it is
+// an error rather than a reason to send in the clear; `ImplicitTls` speaks TLS from the first byte
+// (port 465); only `Unencrypted`, asked for by name, sends without TLS. A password is sent only over
+// TLS unless `authWithoutTls` says otherwise. The server's certificate is checked for the host, as
+// every `TlsStream` checks it.
+//
+// Every wait is bounded: connecting by `connectTimeout`, each command's reply by `commandTimeout`,
+// and the message's data and the reply to it by `dataTimeout`, each counted from when the wait
+// began, so a server sending a byte at a time cannot hold a session for ever. Every reply is
+// bounded too, a line by `maxReplyLine` bytes and a reply by `maxReplyLines` lines, so a hostile
+// server cannot make the client hold what it sends.
+
+import avin.encoding.toBase64
+import avin.io
+import avin.io.{IoError, TimedOut}
+import avin.net.{ByteStream, TcpStream}
+import avin.net.mail.{MailError, Message, checkedAddress}
+import avin.net.tls
+import avin.net.tls.{TlsClient, TlsError, TlsStream}
+import avin.threads.withTimeout
+import avin.time.{Duration, minutes, monotonic, seconds}
+
+// How a connection to the server is secured.
+data Security
+  // A plain connection upgraded to TLS by STARTTLS before anything else is sent, the server's not
+  // offering it being an error; the default port is 587.
+  StartTls
+  // TLS from the connection's first byte, as on port 465, the default.
+  ImplicitTls
+  // No TLS at all, as on port 25 to a relay on the same network, the default port 25.
+  Unencrypted
+
+// The way a client proves who it is (RFC 4954).
+data AuthMechanism
+  // `AUTH PLAIN`, the user name and password in one message (RFC 4616).
+  Plain
+  // `AUTH LOGIN`, the user name and the password each answering the server's prompt.
+  Login
+
+// A server's reply: its three-digit code and the text of each of its lines, without the code.
+data Reply(code: int, lines: Vector[string])
+
+impl Reply
+  // The text of every line, a line break between each.
+  text -> string = lines.mkString("\n")
+
+  // Whether the code is 4xx, a refusal that may succeed later.
+  transient -> bool = 400 <= code < 500
+
+  // Whether the code is 5xx, a refusal that will not succeed as it stands.
+  permanent -> bool = 500 <= code < 600
+
+  // The enhanced status code at the start of the first line (RFC 3463), `5.1.1` say, if it has one.
+  enhanced -> Option[string]
+    if lines.isEmpty then return None
+    val word = lines(0).split(' ')(0)
+    val parts = word.split('.')
+    if parts.size != 3 then return None
+    if !("2" <= parts(0) <= "5") || parts(0).byteLength != 1 then return None
+    for p in parts
+      if p.isEmpty || p.byteLength > 3 || !p.forall(c -> '0' <= c <= '9') then return None
+    Some(word)
+
+// Why mail could not be sent.
+data SmtpError
+  // The connection could not be made, broke, was closed by the server, or a wait ran out of time
+  // (kind `TimedOut`).
+  Transport(error: IoError)
+  // TLS could not be set up: the certificate was refused or the handshake failed.
+  Tls(error: TlsError)
+  // The server refused `command` (a password is never part of it) with `reply`.
+  Rejected(command: string, reply: Reply)
+  // The server broke the protocol: a reply that is not one, a line or a reply longer than the
+  // limits, a code where another was due, or bytes it sent where it had to wait.
+  Protocol(text: string)
+  // The server lacks what sending needs: STARTTLS, AUTH or the mechanism asked for, SMTPUTF8 for an
+  // address beyond ASCII, 8BITMIME for data beyond ASCII.
+  Unsupported(text: string)
+  // A password would have gone without TLS, which the client does not do unless asked.
+  NotSecure
+  // The message is larger than the server said it takes (SIZE), both in bytes.
+  TooLarge(size: long, limit: long)
+  // The message, an address or an argument cannot be sent: `error` says why.
+  BadMessage(error: MailError)
+  // An argument the client was given cannot go into a command: `text` says why.
+  Invalid(text: string)
+
+impl SmtpError
+  // The reply's code, for a refusal.
+  code -> Option[int] = self match
+    Rejected(_, r) -> Some(r.code)
+    _ -> None
+
+  // Whether trying again later may succeed: a 4xx refusal, or a connection that failed, broke or
+  // timed out, a TLS handshake's included.
+  transient -> bool = self match
+    Rejected(_, r) -> r.transient
+    Transport(_) -> true
+    Tls(e) -> brokenTls(e)
+    _ -> false
+
+  // Whether the same mail will fail again: a 5xx refusal, or anything else but a failed connection.
+  permanent -> bool = !transient
+
+// Whether a TLS failure is the connection's beneath it (failed, broken or timed out), not a refusal.
+private brokenTls(e: TlsError) -> bool = e match
+  tls.Transport(_) -> true
+  _ -> false
+
+impl Error for SmtpError
+  // A sentence saying what went wrong, for a message to a person.
+  message -> string = self match
+    Transport(e) -> e.message
+    Tls(e) -> e.message
+    Rejected(c, r) -> s"the server refused $c: ${r.code} ${r.text}"
+    Protocol(t) -> s"the server broke the protocol: $t"
+    Unsupported(t) -> s"the server does not offer $t"
+    NotSecure -> "a password is sent only over TLS"
+    TooLarge(size, limit) -> s"the message is $size bytes and the server takes at most $limit"
+    BadMessage(e) -> e.message
+    Invalid(t) -> t
+
+// How to reach a server and what to tell it. `port` zero is the security's own: 587 for `StartTls`,
+// 465 for `ImplicitTls`, 25 for `Unencrypted`. Where `user` is not empty the client authenticates
+// with `password`, by `mechanism` where one is given and otherwise by PLAIN or else LOGIN, whichever
+// the server offers. `helo` is the name the client gives itself in `EHLO`.
+//
+// The limits: `connectTimeout`, 30 seconds, for the lookup, the connection and a TLS handshake;
+// `commandTimeout`, 5 minutes as RFC 5321 suggests, for each reply; `dataTimeout`, 10 minutes as
+// RFC 5321 suggests, for sending the message (each wait) and its reply; zero takes a limit away and a
+// negative one traps. `maxReplyLine`, 1000 bytes, and `maxReplyLines`, 100, bound a reply.
+class SmtpClient(
+    val host: string,
+    val port: int = 0,
+    val security: Security = StartTls,
+    val tls: TlsClient = TlsClient(),
+    val user: string = "",
+    private val password: string = "",
+    val mechanism: Option[AuthMechanism] = None,
+    val authWithoutTls: bool = false,
+    val helo: string = "localhost",
+    val connectTimeout: Duration = seconds(30),
+    val commandTimeout: Duration = minutes(5),
+    val dataTimeout: Duration = minutes(10),
+    val maxReplyLine: int = 1000,
+    val maxReplyLines: int = 100
+)
+  for (name, d) in [
+    ("connectTimeout", connectTimeout),
+    ("commandTimeout", commandTimeout),
+    ("dataTimeout", dataTimeout)
+  ]
+    if d.micros < 0 then fail(s"SmtpClient's $name is negative: $d")
+  if maxReplyLine < 4 || maxReplyLines < 1 then fail("SmtpClient's reply limits must allow a reply of one line")
+
+  // The port connected to.
+  portUsed -> int = if port != 0 then port else security match
+    StartTls -> 587
+    ImplicitTls -> 465
+    Unencrypted -> 25
+
+  // A session with the server: connected, greeted, `EHLO` said, upgraded to TLS as `security`
+  // says and authenticated where a user is given, ready to send.
+  open() -> Result[SmtpSession, SmtpError]
+    checkedHelo(helo)?
+    val tcp = connected(host, portUsed, connectTimeout).mapErr(e -> Transport(e))?
+    val peer = s"$host:$portUsed"
+    var stream: ByteStream = tcp
+    if security == ImplicitTls
+      upgraded(tcp, host, tls, connectTimeout) match
+        Ok(s) -> stream = s
+        Err(e) ->
+          _ = tcp.close()
+          return Err(e)
+    val session = SmtpSession(tcp, stream, security == ImplicitTls, self, peer)
+    session.begin(password) match
+      Ok(_) -> Ok(session)
+      Err(e) ->
+        session.close()
+        Err(e)
+
+  // Opens a session, sends `message` and quits.
+  send(message: Message) -> Result[unit, SmtpError]
+    val session = open()?
+    session.send(message) match
+      Ok(_) ->
+        session.quit()
+      Err(e) ->
+        _ = session.quit()
+        Err(e)
+
+// A name for `EHLO` checked: a domain or an address literal, printable ASCII without spaces.
+private checkedHelo(name: string) -> Result[unit, SmtpError]
+  if name.isEmpty || name.byteLength > 255 then return Err(Invalid("the EHLO name must be 1 to 255 characters"))
+  for i in 0 ..< name.byteLength
+    val c = int(name.byteAt(i))
+    if !(33 <= c <= 126) then return Err(Invalid(s"the EHLO name `${shown(name)}` holds a character a name cannot"))
+  Ok(())
+
+// A TCP connection to `host`, the lookup and connecting done within `timeout` (zero for no limit).
+private connected(host: string, port: int, timeout: Duration) -> Result[TcpStream, IoError]
+  if timeout.micros == 0 then return TcpStream.connect(host, port)
+  withTimeout(timeout, s -> TcpStream.connect(host, port)) match
+    Some(r) -> r
+    None -> Err(IoError(TimedOut, "connect to", s"$host:$port"))
+
+// TLS as the client over `tcp`, each of the handshake's waits within `timeout`. Where it fails,
+// `tcp` is the caller's to close.
+private upgraded(tcp: TcpStream, host: string, tls: TlsClient, timeout: Duration) -> Result[TlsStream, SmtpError]
+  tcp.setTimeout(timeout).mapErr(e -> Transport(e))?
+  TlsStream.client(tcp, host, tls).mapErr(e -> Tls(e))
+
+// `text` cut to 80 bytes where longer, for an error to show a hostile line without holding it whole.
+private shown(text: string) -> string = if text.byteLength <= 80 then text else text.take(80) + "…"
+
+// Whether every byte of `text` is ASCII.
+private ascii(text: string) -> bool
+  for i in 0 ..< text.byteLength
+    if int(text.byteAt(i)) >= 128 then return false
+  true
+
+// `data` ready to follow `DATA`: each line break, CR LF, a lone CR or a lone LF, written CR LF, so a
+// lone one can never end the data early; a `.` doubled at the start of a line (RFC 5321 § 4.5.2); a
+// CR LF at the end where there is none; and the `.` line that ends it. A line longer than 998 bytes
+// is an `Invalid`.
+private dotStuffed(data: Array[byte]) -> Result[Array[byte], SmtpError]
+  val out = Buffer[byte]()
+  val n = data.length
+  var line = 0
+  var i = 0
+  while i < n
+    val b = data(i)
+    if b == byte(13) || b == byte(10)
+      out += byte(13)
+      out += byte(10)
+      line = 0
+      i += if b == byte(13) && i + 1 < n && data(i + 1) == byte(10) then 2 else 1
+    else
+      if line == 0 && b == byte(int('.')) then out += b
+      out += b
+      line += 1
+      if line > 998 then return Err(Invalid("the message has a line longer than 998 bytes"))
+      i += 1
+  if line > 0
+    out += byte(13)
+    out += byte(10)
+  out += byte(int('.'))
+  out += byte(13)
+  out += byte(10)
+  Ok(out.toArray())
+
+// A session with a server, made by `SmtpClient.open`: it sends any number of messages, one after
+// another, and ends with `quit`. After a failure of the connection or of the protocol it is closed,
+// and every operation answers an error.
+class SmtpSession(
+    private val tcp: TcpStream,
+    private var conn: ByteStream,
+    private var secure: bool,
+    private val client: SmtpClient,
+    private val peer: string
+)
+  // Bytes read from the server and not yet taken as reply lines.
+  private val pending = Buffer[byte]()
+  // Each extension the server's `EHLO` reply named, its keyword in upper case, and its parameters.
+  private var offered = Vector.empty[(string, string)]()
+  private var ended = false
+
+  // The extensions the server's reply to `EHLO` named, each keyword in upper case with the rest of
+  // its line.
+  extensions -> Vector[(string, string)] = offered
+
+  // Whether the server offers the extension `keyword`, compared without regard to case.
+  offers(keyword: string) -> bool = offered.exists(e -> e.0 == keyword.toUpper)
+
+  // Whether the session runs over TLS.
+  encrypted -> bool = secure
+
+  // The largest message the server takes, where its `SIZE` says one.
+  sizeLimit -> Option[long]
+    for (k, v) in offered
+      if k == "SIZE" then return v.trim.toLongOption().filter(n -> n > 0)
+    None
+
+  // The greeting, `EHLO`, STARTTLS where asked and authentication where a user is given.
+  begin(password: string) -> Result[unit, SmtpError]
+    expect("the greeting", reply(client.commandTimeout)?, 220)?
+    hello()?
+    if client.security == StartTls
+      if !offers("STARTTLS") then return Err(Unsupported("STARTTLS"))
+      expect("STARTTLS", command("STARTTLS", client.commandTimeout)?, 220)?
+      // Bytes the server sent after its reply would be read as if they came over TLS.
+      if pending.nonEmpty || tcp.readable() then return Err(Protocol("it sent bytes after its reply to STARTTLS"))
+      conn = upgraded(tcp, client.host, client.tls, client.connectTimeout)?
+      secure = true
+      hello()?
+    if client.user.nonEmpty then authenticate(password)?
+    Ok(())
+
+  // `EHLO`, reading the extensions; where the server refuses it outright on a connection that is to
+  // stay unencrypted, `HELO`, which offers none.
+  private hello() -> Result[unit, SmtpError]
+    val r = command("EHLO " + client.helo, client.commandTimeout)?
+    if r.code == 250
+      offered = r.lines.drop(1).map(l ->
+        val sp = l.indexOf(' ')
+        if sp < 0 then (l.toUpper, "") else (l.slice(0, sp).toUpper, l.slice(sp + 1, l.byteLength)))
+      return Ok(())
+    if r.permanent && client.security == Unencrypted
+      offered = Vector.empty[(string, string)]()
+      expect("HELO", command("HELO " + client.helo, client.commandTimeout)?, 250)?
+      return Ok(())
+    Err(Rejected("EHLO", r))
+
+  // `AUTH` by the mechanism asked for, or PLAIN or else LOGIN, whichever is offered.
+  private authenticate(password: string) -> Result[unit, SmtpError]
+    if !secure && !client.authWithoutTls then return Err(NotSecure)
+    var mechanisms = Vector.empty[string]()
+    for (k, v) in offered
+      if k == "AUTH" then mechanisms = v.toUpper.split(' ')
+    if mechanisms.isEmpty then return Err(Unsupported("AUTH"))
+    val chosen = client.mechanism match
+      Some(m) -> m
+      None ->
+        if mechanisms.exists(m -> m == "PLAIN") then Plain
+        elif mechanisms.exists(m -> m == "LOGIN") then Login
+        else return Err(Unsupported("AUTH PLAIN or LOGIN"))
+    chosen match
+      Plain ->
+        if !mechanisms.exists(m -> m == "PLAIN") then return Err(Unsupported("AUTH PLAIN"))
+        if client.user.contains("\u{0}") || password.contains("\u{0}")
+          return Err(Invalid("a user name or password for PLAIN cannot hold NUL"))
+        val first = command(
+          "AUTH PLAIN " + toBase64("\u{0}" + client.user + "\u{0}" + password),
+          client.commandTimeout
+        )?
+        // A server that takes no initial response asks for it with an empty prompt.
+        val r =
+          if first.code == 334 then command(
+            toBase64("\u{0}" + client.user + "\u{0}" + password),
+            client.commandTimeout
+          )?
+          else first
+        expect("AUTH PLAIN", r, 235)?
+      Login ->
+        if !mechanisms.exists(m -> m == "LOGIN") then return Err(Unsupported("AUTH LOGIN"))
+        expect("AUTH LOGIN", command("AUTH LOGIN", client.commandTimeout)?, 334)?
+        expect("AUTH LOGIN", command(toBase64(client.user), client.commandTimeout)?, 334)?
+        expect("AUTH LOGIN", command(toBase64(password), client.commandTimeout)?, 235)?
+    Ok(())
+
+  // Sends `message` to its recipients, `bcc` included, from its sender. Where an address of the
+  // message is beyond ASCII, the server must offer SMTPUTF8.
+  send(message: Message) -> Result[unit, SmtpError]
+    val text = message.render().mapErr(e -> BadMessage(e))?
+    transaction(message.from.address, message.recipients, text.utf8, message.needsUtf8)
+
+  // Sends `data`, a message as it goes over the wire, from `from` to each of `recipients`: `MAIL
+  // FROM`, a `RCPT TO` for each, `DATA`, the data dot-stuffed with each line break made CR LF, and
+  // the `.` that ends it. An empty `from` is the null sender, `<>`, of a bounce. With an address
+  // beyond ASCII the server must offer SMTPUTF8; with data beyond ASCII, 8BITMIME. Where the server
+  // says SIZE, a larger message is `TooLarge` before anything is sent, and `SIZE=` tells it the
+  // size. A recipient refused refuses the whole message: the transaction is reset and the `Err`
+  // names the refusal.
+  sendData(from: string, recipients: Vector[string], data: Array[byte]) -> Result[unit, SmtpError] =
+    transaction(from, recipients, data, false)
+
+  private transaction(
+      from: string,
+      recipients: Vector[string],
+      data: Array[byte],
+      utf8: bool
+  ) -> Result[unit, SmtpError]
+    usable()?
+    if from.nonEmpty then checkedAddress("MAIL FROM", from).mapErr(e -> BadMessage(e))?
+    if recipients.isEmpty then return Err(Invalid("a message needs at least one recipient"))
+    for r in recipients do checkedAddress("RCPT TO", r).mapErr(e -> BadMessage(e))?
+    val international = utf8 || !ascii(from) || recipients.exists(r -> !ascii(r))
+    if international && !offers("SMTPUTF8") then return Err(Unsupported("SMTPUTF8"))
+    var eightBit = false
+    for b in data
+      if int(b) >= 128 then eightBit = true
+    if eightBit && !offers("8BITMIME") && !international then return Err(Unsupported("8BITMIME"))
+    val stuffed = dotStuffed(data)?
+    val size = long(stuffed.length)
+    sizeLimit match
+      Some(limit) -> if size > limit then return Err(TooLarge(size, limit))
+      None -> ()
+    var mail = s"MAIL FROM:<$from>"
+    if offers("SIZE") then mail += s" SIZE=$size"
+    if eightBit && offers("8BITMIME") then mail += " BODY=8BITMIME"
+    if international then mail += " SMTPUTF8"
+    expect("MAIL FROM", command(mail, client.commandTimeout)?, 250) match
+      Ok(_) -> ()
+      Err(e) -> return Err(afterRefusal(e))
+    for r in recipients
+      val reply = command(s"RCPT TO:<$r>", client.commandTimeout)?
+      if reply.code != 250 && reply.code != 251 then return Err(afterRefusal(refusalOf(s"RCPT TO:<$r>", reply)))
+    expect("DATA", command("DATA", client.commandTimeout)?, 354) match
+      Ok(_) -> ()
+      Err(e) -> return Err(afterRefusal(e))
+    conn.setTimeout(client.dataTimeout).mapErr(e -> broke(Transport(e)))?
+    conn.write(stuffed).mapErr(e -> broke(Transport(e)))?
+    expect("the message", reply(client.dataTimeout)?, 250)?
+    Ok(())
+
+  // `RSET`, ending a transaction begun; the server forgets the sender and recipients given.
+  reset() -> Result[unit, SmtpError]
+    expect("RSET", command("RSET", client.commandTimeout)?, 250)?
+    Ok(())
+
+  // `QUIT`, then the connection closed, whatever the server answers.
+  quit() -> Result[unit, SmtpError]
+    if ended then return Ok(())
+    val r = command("QUIT", client.commandTimeout)
+    close()
+    r.map(reply -> ())
+
+  // Closes the connection without `QUIT`; closing again does nothing.
+  close()
+    if !ended
+      ended = true
+      _ = conn.close()
+      _ = tcp.close()
+
+  // A refusal made into an error, the transaction reset where the connection still works.
+  private afterRefusal(e: SmtpError) -> SmtpError
+    e match
+      Rejected(_, r) -> if !ended && r.code != 421 then _ = reset()
+      _ -> ()
+    e
+
+  // The error a reply to `what` is where it is not `code`.
+  private refusalOf(what: string, r: Reply) -> SmtpError =
+    if 400 <= r.code < 600 then Rejected(what, r) else broke(Protocol(s"it answered $what with ${r.code}"))
+
+  // `r` where its code is `code`, else the refusal; a 421 closes the session, the server having
+  // said it is closing.
+  private expect(what: string, r: Reply, code: int) -> Result[Reply, SmtpError]
+    if r.code == code then return Ok(r)
+    if r.code == 421 then close()
+    Err(refusalOf(what, r))
+
+  // An error after which the session cannot go on, the connection closed.
+  private broke(e: SmtpError) -> SmtpError
+    close()
+    e
+
+  private usable() -> Result[unit, SmtpError] =
+    if ended then Err(Transport(IoError(io.Other("the session is closed"), "send to", peer))) else Ok(())
+
+  // Sends `line` and CR LF, then reads the reply within `limit`.
+  private command(line: string, limit: Duration) -> Result[Reply, SmtpError]
+    usable()?
+    conn.setTimeout(client.commandTimeout).mapErr(e -> broke(Transport(e)))?
+    conn.writeText(line + "\r\n").mapErr(e -> broke(Transport(e)))?
+    reply(limit)
+
+  // The next reply, every line of it read within `limit` from now.
+  private reply(limit: Duration) -> Result[Reply, SmtpError]
+    usable()?
+    val deadline = if limit.micros == 0 then Duration.Zero else monotonic() + limit
+    val lines = Buffer[string]()
+    var code = -1
+    while true
+      val l = line(deadline)?
+      if l.byteLength < 3 || !l.slice(0, 3).forall(c -> '0' <= c <= '9') || !('2' <= l.charAt(0) <= '5')
+        return Err(broke(Protocol(s"a reply line does not begin with a code: `${shown(l)}`")))
+      val c = l.slice(0, 3).toInt()
+      if code >= 0 && c != code then return Err(broke(Protocol(s"a reply's lines have the codes $code and $c")))
+      code = c
+      val more = l.byteLength > 3 && l.byteAt(3) == byte(int('-'))
+      if l.byteLength > 3 && !more && l.byteAt(3) != byte(int(' '))
+        return Err(broke(Protocol(s"a reply line has no space or hyphen after its code: `${shown(l)}`")))
+      lines += (if l.byteLength > 4 then l.slice(4, l.byteLength) else "")
+      if !more then return Ok(Reply(code, lines.toVector))
+      if lines.length >= client.maxReplyLines
+        return Err(broke(Protocol(s"a reply is longer than ${client.maxReplyLines} lines")))
+    Err(broke(Protocol("unreachable")))
+
+  // The next line of what the server sends, without its line break (LF, or CR LF), within
+  // `deadline` on the monotonic clock (zero for none).
+  private line(deadline: Duration) -> Result[string, SmtpError]
+    var scanned = 0
+    while true
+      while scanned < pending.length
+        if pending(scanned) == byte(10)
+          var end = scanned
+          if end > 0 && pending(end - 1) == byte(13) then end -= 1
+          val bytes = pending.toArray().slice(0, end)
+          pending.trimStart(scanned + 1)
+          return Ok(string.fromUtf8Lossy(bytes))
+        scanned += 1
+        // The line's CR is not counted against the limit.
+        if scanned > client.maxReplyLine + 1
+          return Err(broke(Protocol(s"a reply line is longer than ${client.maxReplyLine} bytes")))
+      if deadline.micros != 0
+        val left = deadline - monotonic()
+        if left.micros <= 0 then return Err(broke(Transport(IoError(TimedOut, "read a reply from", peer))))
+        conn.setTimeout(left).mapErr(e -> broke(Transport(e)))?
+      else
+        conn.setTimeout(Duration.Zero).mapErr(e -> broke(Transport(e)))?
+      val got = conn.read(4096).mapErr(e -> broke(Transport(e)))?
+      if got.length == 0
+        return Err(broke(Transport(IoError(io.ConnectionReset, "read a reply from", peer))))
+      for b in got do pending += b
+    Err(broke(Protocol("unreachable")))

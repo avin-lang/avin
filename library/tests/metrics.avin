@@ -1,0 +1,338 @@
+// `avin.metrics`: counters, gauges and histograms without labels and with them, rendered in the
+// Prometheus text exposition format, exactly; label values and help escaped, Unicode kept; a series
+// found again being the same one; the cardinality guard sending every label set past the limit to one
+// overflow series, rendered last; numbers written as the format asks, infinities and `NaN` by name;
+// histogram buckets at, between, below and past their bounds, none at all, durations, negatives and
+// `NaN`; the bucket helpers; gauges read when rendered; families in the order made; many threads
+// counting at once, their totals exact; and the HTTP handler and route serving a registry.
+import avin.metrics
+
+import avin.metrics.{
+  Counter, Registry, TextContentType, defaultBuckets, defaultMaxSeries, exponentialBuckets, linearBuckets, number
+}
+
+import avin.net.http.{
+  Metrics, MetricsContentType, Response, Route, Router, ServerRequest, methodLabel, metricsHandler, metricsRoute
+}
+
+import avin.threads.{Atomic, spawn}
+import avin.time.{micros, millis, seconds}
+
+@test("a counter without labels counts up by one and by any finite amount, and renders as one line")
+counterAlone()
+  val r = Registry()
+  val c = r.counter("jobs_total", "Jobs done.")
+  assertEq(c.value, 0.0)
+  assertEq(r.render, "# HELP jobs_total Jobs done.\n# TYPE jobs_total counter\njobs_total 0\n")
+  c.inc()
+  c.add(2.5)
+  c.add(0.0)
+  assertEq(c.value, 3.5)
+  assertEq(c.labels().value, 3.5)
+  assertEq(c.size, 1)
+  assertEq(r.render, "# HELP jobs_total Jobs done.\n# TYPE jobs_total counter\njobs_total 3.5\n")
+  assertEq(c.render, r.render)
+
+@test("a labelled counter keeps a series for each label set, ordered by the label values")
+counterLabelled()
+  val r = Registry()
+  val c = r.counter("http_total", "Requests.", ["method", "code"])
+  c.labels("POST", "201").inc()
+  c.labels("GET", "500").inc()
+  c.labels("GET", "200").add(4.0)
+  c.labels("GET", "200").inc()
+  assertEq(c.size, 3)
+  assertEq(c.labels("GET", "200").value, 5.0)
+  assertEq(
+    r.render,
+    "# HELP http_total Requests.\n# TYPE http_total counter\n" + "http_total{method=\"GET\",code=\"200\"} 5\n"
+      + "http_total{method=\"GET\",code=\"500\"} 1\n"
+      + "http_total{method=\"POST\",code=\"201\"} 1\n"
+  )
+  // A family with labels and none yet renders its header alone.
+  val empty = Registry()
+  _ = empty.gauge("idle", "Idle.", ["pool"])
+  assertEq(empty.render, "# HELP idle Idle.\n# TYPE idle gauge\n")
+
+@test("a series found again by the same label values is the same series")
+seriesFoundAgain()
+  val c = Registry().counter("n_total", "N.", ["a"])
+  val first = c.labels("x")
+  assert(c.labels("x") === first)
+  assert(!(c.labels("y") === first))
+  first.inc()
+  assertEq(c.labels("x").value, 1.0)
+  assertEq(c.labels("y").value, 0.0)
+
+@test("label values escape a backslash, a quote and a line end; help escapes a backslash and a line end")
+escaping()
+  val r = Registry()
+  val c = r.counter("e_total", "Back \\ slash,\nnew line and \"quotes\".", ["v"])
+  c.labels("a\"b\\c\nd").inc()
+  c.labels("").inc()
+  c.labels("héllo ✓ 日本").inc()
+  assertEq(
+    r.render,
+    "# HELP e_total Back \\\\ slash,\\nnew line and \"quotes\".\n# TYPE e_total counter\n" + "e_total{v=\"\"} 1\n"
+      + "e_total{v=\"a\\\"b\\\\c\\nd\"} 1\n"
+      + "e_total{v=\"héllo ✓ 日本\"} 1\n"
+  )
+
+@test("past maxSeries every new label set is one overflow series, rendered last, and known ones still count")
+cardinalityGuard()
+  val r = Registry()
+  val c = r.counter("ids_total", "By id.", ["id", "kind"], maxSeries = 2)
+  c.labels("1", "a").inc()
+  c.labels("2", "a").inc()
+  assertEq(c.size, 2)
+  val over = c.labels("3", "a")
+  over.inc()
+  c.labels("4", "b").add(2.0)
+  assert(c.labels("5", "c") === over)
+  assertEq(c.size, 3)
+  c.labels("1", "a").inc()
+  assertEq(c.labels("1", "a").value, 2.0)
+  assertEq(over.value, 3.0)
+  assertEq(
+    r.render,
+    "# HELP ids_total By id.\n# TYPE ids_total counter\n" + "ids_total{id=\"1\",kind=\"a\"} 2\n"
+      + "ids_total{id=\"2\",kind=\"a\"} 1\n"
+      + "ids_total{id=\"_overflow\",kind=\"_overflow\"} 3\n"
+  )
+  assertEq(metrics.OverflowValue, "_overflow")
+  assertEq(defaultMaxSeries, 10000)
+  // A limit of one: the first set is kept, every other overflows; a family without labels has its one.
+  val one = Registry().gauge("g", "G.", ["k"], maxSeries = 1)
+  one.labels("a").set(1.0)
+  one.labels("b").set(2.0)
+  one.labels("c").set(3.0)
+  assertEq(one.labels("a").value, 1.0)
+  assertEq(one.labels("zzz").value, 3.0)
+  assertEq(one.size, 2)
+  val alone = Registry().counter("c_total", "C.", maxSeries = 1)
+  alone.inc()
+  assertEq(alone.size, 1)
+
+@test("the guard holds the default limit: ten thousand series and then the overflow")
+cardinalityDefault()
+  val c = Registry().counter("many_total", "Many.", ["n"])
+  for i in 0 ..< 10005
+    c.labels(i.toString()).inc()
+  assertEq(c.size, 10001)
+  assertEq(c.labels("10004").value, 5.0)
+  assertEq(c.labels("9999").value, 1.0)
+
+@test("a gauge goes up and down, and is set to anything, infinities and NaN written by name")
+gauges()
+  val r = Registry()
+  val g = r.gauge("temp", "Temperature.")
+  g.set(-1.5)
+  g.inc()
+  assertEq(g.value, -0.5)
+  g.dec()
+  g.dec()
+  g.add(10.0)
+  g.sub(0.25)
+  assertEq(g.value, 7.25)
+  assertEq(r.render, "# HELP temp Temperature.\n# TYPE temp gauge\ntemp 7.25\n")
+  g.set(real.PositiveInfinity)
+  assert(r.render.endsWith("temp +Inf\n"))
+  g.set(real.NegativeInfinity)
+  assert(r.render.endsWith("temp -Inf\n"))
+  g.set(0.0 / 0.0)
+  assert(r.render.endsWith("temp NaN\n"))
+  val labelled = r.gauge("pool_size", "Pool size.", ["pool"])
+  val s = labelled.labels("db")
+  s.inc()
+  s.inc()
+  s.dec()
+  s.add(-3.0)
+  s.sub(-0.5)
+  assertEq(s.value, -1.5)
+  s.set(42.0)
+  assertEq(labelled.labels("db").value, 42.0)
+
+@test("numbers are written whole without a fraction, others in their shortest form")
+numbers()
+  assertEq(number(0.0), "0")
+  assertEq(number(-0.0), "-0")
+  assertEq(number(1.0), "1")
+  assertEq(number(2.5), "2.5")
+  assertEq(number(0.005), "0.005")
+  assertEq(number(0.1 + 0.2), "0.30000000000000004")
+  assertEq(number(1e21), "1000000000000000000000")
+  assertEq(number(-7.0), "-7")
+  assertEq(number(real.PositiveInfinity), "+Inf")
+  assertEq(number(real.NegativeInfinity), "-Inf")
+  assertEq(number(0.0 / 0.0), "NaN")
+
+@test("a histogram counts a value equal to a bound in that bound's bucket, cumulatively, with +Inf, sum and count")
+histogramBuckets()
+  val r = Registry()
+  val h = r.histogram("lat_seconds", "Latency.", ["op"], [0.1, 1.0])
+  val s = h.labels("get")
+  for v in [0.0, 0.1, 0.10000000000000002, 1.0, 7.0, -3.0]
+    s.observe(v)
+  assertEq(s.count, long(6))
+  assertEq(s.cumulative, [long(3), long(5), long(6)])
+  assertEq(
+    r.render,
+    "# HELP lat_seconds Latency.\n# TYPE lat_seconds histogram\n" + "lat_seconds_bucket{op=\"get\",le=\"0.1\"} 3\n"
+      + "lat_seconds_bucket{op=\"get\",le=\"1\"} 5\n"
+      + "lat_seconds_bucket{op=\"get\",le=\"+Inf\"} 6\n"
+      + s"lat_seconds_sum{op=\"get\"} ${number(s.sum)}\n"
+      + "lat_seconds_count{op=\"get\"} 6\n"
+  )
+  assertEq(s.sum, 0.0 + 0.1 + 0.10000000000000002 + 1.0 + 7.0 - 3.0)
+
+@test("a histogram without labels, without buckets, of durations, and of NaN")
+histogramShapes()
+  val r = Registry()
+  val h = r.histogram("wait_seconds", "Wait.")
+  assertEq(h.buckets, defaultBuckets)
+  h.observe(millis(5))
+  h.observe(micros(5001))
+  h.observe(seconds(11))
+  assertEq(h.count, long(3))
+  assertEq(h.sum, 0.005 + 0.005001 + 11.0)
+  assertEq(
+    h.labels().cumulative,
+    [long(1), long(2), long(2), long(2), long(2), long(2), long(2), long(2), long(2), long(2), long(2), long(3)]
+  )
+  val bare = r.histogram("bare", "No buckets.", buckets = [])
+  bare.observe(3.0)
+  assertEq(
+    bare.render,
+    "# HELP bare No buckets.\n# TYPE bare histogram\nbare_bucket{le=\"+Inf\"} 1\nbare_sum 3\nbare_count 1\n"
+  )
+  val odd = r.histogram("odd", "NaN.", buckets = [-1.0, 0.0])
+  odd.observe(0.0 / 0.0)
+  odd.observe(-1.0)
+  odd.observe(-0.5)
+  assertEq(odd.labels().cumulative, [long(1), long(2), long(3)])
+  assert(odd.sum.isNaN)
+  assert(odd.render.contains("odd_sum NaN\n"))
+
+@test("linear and exponential buckets")
+bucketHelpers()
+  assertEq(linearBuckets(1.0, 2.0, 4), [1.0, 3.0, 5.0, 7.0])
+  assertEq(linearBuckets(-1.0, 0.5, 1), [-1.0])
+  assertEq(exponentialBuckets(0.01, 10.0, 3), [0.01, 0.1, 1.0])
+  assertEq(exponentialBuckets(1.0, 2.0, 5), [1.0, 2.0, 4.0, 8.0, 16.0])
+  assertEq(exponentialBuckets(3.0, 1.5, 1), [3.0])
+
+@test("a gauge of a function is read each time the registry renders")
+gaugeOfReads()
+  val r = Registry()
+  val n = Atomic(0)
+  r.gaugeOf("conns", "Connections.", () -> real(n.add(1)))
+  assertEq(r.render, "# HELP conns Connections.\n# TYPE conns gauge\nconns 1\n")
+  assertEq(r.render, "# HELP conns Connections.\n# TYPE conns gauge\nconns 2\n")
+
+@test("families render in the order they were made; an empty registry renders nothing")
+registryOrder()
+  val r = Registry()
+  assertEq(r.render, "")
+  assertEq(r.names, Vector.empty[string]())
+  _ = r.gauge("zeta", "Z.")
+  _ = r.counter("alpha_total", "A.")
+  _ = r.histogram("mid", "M.", buckets = [1.0])
+  r.gaugeOf("ns:colon_name", "C.", () -> 1.0)
+  _ = r.counter("_under9", "U.", ["l_9", "_x"])
+  assertEq(r.names, ["zeta", "alpha_total", "mid", "ns:colon_name", "_under9"])
+  val lines = r.render.split("\n").filter(l -> l.startsWith("# TYPE"))
+  assertEq(
+    lines,
+    [
+      "# TYPE zeta gauge", "# TYPE alpha_total counter", "# TYPE mid histogram", "# TYPE ns:colon_name gauge",
+      "# TYPE _under9 counter"
+    ]
+  )
+  // A family made outside a registry renders alone, and its name is free in any registry.
+  val loose = Counter("loose_total", "Loose.")
+  loose.inc()
+  assertEq(loose.render, "# HELP loose_total Loose.\n# TYPE loose_total counter\nloose_total 1\n")
+  assertEq(TextContentType, "text/plain; version=0.0.4; charset=utf-8")
+
+@test("eight threads counting at once, finding and making series as they go, give exact totals")
+threadsAtOnce()
+  val r = Registry()
+  val total = r.counter("t_total", "T.")
+  val byWorker = r.counter("w_total", "W.", ["worker", "parity"])
+  val level = r.gauge("level", "L.")
+  val lat = r.histogram("lat", "Lat.", ["parity"], [0.5])
+  val done = Atomic(false)
+  val renderer = spawn(() ->
+    var renders = 0
+    while !done.load()
+      _ = r.render
+      renders += 1
+    renders > 0)
+  val workers = Vector.tabulate(8, w -> spawn(() ->
+    val mine = total.labels()
+    for i in 0 ..< 5000
+      mine.inc()
+      byWorker.labels(w.toString(), if i % 2 == 0 then "even" else "odd").add(0.5)
+      level.inc()
+      level.dec()
+      lat.labels(if i % 2 == 0 then "even" else "odd").observe(if i % 3 == 0 then 0.25 else 0.75)
+    ()))
+  for w in workers
+    w.join()
+  done.store(true)
+  assert(renderer.join())
+  assertEq(total.value, 40000.0)
+  assertEq(byWorker.size, 16)
+  for w in 0 ..< 8
+    assertEq(byWorker.labels(w.toString(), "even").value, 1250.0)
+    assertEq(byWorker.labels(w.toString(), "odd").value, 1250.0)
+  assertEq(level.value, 0.0)
+  assertEq(lat.labels("even").count + lat.labels("odd").count, long(40000))
+  // i % 3 == 0 for 1667 of every 5000 values of i.
+  assertEq(lat.labels("even").cumulative(0) + lat.labels("odd").cumulative(0), long(8 * 1667))
+
+@test("eight threads racing to make the same series past the limit agree on one series each")
+threadsRacingSeries()
+  val c = Registry().counter("race_total", "Race.", ["k"], maxSeries = 50)
+  val workers = Vector.tabulate(8, _ -> spawn(() ->
+    for i in 0 ..< 100
+      c.labels(i.toString()).inc()
+    ()))
+  for w in workers
+    w.join()
+  assertEq(c.size, 51)
+  var sum = 0.0
+  for line in c.render.split("\n")
+    if line.startsWith("race_total{") then sum += line.slice(line.indexOf("} ") + 2, line.byteLength).toReal()
+  assertEq(sum, 800.0)
+
+@test("the HTTP handler and route answer a registry in the format's type; a Metrics shares a registry")
+httpServing()
+  val r = Registry()
+  val jobs = r.counter("jobs_total", "Jobs.")
+  jobs.inc()
+  val m = Metrics(registry = r)
+  val router = Router([metricsRoute(r), metricsRoute(r, "/other"), Route.get("/a", _ -> Response.text(200, "a"))])
+  val answered = m.middleware(router.handle)(ServerRequest("GET", "/a"))
+  assertEq(answered.status, 200)
+  val shown = router.handle(ServerRequest("GET", "/metrics"))
+  assertEq(shown.status, 200)
+  assertEq(shown.header("Content-Type"), Some(MetricsContentType))
+  assertEq(MetricsContentType, TextContentType)
+  assert(
+    shown.text.startsWith(
+      "# HELP jobs_total Jobs.\n# TYPE jobs_total counter\njobs_total 1\n# HELP http_requests_total"
+    )
+  )
+  assert(shown.text.contains("http_requests_total{method=\"GET\",route=\"\",status=\"2xx\"} 1\n"))
+  assertEq(router.handle(ServerRequest("HEAD", "/other")).status, 200)
+  assertEq(metricsHandler(r)(ServerRequest("POST", "/x")).text, r.render)
+  assertEq(m.render, r.render)
+  assertEq(r.names, ["jobs_total", "http_requests_total", "http_request_duration_seconds", "http_requests_in_flight"])
+
+@test("a method is counted by its name where HTTP defines it, and as _other where it does not")
+methodLabels()
+  for m in ["GET", "HEAD", "POST", "PUT", "DELETE", "CONNECT", "OPTIONS", "TRACE", "PATCH"]
+    assertEq(methodLabel(m), m)
+  for m in ["get", "PROPFIND", "", "GETX", "Ǵ"]
+    assertEq(methodLabel(m), "_other")

@@ -1,0 +1,331 @@
+module avin.crypto
+
+// Digital signatures and the keys that make and check them: Ed25519 (RFC 8032), ECDSA over P-256 and
+// P-384 (FIPS 186-5), and RSA with PKCS#1 v1.5 or PSS padding (RFC 8017), through OpenSSL's libcrypto.
+//
+//     val key = generatePrivateKey(Ed25519Key)
+//     val signature = key.sign(Ed25519, "hello").getOrElse(Vector())
+//     println(key.publicKey.verify(Ed25519, "hello", signature))
+//
+// A key is a value: it is read from PEM or DER, or generated, and any thread may use it. It holds its
+// DER encoding, which each `sign` and `verify` parses again, so a key costs nothing to keep and never
+// belongs to one thread; the parse is small beside the signature itself. The scheme is always the
+// caller's to name, never read from the data being checked, so a message cannot choose how it is
+// verified.
+
+import avin.encoding.{toBase64, fromBase64}
+
+// What a key is.
+@sysl("avincrypto.KeyKind")
+data KeyKind
+  // An Ed25519 key (RFC 8032).
+  Ed25519Key
+  // An elliptic-curve key on NIST P-256 (secp256r1).
+  EcP256Key
+  // An elliptic-curve key on NIST P-384 (secp384r1).
+  EcP384Key
+  // An RSA key whose modulus has `bits` bits, from 2048 to 16384.
+  RsaKey(bits: int)
+
+impl Display for KeyKind
+  display(out: Writer, spec: FormatSpec) = out.writeField(self match
+    Ed25519Key -> "Ed25519"
+    EcP256Key -> "ECDSA P-256"
+    EcP384Key -> "ECDSA P-384"
+    RsaKey(bits) -> s"RSA $bits", spec)
+
+// A signature scheme: the kind of key, the digest, and for RSA the padding. TLS 1.3 and JOSE name the
+// same ones (`ed25519`, `ecdsa_secp256r1_sha256`, `rsa_pss_rsae_sha256`, `rsa_pkcs1_sha256`; EdDSA,
+// ES256, PS256, RS256).
+@sysl("avincrypto.Scheme")
+data SignatureScheme
+  // Ed25519, which hashes inside the signature with SHA-512: a 64-byte signature.
+  Ed25519
+  // ECDSA over P-256 with SHA-256.
+  EcdsaP256Sha256
+  // ECDSA over P-384 with SHA-384.
+  EcdsaP384Sha384
+  // RSASSA-PKCS1-v1_5 with SHA-256.
+  RsaPkcs1Sha256
+  // RSASSA-PKCS1-v1_5 with SHA-384.
+  RsaPkcs1Sha384
+  // RSASSA-PKCS1-v1_5 with SHA-512.
+  RsaPkcs1Sha512
+  // RSASSA-PSS with SHA-256, MGF1 over SHA-256 and a 32-byte salt.
+  RsaPssSha256
+  // RSASSA-PSS with SHA-384, MGF1 over SHA-384 and a 48-byte salt.
+  RsaPssSha384
+  // RSASSA-PSS with SHA-512, MGF1 over SHA-512 and a 64-byte salt.
+  RsaPssSha512
+
+impl SignatureScheme
+  // Whether a key of `kind` signs with this scheme.
+  fits(kind: KeyKind) -> bool = (self, kind) match
+    (Ed25519, Ed25519Key) -> true
+    (EcdsaP256Sha256, EcP256Key) -> true
+    (EcdsaP384Sha384, EcP384Key) -> true
+    (Ed25519, _) -> false
+    (EcdsaP256Sha256, _) -> false
+    (EcdsaP384Sha384, _) -> false
+    (_, RsaKey(_)) -> true
+    _ -> false
+
+impl Display for SignatureScheme
+  display(out: Writer, spec: FormatSpec) = out.writeField(self match
+    Ed25519 -> "Ed25519"
+    EcdsaP256Sha256 -> "ECDSA P-256 SHA-256"
+    EcdsaP384Sha384 -> "ECDSA P-384 SHA-384"
+    RsaPkcs1Sha256 -> "RSA PKCS#1 v1.5 SHA-256"
+    RsaPkcs1Sha384 -> "RSA PKCS#1 v1.5 SHA-384"
+    RsaPkcs1Sha512 -> "RSA PKCS#1 v1.5 SHA-512"
+    RsaPssSha256 -> "RSA-PSS SHA-256"
+    RsaPssSha384 -> "RSA-PSS SHA-384"
+    RsaPssSha512 -> "RSA-PSS SHA-512", spec)
+
+// What went wrong in `avin.crypto`'s signatures, keys and sealed messages.
+data CryptoError
+  // Bytes or text that are not a key of a kind this module reads, or a key it refuses: an encrypted
+  // key, a curve other than P-256 and P-384, an RSA key under 2048 or over 16384 bits.
+  InvalidKey(reason: string)
+  // A key used with a scheme for another kind of key: an RSA key asked for an Ed25519 signature.
+  KeyMismatch(kind: KeyKind, scheme: SignatureScheme)
+  // A sealed message that does not open: changed, cut short, or sealed under another key, nonce or
+  // associated data.
+  Unauthentic
+  // OpenSSL failed for a reason of its own, in its words.
+  CryptoFailure(text: string)
+
+impl Error for CryptoError
+  // A sentence saying what went wrong.
+  message -> string = self match
+    InvalidKey(reason) -> s"not a usable key: $reason"
+    KeyMismatch(kind, scheme) -> s"a $kind key does not sign with $scheme"
+    Unauthentic -> "the message does not authenticate"
+    CryptoFailure(text) -> text
+
+// Why the Sysl side refused.
+@sysl("avincrypto.Refusal")
+private data Refusal
+  BadKey(reason: string)
+  Mismatch(reason: string)
+  Unauthentic
+  Failed(message: string)
+
+// The `CryptoError` a refusal is.
+private errorOf(r: Refusal) -> CryptoError = r match
+  BadKey(reason) -> InvalidKey(reason)
+  Mismatch(reason) -> CryptoFailure(reason)
+  Unauthentic -> CryptoError.Unauthentic
+  Failed(message) -> CryptoFailure(message)
+
+// A key as the Sysl side gives it: its kind and its DER, PKCS#8 or SubjectPublicKeyInfo.
+@sysl("avincrypto.Key")
+private data KeyParts(kind: KeyKind, der: Vector[byte])
+
+// A private key: it signs, and it has a public key. Its text shows its kind and nothing of the key;
+// `toPem` and `toDer` are the only ways out of it.
+opaque type PrivateKey = KeyParts
+
+// A public key: it checks signatures. Two public keys are equal when they are the same key.
+opaque type PublicKey = KeyParts
+
+@sysl("avincrypto.read_private")
+private readPrivate(der: Vector[byte]) -> Result[KeyParts, Refusal]
+
+@sysl("avincrypto.read_public")
+private readPublic(der: Vector[byte]) -> Result[KeyParts, Refusal]
+
+@sysl("avincrypto.public_of")
+private publicOf(der: Vector[byte]) -> Result[KeyParts, Refusal]
+
+@sysl("avincrypto.generate", blocking)
+private generate(kind: KeyKind) -> Result[KeyParts, Refusal]
+
+@sysl("avincrypto.ed25519_private")
+private ed25519Private(seed: Vector[byte]) -> Result[KeyParts, Refusal]
+
+@sysl("avincrypto.ed25519_public")
+private ed25519Public(raw: Vector[byte]) -> Result[KeyParts, Refusal]
+
+@sysl("avincrypto.ed25519_raw")
+private ed25519Raw(der: Vector[byte]) -> Result[Vector[byte], Refusal]
+
+@sysl("avincrypto.sign")
+private rawSign(der: Vector[byte], scheme: SignatureScheme, message: Vector[byte]) -> Result[Vector[byte], Refusal]
+
+@sysl("avincrypto.verify")
+private rawVerify(
+    der: Vector[byte],
+    scheme: SignatureScheme,
+    message: Vector[byte],
+    signature: Vector[byte]
+) -> Result[bool, Refusal]
+
+@sysl("avincrypto.ecdsa_fixed")
+private rawEcdsaFixed(der: Vector[byte], scheme: SignatureScheme) -> Option[Vector[byte]]
+
+@sysl("avincrypto.ecdsa_der")
+private rawEcdsaDer(fixed: Vector[byte], scheme: SignatureScheme) -> Option[Vector[byte]]
+
+// -- reading and writing keys --------------------------------------------------------------------------
+
+// The private key in `der`: PKCS#8 (`PrivateKeyInfo`), or the traditional RSA (PKCS#1) or EC (RFC
+// 5915) encoding, and nothing after it. An encrypted key is refused, as is a kind this module does
+// not sign with.
+privateKeyFromDer(der: Vector[byte]) -> Result[PrivateKey, CryptoError] = readPrivate(der) match
+  Ok(parts) -> Ok(PrivateKey(parts))
+  Err(r) -> Err(errorOf(r))
+
+// The public key in `der`, a SubjectPublicKeyInfo (`BEGIN PUBLIC KEY` in PEM), and nothing after it.
+publicKeyFromDer(der: Vector[byte]) -> Result[PublicKey, CryptoError] = readPublic(der) match
+  Ok(parts) -> Ok(PublicKey(parts))
+  Err(r) -> Err(errorOf(r))
+
+// The private key in PEM text: the first `PRIVATE KEY`, `RSA PRIVATE KEY` or `EC PRIVATE KEY` block,
+// with any text around it, other blocks included (the `EC PARAMETERS` some tools write first). An
+// `ENCRYPTED PRIVATE KEY` block, or an encrypted traditional one, is refused rather than asked a
+// passphrase.
+privateKeyFromPem(pem: string) -> Result[PrivateKey, CryptoError] =
+  pemBody(pem, ["PRIVATE KEY", "RSA PRIVATE KEY", "EC PRIVATE KEY"], "ENCRYPTED PRIVATE KEY") match
+    Ok(der) -> privateKeyFromDer(der)
+    Err(e) -> Err(e)
+
+// The public key in PEM text: the first `PUBLIC KEY` block, with any text around it.
+publicKeyFromPem(pem: string) -> Result[PublicKey, CryptoError] =
+  pemBody(pem, ["PUBLIC KEY"], "") match
+    Ok(der) -> publicKeyFromDer(der)
+    Err(e) -> Err(e)
+
+// A new private key of `kind`, from the operating system's randomness. An RSA size outside 2048 to
+// 16384 bits traps. An RSA key takes a moment to make, seconds at 4096 bits and over; while it is
+// made, the collector carries on for the program's other threads.
+generatePrivateKey(kind: KeyKind) -> PrivateKey = generate(kind) match
+  Ok(parts) -> PrivateKey(parts)
+  Err(r) -> fail(s"generatePrivateKey: ${errorOf(r).message}")
+
+// The Ed25519 private key whose 32-byte seed (RFC 8032's private key) is `seed`.
+ed25519PrivateKey(seed: Vector[byte]) -> Result[PrivateKey, CryptoError] = ed25519Private(seed) match
+  Ok(parts) -> Ok(PrivateKey(parts))
+  Err(r) -> Err(errorOf(r))
+
+// The Ed25519 public key whose 32-byte encoding (RFC 8032's, a JWK's `x`) is `raw`.
+ed25519PublicKey(raw: Vector[byte]) -> Result[PublicKey, CryptoError] = ed25519Public(raw) match
+  Ok(parts) -> Ok(PublicKey(parts))
+  Err(r) -> Err(errorOf(r))
+
+// The body of the first PEM block in `text` whose label is one of `labels`, decoded. A block labelled
+// `encrypted`, met before one of `labels`, or a body with RFC 1421 headers (`Proc-Type`), is refused
+// as an encrypted key.
+private pemBody(text: string, labels: Vector[string], encrypted: string) -> Result[Vector[byte], CryptoError]
+  var at = 0
+  while true
+    val begin = text.indexOf("-----BEGIN ", at)
+    if begin < 0 then return Err(InvalidKey(s"no PEM block labelled ${labels.mkString(" or ")}"))
+    val labelStart = begin + 11
+    val labelEnd = text.indexOf("-----", labelStart)
+    if labelEnd < 0 then return Err(InvalidKey("a PEM block's BEGIN line is not closed"))
+    val label = text.slice(labelStart, labelEnd)
+    if encrypted.nonEmpty && label == encrypted then return Err(InvalidKey("the key is encrypted; decrypt it first"))
+    if labels.contains(label)
+      val bodyStart = labelEnd + 5
+      val end = text.indexOf(s"-----END $label-----", bodyStart)
+      if end < 0 then return Err(InvalidKey(s"the PEM block $label has no END line"))
+      val body = text.slice(bodyStart, end)
+      if body.contains(":") then return Err(InvalidKey("the key is encrypted; decrypt it first"))
+      return fromBase64(body.filter(c -> !(c == ' ' || c == '\t' || c == '\r' || c == '\n'))) match
+        Ok(der) -> Ok(der)
+        Err(e) -> Err(InvalidKey(s"the PEM block $label is not base64: ${e.message}"))
+    at = labelEnd + 5
+  Err(InvalidKey("unreachable"))
+
+// `der` as a PEM block labelled `label`: base64 in lines of 64 characters (RFC 7468).
+private pemOf(label: string, der: Vector[byte]) -> string
+  val body = toBase64(der)
+  val lines = Buffer[string]()
+  lines.addOne(s"-----BEGIN $label-----")
+  var i = 0
+  while i < body.byteLength
+    val j = if i + 64 < body.byteLength then i + 64 else body.byteLength
+    lines.addOne(body.slice(i, j))
+    i = j
+  lines.addOne(s"-----END $label-----")
+  lines.mkString("\n") + "\n"
+
+impl PrivateKey
+  // What the key is.
+  kind -> KeyKind = repr.kind
+
+  // The key's public half.
+  publicKey -> PublicKey = publicOf(repr.der) match
+    Ok(parts) -> PublicKey(parts)
+    Err(r) -> fail(s"PrivateKey.publicKey: ${errorOf(r).message}")
+
+  // The key as PKCS#8 DER, the private key itself in the clear.
+  toDer() -> Vector[byte] = repr.der
+
+  // The key as a PKCS#8 PEM block, `-----BEGIN PRIVATE KEY-----`, the private key in the clear.
+  toPem() -> string = pemOf("PRIVATE KEY", repr.der)
+
+  // The signature over `message` with `scheme`, which must fit the key's kind (`KeyMismatch`
+  // otherwise). An ECDSA signature is DER, as X.509, TLS and WebAuthn carry it;
+  // `ecdsaFixedSignature` gives the fixed-width form JOSE and COSE carry. ECDSA and RSA-PSS
+  // signatures are randomised, so signing one message twice gives two signatures, each valid;
+  // Ed25519 and RSA PKCS#1 v1.5 give the same signature every time.
+  sign(scheme: SignatureScheme, message: Vector[byte]) -> Result[Vector[byte], CryptoError]
+    if !scheme.fits(repr.kind) then return Err(KeyMismatch(repr.kind, scheme))
+    rawSign(repr.der, scheme, message) match
+      Ok(signature) -> Ok(signature)
+      Err(r) -> Err(errorOf(r))
+
+  // The signature over the UTF-8 bytes of `message`.
+  sign(scheme: SignatureScheme, message: string) -> Result[Vector[byte], CryptoError] = sign(scheme, message.bytes)
+
+impl Display for PrivateKey
+  display(out: Writer, spec: FormatSpec) = out.writeField(s"PrivateKey(${repr.kind})", spec)
+
+impl PublicKey
+  // What the key is.
+  kind -> KeyKind = repr.kind
+
+  // The key as SubjectPublicKeyInfo DER.
+  toDer() -> Vector[byte] = repr.der
+
+  // The key as a PEM block, `-----BEGIN PUBLIC KEY-----`.
+  toPem() -> string = pemOf("PUBLIC KEY", repr.der)
+
+  // The 32 bytes of an Ed25519 key (RFC 8032's encoding, a JWK's `x`), or `None` for another kind.
+  ed25519Bytes() -> Option[Vector[byte]] = repr.kind match
+    Ed25519Key -> ed25519Raw(repr.der) match
+      Ok(raw) -> Some(raw)
+      Err(_) -> None
+    _ -> None
+
+  // Whether `signature` is this key's signature over `message` with `scheme`. `Ok(false)` is a
+  // signature that does not check: forged, made over other bytes or by another key, or not even the
+  // right shape, since it is bytes somebody sent. `Err(KeyMismatch(...))` is a scheme the key does not
+  // sign with, a mistake in the program rather than in the signature. An ECDSA signature is DER;
+  // `ecdsaDerSignature` makes one from the fixed-width form.
+  verify(scheme: SignatureScheme, message: Vector[byte], signature: Vector[byte]) -> Result[bool, CryptoError]
+    if !scheme.fits(repr.kind) then return Err(KeyMismatch(repr.kind, scheme))
+    rawVerify(repr.der, scheme, message, signature) match
+      Ok(verdict) -> Ok(verdict)
+      Err(r) -> Err(errorOf(r))
+
+  // Whether `signature` is this key's signature over the UTF-8 bytes of `message`.
+  verify(scheme: SignatureScheme, message: string, signature: Vector[byte]) -> Result[bool, CryptoError] =
+    verify(scheme, message.bytes, signature)
+
+impl Display for PublicKey
+  display(out: Writer, spec: FormatSpec) = out.writeField(s"PublicKey(${repr.kind})", spec)
+
+// -- the two forms of an ECDSA signature --------------------------------------------------------------
+
+// An ECDSA signature in DER (an `ECDSA-Sig-Value`, what `sign` makes) as its two integers, each
+// big-endian in the curve's width: 64 bytes for P-256, 96 for P-384, the form JOSE, COSE and
+// WebCrypto carry. `None` unless `der` is one signature in canonical DER whose integers fit, or for a
+// scheme that is not ECDSA.
+ecdsaFixedSignature(der: Vector[byte], scheme: SignatureScheme) -> Option[Vector[byte]] = rawEcdsaFixed(der, scheme)
+
+// The DER form of an ECDSA signature given as its two fixed-width integers. `None` unless `fixed` is
+// exactly twice the curve's width, or for a scheme that is not ECDSA.
+ecdsaDerSignature(fixed: Vector[byte], scheme: SignatureScheme) -> Option[Vector[byte]] = rawEcdsaDer(fixed, scheme)

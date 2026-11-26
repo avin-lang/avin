@@ -1,0 +1,297 @@
+module avin.net.http
+
+// A client's cookie store, RFC 6265 and its revision (6265bis): the cookies responses set, kept by
+// their name, domain and path, and the ones a request to a URL carries back. A `Client` made with
+// `cookies = Some(jar)` stores each response's `Set-Cookie` headers in the jar, a redirect's too, and
+// sends the cookies matching each request's URL in one `Cookie` header.
+
+import avin.net.Url
+import avin.threads.Mutex
+import avin.time.{Duration, Instant, days, now, seconds}
+
+// A cookie a jar holds: its name and value; the domain it is sent to and whether to that host only
+// (`hostOnly`) or to the domain's subdomains too; the path it is sent under; whether it goes only over
+// `https` (`secure`); whether a browser would hide it from a page's scripts (`httpOnly`), kept and
+// sent all the same; its `SameSite`, kept; when it expires, `None` for a cookie that lasts as long as
+// the jar; and when it was first stored.
+data StoredCookie(
+    name: string,
+    value: string,
+    domain: string,
+    path: string,
+    hostOnly: bool,
+    secure: bool,
+    httpOnly: bool,
+    sameSite: Option[SameSite],
+    expires: Option[Instant],
+    created: Instant
+)
+
+// A cookie jar, safe to share between threads, as one `Client` shares it between its requests:
+//
+//     val jar = CookieJar()
+//     val client = Client(cookies = Some(jar))
+//
+// A cookie is stored as RFC 6265bis says, read from its `Set-Cookie` header by `SetCookie.parse`
+// (which refuses a cookie breaking its rules, such as a `__Host-` one with a `Domain`):
+//
+// - With no `Domain` it is sent back to the host that set it only. A `Domain` is sent to that domain
+//   and its subdomains, and is refused unless the host setting it is the domain or one of its
+//   subdomains. A domain of a single label (`com`, `localhost`) is refused unless it is the host
+//   itself, when the cookie is the host's only: the jar has no public-suffix list, so a domain of two
+//   labels or more that is a public suffix (`co.uk`) is not caught. An IP address is a domain only to
+//   itself.
+// - With no `Path`, or one not beginning with `/`, its path is the request path's up to its last `/`
+//   (`/` where that leaves nothing).
+// - `Max-Age` (seconds) wins over `Expires`; either is cut to 400 days from now, and one already past
+//   removes the jar's cookie of that name, domain and path instead of storing one.
+// - A `Secure` cookie, which every `__Secure-` and `__Host-` one is, is stored only from an `https`
+//   URL, and a cookie from an `http` URL may not replace or shadow a `Secure` one of its name whose
+//   domain and path it overlaps.
+// - A cookie of the same name, domain, host-only-ness and path replaces the one stored, keeping its
+//   creation time.
+//
+// A request carries every cookie whose domain and path match its URL and that has not expired, a
+// `Secure` one only over `https`, those with longer paths first and among equal paths the earlier
+// stored first. `HttpOnly` and `SameSite` are kept but do not hold a cookie back: they are rules for a
+// browser's scripts and the sites a page links, and a client is neither.
+//
+// The jar is bounded: a cookie whose name and value are over `maxCookieBytes` together is refused, and
+// once a domain holds more than `maxPerDomain` cookies, or the jar more than `maxCookies`, the expired
+// ones go first and then the ones least recently sent or stored. The time is read from `clock`. A
+// limit below one traps.
+class CookieJar(
+    val maxCookieBytes: int = 4096,
+    val maxPerDomain: int = 50,
+    val maxCookies: int = 3000,
+    private val clock: @sendable () -> Instant = now
+): Sendable
+  if maxCookieBytes < 1 then fail(s"a cookie limit of $maxCookieBytes bytes: it is at least one")
+  if maxPerDomain < 1 then fail(s"a limit of $maxPerDomain cookies a domain: it is at least one")
+  if maxCookies < 1 then fail(s"a limit of $maxCookies cookies: it is at least one")
+  private val held = Mutex(Cookies())
+
+  // Stores the cookie of `header`, a `Set-Cookie` header's value from a response to `url`, by the
+  // rules above, and answers whether it was taken: stored, or, already expired, removing the one it
+  // names. A `url` that is not an absolute `http` or `https` URL with a host takes none.
+  setCookie(url: string, header: string) -> bool = Url.parse(url) match
+    Ok(u) -> store(u, header, clock())
+    Err(_) -> false
+
+  // The cookies a request to `url` carries, in the order it sends them; none for a `url` that is not
+  // an absolute `http` or `https` URL with a host.
+  cookies(url: string) -> Vector[Cookie] = Url.parse(url) match
+    Ok(u) -> matching(u, clock()).map(c -> Cookie(c.name, c.value))
+    Err(_) -> Vector.empty[Cookie]()
+
+  // The `Cookie` header a request to `url` carries, `None` where it carries no cookie.
+  header(url: string) -> Option[string] = Url.parse(url) match
+    Ok(u) -> header(u)
+    Err(_) -> None
+
+  // The `Cookie` header a request to `url` carries, `None` where it carries no cookie.
+  header(url: Url) -> Option[string]
+    val sent = matching(url, clock())
+    if sent.isEmpty then None else Some(sent.map(c -> s"${c.name}=${c.value}").mkString("; "))
+
+  // Stores the cookie of every `Set-Cookie` header of `headers`, a response's to `url`, as
+  // `setCookie` does each.
+  receive(url: Url, headers: Vector[(string, string)])
+    val t = clock()
+    for (name, value) in headers
+      if name.equalsIgnoreCase("Set-Cookie") then _ = store(url, value, t)
+
+  // Every cookie the jar holds that has not expired, in the order they were first stored.
+  all() -> Vector[StoredCookie]
+    val t = clock()
+    held.with(h -> h.live(t))
+
+  // How many cookies the jar holds that have not expired.
+  size -> int = all().length
+
+  // Removes every cookie.
+  clear() = held.with(h -> h.list.clear())
+
+  // Removes every cookie that lasts as long as the jar, one with no `Max-Age` or `Expires`, as a
+  // browser does when its session ends.
+  clearSession() = held.with(h -> h.list.filterInPlace(k -> k.cookie.expires.isDefined))
+
+  private store(u: Url, header: string, t: Instant) -> bool
+    val host = hostOf(u) match
+      Some(h) -> h
+      None -> return false
+    val secureUrl = u.scheme == "https"
+    val sc = SetCookie.parse(header) match
+      Ok(c) -> c
+      Err(_) -> return false
+    if sc.name.byteLength + sc.value.byteLength > maxCookieBytes then return false
+    if sc.secure && !secureUrl then return false
+    val (domain, hostOnly) = sc.domain match
+      Some(d) ->
+        if d == host then (d, isIpLiteral(host) || d.indexOf('.') < 0)
+        elif d.indexOf('.') < 0 || !domainMatches(host, d) then return false
+        else (d, false)
+      None -> (host, true)
+    val path = sc.path.getOrElse(defaultPath(u.path))
+    val expires = expiryOf(sc, t)
+    val cookie = StoredCookie(
+      sc.name,
+      sc.value,
+      domain,
+      path,
+      hostOnly,
+      sc.secure,
+      sc.httpOnly,
+      sc.sameSite,
+      expires,
+      t
+    )
+    val perDomain = maxPerDomain
+    val most = maxCookies
+    held.with(h -> h.put(cookie, secureUrl, t, perDomain, most))
+
+  // The cookies a request to `u` at `t` carries, in order, each marked as sent at `t`.
+  private matching(u: Url, t: Instant) -> Vector[StoredCookie]
+    val host = hostOf(u) match
+      Some(h) -> h
+      None -> return Vector.empty[StoredCookie]()
+    val secureUrl = u.scheme == "https"
+    val path = if u.path.startsWith("/") then u.path else "/"
+    held.with(h -> h.sent(host, path, secureUrl, t))
+
+// A cookie held, and when it was last stored or sent.
+private class HeldCookie(var cookie: StoredCookie, var touched: Instant, val order: long)
+
+// The cookies a jar holds, reached only holding its mutex, in the order they were first stored.
+private class Cookies()
+  val list = Buffer[HeldCookie]()
+  private var stored: long = 0
+
+  live(t: Instant) -> Vector[StoredCookie]
+    val out = Buffer[StoredCookie]()
+    for k in list
+      if !isExpired(k.cookie, t) then out.addOne(k.cookie)
+    out.toVector
+
+  // Stores `c`, sent from a URL that is `https` where `secureUrl`, at `t`, then keeps the domain to
+  // `perDomain` cookies and the jar to `most`; answers whether `c` was taken.
+  put(c: StoredCookie, secureUrl: bool, t: Instant, perDomain: int, most: int) -> bool
+    if !secureUrl && !c.secure
+      for k in list
+        val o = k.cookie
+        val overlaps = domainMatches(o.domain, c.domain) || domainMatches(c.domain, o.domain)
+        if o.secure && o.name == c.name && overlaps && pathMatches(c.path, o.path) && !isExpired(o, t)
+          return false
+    val at = list.indexWhere(k -> sameSlot(k.cookie, c))
+    if isExpired(c, t)
+      if at >= 0 then _ = list.remove(at)
+      return true
+    if at >= 0
+      val old = list(at)
+      old.cookie = StoredCookie(
+        c.name,
+        c.value,
+        c.domain,
+        c.path,
+        c.hostOnly,
+        c.secure,
+        c.httpOnly,
+        c.sameSite,
+        c.expires,
+        old.cookie.created
+      )
+      old.touched = t
+      return true
+    stored += 1
+    list.addOne(HeldCookie(c, t, stored))
+    val domain = c.domain
+    if list.count(k -> k.cookie.domain == domain) > perDomain then evict(t, k -> k.cookie.domain == domain)
+    if list.length > most then evict(t, _ -> true)
+    true
+
+  // The cookies for a request to `host` and `path`, over `https` where `secureUrl`, at `t`, in the
+  // order they are sent, each marked as sent at `t`; expired ones are dropped on the way.
+  sent(host: string, path: string, secureUrl: bool, t: Instant) -> Vector[StoredCookie]
+    list.filterInPlace(k -> !isExpired(k.cookie, t))
+    val out = Buffer[HeldCookie]()
+    for k in list
+      val c = k.cookie
+      val hostFits = if c.hostOnly then host == c.domain else domainMatches(host, c.domain)
+      if hostFits && pathMatches(path, c.path) && (secureUrl || !c.secure)
+        k.touched = t
+        out.addOne(k)
+    out.toVector.sortWith((a, b) -> sendOrder(a, b)).map(k -> k.cookie)
+
+  // Removes one cookie of those `p` picks: an expired one where there is, else the one least recently
+  // stored or sent, the first stored among equals.
+  private evict(t: Instant, p: (HeldCookie) -> bool)
+    var pick = -1
+    for i in 0 ..< list.length
+      val k = list(i)
+      if p(k)
+        if isExpired(k.cookie, t)
+          pick = i
+          break
+        if pick < 0 || k.touched < list(pick).touched then pick = i
+    if pick >= 0 then _ = list.remove(pick)
+
+// A negative number where `a` is sent before `b`: the longer path first, then the earlier created,
+// then the earlier stored.
+private sendOrder(a: HeldCookie, b: HeldCookie) -> int
+  val byPath = b.cookie.path.byteLength - a.cookie.path.byteLength
+  if byPath != 0 then return byPath
+  if a.cookie.created < b.cookie.created then return -1
+  if b.cookie.created < a.cookie.created then return 1
+  if a.order < b.order then -1 elif a.order > b.order then 1 else 0
+
+// Whether `a` and `b` are one cookie: the same name, domain, host-only-ness and path.
+private sameSlot(a: StoredCookie, b: StoredCookie) -> bool =
+  a.name == b.name && a.domain == b.domain && a.hostOnly == b.hostOnly && a.path == b.path
+
+private isExpired(c: StoredCookie, t: Instant) -> bool = c.expires match
+  Some(e) -> e <= t
+  None -> false
+
+// The longest a cookie is kept, RFC 6265bis's cap on `Max-Age` and `Expires`.
+private val CookieLifetime: Duration = days(400)
+
+// When a cookie set at `t` expires: by its `Max-Age`, else its `Expires`, either cut to 400 days; a
+// `Max-Age` of zero or less is already past.
+private expiryOf(sc: SetCookie, t: Instant) -> Option[Instant]
+  val cap = t + CookieLifetime
+  sc.maxAge match
+    Some(n) ->
+      if n <= 0 then return Some(Instant.Min)
+      Some(if n >= CookieLifetime.micros / 1000000 then cap else t + seconds(n))
+    None -> sc.expires.map(e -> if cap < e then cap else e)
+
+// The host of an `http` or `https` URL, lower case, without a trailing dot; `None` for another URL.
+private hostOf(u: Url) -> Option[string]
+  if u.scheme != "http" && u.scheme != "https" then return None
+  val h = u.host.getOrElse("").toLower
+  val host = if h.endsWith(".") then h.slice(0, h.byteLength - 1) else h
+  if host.isEmpty then None else Some(host)
+
+// Whether `host` domain-matches `domain` (RFC 6265 section 5.1.3): the same, or a host name ending in
+// `.` and `domain`.
+private domainMatches(host: string, domain: string) -> bool =
+  host == domain || (host.endsWith("." + domain) && !isIpLiteral(host))
+
+// Whether `host` is an IP address: IPv6 in brackets, or four dotted decimal numbers.
+private isIpLiteral(host: string) -> bool
+  if host.startsWith("[") then return true
+  val parts = host.split('.')
+  parts.length == 4 && parts.forall(p -> !p.isEmpty && p.byteLength <= 3 && p.forall(c -> '0' <= c <= '9'))
+
+// Whether a request's `path` path-matches a cookie's `cookiePath` (RFC 6265 section 5.1.4).
+private pathMatches(path: string, cookiePath: string) -> bool =
+  path == cookiePath || (
+    path.startsWith(cookiePath) && (cookiePath.endsWith("/") || path.startsWith("/", cookiePath.byteLength))
+  )
+
+// The default path of a cookie set from a URL of `path` (RFC 6265 section 5.1.4): up to its last `/`,
+// or `/` where that is the first or there is none.
+private defaultPath(path: string) -> string
+  if !path.startsWith("/") then return "/"
+  val last = path.lastIndexOf('/')
+  if last <= 0 then "/" else path.slice(0, last)
