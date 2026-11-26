@@ -71,6 +71,20 @@ private unixListenRaw(at: UnixAddress, backlog: int) -> Result[UnixListenSocket,
 @sysl("sysl.net.unix_connect", blocking)
 private unixConnectRaw(to: UnixAddress) -> Result[UnixSocket, SyslError]
 
+// A peer's ids, as the runtime widens them; a process id of -1 is one the system did not give.
+@sysl("avin.rt.Credentials")
+private class Credentials
+  userId() -> long
+  groupId() -> long
+  processId() -> long
+
+@sysl("avin.rt.peer_credentials_of")
+private peerCredentialsOf(s: UnixSocket) -> Result[Credentials, SyslError]
+
+// The program at the other end of a Unix connection, as the system vouches for it: the numeric user
+// and group it runs as, and its process id, `None` where the system does not say.
+data PeerCredentials(user: long, group: long, process: Option[long])
+
 // The address of `path`, its failure as an `IoError`.
 private addressAt(path: string, operation: string) -> Result[UnixAddress, IoError] =
   unixAddressRaw(path).mapErr(failed(operation, path))
@@ -78,7 +92,9 @@ private addressAt(path: string, operation: string) -> Result[UnixAddress, IoErro
 // A connection to a program listening at a path, made by `UnixStream.connect` or a listener's
 // `accept`. It reads and writes as a `TcpStream` does: bytes `readLine` reads beyond its line are
 // kept for the next read, and a connection handed to another thread or actor takes them with it.
-@trusted_sendable("it belongs to one thread at a time: a send hands it over, and every operation first checks its owner, so the code that handed it over traps")
+@trusted_sendable(
+  "it belongs to one thread at a time: a send hands it over, and every operation first checks its owner, so the code that handed it over traps"
+)
 class UnixStream(
     private val conn: UnixSocket,
     private val buffered: ReadAhead,
@@ -172,16 +188,34 @@ class UnixStream(
       conn.close()
     Ok(())
 
-  // The reading and writing halves of the connection, as a `TcpStream`'s `split` makes them.
+  // Who is at the other end: the user and group the peer program ran as, the ids `process.userId()`
+  // and `process.groupId()` answer, and its process id where the system says. It is how a server
+  // learns which user of the machine is talking to it, with no password; the system vouches for it,
+  // so the peer cannot claim another's.
+  peerCredentials() -> Result[PeerCredentials, IoError]
+    mine()
+    if closed || halved then return Err(unusable("read the credentials of", peer))
+    peerCredentialsOf(conn).map(
+      c -> PeerCredentials(
+        c.userId(),
+        c.groupId(),
+        if c.processId() < 0 then None else Some(c.processId())
+      )
+    ).mapErr(failed("read the credentials of", peer))
+
+  // The reading and writing halves of the connection, as a `TcpStream`'s `split` makes them, the
+  // connection giving its own share of the socket back as that one does.
   override split() -> (StreamReader, StreamWriter)
     mine()
     if halved || closed then unsplittable(halved)
     halved = true
-    halves(unixReadHalfOf(conn), unixWriteHalfOf(conn), buffered, limitMs, peer, None)
+    val (r, w) = halves(unixReadHalfOf(conn), unixWriteHalfOf(conn), buffered, limitMs, peer, None)
+    conn.close()
+    (r, w)
 
-  // Stops the program where the connection belongs to another thread.
+  // Stops the program where the connection belongs to another thread, as a `TcpStream`'s does.
   private mine()
-    if closed && !halved then _ = conn.close() else _ = conn.held()
+    if closed || halved then _ = conn.close() else _ = conn.held()
 
   // What an operation on the connection answers once it is closed or split.
   private unusable(operation: string, subject: string) -> IoError =
@@ -208,19 +242,21 @@ object UnixStream
 // A socket listening for connections at a path, made by `UnixListener.bind`. Like a connection, it may
 // be handed to another thread, which takes it over. Closing it leaves its socket file in the file
 // system, where `bindReplacing` or `fs.remove` clears it.
-@trusted_sendable("it belongs to one thread at a time: a send hands it over, and every operation first checks its owner, so the code that handed it over traps")
+@trusted_sendable(
+  "it belongs to one thread at a time: a send hands it over, and every operation first checks its owner, so the code that handed it over traps"
+)
 class UnixListener(
     private val conn: UnixListenSocket,
     private val at: string,
     private var closed: bool
-): Sendable, io.Close
+): Sendable, io.Close, Listener[UnixStream]
   // The path it listens at.
   path() -> string
     mine()
     at
 
   // Waits for the next connection.
-  accept() -> Result[UnixStream, IoError]
+  override accept() -> Result[UnixStream, IoError]
     mine()
     if closed then return Err(IoError(io.Other("the listener is closed"), "accept on", at))
     afterWait(unixAcceptOn(conn)) match
@@ -243,10 +279,13 @@ object UnixListener
   // Listens at `path`, which must name nothing yet: a path that already holds a file, a live
   // listener's or a left-over one, is `AlreadyExists`, because what is there may belong to another
   // program. A path the platform cannot carry, too long above all (103 bytes on macOS, 107 on
-  // Linux), is an error saying so, and so is a missing directory on the way.
-  bind(path: string) -> Result[UnixListener, IoError]
+  // Linux), is an error saying so, and so is a missing directory on the way. The system queues up to
+  // `backlog` connections before they are accepted, lowering a larger number to its own limit; a
+  // `backlog` less than one traps.
+  bind(path: string, backlog: int = 128) -> Result[UnixListener, IoError]
+    if backlog < 1 then fail(s"a backlog of $backlog connections: it is at least one")
     val a = addressAt(path, "listen on")?
-    unixListenRaw(a, 128) match
+    unixListenRaw(a, backlog) match
       Ok(c) ->
         unixListenerNonBlocking(c) match
           Ok(_) -> Ok(UnixListener(c, path, false))
@@ -260,8 +299,10 @@ object UnixListener
   // Listens at `path`, first clearing a socket file left behind by a program that is gone: where
   // the path holds a socket nobody listens on, it is removed and bound. A live listener's path is
   // `AlreadyExists` and is left alone, and so is anything that is not a refused socket. Finding
-  // out connects once, so a live listener sees one connection that closes without a word.
-  bindReplacing(path: string) -> Result[UnixListener, IoError]
+  // out connects once, so a live listener sees one connection that closes without a word. `backlog`
+  // is `bind`'s.
+  bindReplacing(path: string, backlog: int = 128) -> Result[UnixListener, IoError]
+    if backlog < 1 then fail(s"a backlog of $backlog connections: it is at least one")
     val a = addressAt(path, "listen on")?
     if fs.exists(path)
       unixConnectRaw(a) match
@@ -272,4 +313,4 @@ object UnixListener
           Refused -> ()
           _ -> return Err(IoError(io.AlreadyExists, "listen on", path))
       fs.remove(path)?
-    bind(path)
+    bind(path, backlog)

@@ -1,0 +1,300 @@
+// expect: exit 0
+// Trusted proxies: forwarding headers believed only from a peer in the trusted blocks, and stripped
+// from any other; the client found by walking `X-Forwarded-For` and `Forwarded` from the nearest hop
+// past every trusted one, so spoofed leading entries are never believed; several hops, header lines
+// joined, ports, IPv6 (brackets, compression, mapped IPv4), scheme and host taken from the outermost
+// trusted proxy's place and validated, malformed headers making the headers worthless, the hop
+// limit, `Cidr` blocks (prefixes, host bits, families, boundaries), and the request's `remote`,
+// `forwarding`, `scheme` and `host`.
+import avin.net.http.{Cidr, Handler, Response, ServerRequest, TrustedProxies}
+
+// What the handler saw: remote, scheme, host, the peer, and which forwarding headers it still has.
+seen(r: ServerRequest) -> string
+  val kept = r.headers.filter(h -> h.0.startsWith("X-Forwarded-") || h.0 == "Forwarded").map(h -> h.0)
+  val peer = r.forwarding.map(f -> f.peer).getOrElse("-")
+  s"remote=${r.remote.getOrElse("-")} scheme=${r.scheme.getOrElse("-")} host=${r.host.getOrElse("-")} peer=$peer kept=$kept"
+
+val handler: Handler = r -> Response.text(200, seen(r))
+
+via(p: TrustedProxies, peer: Option[string], headers: Vector[(string, string)]) -> string =
+  p.middleware(handler)(ServerRequest("GET", "/", headers, remote = peer)).text
+
+val trust = TrustedProxies(["10.0.0.0/8", "192.168.1.1", "fd00::/8", "::1"])
+
+go(peer: string, headers: Vector[(string, string)]) -> string = via(trust, Some(peer), headers)
+
+xff(v: string) -> Vector[(string, string)] = [("X-Forwarded-For", v)]
+
+main()
+  // A trusted peer with no headers: the peer is the client.
+  println(go("10.0.0.5", []))
+  // One hop.
+  println(go("10.0.0.5", xff("203.0.113.9")))
+  // Untrusted peer: nothing believed, headers removed.
+  println(go("198.51.100.7", xff("203.0.113.9")))
+  println(
+    go(
+      "198.51.100.7",
+      [("X-Forwarded-For", "1.1.1.1"), ("X-Forwarded-Proto", "https"), ("X-Forwarded-Host", "evil.example")]
+    )
+  )
+  println(go("198.51.100.7", [("Forwarded", "for=1.1.1.1;proto=https;host=evil.example")]))
+  // Just outside a block, and the one address of a block of one.
+  println(go("11.0.0.1", xff("1.1.1.1")))
+  println(go("192.168.1.1", xff("1.1.1.1")))
+  println(go("192.168.1.2", xff("1.1.1.1")))
+  // No peer known: untrusted.
+  println(via(trust, None, xff("1.1.1.1")))
+  // A peer that is not an address.
+  println(go("not-an-ip", xff("1.1.1.1")))
+  // Spoofing: the client prepends entries; the nearest untrusted one wins.
+  println(go("10.0.0.5", xff("6.6.6.6, 203.0.113.9")))
+  println(go("10.0.0.5", xff("6.6.6.6, 7.7.7.7, 203.0.113.9")))
+  // Several hops: the last untrusted address is the client, trusted ones are proxies.
+  println(go("10.0.0.5", xff("203.0.113.9, 10.0.0.4")))
+  println(go("10.0.0.5", xff("6.6.6.6, 203.0.113.9, 10.0.0.4, 192.168.1.1")))
+  // Every address trusted: the first is the client.
+  println(go("10.0.0.5", xff("10.0.0.1, 10.0.0.2")))
+  // An untrusted hop stops the walk even where a trusted address lies beyond it.
+  println(go("10.0.0.5", xff("10.0.0.1, 203.0.113.9")))
+  // Header lines are one list, in order.
+  println(go("10.0.0.5", [("X-Forwarded-For", "6.6.6.6"), ("x-forwarded-for", "203.0.113.9, 10.0.0.4")]))
+  // Empty entries are skipped.
+  println(go("10.0.0.5", xff("203.0.113.9,, ,10.0.0.4,")))
+  println(go("10.0.0.5", xff("")))
+  println(go("10.0.0.5", xff(" , ")))
+  // Ports are dropped.
+  println(go("10.0.0.5", xff("203.0.113.9:4711")))
+  println(go("10.0.0.5", xff("[2001:db8::1]:4711")))
+  println(go("10.0.0.5", xff("[2001:db8::1]")))
+  // IPv6, in its shortest form whatever its spelling.
+  println(go("10.0.0.5", xff("2001:DB8:0:0:0:0:0:1")))
+  println(go("10.0.0.5", xff("2001:0db8:0000:0000:0001:0000:0000:0001")))
+  println(go("10.0.0.5", xff("2001:db8::")))
+  println(go("10.0.0.5", xff("::")))
+  println(go("10.0.0.5", xff("::1")))
+  println(go("10.0.0.5", xff("1:0:0:2:0:0:0:3")))
+  println(go("10.0.0.5", xff("1:2:3:4:5:6:7:8")))
+  println(go("10.0.0.5", xff("1:0:3:4:5:6:7:8")))
+  println(go("10.0.0.5", xff("::ffff:203.0.113.9")))
+  println(go("10.0.0.5", xff("64:ff9b::203.0.113.9")))
+  // An IPv6 peer, trusted by block, and mapped IPv4 peers.
+  println(go("fd00::1", xff("2001:db8::7")))
+  println(go("::1", xff("203.0.113.9")))
+  println(go("::ffff:10.0.0.5", xff("203.0.113.9")))
+  println(go("::ffff:198.51.100.7", xff("203.0.113.9")))
+  println(go("fe80::1", xff("203.0.113.9")))
+  // A mapped trusted hop inside the list.
+  println(go("10.0.0.5", xff("203.0.113.9, ::ffff:10.0.0.4")))
+  // Malformed entries among those walked: the headers are worthless.
+  println(go("10.0.0.5", xff("unknown")))
+  println(go("10.0.0.5", xff("203.0.113.9, unknown")))
+  println(go("10.0.0.5", xff("203.0.113.9, 10.0.0.4, _hidden")))
+  println(go("10.0.0.5", xff("999.1.1.1")))
+  println(go("10.0.0.5", xff("1.2.3")))
+  println(go("10.0.0.5", xff("1.2.3.4.5")))
+  println(go("10.0.0.5", xff("01.2.3.4")))
+  println(go("10.0.0.5", xff("1.2.3.4:")))
+  println(go("10.0.0.5", xff("1.2.3.4:99999")))
+  println(go("10.0.0.5", xff("1.2.3.4:http")))
+  println(go("10.0.0.5", xff("[2001:db8::1")))
+  println(go("10.0.0.5", xff("[2001:db8::1]x")))
+  println(go("10.0.0.5", xff("2001:db8::1::2")))
+  println(go("10.0.0.5", xff(":::")))
+  println(go("10.0.0.5", xff("1:2:3:4:5:6:7")))
+  println(go("10.0.0.5", xff("1:2:3:4:5:6:7:8:9")))
+  println(go("10.0.0.5", xff("1:2:3:4:5:6:7::8")))
+  println(go("10.0.0.5", xff("12345::1")))
+  println(go("10.0.0.5", xff("g::1")))
+  println(go("10.0.0.5", xff("fe80::1%eth0")))
+  println(go("10.0.0.5", xff("1.2.3.4, 5.6.7.8; evil")))
+  println(go("10.0.0.5", xff("\"1.2.3.4\"")))
+  // A malformed entry beyond the first untrusted address is never read.
+  println(go("10.0.0.5", xff("garbage, 203.0.113.9")))
+  // Scheme and host: from the outermost trusted proxy's place, validated, lower-cased.
+  val full = [
+    ("X-Forwarded-For", "203.0.113.9"),
+    ("X-Forwarded-Proto", "HTTPS"),
+    ("X-Forwarded-Host", "Shop.Example:8443")
+  ]
+  println(go("10.0.0.5", full))
+  println(go("10.0.0.5", [("X-Forwarded-Proto", "https"), ("Host", "inner.example")]))
+  println(go("10.0.0.5", [("Host", "inner.example")]))
+  println(go("198.51.100.7", [("X-Forwarded-Host", "evil.example"), ("Host", "inner.example")]))
+  println(
+    go(
+      "10.0.0.5",
+      [
+        ("X-Forwarded-For", "203.0.113.9, 10.0.0.4"),
+        ("X-Forwarded-Proto", "https, http"),
+        ("X-Forwarded-Host", "a.example, b.example")
+      ]
+    )
+  )
+  println(
+    go(
+      "10.0.0.5",
+      [
+        ("X-Forwarded-For", "6.6.6.6, 203.0.113.9"),
+        ("X-Forwarded-Proto", "http, https"),
+        ("X-Forwarded-Host", "evil.example, real.example")
+      ]
+    )
+  )
+  println(
+    go(
+      "10.0.0.5",
+      [("X-Forwarded-For", "203.0.113.9"), ("X-Forwarded-Proto", "ftp"), ("X-Forwarded-Host", "ok.example")]
+    )
+  )
+  println(
+    go("10.0.0.5", [("X-Forwarded-For", "203.0.113.9"), ("X-Forwarded-Proto", "https"), ("X-Forwarded-Host", "a b")])
+  )
+  println(go("10.0.0.5", [("X-Forwarded-Host", "[2001:db8::1]:8080")]))
+  println(go("10.0.0.5", [("X-Forwarded-Host", "[2001:db8::1]")]))
+  println(go("10.0.0.5", [("X-Forwarded-Host", "[nope]")]))
+  println(go("10.0.0.5", [("X-Forwarded-Host", "evil.example/path")]))
+  println(go("10.0.0.5", [("X-Forwarded-Host", "user@evil.example")]))
+  println(go("10.0.0.5", [("X-Forwarded-Host", "host:")]))
+  println(go("10.0.0.5", [("X-Forwarded-Host", "host:70000")]))
+  println(go("10.0.0.5", [("X-Forwarded-Host", ":80")]))
+  println(go("10.0.0.5", [("X-Forwarded-Host", "[::1]x")]))
+  println(go("10.0.0.5", [("X-Forwarded-Host", "x".repeat(255))]).contains("host=-"))
+  println(go("10.0.0.5", [("X-Forwarded-Host", "x".repeat(256))]).contains("host=-"))
+  // A malformed address makes scheme and host worthless too.
+  println(
+    go("10.0.0.5", [("X-Forwarded-For", "unknown"), ("X-Forwarded-Proto", "https"), ("X-Forwarded-Host", "a.example")])
+  )
+  // Forwarded (RFC 7239).
+  println(go("10.0.0.5", [("Forwarded", "for=203.0.113.9;proto=https;host=shop.example")]))
+  println(go("10.0.0.5", [("Forwarded", "For=203.0.113.9;Proto=HTTPS;Host=Shop.Example")]))
+  println(go("10.0.0.5", [("Forwarded", "for=\"[2001:db8::1]:4711\";proto=https")]))
+  println(go("10.0.0.5", [("Forwarded", "for=\"203.0.113.9:80\"")]))
+  println(go("10.0.0.5", [("Forwarded", "for=203.0.113.9;by=10.0.0.5;ext=1")]))
+  println(
+    go("10.0.0.5", [("Forwarded", "for=6.6.6.6;proto=http, for=203.0.113.9;proto=https, for=10.0.0.4;proto=http")])
+  )
+  println(go("10.0.0.5", [("Forwarded", "for=6.6.6.6;host=evil.example, for=203.0.113.9;host=real.example")]))
+  println(go("10.0.0.5", [("Forwarded", "for=6.6.6.6"), ("forwarded", "for=203.0.113.9, for=10.0.0.4")]))
+  println(go("10.0.0.5", [("Forwarded", "for=\"a,b\";host=x.example")]))
+  println(go("10.0.0.5", [("Forwarded", "for=\"203.0.113.9\\\"\"")]))
+  println(go("10.0.0.5", [("Forwarded", "for=\"\\2\\0\\3.0.113.9\"")]))
+  println(go("10.0.0.5", [("Forwarded", "for=203.0.113.9;;proto=https;")]))
+  println(go("10.0.0.5", [("Forwarded", ", for=203.0.113.9,,")]))
+  println(go("10.0.0.5", [("Forwarded", "")]))
+  // Forwarded wins over the X-Forwarded headers.
+  println(
+    go("10.0.0.5", [("Forwarded", "for=203.0.113.9"), ("X-Forwarded-For", "6.6.6.6"), ("X-Forwarded-Proto", "https")])
+  )
+  // Forwarded from an untrusted peer is removed.
+  println(go("1.2.3.4", [("Forwarded", "for=203.0.113.9"), ("X-Forwarded-For", "6.6.6.6")]))
+  // Malformed Forwarded: worthless, and the X-Forwarded headers are not read in its place.
+  println(go("10.0.0.5", [("Forwarded", "for=unknown")]))
+  println(go("10.0.0.5", [("Forwarded", "for=_hidden;proto=https")]))
+  println(go("10.0.0.5", [("Forwarded", "proto=https")]))
+  println(go("10.0.0.5", [("Forwarded", "for=203.0.113.9"), ("Forwarded", "proto=https")]))
+  println(go("10.0.0.5", [("Forwarded", "for=\"203.0.113.9")]))
+  println(go("10.0.0.5", [("Forwarded", "for")]))
+  println(go("10.0.0.5", [("Forwarded", "=203.0.113.9")]))
+  println(go("10.0.0.5", [("Forwarded", "for=203.0.113.9;for=1.1.1.1")]))
+  println(go("10.0.0.5", [("Forwarded", "for=203.0.113.9;proto=https;proto=http")]))
+  println(go("10.0.0.5", [("Forwarded", "for=203.0.113.9;host=a;host=b")]))
+  println(go("10.0.0.5", [("Forwarded", "for=a\"b\"")]))
+  println(go("10.0.0.5", [("Forwarded", "for=\"1.1.1.1\"x")]))
+  println(go("10.0.0.5", [("Forwarded", "for=\"1.1.1.1\\")]))
+  println(go("10.0.0.5", [("Forwarded", "for=203.0.113.9;proto=ftp;host=x y")]))
+  println(go("10.0.0.5", [("Forwarded", "for=garbage, for=203.0.113.9")]))
+  // The hop limit.
+  val few = TrustedProxies(["10.0.0.0/8"], maxHops = 3)
+  println(via(few, Some("10.0.0.5"), xff("203.0.113.9, 10.0.0.1, 10.0.0.2")))
+  println(via(few, Some("10.0.0.5"), xff("203.0.113.9, 10.0.0.1, 10.0.0.2, 10.0.0.3")))
+  println(via(few, Some("10.0.0.5"), [("Forwarded", "for=203.0.113.9, for=10.0.0.1, for=10.0.0.2, for=10.0.0.3")]))
+  println(via(TrustedProxies(["10.0.0.0/8"], maxHops = 1), Some("10.0.0.5"), xff("203.0.113.9")))
+  println(via(TrustedProxies(["10.0.0.0/8"], maxHops = 1), Some("10.0.0.5"), xff("1.1.1.1, 203.0.113.9")))
+  // No trusted blocks trusts nothing; the all-addresses blocks trust every peer of their family.
+  println(via(TrustedProxies(), Some("10.0.0.5"), xff("203.0.113.9")))
+  println(via(TrustedProxies(["0.0.0.0/0"]), Some("198.51.100.7"), xff("203.0.113.9")))
+  println(via(TrustedProxies(["0.0.0.0/0"]), Some("::1"), xff("203.0.113.9")))
+  println(via(TrustedProxies(["::/0"]), Some("fe80::1"), xff("203.0.113.9")))
+  println(via(TrustedProxies(["::/0"]), Some("10.0.0.5"), xff("203.0.113.9")))
+  // The trust list is separate from the answer: isTrusted.
+  println(trust.isTrusted("10.255.255.255"))
+  println(trust.isTrusted("9.255.255.255"))
+  println(trust.isTrusted("fdff::1"))
+  println(trust.isTrusted("fe00::1"))
+  println(trust.isTrusted("junk"))
+  println(trust.isTrusted(""))
+  // The middleware leaves the rest of the request as it was.
+  val echo: Handler = r -> Response.text(
+    200,
+    s"${r.method} ${r.target} ${r.header("X-Other").getOrElse("-")} ${r.text}"
+  )
+  val wrapped = trust.middleware(echo)
+  println(
+    wrapped(
+      ServerRequest(
+        "POST",
+        "/p?q=1",
+        [("X-Other", "kept"), ("X-Forwarded-For", "1.1.1.1")],
+        Array.tabulate(2, i -> byte(65 + i)),
+        remote = Some("10.0.0.5")
+      )
+    ).text
+  )
+  println(
+    wrapped(
+      ServerRequest(
+        "POST",
+        "/p?q=1",
+        [("X-Other", "kept"), ("X-Forwarded-For", "1.1.1.1")],
+        Array.tabulate(2, i -> byte(65 + i)),
+        remote = Some("8.8.8.8")
+      )
+    ).text
+  )
+  // A request that did not pass the middleware has no forwarding, and its host is the header's.
+  val plain = ServerRequest("GET", "/", [("Host", "h.example")], remote = Some("10.0.0.5"))
+  println(s"${plain.forwarding.isDefined} ${plain.scheme} ${plain.host}")
+  println(ServerRequest("GET", "/").host)
+  // The peer is kept, apart from the client's address.
+  val resolved: Handler = r -> Response.text(
+    200,
+    s"${r.forwarding.map(f -> s"${f.peer} ${f.address} ${f.scheme} ${f.host}")}"
+  )
+  println(trust.middleware(resolved)(ServerRequest("GET", "/", xff("2001:db8::1"), remote = Some("10.0.0.5"))).text)
+  // Two middlewares in a row: an outer one trusting the edge, an inner one trusting the same.
+  val twice = trust.middleware(trust.middleware(handler))
+  println(twice(ServerRequest("GET", "/", xff("203.0.113.9, 10.0.0.4"), remote = Some("10.0.0.5"))).text)
+  // Cidr.
+  val net = Cidr("10.1.2.3/8")
+  println(s"${net.text} ${net.network} ${net.prefix}")
+  println(Cidr("192.0.2.1").prefix)
+  println(Cidr("2001:db8::1").prefix)
+  println(Cidr("2001:DB8::/32").network.length)
+  println(Cidr("::ffff:10.0.0.0/104").network)
+  println(Cidr("::ffff:10.0.0.0/104").prefix)
+  println(Cidr("::ffff:10.0.0.0/104").contains("10.9.9.9"))
+  println(Cidr("::ffff:10.0.0.0/104").contains("11.0.0.0"))
+  println(Cidr("10.0.0.0/8").contains("10.0.0.0"))
+  println(Cidr("10.0.0.0/8").contains("10.255.255.255"))
+  println(Cidr("10.0.0.0/8").contains("11.0.0.0"))
+  println(Cidr("10.0.0.0/8").contains("9.255.255.255"))
+  println(Cidr("10.0.0.0/9").contains("10.127.255.255"))
+  println(Cidr("10.0.0.0/9").contains("10.128.0.0"))
+  println(Cidr("10.0.0.0/32").contains("10.0.0.0"))
+  println(Cidr("10.0.0.0/32").contains("10.0.0.1"))
+  println(Cidr("10.0.0.0/31").contains("10.0.0.1"))
+  println(Cidr("10.0.0.0/31").contains("10.0.0.2"))
+  println(Cidr("0.0.0.0/0").contains("255.255.255.255"))
+  println(Cidr("0.0.0.0/0").contains("::1"))
+  println(Cidr("2001:db8::/32").contains("2001:db8:ffff::1"))
+  println(Cidr("2001:db8::/32").contains("2001:db9::1"))
+  println(Cidr("2001:db8::/33").contains("2001:db8:8000::"))
+  println(Cidr("2001:db8::/33").contains("2001:db8:7fff::"))
+  println(Cidr("::1/128").contains("::1"))
+  println(Cidr("::1/128").contains("::2"))
+  println(Cidr("::/0").contains("10.0.0.1"))
+  println(Cidr("10.0.0.0/8").contains("not an address"))
+  println(Cidr("10.0.0.0/8").contains("10.0.0.0:80"))
+  println(Cidr("10.0.0.0/8").contains("::ffff:10.1.1.1"))
+  println(Cidr("10.0.0.0/8").contains(""))

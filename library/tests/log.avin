@@ -1,0 +1,562 @@
+// `avin.log`: every level against every threshold, through a logger's methods, its `log` and the module
+// functions with a given; a record below the threshold evaluating neither its message nor its fields;
+// fields of a record, of a logger and of children, in order; the text format and its quoting, its
+// colour only where asked and taken; JSON lines with their escaping and the kinds of their values;
+// lines written at once from many threads, each whole; the file sink; and the access log writing
+// through a logger.
+import avin.fs
+import avin.log
+import avin.log.{Format, Json, Level, Logger, Sink, Text, fileSink, parseLevel, writerSink}
+import avin.net.http
+import avin.net.http.{Response, ServerRequest}
+import avin.process
+import avin.signal
+import avin.threads.{Atomic, Mutex, scope, sleep}
+import avin.time.{Duration, Instant, epochMicros, epochSeconds, millis, seconds}
+
+private val Levels: Vector[Level] = [Level.Trace, Level.Debug, Level.Info, Level.Warn, Level.Error]
+
+// A clock standing still at 2026-11-23T10:20:30.5Z.
+private fixed() -> Instant = epochMicros(1795429230500000)
+
+private val Stamp = "2026-11-23T10:20:30.5Z"
+
+// A logger writing into a string, and the string.
+private class Captured(level: Level = Level.Trace, format: Format = Text, colours: bool = false)
+  val out = Mutex(StringWriter())
+  val logger: Logger = capturing(out, level, format, colours)
+  text -> string = out.with(w -> w.text)
+  lines -> Vector[string] = text.split("\n").filter(l -> !l.isEmpty)
+
+private capturing(out: Mutex[StringWriter], level: Level, format: Format, colours: bool) -> Logger =
+  Logger(level, format, Sink(line -> out.with(w -> w.write(line)), colours), clock = fixed)
+
+private emit(logger: Logger, at: Level, message: string)
+  at match
+    Level.Trace -> logger.trace(message)
+    Level.Debug -> logger.debug(message)
+    Level.Info -> logger.info(message)
+    Level.Warn -> logger.warn(message)
+    Level.Error -> logger.error(message)
+
+private emitGiven(at: Level, message: string, using logger: Logger)
+  at match
+    Level.Trace -> log.trace(message)
+    Level.Debug -> log.debug(message)
+    Level.Info -> log.info(message)
+    Level.Warn -> log.warn(message)
+    Level.Error -> log.error(message)
+
+@test("levels order trace < debug < info < warn < error, and name themselves")
+levelOrder()
+  for i in 0 ..< Levels.length
+    for j in 0 ..< Levels.length
+      assertEq(Levels(i) < Levels(j), i < j)
+  assertEq(Levels.map(l -> l.name), ["trace", "debug", "info", "warn", "error"])
+  assertEq(Levels.map(l -> l.label), ["TRACE", "DEBUG", "INFO ", "WARN ", "ERROR"])
+  assertEq(s"${Level.Warn}", "warn")
+
+@test("parseLevel reads each name in any case, warning as warn, and nothing else")
+levelParsing()
+  for l in Levels
+    assertEq(parseLevel(l.name), Some(l))
+    assertEq(parseLevel(l.name.toUpper), Some(l))
+  assertEq(parseLevel("Warning"), Some(Level.Warn))
+  assertEq(parseLevel("DeBuG"), Some(Level.Debug))
+  for bad in ["", " info", "info ", "inf", "fatal", "verbose", "0"]
+    assertEq(parseLevel(bad), None)
+
+@test("every level against every threshold: written exactly where it is at the threshold or above")
+everyThreshold()
+  for threshold in Levels
+    for at in Levels
+      val methods = Captured(threshold)
+      emit(methods.logger, at, "m")
+      val direct = Captured(threshold)
+      direct.logger.log(at, "m")
+      val viaGiven = Captured(threshold)
+      emitGiven(at, "m", logger = viaGiven.logger)
+      val expected = if at >= threshold then [s"$Stamp ${at.label} m"] else Vector.empty[string]()
+      assertEq(methods.lines, expected)
+      assertEq(direct.lines, expected)
+      assertEq(viaGiven.lines, expected)
+      assertEq(methods.logger.enabled(at), at >= threshold)
+
+@test("atLevel changes the threshold and keeps the logger's fields")
+atLevelKeepsFields()
+  val c = Captured(Level.Error)
+  val lower = c.logger.child([("a", 1)]).atLevel(Level.Debug)
+  lower.trace("no")
+  lower.debug("yes")
+  c.logger.warn("no")
+  assertEq(c.lines, [s"$Stamp DEBUG yes a=1"])
+  assertEq(lower.level, Level.Debug)
+  assertEq(c.logger.level, Level.Error)
+
+@test("a record below the threshold evaluates neither its message nor its fields")
+disabledEvaluatesNothing()
+  val count = Atomic(0)
+  val touched: () -> string = () ->
+    _ = count.add(1)
+    "v"
+  val c = Captured(Level.Warn)
+  c.logger.trace(touched(), [("k", touched())])
+  c.logger.debug(touched(), [("k", touched())])
+  c.logger.info(s"${touched()}", [("k", touched()), ("j", touched())])
+  c.logger.log(Level.Info, touched(), [("k", touched())])
+  given g: Logger = c.logger
+  log.trace(touched(), [("k", touched())])
+  log.info(touched(), [("k", touched())])
+  assertEq(count.load(), 0)
+  assertEq(c.text, "")
+  c.logger.warn(touched(), [("k", touched())])
+  log.error(touched(), [("k", touched())])
+  assertEq(count.load(), 4)
+  assertEq(c.lines, [s"$Stamp WARN  v k=v", s"$Stamp ERROR v k=v"])
+
+@test("the module functions find the nearest given logger")
+nearestGiven()
+  val outer = Captured()
+  val inner = Captured()
+  given g: Logger = outer.logger
+  log.info("outer")
+  if true
+    given h: Logger = inner.logger
+    log.info("inner")
+  log.info("outer again")
+  log.warn("named", logger = inner.logger)
+  assertEq(outer.lines, [s"$Stamp INFO  outer", s"$Stamp INFO  outer again"])
+  assertEq(inner.lines, [s"$Stamp INFO  inner", s"$Stamp WARN  named"])
+
+@test("the default logger writes info and above as text")
+defaultLogger()
+  assertEq(log.DefaultLogger.level, Level.Info)
+  assertEq(log.DefaultLogger.format, Text)
+  assert(!log.DefaultLogger.enabled(Level.Debug))
+  assert(log.DefaultLogger.enabled(Level.Info))
+
+@test("fields follow the message: the logger's, then each child's, then the record's")
+fieldOrder()
+  val out = Mutex(StringWriter())
+  val base = Logger(sink = writerSink(out), clock = fixed, fields = [("svc", "api"), ("pid", 7)])
+  val child = base.child([("request", "r1")])
+  val grandchild = child.child([("user", "ann"), ("svc", "again")])
+  base.info("a")
+  child.info("b", [("n", 1)])
+  grandchild.info("c", [("n", 2), ("m", 3)])
+  child.info("d")
+  base.child([]).info("e", [])
+  assertEq(
+    out.with(w -> w.text),
+    s"$Stamp INFO  a svc=api pid=7\n" + s"$Stamp INFO  b svc=api pid=7 request=r1 n=1\n"
+      + s"$Stamp INFO  c svc=api pid=7 request=r1 user=ann svc=again n=2 m=3\n"
+      + s"$Stamp INFO  d svc=api pid=7 request=r1\n"
+      + s"$Stamp INFO  e svc=api pid=7\n"
+  )
+
+@test("children in JSON carry their fields in order")
+jsonChildren()
+  val c = Captured(format = Json)
+  c.logger.child([("a", 1)]).child([("b", "x")]).info("m", [("c", true)])
+  assertEq(c.lines, [s"{\"time\":\"$Stamp\",\"level\":\"info\",\"message\":\"m\",\"a\":1,\"b\":\"x\",\"c\":true}"])
+
+@test("the text format: time, padded level, message, then key=value, quoted only where needed")
+textGolden()
+  val c = Captured()
+  c.logger.info("plain")
+  c.logger.info("")
+  c.logger.debug("é 日本 🙂", [("é", "日本"), ("emoji", "🙂")])
+  c.logger.info("fields", [("empty", ""), ("space", "a b"), ("eq", "a=b"), ("quote", "say \"hi\""), ("slash", "a\\b")])
+  c.logger.info(
+    "kinds",
+    [("i", 42), ("neg", -1), ("l", long.MaxValue), ("r", 2.5), ("b", false), ("d", Duration(1500)), ("c", 'x')]
+  )
+  c.logger.info("keys", [("a key", 1), ("", 2), ("k=", 3)])
+  c.logger.error("tab\tnl\ncr\resc\u{1b}[31m del\u{7f} back\\slash \"quoted\"")
+  c.logger.warn("control in value", [("v", "a\nb\u{1}")])
+  assertEq(
+    c.lines,
+    [
+      s"$Stamp INFO  plain",
+      s"$Stamp INFO  ",
+      s"$Stamp DEBUG é 日本 🙂 é=日本 emoji=🙂",
+      s"$Stamp INFO  fields empty=\"\" space=\"a b\" eq=\"a=b\" quote=\"say \\\"hi\\\"\" slash=\"a\\\\b\"",
+      s"$Stamp INFO  kinds i=42 neg=-1 l=9223372036854775807 r=2.5 b=false d=1.5ms c=x",
+      s"$Stamp INFO  keys \"a key\"=1 \"\"=2 \"k=\"=3",
+      s"$Stamp ERROR tab\\tnl\\ncr\\resc\\u001B[31m del\\u007F back\\slash \"quoted\"",
+      s"$Stamp WARN  control in value v=\"a\\nb\\u0001\""
+    ]
+  )
+
+@test("text paints the level only where colour is asked for and the sink takes it; JSON never")
+colour()
+  val painted = Captured(colours = true)
+  painted.logger.trace("t")
+  painted.logger.debug("d")
+  painted.logger.info("i", [("k", 1)])
+  painted.logger.warn("w")
+  painted.logger.error("e")
+  assertEq(
+    painted.lines,
+    [
+      s"$Stamp \u{1b}[2mTRACE\u{1b}[0m t",
+      s"$Stamp \u{1b}[36mDEBUG\u{1b}[0m d",
+      s"$Stamp \u{1b}[32mINFO \u{1b}[0m i k=1",
+      s"$Stamp \u{1b}[33mWARN \u{1b}[0m w",
+      s"$Stamp \u{1b}[1;31mERROR\u{1b}[0m e"
+    ]
+  )
+  val out = Mutex(StringWriter())
+  val takes = Sink(line -> out.with(w -> w.write(line)), true)
+  Logger(sink = takes, colour = false, clock = fixed).info("asked not to")
+  Logger(sink = takes, format = Json, clock = fixed).info("json")
+  Logger(sink = writerSink(out), clock = fixed).info("sink takes none")
+  assertEq(
+    out.with(w -> w.text),
+    s"$Stamp INFO  asked not to\n{\"time\":\"$Stamp\",\"level\":\"info\",\"message\":\"json\"}\n" + s"$Stamp INFO  sink takes none\n"
+  )
+  assert(!writerSink(out).colours)
+
+@test("JSON lines: one object a line with time, level, message and fields, every level by name")
+jsonGolden()
+  val c = Captured(format = Json)
+  for l in Levels do c.logger.log(l, l.label)
+  c.logger.info("")
+  assertEq(
+    c.lines,
+    [
+      s"{\"time\":\"$Stamp\",\"level\":\"trace\",\"message\":\"TRACE\"}",
+      s"{\"time\":\"$Stamp\",\"level\":\"debug\",\"message\":\"DEBUG\"}",
+      s"{\"time\":\"$Stamp\",\"level\":\"info\",\"message\":\"INFO \"}",
+      s"{\"time\":\"$Stamp\",\"level\":\"warn\",\"message\":\"WARN \"}",
+      s"{\"time\":\"$Stamp\",\"level\":\"error\",\"message\":\"ERROR\"}",
+      s"{\"time\":\"$Stamp\",\"level\":\"info\",\"message\":\"\"}"
+    ]
+  )
+
+@test("JSON escapes quotes, backslashes and every control character, and keeps Unicode as it is")
+jsonEscaping()
+  val c = Captured(format = Json)
+  c.logger.info("q\"b\\s/", [("k\"", "v\\")])
+  c.logger.info("\u{8}\u{c}\n\r\t\u{0}\u{1}\u{1f}\u{7f} ")
+  c.logger.info("é日本🙂\u{2028}", [("ключ", "значение")])
+  val head = s"{\"time\":\"$Stamp\",\"level\":\"info\",\"message\":"
+  assertEq(
+    c.lines,
+    [
+      head + "\"q\\\"b\\\\s/\",\"k\\\"\":\"v\\\\\"}",
+      head + "\"\\b\\f\\n\\r\\t\\u0000\\u0001\\u001F\\u007F \"}",
+      head + "\"é日本🙂\u{2028}\",\"ключ\":\"значение\"}"
+    ]
+  )
+
+@test("JSON keeps the kinds of int, long, real and bool, and writes anything else as a string")
+jsonKinds()
+  val c = Captured(format = Json)
+  c.logger.info(
+    "k",
+    [
+      ("i", 0),
+      ("min", int.MinValue),
+      ("l", long.MinValue),
+      ("r", -0.25),
+      ("nan", real.NaN),
+      ("inf", real.PositiveInfinity),
+      ("-inf", real.NegativeInfinity),
+      ("t", true),
+      ("s", "7"),
+      ("d", Duration(2000000)),
+      ("at", epochSeconds(0)),
+      ("c", '"'),
+      ("v", [1, 2])
+    ]
+  )
+  assertEq(
+    c.lines,
+    [
+      s"{\"time\":\"$Stamp\",\"level\":\"info\",\"message\":\"k\",\"i\":0,\"min\":-2147483648," + "\"l\":-9223372036854775808,\"r\":-0.25,\"nan\":\"NaN\",\"inf\":\"inf\",\"-inf\":\"-inf\",\"t\":true,"
+        + "\"s\":\"7\",\"d\":\"2s\",\"at\":\"1970-01-01T00:00:00Z\",\"c\":\"\\\"\",\"v\":\"[1, 2]\"}"
+    ]
+  )
+
+@test("the time is the clock's, in RFC 3339 form, UTC")
+clockTime()
+  val out = Mutex(StringWriter())
+  Logger(sink = writerSink(out), clock = () -> epochSeconds(0)).info("epoch")
+  Logger(sink = writerSink(out), clock = () -> epochMicros(1001)).info("fraction")
+  assertEq(out.with(w -> w.text), "1970-01-01T00:00:00Z INFO  epoch\n1970-01-01T00:00:00.001001Z INFO  fraction\n")
+
+@test("lines written at once from many threads arrive whole, none lost")
+concurrentWriters()
+  for format in [Text, Json]
+    val c = Captured(format = format)
+    scope(s ->
+      for t in 0 ..< 16
+        val child = c.logger.child([("thread", t)])
+        s.spawn(() ->
+          for i in 0 ..< 200
+            child.info(s"record $i of thread $t", [("i", i), ("pad", "x".repeat(i))])
+          ()))
+    val lines = c.lines
+    assertEq(lines.length, 16 * 200)
+    for t in 0 ..< 16
+      for i in [0, 1, 99, 199]
+        val pad = "x".repeat(i)
+        val expected = format match
+          Text -> s"$Stamp INFO  record $i of thread $t thread=$t i=$i pad=${if i == 0 then "\"\"" else pad}"
+          Json -> s"{\"time\":\"$Stamp\",\"level\":\"info\",\"message\":\"record $i of thread $t\",\"thread\":$t,\"i\":$i,\"pad\":\"$pad\"}"
+        assert(lines.contains(expected))
+    for line in lines
+      assert(line.startsWith(if format == Text then s"$Stamp INFO  record " else "{\"time\""))
+
+@test("the file sink appends whole lines, creating the file, and keeps what was there")
+fileSinkWrites()
+  val dir = fs.createTempDir("avin-log-test").ok.get
+  val file = dir + "/app.log"
+  val sink = fileSink(file).ok.get
+  val logger = Logger(sink = sink, clock = fixed)
+  assert(!sink.colours)
+  logger.info("first", [("n", 1)])
+  assertEq(fs.readText(file), Ok(s"$Stamp INFO  first n=1\n"))
+  Logger(sink = fileSink(file).ok.get, format = Json, clock = fixed).warn("second")
+  logger.error("third")
+  assertEq(
+    fs.readText(file),
+    Ok(s"$Stamp INFO  first n=1\n{\"time\":\"$Stamp\",\"level\":\"warn\",\"message\":\"second\"}\n$Stamp ERROR third\n")
+  )
+  _ = fs.removeDirAll(dir)
+
+@test("the file sink keeps lines whole when many threads write at once")
+fileSinkConcurrent()
+  val dir = fs.createTempDir("avin-log-test").ok.get
+  val file = dir + "/many.log"
+  val logger = Logger(sink = fileSink(file).ok.get, clock = fixed)
+  scope(s ->
+    for t in 0 ..< 8
+      s.spawn(() ->
+        for i in 0 ..< 100
+          logger.info("r", [("t", t), ("i", i)])
+        ()))
+  val lines = fs.readText(file).ok.get.split("\n").filter(l -> !l.isEmpty)
+  assertEq(lines.length, 800)
+  for t in 0 ..< 8
+    for i in 0 ..< 100
+      assert(lines.contains(s"$Stamp INFO  r t=$t i=$i"))
+  _ = fs.removeDirAll(dir)
+
+@test("the file sink makes the file again once a rotator has moved it away, and writes long lines whole")
+fileSinkRotation()
+  val dir = fs.createTempDir("avin-log-test").ok.get
+  val file = dir + "/app.log"
+  val logger = Logger(sink = fileSink(file, Duration.Zero).ok.get, clock = fixed)
+  logger.info("before")
+  assert(fs.rename(file, dir + "/app.log.1").isOk)
+  val big = "y".repeat(20000)
+  scope(s ->
+    for t in 0 ..< 4
+      s.spawn(() ->
+        for i in 0 ..< 10
+          logger.info(big)
+        ()))
+  assertEq(fs.readText(dir + "/app.log.1"), Ok(s"$Stamp INFO  before\n"))
+  val lines = fs.readText(file).ok.get.split("\n").filter(l -> !l.isEmpty)
+  assertEq(lines.length, 40)
+  assert(lines.forall(l -> l == s"$Stamp INFO  $big"))
+  _ = fs.removeDirAll(dir)
+
+@test("the file sink keeps one file open: until it looks again, lines follow the file a rotator moved")
+fileSinkKeepsTheFile()
+  val dir = fs.createTempDir("avin-log-test").ok.get
+  val file = dir + "/app.log"
+  val logger = Logger(sink = fileSink(file, seconds(3600)).ok.get, clock = fixed)
+  logger.info("one")
+  assert(fs.rename(file, dir + "/old.log").isOk)
+  logger.info("two")
+  assertEq(fs.readText(dir + "/old.log"), Ok(s"$Stamp INFO  one\n$Stamp INFO  two\n"))
+  assert(!fs.exists(file))
+  _ = fs.removeDirAll(dir)
+
+@test("reopen makes the sink open its file again at once, whatever its recheck, making a file moved away")
+fileSinkReopen()
+  val dir = fs.createTempDir("avin-log-test").ok.get
+  val file = dir + "/app.log"
+  val sink = fileSink(file, seconds(3600)).ok.get
+  val logger = Logger(sink = sink, clock = fixed)
+  logger.info("one")
+  assert(fs.rename(file, dir + "/old.log").isOk)
+  sink.reopen()
+  assert(fs.exists(file))
+  assertEq(fs.readText(file), Ok(""))
+  logger.info("two")
+  assertEq(fs.readText(dir + "/old.log"), Ok(s"$Stamp INFO  one\n"))
+  assertEq(fs.readText(file), Ok(s"$Stamp INFO  two\n"))
+  // Reopening with the file in place keeps what it holds, and twice does no harm.
+  sink.reopen()
+  sink.reopen()
+  logger.info("three")
+  assertEq(fs.readText(file), Ok(s"$Stamp INFO  two\n$Stamp INFO  three\n"))
+  _ = fs.removeDirAll(dir)
+
+@test("reopen on a sink with no file to open does nothing")
+reopenOtherSinks()
+  val kept = Mutex(Vector.empty[string]())
+  val sink = Sink(line -> kept.update(v -> v :+ line))
+  sink.reopen()
+  Logger(sink = sink, clock = fixed).info("x")
+  sink.reopen()
+  assertEq(kept.get().length, 1)
+  log.stderrSink().reopen()
+  log.stdoutSink().reopen()
+
+@test("a hangup reopens the sink: the log moved away by a rotator is made again, each time one arrives")
+reopenOnHangup()
+  val dir = fs.createTempDir("avin-log-test").ok.get
+  val file = dir + "/app.log"
+  val sink = fileSink(file, seconds(3600)).ok.get
+  val logger = Logger(sink = sink, clock = fixed)
+  val watcher = log.reopenOnSignal(sink).ok.get
+  logger.info("one")
+  for round in 0 ..< 2
+    assert(fs.rename(file, dir + s"/old$round.log").isOk)
+    logger.info(s"into the old file $round")
+    assert(process.signal(process.pid(), signal.Hangup).isOk)
+    var waited = 0
+    while !fs.exists(file) && waited < 100
+      sleep(millis(50))
+      waited += 1
+    assert(fs.exists(file))
+    logger.info(s"into the new file $round")
+  watcher.stop()
+  watcher.stop()
+  assertEq(
+    fs.readText(dir + "/old0.log"),
+    Ok(s"$Stamp INFO  one\n$Stamp INFO  into the old file 0\n")
+  )
+  assertEq(
+    fs.readText(dir + "/old1.log"),
+    Ok(s"$Stamp INFO  into the new file 0\n$Stamp INFO  into the old file 1\n")
+  )
+  assertEq(fs.readText(file), Ok(s"$Stamp INFO  into the new file 1\n"))
+  _ = fs.removeDirAll(dir)
+
+@test("reopenOnSignal watches the signal it is given, and refuses one that cannot be watched")
+reopenOnOtherSignal()
+  val dir = fs.createTempDir("avin-log-test").ok.get
+  val file = dir + "/app.log"
+  val sink = fileSink(file, seconds(3600)).ok.get
+  assert(log.reopenOnSignal(sink, signal.Kill).isErr)
+  val watcher = log.reopenOnSignal(sink, signal.User1).ok.get
+  assert(fs.rename(file, dir + "/old.log").isOk)
+  assert(process.signal(process.pid(), signal.User1).isOk)
+  var waited = 0
+  while !fs.exists(file) && waited < 100
+    sleep(millis(50))
+    waited += 1
+  assert(fs.exists(file))
+  watcher.stop()
+  _ = fs.removeDirAll(dir)
+
+@test("the file sink looks again once its recheck has passed, and not before")
+fileSinkRecheck()
+  val dir = fs.createTempDir("avin-log-test").ok.get
+  val file = dir + "/app.log"
+  val logger = Logger(sink = fileSink(file, millis(200)).ok.get, clock = fixed)
+  logger.info("one")
+  assert(fs.rename(file, dir + "/old.log").isOk)
+  logger.info("two")
+  sleep(millis(250))
+  logger.info("three")
+  logger.info("four")
+  assertEq(fs.readText(dir + "/old.log"), Ok(s"$Stamp INFO  one\n$Stamp INFO  two\n"))
+  assertEq(fs.readText(file), Ok(s"$Stamp INFO  three\n$Stamp INFO  four\n"))
+  _ = fs.removeDirAll(dir)
+
+@test("the file sink opens the file a rotator put in the old one's place, and makes one that was removed")
+fileSinkReplacedAndRemoved()
+  val dir = fs.createTempDir("avin-log-test").ok.get
+  val file = dir + "/app.log"
+  val logger = Logger(sink = fileSink(file, millis(-5)).ok.get, clock = fixed)
+  logger.info("one")
+  assert(fs.rename(file, dir + "/old.log").isOk)
+  assert(fs.writeText(file, "fresh\n").isOk)
+  logger.info("two")
+  assertEq(fs.readText(dir + "/old.log"), Ok(s"$Stamp INFO  one\n"))
+  assertEq(fs.readText(file), Ok(s"fresh\n$Stamp INFO  two\n"))
+  assert(fs.remove(file).isOk)
+  logger.info("three")
+  assertEq(fs.readText(file), Ok(s"$Stamp INFO  three\n"))
+  _ = fs.removeDirAll(dir)
+
+@test("the file sink appends to what the file already holds, and each line is in the file when its call returns")
+fileSinkAppendsAndFlushes()
+  val dir = fs.createTempDir("avin-log-test").ok.get
+  val file = dir + "/app.log"
+  assert(fs.writeText(file, "kept\n").isOk)
+  val logger = Logger(sink = fileSink(file).ok.get, clock = fixed)
+  for i in 0 ..< 3
+    logger.info("r", [("i", i)])
+    assertEq(fs.readText(file).ok.get.split("\n").filter(l -> !l.isEmpty).length, i + 2)
+  logger.info("ü ✓ 𝄞")
+  assertEq(fs.readText(file).ok.get.split("\n").filter(l -> !l.isEmpty).last, s"$Stamp INFO  ü ✓ 𝄞")
+  assert(fs.readText(file).ok.get.startsWith("kept\n"))
+  _ = fs.removeDirAll(dir)
+
+@test("the file sink is an Err where the file cannot be opened")
+fileSinkError()
+  val dir = fs.createTempDir("avin-log-test").ok.get
+  assert(fileSink(dir + "/missing/app.log").isErr)
+  assert(fileSink(dir).isErr)
+  _ = fs.removeDirAll(dir)
+
+// A clock moving 1.5 ms each time it is read.
+private ticking() -> @sendable () -> Duration
+  val now = Atomic(long(0))
+  () -> Duration(now.add(1500))
+
+private hello(r: ServerRequest) -> Response = Response.text(200, "hello")
+
+@test("the access log writes a request record through a logger, in its format, with its fields")
+accessLogThroughLogger()
+  val text = Captured()
+  val h = http.accessLog(text.logger.child([("svc", "web")]), clock = ticking(), ids = () -> "id1")(hello)
+  val r = h(ServerRequest("GET", "/a=b", remote = Some("10.0.0.1")))
+  assertEq(r.header("X-Request-Id"), Some("id1"))
+  _ = h(ServerRequest("POST", "/x", Vector(("X-Request-Id", "sent-1"))))
+  val json = Captured(format = Json)
+  val hj = http.accessLog(json.logger, clock = ticking(), ids = () -> "id2")(hello)
+  _ = hj(ServerRequest("GET", "/q%22%0A", remote = Some("::1")))
+  _ = hj(ServerRequest("GET", "/n"))
+  assertEq(
+    text.lines,
+    [
+      s"$Stamp INFO  request svc=web id=id1 method=GET path=\"/a=b\" status=200 bytes=5 micros=1500 remote=10.0.0.1",
+      s"$Stamp INFO  request svc=web id=sent-1 method=POST path=/x status=200 bytes=5 micros=1500"
+    ]
+  )
+  val head = s"{\"time\":\"$Stamp\",\"level\":\"info\",\"message\":\"request\","
+  assertEq(
+    json.lines,
+    [
+      head + "\"id\":\"id2\",\"method\":\"GET\",\"path\":\"/q\\\"\\n\",\"status\":200,\"bytes\":5,\"micros\":1500,\"remote\":\"::1\"}",
+      head + "\"id\":\"id2\",\"method\":\"GET\",\"path\":\"/n\",\"status\":200,\"bytes\":5,\"micros\":1500}"
+    ]
+  )
+
+@test("the access log through a logger that leaves out info writes nothing, and still answers with the id")
+accessLogQuiet()
+  val c = Captured(Level.Warn)
+  val calls = Atomic(0)
+  val h = http.accessLog(c.logger, clock = ticking(), ids = () ->
+    _ = calls.add(1)
+    "q1")(hello)
+  val r = h(ServerRequest("GET", "/"))
+  assertEq(r.header("X-Request-Id"), Some("q1"))
+  assertEq(r.text, "hello")
+  assertEq(c.text, "")
+
+@test("the access log's sink form is unchanged beside the logger form")
+accessLogSinkForm()
+  val kept = Mutex(Vector.empty[string]())
+  val h = http.accessLog(line -> _ = kept.update(v -> v :+ line), clock = ticking(), ids = () -> "s1")(hello)
+  _ = h(ServerRequest("GET", "/p"))
+  assertEq(kept.get(), ["GET /p 200 5 1.5ms id=s1 remote=-"])

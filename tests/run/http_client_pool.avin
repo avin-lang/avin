@@ -1,0 +1,170 @@
+// expect: exit 0
+// A `Client` keeps its connections for the requests after the first, against `http.serve` over the
+// loopback, counted at both ends, the client's `stats` and the server's live `connections`:
+// requests one after another share one connection, `POST` and `HEAD` among them; a server's
+// `Connection: close`, a body left partly read, a timeout and a total timeout each close theirs; a
+// connection the server closed while it was kept is found and replaced; the client's idle timeout,
+// lifetime and `evictIdle` close kept ones; `keepAlive = false` keeps none; a host's limit makes a
+// request wait for a connection, within its connect timeout; a closed client makes no connection;
+// and many lightweight threads share one client, never more connections than its limit.
+import avin.io.{IoError, TimedOut}
+import avin.net.TcpServer
+import avin.net.http
+import avin.net.http.{Client, ClientStats, HttpError, Io, Request, Response, ServerRequest}
+import avin.threads.{sleep, spawn}
+import avin.time.millis
+
+ok[T](r: Result[T, IoError]) -> T = r match
+  Ok(v) -> v
+  Err(e) -> fail(e.message)
+
+answer(r: ServerRequest) -> Response = r.target.split("?")(0) match
+  "/close" -> Response.text(200, "closing").withHeader("Connection", "close")
+  "/big" -> Response.text(200, "x".repeat(100000))
+  "/slow" ->
+    sleep(millis(300))
+    Response.text(200, "slow")
+  "/hold" ->
+    sleep(millis(400))
+    Response.text(200, "held")
+  "/drip" -> Response.stream(200, "text/plain", w ->
+    for _ in 1 .. 10
+      _ = w.write("drip ")
+      sleep(millis(40)))
+  _ -> Response.text(200, s"${r.method} ${r.body.length}")
+
+// The server's live connections once they have come to `n`, waiting up to two seconds for a
+// connection's close to reach it.
+settled(server: TcpServer, n: int) -> int
+  var waited = 0
+  while server.connections() != n && waited < 200
+    sleep(millis(10))
+    waited += 1
+  server.connections()
+
+counts(s: ClientStats) -> string = s"opened ${s.opened} reused ${s.reused} idle ${s.idle} active ${s.active}"
+
+describe(r: Result[Response, HttpError]) -> string = r match
+  Ok(res) -> s"${res.status} ${res.text}"
+  Err(e) -> s"error: ${e.message}"
+
+// The client's counts and the server's, then the client closed and the server's count back to none.
+report(label: string, client: Client, server: TcpServer, live: int)
+  println(s"$label: ${counts(client.stats())}, live ${settled(server, live)}")
+  client.close()
+  if settled(server, 0) != 0 then println(s"$label: still live after closing")
+
+main()
+  val server = ok(http.serve("127.0.0.1", 0, answer, idleTimeout = millis(5000)))
+  val base = s"http://127.0.0.1:${server.port()}"
+
+  // Six requests, one connection.
+  val client = Client()
+  for _ in 1 .. 3
+    println(describe(client.get(s"$base/a")))
+  println(describe(client.post(s"$base/a", "body", "text/plain")))
+  println(describe(client.put(s"$base/a", "more", "text/plain")))
+  client.head(s"$base/a") match
+    Ok(r) -> println(s"head ${r.status} ${r.body.length}")
+    Err(e) -> println(e.message)
+  report("one connection", client, server, 1)
+
+  // A server's `Connection: close` ends its connection; the next request makes another.
+  val closing = Client()
+  println(describe(closing.get(s"$base/close")))
+  println(describe(closing.get(s"$base/a")))
+  report("closed by the server", closing, server, 1)
+
+  // A body read whole leaves its connection; one left partly read closes it.
+  val streams = Client()
+  println(s"read whole: ${streams.stream(Request("GET", s"$base/big"), r -> ok(r.body.readAll()).length)}")
+  println(s"read in part: ${streams.stream(Request("GET", s"$base/big"), r -> ok(r.body.read(10)).length)}")
+  println(s"after a part: ${counts(streams.stats())}, live ${settled(server, 0)}")
+  _ = streams.get(s"$base/a")
+  report("read again", streams, server, 1)
+
+  // A request that times out closes its connection, and the next has a new one.
+  val timing = Client()
+  _ = timing.get(s"$base/a")
+  timing.send(Request("GET", s"$base/slow").withTimeout(millis(50))) match
+    Err(Io(IoError(TimedOut, _, _))) -> println("timed out")
+    other -> println(s"not timed out: ${describe(other)}")
+  _ = timing.get(s"$base/a")
+  println(s"after a timeout: ${counts(timing.stats())}")
+
+  // The whole of a request within its total timeout, however each read keeps within its own.
+  timing.send(Request("GET", s"$base/drip").withTimeout(millis(200)).withTotalTimeout(millis(150))) match
+    Err(Io(e)) -> println(s"total: ${e.message.replace(server.port().toString(), "PORT")}")
+    other -> println(s"not timed out: ${describe(other)}")
+  timing.send(Request("GET", s"$base/drip").withTotalTimeout(millis(5000))) match
+    Ok(r) -> println(s"in time: ${r.text.byteLength}")
+    Err(e) -> println(e.message)
+  report("after a total timeout", timing, server, 1)
+
+  // A server that closes a kept connection: the client finds it closed and makes another.
+  val quick = ok(http.serve("127.0.0.1", 0, answer, idleTimeout = millis(100)))
+  val kept = Client()
+  println(describe(kept.get(s"http://127.0.0.1:${quick.port()}/a")))
+  println(s"the server closed it: live ${settled(quick, 0)}, the client keeps ${kept.stats().idle}")
+  println(describe(kept.get(s"http://127.0.0.1:${quick.port()}/a")))
+  report("closed while kept", kept, quick, 1)
+  quick.stop()
+
+  // The client's own idle timeout and lifetime, and `evictIdle`.
+  val idle = Client(idleTimeout = millis(50))
+  _ = idle.get(s"$base/a")
+  sleep(millis(100))
+  _ = idle.get(s"$base/a")
+  println(s"idle timeout: ${counts(idle.stats())}, live ${settled(server, 1)}")
+  sleep(millis(100))
+  println(s"evicted ${idle.evictIdle()}: ${counts(idle.stats())}, live ${settled(server, 0)}")
+  println(s"evicted again ${idle.evictIdle()}")
+  report("evicted", idle, server, 0)
+  val aging = Client(maxLifetime = millis(400), idleTimeout = millis(0))
+  _ = aging.get(s"$base/a")
+  _ = aging.get(s"$base/a")
+  sleep(millis(500))
+  _ = aging.get(s"$base/a")
+  report("lifetime", aging, server, 1)
+
+  // No connection kept.
+  val single = Client(keepAlive = false)
+  for _ in 1 .. 3
+    _ = single.get(s"$base/a")
+  report("no keep-alive", single, server, 0)
+
+  // A host's limit: a second request waits for the first's connection, or times out waiting.
+  val one = Client(maxPerHost = 1)
+  val holder = spawn(() -> describe(one.get(s"$base/hold")))
+  sleep(millis(100))
+  one.send(Request("GET", s"$base/a").withConnectTimeout(millis(50))) match
+    Err(Io(e)) -> println(s"waited: ${e.message.replace(server.port().toString(), "PORT")}")
+    other -> println(s"did not wait: ${describe(other)}")
+  println(s"waited for it: ${describe(one.send(Request("GET", s"$base/a")))} ${holder.join()}")
+  report("one a host", one, server, 1)
+
+  // A closed client.
+  one.get(s"$base/a") match
+    Err(e) -> println(e.message.replace(server.port().toString(), "PORT"))
+    Ok(_) -> println("sent")
+  println(s"closed: ${counts(one.stats())}")
+
+  // Forty lightweight threads, five requests each, through one client of four connections a host.
+  val shared = Client(maxPerHost = 4)
+  val threads = Vector.tabulate(40, _ -> spawn(() -> Vector.tabulate(5, _ -> describe(shared.get(s"$base/a")))))
+  var answered = 0
+  for t in threads
+    for text in t.join()
+      if text == "200 GET 0" then answered += 1
+  val s = shared.stats()
+  println(
+    s"shared: $answered answered, ${s.opened <= 4} ${s.opened + s.reused} ${s.active} ${server.connections() <= 4}"
+  )
+  println(s"shared: live as kept ${settled(server, s.idle) == s.idle}")
+  shared.close()
+  println(s"shared: closed, live ${settled(server, 0)}")
+
+  // The module's own functions keep nothing.
+  println(describe(http.get(s"$base/a")))
+  println(s"one-shot: live ${settled(server, 0)}")
+  server.stop()

@@ -1,0 +1,87 @@
+// expect: exit 0
+// HTTP over a Unix socket: `http.serveUnix` answers requests at a path as `serve` does at a port, a
+// request's `remote` being `None`, connections kept alive between requests, and its limits holding.
+// `TcpServer.startUnix` serves each Unix connection in an actor of its own, which can ask who the
+// peer is; its `port()` is zero. The socket file stays once a server stops: binding it again is
+// `AlreadyExists`, and `replacing` takes it over.
+import avin.fs
+import avin.io.IoError
+import avin.net.{TcpServer, UnixStream}
+import avin.net.http
+import avin.net.http.{Response, ServerRequest}
+import avin.process
+import avin.threads.Channel
+
+ok[T](r: Result[T, IoError]) -> T = r match
+  Ok(v) -> v
+  Err(e) -> fail(e.message)
+
+echo(r: ServerRequest) -> Response = Response.text(200, s"${r.method} ${r.target} ${r.remote} ${r.body.length}")
+
+// The lines of the response to `request`, sent on a connection of its own that it closes.
+asked(path: string, request: string) -> Vector[string]
+  val c = ok(UnixStream.connect(path))
+  ok(c.writeText(request))
+  val all = string.fromUtf8Lossy(ok(c.readAll()))
+  _ = c.close()
+  all.split("\r\n")
+
+// The status line and the body of a response that closes its connection.
+answer(path: string, request: string) -> string
+  val lines = asked(path, request)
+  s"${lines(0)} | ${lines(lines.length - 1)}"
+
+main()
+  val dir = ok(fs.createTempDir("avh"))
+  val sock = dir + "/http"
+  val web = ok(http.serveUnix(sock, echo, date = false, maxBodyBytes = 4))
+  println("port", web.port())
+  println(answer(sock, "GET /a?b=c HTTP/1.1\r\nHost: here\r\nConnection: close\r\n\r\n"))
+  println(answer(sock, "POST /up HTTP/1.1\r\nHost: here\r\nContent-Length: 3\r\nConnection: close\r\n\r\nabc"))
+  println(answer(sock, "POST /big HTTP/1.1\r\nHost: here\r\nContent-Length: 5\r\nConnection: close\r\n\r\nabcde"))
+  println(answer(sock, "nonsense\r\n\r\n"))
+
+  // Two requests on one connection kept alive.
+  val c = ok(UnixStream.connect(sock))
+  ok(c.writeText("GET /one HTTP/1.1\r\nHost: here\r\n\r\n"))
+  var lines = Vector.empty[string]()
+  while true
+    ok(c.readLine()) match
+      Some(line) if line.isEmpty -> break
+      Some(line) -> lines = lines :+ line
+      None -> break
+  println("kept alive:", lines(0))
+  ok(c.writeText("GET /two HTTP/1.1\r\nHost: here\r\nConnection: close\r\n\r\n"))
+  val rest = string.fromUtf8Lossy(ok(c.readAll()))
+  println("then:", rest.contains("GET /two None 0"))
+  _ = c.close()
+  web.shutdown()
+
+  println("the socket file stays", fs.exists(sock))
+  println("bound again", http.serveUnix(sock, echo).isErr)
+  http.serveUnix(sock, echo) match
+    Err(e) -> println(e.kind)
+    Ok(_) -> ()
+  val again = ok(http.serveUnix(sock, echo, date = false, replacing = true, backlog = 4))
+  println("replaced:", answer(sock, "GET /again HTTP/1.1\r\nHost: here\r\nConnection: close\r\n\r\n"))
+  again.shutdown()
+  ok(fs.remove(sock))
+
+  // A plain server on a Unix socket, asking who its peer is.
+  val raw = dir + "/raw"
+  val seen = Channel[string]()
+  val server = ok(TcpServer.startUnix(raw, (s, _) ->
+    val who = ok(s.peerCredentials())
+    val same = who.user == process.userId() && who.process == Some(process.pid())
+    val line = ok(s.readLine()).getOrElse("nothing")
+    seen.send(s"$line from this program: $same"), maxConnections = 2))
+  println("port", server.port())
+  for word in ["one", "two", "three"]
+    val d = ok(UnixStream.connect(raw))
+    ok(d.writeText(word + "\n"))
+    println(seen.receive().getOrElse("nothing"))
+    _ = d.close()
+  server.shutdown()
+  println("a missing directory", TcpServer.startUnix(dir + "/no/such/s", (_, _) -> ()).isErr)
+  ok(fs.remove(raw))
+  ok(fs.removeDir(dir))

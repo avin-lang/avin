@@ -1,0 +1,175 @@
+module avin.net.http
+
+// Health routes and a graceful drain. A `Health` answers two questions a supervisor asks of a
+// server: whether it is alive (`/livez`) and whether it will take traffic (`/readyz`). Each answer is
+// built from named checks, run at once and each within a time of its own, and a plain text summary
+// of them, in full where the request asks `?verbose`. A program flips readiness itself, while it
+// starts and while it drains before it stops. `drain` and `drainOnSignal` stop a server in the order
+// a load balancer needs: not ready first, then no new connections, then the requests in flight
+// finish, within a deadline.
+
+import avin.io.IoError
+import avin.net.TcpServer
+import avin.signal
+import avin.threads.{Atomic, Promise, sleep, spawn}
+import avin.time.{Duration, millis, monotonic, seconds}
+
+// How a check ended: its name, `0` for passed, `1` for failed and `2` for timed out, and the reason
+// it gave, or the limit it passed.
+private data Outcome(name: string, state: int, reason: string)
+
+// One thing a health route looks at: a name for the summary, a probe that answers `Ok` where all is
+// well or `Err` with the reason it is not, and the time the probe may take. A probe that traps stops
+// the program, as any thread's trap does, so it answers its failures as `Err`. A probe still running
+// when its time has passed is reported as timed out and left to end on its own thread.
+class Check(
+    val name: string,
+    private val probe: @sendable () -> Result[unit, string],
+    val timeout: Duration = seconds(2)
+): Sendable
+  // Starts the probe on a thread of its own and answers a handle to wait for it by; `Health` runs
+  // checks by it.
+  start() -> Running
+    val done = Promise[Outcome]()
+    val n = name
+    val p = probe
+    spawn(() ->
+      val outcome = p() match
+        Ok(_) -> Outcome(n, 0, "")
+        Err(why) -> Outcome(n, 1, why)
+      done.tryComplete(outcome)
+      ())
+    Running(name, timeout, monotonic().micros, done)
+
+// A probe started: waits for it until its limit, counted from its start.
+private class Running(
+    private val name: string,
+    private val limit: Duration,
+    private val began: long,
+    private val done: Promise[Outcome]
+)
+  finish() -> Outcome
+    val left = limit.micros - (monotonic().micros - began)
+    val wait = if left < 0 then Duration.Zero else Duration(left)
+    done.future.await(wait) match
+      Some(o) -> o
+      None -> Outcome(name, 2, s"timed out after ${limit.micros / 1000}ms")
+
+// Runs every check at once and answers their outcomes in order.
+private runAll(checks: Vector[Check]) -> Vector[Outcome]
+  val started = checks.map(c -> c.start())
+  started.map(r -> r.finish())
+
+// The reason on one line and at most 200 characters, whatever the probe wrote.
+private tidy(reason: string) -> string
+  val flat = reason.replace("\r", " ").replace("\n", " ")
+  if flat.charCount > 200 then flat.slice(0, 200) + "..." else flat
+
+// A check for the summary's lines: a name is one line of printable characters.
+private checkName(name: string) -> string
+  if name.isEmpty then fail("a check named \"\": a name is at least one character")
+  if name.exists(c -> c < ' ' || c == '\u{7f}') then fail("a check's name holds a control character")
+  name
+
+// The summary's line for one outcome.
+private lineOf(o: Outcome) -> string = o.state match
+  0 -> s"[+] ${o.name} ok\n"
+  1 -> s"[-] ${o.name} failed: ${tidy(o.reason)}\n"
+  _ -> s"[-] ${o.name} ${o.reason}\n"
+
+// The health a server reports: liveness checks, readiness checks and the readiness switch. Made by
+// `health`. It may be shared between threads, any of which may flip readiness.
+class Health(
+    private val liveChecks: Vector[Check],
+    private val readyChecks: Vector[Check],
+    private val flag: Atomic[bool],
+    val livePath: string,
+    val readyPath: string
+): Sendable
+  // Whether the program has declared itself ready; the checks are asked besides.
+  isReady() -> bool = flag.load()
+
+  // Declares the program ready or not. Not ready answers `503` from the readiness route at once,
+  // without running its checks: what a program does while it starts and once it begins to stop.
+  setReady(ready: bool) = flag.store(ready)
+
+  // The liveness answer: `200` where every liveness check passes (none, by default: the process is
+  // answering), `503` otherwise. The summary is `ok` or `failed`; `?verbose` lists the checks.
+  live(request: ServerRequest) -> Response = summary(request, runAll(liveChecks))
+
+  // The readiness answer: `503` where the program is not ready, else `200` where every readiness
+  // check passes and `503` where one fails or times out. Verbose lists a program not ready as
+  // `[-] ready: not ready`.
+  ready(request: ServerRequest) -> Response
+    if flag.load() then summary(request, runAll(readyChecks))
+    else summary(request, Vector(Outcome("ready", 1, "not ready")))
+
+  // The two routes, `GET` at `livePath` and `readyPath`, for a router.
+  routes() -> Vector[Route] = [Route.get(livePath, r -> live(r)), Route.get(readyPath, r -> ready(r))]
+
+  private summary(request: ServerRequest, outcomes: Vector[Outcome]) -> Response
+    val passed = outcomes.forall(o -> o.state == 0)
+    val verbose = request.queryParams.exists(p -> p.0 == "verbose")
+    val last = if passed then "ok\n" else "failed\n"
+    val body = if verbose then outcomes.map(lineOf).mkString("") + last else last
+    Response.text(if passed then 200 else 503, body).withHeader("Cache-Control", "no-store")
+
+// A check named `name` that asks `probe` within `timeout`. A `name` that is empty or holds a control
+// character, or a `timeout` of zero or less, traps.
+check(name: string, probe: @sendable () -> Result[unit, string], timeout: Duration = seconds(2)) -> Check
+  if timeout.micros <= 0 then fail(s"a check with a timeout of $timeout: it is more than zero")
+  Check(checkName(name), probe, timeout)
+
+// Health routes over `ready` checks, which readiness runs, and `live` checks, which liveness runs.
+// The program starts ready unless `ready` is false. The paths are `/livez` and `/readyz` unless
+// given others; each begins with `/`, else this traps.
+health(
+    checks: Vector[Check] = Vector.empty[Check](),
+    live: Vector[Check] = Vector.empty[Check](),
+    ready: bool = true,
+    livePath: string = "/livez",
+    readyPath: string = "/readyz"
+) -> Health
+  if !livePath.startsWith("/") then fail(s"a live path of `$livePath`: it begins with `/`")
+  if !readyPath.startsWith("/") then fail(s"a ready path of `$readyPath`: it begins with `/`")
+  Health(live, checks, Atomic(ready), livePath, readyPath)
+
+// Stops `server` the way a load balancer wants: `health`, where given, stops being ready; after
+// `grace`, which lets the balancer see it, the server stops accepting; and the requests in flight are
+// given `deadline` to finish. Answers whether every connection had ended by then; where one has not,
+// it goes on running and the caller decides whether to end the program anyway. A connection idle
+// between two requests is ended at once.
+drain(
+    server: TcpServer,
+    health: Option[Health] = None,
+    deadline: Duration = seconds(30),
+    grace: Duration = Duration.Zero
+) -> bool
+  health match
+    Some(h) -> h.setReady(false)
+    None -> ()
+  if grace.micros > 0 then sleep(grace)
+  server.stop()
+  val ended = Promise[bool]()
+  spawn(() ->
+    server.join()
+    ended.tryComplete(true)
+    ())
+  ended.future.await(deadline).isDefined
+
+// Waits until one of `signals` arrives (`Terminate` and `Interrupt` by default) or the server is
+// stopped by other code, then `drain`s it. Answers whether the drain finished within `deadline`, or
+// the `IoError` of a signal that cannot be watched. While it waits the signals no longer end the
+// program.
+drainOnSignal(
+    server: TcpServer,
+    health: Option[Health] = None,
+    deadline: Duration = seconds(30),
+    grace: Duration = Duration.Zero,
+    signals: Vector[int] = [signal.Terminate, signal.Interrupt]
+) -> Result[bool, IoError]
+  var all = Vector.empty[signal.Watch]()
+  for s in signals
+    all = all :+ signal.watch(s)?
+  while !server.isStopping() && !all.exists(w -> w.take()) do sleep(millis(20))
+  Ok(drain(server, health, deadline, grace))

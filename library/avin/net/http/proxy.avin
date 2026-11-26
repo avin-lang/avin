@@ -1,0 +1,265 @@
+module avin.net.http
+
+// The proxies a `Client` sends its requests by. An `http` URL is asked of the proxy itself, the
+// request line naming the whole URL; an `https` URL goes through a tunnel the proxy opens with
+// `CONNECT`, the TLS handshake made with the server through it, so the proxy sees neither the request
+// nor the response.
+
+import avin.encoding.toBase64
+import avin.net.Url
+import avin.process
+
+// Which proxy a request goes by: `http` for an `http` URL and `https` for an `https` one, each a proxy
+// URL such as `http://proxy.internal:3128`, or `None` (or `""`) for no proxy; and `noProxy`, the hosts
+// reached directly whatever the URL's scheme. A proxy URL without a scheme is an `http` one, and its
+// port is `80` where it names none; a user and password in it (`http://user:secret@proxy:3128`,
+// each percent-encoded) are sent to the proxy as `Proxy-Authorization: Basic`, on every request for
+// an `http` URL and on the `CONNECT` for an `https` one. A proxy URL of another scheme, or one that is
+// not a URL, fails the request it would have carried with `Unsupported` or `BadUrl`, rather than
+// sending it directly.
+//
+// `noProxy` is a list of entries separated by commas or spaces, compared without regard to case:
+//
+// - `*` alone: every host;
+// - a host name, `example.com`, written also `.example.com` or `*.example.com`: that host and every
+//   host under it, `api.example.com` but not `badexample.com`;
+// - an IP address, `10.1.2.3` or `::1` (or `[::1]`), that address, and a network in CIDR notation,
+//   `10.0.0.0/8` or `fe80::/10`, every address in it;
+// - any of these but `*` with `:port` after it (`[::1]:8080` for IPv6): only that port.
+//
+// An entry matches the URL's host as it is written: a host name never matches an address entry, and
+// no name is looked up. An entry that is none of these is passed over.
+class Proxy(
+    val http: Option[string] = None,
+    val https: Option[string] = None,
+    val noProxy: string = ""
+): Sendable
+  private val exemptions: Vector[Exemption] = exemptionsOf(noProxy)
+
+  // The proxy URL a request to `url` goes by, as given, or `None` where it goes directly: where the
+  // scheme has no proxy, or `noProxy` names its host. A `url` that is not a URL goes directly.
+  forUrl(url: string) -> Option[string] = Url.parse(url) match
+    Ok(u) -> forUrl(u)
+    Err(_) -> None
+
+  // The proxy URL a request to `url` goes by, as given, or `None` where it goes directly.
+  forUrl(url: Url) -> Option[string]
+    val chosen = url.scheme match
+      "http" -> http
+      "https" -> https
+      _ -> None
+    chosen match
+      Some(p) -> if p.isEmpty || bypasses(url) then None else Some(p)
+      None -> None
+
+  // Whether `noProxy` names the host of `url`, which then goes directly.
+  bypasses(url: string) -> bool = Url.parse(url) match
+    Ok(u) -> bypasses(u)
+    Err(_) -> false
+
+  // Whether `noProxy` names the host of `url`, which then goes directly.
+  bypasses(url: Url) -> bool
+    val host = bareHost(url.host.getOrElse(""))
+    val port = url.portOrDefault.getOrElse(0)
+    val address = ipOf(host)
+    exemptions.exists(e -> exempts(e, host, address, port))
+
+object Proxy
+  // Every request, `http` and `https`, by the proxy at `url`, but those to the hosts `noProxy` names.
+  to(url: string, noProxy: string = "") -> Proxy = Proxy(Some(url), Some(url), noProxy)
+
+  // The proxies the process's environment names, as `fromEnvironment(lookup)` reads them from
+  // `process.env`.
+  fromEnvironment() -> Proxy = fromEnvironment(name -> process.env(name))
+
+  // The proxies the variables `lookup` answers name, as tools on the machine read them: `http` from
+  // `http_proxy`, else `HTTP_PROXY`; `https` from `https_proxy`, else `HTTPS_PROXY`; either, where
+  // those leave it unset, from `all_proxy`, else `ALL_PROXY`; and `noProxy` from `no_proxy`, else
+  // `NO_PROXY`. A variable set to `""` is unset. Where `REQUEST_METHOD` is set, the process is serving
+  // a request through CGI, which turns a request's `Proxy` header into `HTTP_PROXY`, and that one is
+  // not read.
+  fromEnvironment(lookup: (string) -> Option[string]) -> Proxy
+    val cgi = lookup("REQUEST_METHOD").isDefined
+    val all = setIn(lookup, "all_proxy").orElse(setIn(lookup, "ALL_PROXY"))
+    val http = setIn(lookup, "http_proxy").orElse(if cgi then None else setIn(lookup, "HTTP_PROXY")).orElse(all)
+    val https = setIn(lookup, "https_proxy").orElse(setIn(lookup, "HTTPS_PROXY")).orElse(all)
+    val noProxy = setIn(lookup, "no_proxy").orElse(setIn(lookup, "NO_PROXY")).getOrElse("")
+    Proxy(http, https, noProxy)
+
+// The value of `name`, where it is set and not empty.
+private setIn(lookup: (string) -> Option[string], name: string) -> Option[string] = lookup(name) match
+  Some(v) -> if v.trim.isEmpty then None else Some(v.trim)
+  None -> None
+
+// A proxy a connection is made to: its host, as a URL names it and as a connection does, its port,
+// its URL as text without the credentials, and the `Proxy-Authorization` its credentials make.
+private data ProxyRoute(host: string, address: string, port: int, text: string, authorization: Option[string])
+
+// The proxy the proxy URL `text` names.
+private routeOf(text: string) -> Result[ProxyRoute, HttpError]
+  val u = Url.parse(if text.contains("://") then text else "http://" + text).mapErr(e -> BadUrl(e))?
+  if u.scheme != "http" then return Err(
+    Unsupported(s"a proxy of the scheme `${u.scheme}`: a proxy is reached over `http`")
+  )
+  val host = u.host.getOrElse("")
+  if host.isEmpty then return Err(Unsupported(s"a proxy URL without a host: $text"))
+  val port = u.portOrDefault.getOrElse(80)
+  val authorization = u.userInfo match
+    Some(info) ->
+      val colon = info.indexOf(':')
+      val user = Url.decode(if colon < 0 then info else info.slice(0, colon)).mapErr(e -> BadUrl(e))?
+      val password = Url.decode(
+        if colon < 0 then "" else info.slice(colon + 1, info.byteLength)
+      ).mapErr(e -> BadUrl(e))?
+      Some("Basic " + toBase64(s"$user:$password"))
+    None -> None
+  Ok(ProxyRoute(host, addressOf(host), port, s"http://$host:$port", authorization))
+
+// One entry of a `noProxy` list.
+private data Exemption
+  // `*`: every host.
+  Everything
+  // A host name and the hosts under it, on `port` where it is not zero.
+  Named(name: string, port: int)
+  // The addresses whose first `bits` bits are those of `address` (4 octets, or 16 for IPv6), on
+  // `port` where it is not zero.
+  Network(address: Vector[int], bits: int, port: int)
+
+// The entries of the `noProxy` list `text`, those that are none passed over.
+private exemptionsOf(text: string) -> Vector[Exemption]
+  val out = Buffer[Exemption]()
+  for piece in text.replace("\t", ",").replace(" ", ",").split(',')
+    val entry = piece.trim.toLower
+    if entry == "*" then out.addOne(Everything)
+    elif !entry.isEmpty
+      exemptionOf(entry) match
+        Some(e) -> out.addOne(e)
+        None -> ()
+  out.toVector
+
+// The entry `text`, lower case and not empty, or `None` where it is not one.
+private exemptionOf(text: string) -> Option[Exemption]
+  val slash = text.indexOf('/')
+  if slash >= 0
+    val address = ipOf(bareHost(text.slice(0, slash)))
+    val bits = digitsValue(text.slice(slash + 1, text.byteLength))
+    return address match
+      Some(a) -> if 0 <= bits <= a.length * 8 then Some(Network(a, bits, 0)) else None
+      None -> None
+  // A host and port, the host an IPv6 address in brackets or one without a colon.
+  var host = text
+  var port = 0
+  if text.startsWith("[")
+    val close = text.indexOf(']')
+    if close < 0 then return None
+    host = text.slice(1, close)
+    val rest = text.slice(close + 1, text.byteLength)
+    if !rest.isEmpty
+      if !rest.startsWith(":") then return None
+      port = digitsValue(rest.slice(1, rest.byteLength))
+      if !(1 <= port <= 65535) then return None
+  elif text.count(c -> c == ':') == 1
+    val colon = text.indexOf(':')
+    host = text.slice(0, colon)
+    port = digitsValue(text.slice(colon + 1, text.byteLength))
+    if !(1 <= port <= 65535) then return None
+  ipOf(host) match
+    Some(a) -> return Some(Network(a, a.length * 8, port))
+    None -> ()
+  if host.indexOf(':') >= 0 || host.startsWith("[") then return None
+  var name = host
+  if name.startsWith("*.") then name = name.slice(2, name.byteLength)
+  elif name.startsWith(".") then name = name.slice(1, name.byteLength)
+  if name.endsWith(".") then name = name.slice(0, name.byteLength - 1)
+  if name.isEmpty || name.indexWhere(c -> c == '*' || c == '/' || c == '[' || c == ']') >= 0 then None
+  else Some(Named(name, port))
+
+// Whether `e` exempts a request to `host`, lower case and bare, which is the IP address `address`
+// where it is one, on `port`.
+private exempts(e: Exemption, host: string, address: Option[Vector[int]], port: int) -> bool = e match
+  Everything -> true
+  Named(name, p) ->
+    (p == 0 || p == port) && address.isEmpty && (host == name || host.endsWith("." + name))
+  Network(net, bits, p) ->
+    (p == 0 || p == port) && address.exists(a -> a.length == net.length && prefixMatches(a, net, bits))
+
+// Whether the first `bits` bits of `a` and `b` are the same.
+private prefixMatches(a: Vector[int], b: Vector[int], bits: int) -> bool
+  var left = bits
+  var i = 0
+  while left > 0
+    val take = if left >= 8 then 8 else left
+    val mask = (0xff << (8 - take)) & 0xff
+    if (a(i) & mask) != (b(i) & mask) then return false
+    left -= take
+    i += 1
+  true
+
+// A URL's host as an entry is matched against: lower case, without the brackets and zone of an IPv6
+// address or a trailing dot.
+private bareHost(host: string) -> string
+  var h = host.toLower
+  if h.startsWith("[") && h.endsWith("]") then h = h.slice(1, h.byteLength - 1)
+  val zone = h.indexOf('%')
+  if zone >= 0 then h = h.slice(0, zone)
+  if h.endsWith(".") then h = h.slice(0, h.byteLength - 1)
+  h
+
+// The value of a run of at most five ASCII digits, -1 for anything else.
+private digitsValue(text: string) -> int
+  if text.isEmpty || text.byteLength > 5 || !text.forall(c -> '0' <= c <= '9') then return -1
+  text.toInt()
+
+// The octets of the IPv4 or IPv6 address `text`, `None` where it is neither.
+private ipOf(text: string) -> Option[Vector[int]] = if text.indexOf(':') >= 0 then ipv6Of(text) else ipv4Of(text)
+
+// The four octets of a dotted decimal IPv4 address.
+private ipv4Of(text: string) -> Option[Vector[int]]
+  val parts = text.split('.')
+  if parts.length != 4 then return None
+  val out = Buffer[int]()
+  for p in parts
+    val n = if p.byteLength <= 3 then digitsValue(p) else -1
+    if !(0 <= n <= 255) then return None
+    out.addOne(n)
+  Some(out.toVector)
+
+// The sixteen octets of an IPv6 address: eight groups of hexadecimal digits, a run of zero groups
+// written `::` once at most, and the last two groups written as an IPv4 address where they are.
+private ipv6Of(text: string) -> Option[Vector[int]]
+  val gap = text.indexOf("::")
+  if gap >= 0 && text.indexOf("::", gap + 1) >= 0 then return None
+  val left = if gap < 0 then text else text.slice(0, gap)
+  val right = if gap < 0 then "" else text.slice(gap + 2, text.byteLength)
+  val head = groupsOf(left, gap < 0)?
+  val tail = groupsOf(right, true)?
+  val missing = 8 - head.length - tail.length
+  if (gap < 0 && missing != 0) || (gap >= 0 && missing < 1) then return None
+  val words = head ++ Vector.fill(if gap < 0 then 0 else missing, 0) ++ tail
+  val out = Buffer[int]()
+  for w in words
+    out.addOne(w >> 8)
+    out.addOne(w & 0xff)
+  Some(out.toVector)
+
+// The 16-bit groups of `text`, groups separated by `:`, its last two written as an IPv4 address where
+// `last` says it ends the address and it is.
+private groupsOf(text: string, last: bool) -> Option[Vector[int]]
+  if text.isEmpty then return Some(Vector.empty[int]())
+  val parts = text.split(':')
+  val out = Buffer[int]()
+  for i in 0 ..< parts.length
+    val p = parts(i)
+    if last && i == parts.length - 1 && p.indexOf('.') >= 0
+      val v4 = ipv4Of(p)?
+      out.addOne(v4(0) * 256 + v4(1))
+      out.addOne(v4(2) * 256 + v4(3))
+    else
+      if p.isEmpty || p.byteLength > 4 then return None
+      var n = 0
+      for c in p.chars
+        val d = hexDigit(c)
+        if d < 0 then return None
+        n = n * 16 + d
+      out.addOne(n)
+  Some(out.toVector)

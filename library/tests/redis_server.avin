@@ -1,0 +1,298 @@
+// `avin.net.redis` against a real `redis-server`, started by the test on a port of its own with a
+// directory of its own, and stopped at the end; where `redis-server` is not installed, each test says
+// so and passes. Every typed command against the server's real replies, in RESP3 and RESP2, binary
+// values, a long pipeline, transactions with WATCH, publish and subscribe, a scan over many keys, ACL
+// users, a pool shared by threads, and a connection the server kills, made again.
+
+import avin.fs
+import avin.fs.TempDir
+import avin.net.TcpListener
+
+import avin.net.redis.{
+  ExpiresIn, NoExpiry, NoKey, Number, Redis, RedisError, RedisOptions, ServerError, SimpleString, Subscriber, blobOf
+}
+
+import avin.process.{Child, Command}
+import avin.threads.{Atomic, scope, sleep}
+import avin.time.{millis, seconds}
+
+// A running `redis-server`: the process, its port and its directory.
+class RedisRunning(val child: Child, val port: int, val dir: TempDir)
+  stop()
+    child.kill()
+    _ = child.waitFor()
+    _ = dir.close()
+
+// A `redis-server` started on a free port, with `args` after its own, answering once it does; `None`
+// where there is no `redis-server` to start, which is said.
+redisStart(args: string*) -> Option[RedisRunning]
+  if !(Command("which", "redis-server").output() is Ok(_))
+    println(
+      "skipped: redis-server is not installed (`which redis-server` found none), so the tests against a real server did not run"
+    )
+    return None
+  val l = TcpListener.bind("127.0.0.1", 0).ok.get
+  val port = l.port()
+  _ = l.close()
+  val dir = fs.tempDir("avin-redis").ok.get
+  val child = Command(
+    "redis-server",
+    (
+      Vector(
+        "--port",
+        s"$port",
+        "--bind",
+        "127.0.0.1",
+        "--dir",
+        dir.path,
+        "--logfile",
+        dir.path + "/redis.log",
+        "--save",
+        "",
+        "--appendonly",
+        "no",
+        "--daemonize",
+        "no"
+      ) ++ args
+    )*
+  ).start().ok.get
+  for _ in 0 ..< 100
+    if Redis.connect("127.0.0.1", port, RedisOptions(reconnectAttempts = 0)) is Ok(r)
+      _ = r.close()
+      return Some(RedisRunning(child, port, dir))
+    sleep(millis(50))
+  child.kill()
+  _ = dir.close()
+  fail("redis-server did not start")
+
+realOk[T](r: Result[T, RedisError]) -> T = r match
+  Ok(v) -> v
+  Err(e) -> fail(s"unexpected Redis error: ${e.message}")
+
+realConnect(
+    s: RedisRunning,
+    options: RedisOptions = RedisOptions()
+) -> Redis = realOk(Redis.connect("127.0.0.1", s.port, options))
+
+// The typed commands against the server, the same answers over either protocol.
+realTyped(r: Redis)
+  assertEq(r.flushDb(), Ok(()))
+  assertEq(r.ping(), Ok("PONG"))
+  assertEq(r.get("missing"), Ok(None))
+  assertEq(r.set("k", "héllo 😀"), Ok(()))
+  assertEq(r.get("k"), Ok(Some("héllo 😀")))
+  assertEq(r.set("empty", ""), Ok(()))
+  assertEq(r.get("empty"), Ok(Some("")))
+  val every = Array.tabulate(256, i -> byte(i))
+  assertEq(r.set("bin", every), Ok(()))
+  assertEq(r.getBytes("bin").map(b -> b.map(x -> x.toArraySeq)), Ok(Some(every.toArraySeq)))
+  assertEq(r.getBytes("missing"), Ok(None))
+  // Bytes that are not UTF-8 are not text.
+  assert(r.get("bin").isErr)
+  val big = "z".repeat(5 * 1024 * 1024)
+  assertEq(r.set("big", big), Ok(()))
+  assertEq(r.get("big"), Ok(Some(big)))
+  assertEq(r.set("t", "v", seconds(100)), Ok(()))
+  val left = realOk(r.ttl("t"))
+  assert(left is ExpiresIn(d) && 90000000 < d.micros <= 100000000)
+  assertEq(r.ttl("k"), Ok(NoExpiry))
+  assertEq(r.ttl("missing"), Ok(NoKey))
+  assertEq(r.persist("t"), Ok(true))
+  assertEq(r.ttl("t"), Ok(NoExpiry))
+  assertEq(r.expire("t", seconds(50)), Ok(true))
+  assertEq(r.expire("missing", seconds(50)), Ok(false))
+  assertEq(r.set("short", "v", millis(30)), Ok(()))
+  sleep(millis(80))
+  assertEq(r.get("short"), Ok(None))
+  assertEq(r.setIfAbsent("nx", "1"), Ok(true))
+  assertEq(r.setIfAbsent("nx", "2", Some(seconds(5))), Ok(false))
+  assertEq(r.get("nx"), Ok(Some("1")))
+  assertEq(r.mset(("a", "1"), ("b", "2")), Ok(()))
+  assertEq(r.mget("a", "missing", "b"), Ok(Vector(Some("1"), None, Some("2"))))
+  assertEq(r.incr("n"), Ok(1))
+  assertEq(r.incrBy("n", 9), Ok(10))
+  assertEq(r.decr("n"), Ok(9))
+  assertEq(r.decrBy("n", 4), Ok(5))
+  assertEq(r.incrBy("n", long.MaxValue - 5), Ok(long.MaxValue))
+  assertEq(r.incr("n").err.map(e -> e is ServerError("ERR", _)), Some(true))
+  assertEq(r.incrByFloat("f", 1.5), Ok(1.5))
+  assertEq(r.incrByFloat("f", -0.25), Ok(1.25))
+  assertEq(r.append("s", "ab"), Ok(2))
+  assertEq(r.append("s", "cd"), Ok(4))
+  assertEq(r.exists("a", "a", "missing"), Ok(2))
+  assertEq(r.del("a", "b", "missing"), Ok(2))
+  assertEq(r.hset("h", ("f1", "1"), ("f2", "ü")), Ok(2))
+  assertEq(r.hset("h", ("f1", "one")), Ok(0))
+  assertEq(r.hget("h", "f1"), Ok(Some("one")))
+  assertEq(r.hget("h", "none"), Ok(None))
+  assertEq(r.hmget("h", "f2", "none"), Ok(Vector(Some("ü"), None)))
+  val all = realOk(r.hgetAll("h"))
+  assertEq(all.size, 2)
+  assertEq(all.get("f2"), Some("ü"))
+  assertEq(realOk(r.hgetAll("missing")).size, 0)
+  assertEq(r.hincrBy("h", "c", 5), Ok(5))
+  assertEq(r.hexists("h", "c"), Ok(true))
+  assertEq(r.hexists("h", "none"), Ok(false))
+  assertEq(r.hlen("h"), Ok(3))
+  assertEq(r.hdel("h", "c", "none"), Ok(1))
+  assertEq(r.rpush("l", "b", "c"), Ok(2))
+  assertEq(r.lpush("l", "a"), Ok(3))
+  assertEq(r.lrange("l", 0, -1), Ok(Vector("a", "b", "c")))
+  assertEq(r.lrange("l", -2, -1), Ok(Vector("b", "c")))
+  assertEq(r.llen("l"), Ok(3))
+  assertEq(r.lpop("l"), Ok(Some("a")))
+  assertEq(r.rpop("l"), Ok(Some("c")))
+  assertEq(r.lpop("missing"), Ok(None))
+  assertEq(r.sadd("set", "x", "y", "x"), Ok(2))
+  assertEq(r.sismember("set", "x"), Ok(true))
+  assertEq(r.sismember("set", "q"), Ok(false))
+  assertEq(r.scard("set"), Ok(2))
+  assertEq(realOk(r.smembers("set")).sorted, Vector("x", "y"))
+  assertEq(r.srem("set", "x", "q"), Ok(1))
+  assertEq(
+    r.zadd("z", (2.5, "b"), (1.0, "a"), (real.PositiveInfinity, "top"), (real.NegativeInfinity, "bottom")),
+    Ok(4)
+  )
+  assertEq(r.zrange("z", 0, -1), Ok(Vector("bottom", "a", "b", "top")))
+  assertEq(
+    r.zrangeWithScores("z", 0, -1),
+    Ok(Vector(("bottom", real.NegativeInfinity), ("a", 1.0), ("b", 2.5), ("top", real.PositiveInfinity)))
+  )
+  assertEq(r.zscore("z", "b"), Ok(Some(2.5)))
+  assertEq(r.zscore("z", "none"), Ok(None))
+  assertEq(r.zincrBy("z", 0.5, "a"), Ok(1.5))
+  assertEq(r.zrank("z", "b"), Ok(Some(2)))
+  assertEq(r.zrank("z", "none"), Ok(None))
+  assertEq(r.zrem("z", "top", "none"), Ok(1))
+  assertEq(r.zcard("z"), Ok(3))
+  // A command on a key of another type is the server's WRONGTYPE.
+  assertEq(r.get("h").err.map(e -> e is ServerError("WRONGTYPE", _)), Some(true))
+  assertEq(r.command("NOSUCHCOMMAND").err.map(e -> e is ServerError("ERR", _)), Some(true))
+  // Scans see every key, whatever the page size.
+  for i in 0 ..< 250 do assertEq(r.set(s"scan:$i", "v"), Ok(()))
+  var seen = Vector.empty[string]()
+  for k in r.scan("scan:*", 7) do seen = seen :+ k.ok.get
+  assertEq(seen.distinct.length, 250)
+  assertEq(r.hscan("h").toVector.map(x -> x.ok.get).sorted, Vector(("f1", "one"), ("f2", "ü")))
+  assertEq(r.sscan("set").toVector.map(x -> x.ok.get), Vector("y"))
+  assertEq(r.zscan("z").toVector.map(x -> x.ok.get), Vector(("bottom", real.NegativeInfinity), ("a", 1.5), ("b", 2.5)))
+  assertEq(r.dbSize().map(n -> n > 250), Ok(true))
+
+@test("the typed commands against a real server, in RESP3 and in RESP2")
+realServerTyped()
+  val s = redisStart() match
+    Some(running) -> running
+    None -> return
+  val r3 = realConnect(s)
+  assertEq(r3.protocol, 3)
+  realTyped(r3)
+  val r2 = realConnect(s, RedisOptions(protocol = 2, database = 1))
+  assertEq(r2.protocol, 2)
+  realTyped(r2)
+  // The two connections are in different databases.
+  assertEq(r3.get("k"), Ok(Some("héllo 😀")))
+  assertEq(r2.select(0), Ok(()))
+  assertEq(r3.flushDb(), Ok(()))
+  assertEq(r2.get("k"), Ok(None))
+  s.stop()
+
+@test("pipelines, transactions and WATCH against a real server")
+realServerPipelines()
+  val s = redisStart() match
+    Some(running) -> running
+    None -> return
+  val r = realConnect(s)
+  val replies = realOk(r.pipeline(p -> for i in 0 ..< 5000 do p.command("INCR", "counter")))
+  assertEq(replies.length, 5000)
+  assertEq(replies(4999), Ok(Number(5000)))
+  assertEq(
+    r.transaction(t ->
+      t.command("SET", "x", "1")
+      t.command("INCRBY", "x", "41")),
+    Ok(Some(Vector(Ok(SimpleString("OK")), Ok(Number(42)))))
+  )
+  assertEq(r.transaction(t -> t.command("NOSUCHCOMMAND")).err.map(e -> e is ServerError("EXECABORT", _)), Some(true))
+  val mixed = realOk(r.transaction(t ->
+    t.command("SET", "y", "v")
+    t.command("LPUSH", "y", "z"))).get
+  assertEq(mixed(0), Ok(SimpleString("OK")))
+  assert(mixed(1).isErr)
+  // A watched key another client changes: the transaction runs nothing.
+  val other = realConnect(s)
+  assertEq(r.watch("x"), Ok(()))
+  assertEq(other.set("x", "changed"), Ok(()))
+  assertEq(r.transaction(t -> t.command("SET", "x", "mine")), Ok(None))
+  assertEq(r.get("x"), Ok(Some("changed")))
+  assertEq(r.watch("x"), Ok(()))
+  assertEq(r.unwatch(), Ok(()))
+  assertEq(other.set("x", "again"), Ok(()))
+  assertEq(r.transaction(t -> t.command("SET", "x", "mine")), Ok(Some(Vector(Ok(SimpleString("OK"))))))
+  s.stop()
+
+@test("publish and subscribe against a real server, in RESP3 and in RESP2")
+realServerPubSub()
+  val s = redisStart() match
+    Some(running) -> running
+    None -> return
+  val r = realConnect(s)
+  for protocol in Vector(3, 2)
+    val sub = realOk(Subscriber.connect("127.0.0.1", s.port, RedisOptions(protocol = protocol)))
+    assertEq(sub.subscribe("news", "sport"), Ok(()))
+    assertEq(sub.psubscribe("w*"), Ok(()))
+    assertEq(r.publish("news", "first"), Ok(1))
+    assertEq(r.publish("weather", "rain ☂"), Ok(1))
+    assertEq(r.publish("nobody", "x"), Ok(0))
+    assertEq(realOk(sub.receive()).text, "first")
+    val w = realOk(sub.receive())
+    assertEq((w.channel, w.text, w.pattern), ("weather", "rain ☂", Some("w*")))
+    assertEq(sub.receive(millis(50)), Ok(None))
+    assertEq(sub.unsubscribe("news"), Ok(()))
+    sleep(millis(50))
+    assertEq(r.publish("news", "unheard"), Ok(0))
+    assertEq(r.publish("sport", "goal"), Ok(1))
+    assertEq(realOk(sub.receive()).text, "goal")
+    _ = sub.close()
+  s.stop()
+
+@test("ACL users and passwords, client names, and a connection the server kills, made again")
+realServerAuth()
+  val s = redisStart() match
+    Some(running) -> running
+    None -> return
+  val admin = realConnect(s, RedisOptions(clientName = Some("admin")))
+  assertEq(admin.command("CLIENT", "GETNAME"), Ok(blobOf("admin")))
+  assertEq(admin.command("ACL", "SETUSER", "alice", "on", ">s3cret", "~*", "+@all"), Ok(SimpleString("OK")))
+  val alice = realConnect(s, RedisOptions(username = Some("alice"), password = Some("s3cret")))
+  assertEq(alice.command("ACL", "WHOAMI"), Ok(blobOf("alice")))
+  assertEq(
+    Redis.connect("127.0.0.1", s.port, RedisOptions(username = Some("alice"), password = Some("wrong"))).err.map(e ->
+      e is ServerError("WRONGPASS", _)),
+    Some(true)
+  )
+  val alice2 = realConnect(s, RedisOptions(username = Some("alice"), password = Some("s3cret"), protocol = 2))
+  assertEq(alice2.command("ACL", "WHOAMI"), Ok(blobOf("alice")))
+  // The server kills the connection: the next command fails, and the one after runs on a new one.
+  val id = realOk(alice.command("CLIENT", "ID")).asLong.get
+  assertEq(admin.command("CLIENT", "KILL", "ID", s"$id"), Ok(Number(1)))
+  assert(alice.ping().isErr)
+  assertEq(alice.ping(), Ok("PONG"))
+  assertEq(alice.command("ACL", "WHOAMI"), Ok(blobOf("alice")))
+  s.stop()
+
+@test("a pool of connections shared by many threads against a real server")
+realServerPool()
+  val s = redisStart() match
+    Some(running) -> running
+    None -> return
+  val pool = Redis.pool("127.0.0.1", s.port, maxSize = 4)
+  val ok = Atomic(0)
+  scope(sc ->
+    for t in 0 ..< 16
+      sc.spawn(() ->
+        for i in 0 ..< 50
+          if pool.use(r -> r.incr("shared")) is Ok(Ok(_)) then _ = ok.add(1)))
+  assertEq(ok.load(), 800)
+  assertEq(pool.use(r -> r.get("shared")), Ok(Ok(Some("800"))))
+  assert(pool.stats().size <= 4)
+  pool.close()
+  s.stop()

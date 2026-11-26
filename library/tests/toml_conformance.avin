@@ -1,0 +1,233 @@
+// `avin.toml` against the TOML 1.0 cases of toml-test, the language's own conformance suite: every
+// valid document parses to the values its JSON file gives, and reads back to them again once written
+// by `render`; every invalid one is an error, never a trap.
+//
+// `tests/fixtures/toml-test` holds the files `files-toml-1.0.0` lists, from toml-test
+// (`https://github.com/toml-lang/toml-test`, commit 96fd088448ec0f4d9f061c730ed7854399c46faf), under
+// its MIT licence, which is beside them in `LICENSE`. Each valid case's JSON gives a table as an
+// object, an array as an array, and every other value as `{"type": …, "value": …}`, the value as text.
+
+import avin.fs
+import avin.toml
+import avin.toml.Toml
+
+private val root = "tests/fixtures/toml-test"
+
+// The files of the list whose path begins with `kind`, `valid/` or `invalid/`.
+private cases(kind: string) -> Vector[string]
+  val list = fs.readText(s"$root/files-toml-1.0.0") match
+    Ok(t) -> t
+    Err(e) -> fail(s"cannot read the list of cases: ${e.message}")
+  list.lines.filter(l -> l.startsWith(kind) && l.endsWith(".toml"))
+
+private readCase(path: string) -> Array[byte] = fs.readBytes(s"$root/$path") match
+  Ok(b) -> b
+  Err(e) -> fail(s"cannot read $path: ${e.message}")
+
+// A JSON value of the expected files: they hold only objects, arrays and strings.
+private data Expect
+  EStr(value: string)
+  EArr(items: Vector[Expect])
+  EObj(members: Vector[(string, Expect)])
+
+private class ExpectReader(text: string)
+  private var at = 0
+
+  private code() -> int = if at < text.byteLength then int(text.byteAt(at)) else -1
+
+  private skip()
+    while code() == int(' ') || code() == int('\n') || code() == int('\t') || code() == int('\r')
+      at += 1
+
+  read() -> Expect
+    skip()
+    val c = code()
+    if c == int('{')
+      at += 1
+      val members = Buffer[(string, Expect)]()
+      skip()
+      if code() == int('}')
+        at += 1
+        return EObj(members.toVector)
+      loop
+        skip()
+        val k = str()
+        skip()
+        at += 1
+        members.addOne((k, read()))
+        skip()
+        val d = code()
+        at += 1
+        if d == int('}') then return EObj(members.toVector)
+    if c == int('[')
+      at += 1
+      val items = Buffer[Expect]()
+      skip()
+      if code() == int(']')
+        at += 1
+        return EArr(items.toVector)
+      loop
+        items.addOne(read())
+        skip()
+        val d = code()
+        at += 1
+        if d == int(']') then return EArr(items.toVector)
+    EStr(str())
+
+  private hex(count: int) -> int
+    var v = 0
+    var k = 0
+    while k < count
+      val c = code()
+      v = v * 16 + (
+        if int(
+          '0'
+        ) <= c <= int(
+          '9'
+        ) then c - int('0') else if int('a') <= c <= int('f') then c - int('a') + 10 else c - int('A') + 10
+      )
+      at += 1
+      k += 1
+    v
+
+  private str() -> string
+    at += 1
+    val out = StringWriter()
+    loop
+      val c = code()
+      if c == int('"')
+        at += 1
+        return out.text
+      if c == int('\\')
+        at += 1
+        val e = code()
+        at += 1
+        if e == int('n') then out.writeChar('\n')
+        else if e == int('t') then out.writeChar('\t')
+        else if e == int('r') then out.writeChar('\r')
+        else if e == int('b') then out.writeChar('\u{8}')
+        else if e == int('f') then out.writeChar('\u{c}')
+        else if e == int('u')
+          var v = hex(4)
+          if 0xd800 <= v <= 0xdbff
+            at += 2
+            v = 0x10000 + ((v - 0xd800) << 10) + (hex(4) - 0xdc00)
+          out.writeChar(char(v))
+        else out.writeChar(char(e))
+      else
+        val ch = text.charAt(at)
+        out.writeChar(ch)
+        at += ch.toString().byteLength
+
+// The value `text` writes in TOML, as the expected file gives a float or a date-time: read by the
+// parser under test, the one way the formats agree.
+private scalar(text: string) -> Option[Toml] = toml.parse(s"v = $text").ok.flatMap(t -> t.get("v"))
+
+private sameFloat(x: real, y: real) -> bool = (x.isNaN && y.isNaN) || x == y
+
+// Where `actual` differs from `expected`, under the path `at`; None where it does not.
+private differs(expected: Expect, actual: Toml, at: string) -> Option[string]
+  expected match
+    EObj(members) ->
+      if members.length == 2 && members.exists(m -> m.0 == "type" && m.1 is EStr(_)) && members.exists(
+        m -> m.0 == "value" && m.1 is EStr(_)
+      )
+        val kind = members.find(m -> m.0 == "type").get.1
+        val text = members.find(m -> m.0 == "value").get.1
+        return (kind, text) match
+          (EStr(k), EStr(v)) -> scalarDiffers(k, v, actual, at)
+          _ -> Some(s"$at: a malformed expectation")
+      val got = actual match
+        Toml.Table(m) -> m
+        _ -> return Some(s"$at: expected a table, found ${actual.kind}")
+      if got.length != members.length then return Some(s"$at: expected ${members.length} keys, found ${got.length}")
+      for (k, e) in members
+        val a = actual.get(k) match
+          Some(a) -> a
+          None -> return Some(s"$at: the key \"$k\" is missing")
+        if differs(e, a, s"$at.$k") is Some(d) then return Some(d)
+      None
+    EArr(items) ->
+      val got = actual match
+        Toml.Arr(v) -> v
+        _ -> return Some(s"$at: expected an array, found ${actual.kind}")
+      if got.length != items.length then return Some(s"$at: expected ${items.length} elements, found ${got.length}")
+      var i = 0
+      while i < items.length
+        if differs(items(i), got(i), s"$at[$i]") is Some(d) then return Some(d)
+        i += 1
+      None
+    EStr(s) -> Some(s"$at: a bare string in the expectation")
+
+private scalarDiffers(kind: string, text: string, actual: Toml, at: string) -> Option[string]
+  val same = (kind, actual) match
+    ("string", Toml.Str(s)) -> s == text
+    ("integer", Toml.Integer(n)) -> s"$n" == text
+    ("bool", Toml.Bool(b)) -> (if b then "true" else "false") == text
+    ("float", Toml.Float(x)) ->
+      scalar(text) match
+        Some(Toml.Float(y)) -> sameFloat(x, y)
+        Some(Toml.Integer(n)) -> x == real(n)
+        _ -> false
+    ("datetime", Toml.OffsetDateTime(_)) -> scalar(text) == Some(actual)
+    ("datetime-local", Toml.LocalDateTime(_)) -> scalar(text) == Some(actual)
+    ("date-local", Toml.LocalDate(_)) -> scalar(text) == Some(actual)
+    ("time-local", Toml.LocalTime(_)) -> scalar(text) == Some(actual)
+    _ -> false
+  if same then None else Some(s"$at: expected the $kind $text, found ${actual.kind} $actual")
+
+@test("the comparison with an expected file tells a wrong value, kind, key or length from the right one")
+tomlTestComparisonCanFail()
+  val doc = toml.parse("a = 1\nb = [1.5, 'x']\n[t]\nd = 1979-05-27\n").ok.get
+  val right = "{\"a\": {\"type\": \"integer\", \"value\": \"1\"}, \"b\": [{\"type\": \"float\", \"value\": \"1.5\"}, {\"type\": \"string\", \"value\": \"x\"}], \"t\": {\"d\": {\"type\": \"date-local\", \"value\": \"1979-05-27\"}}}"
+  assertEq(differs(ExpectReader(right).read(), doc, ""), None)
+  for wrong in [
+    right.replace("\"1\"", "\"2\""),
+    right.replace("\"integer\"", "\"float\""),
+    right.replace("\"x\"", "\"y\""),
+    right.replace("1979-05-27", "1979-05-28"),
+    right.replace("\"d\"", "\"e\""),
+    right.replace(", {\"type\": \"string\", \"value\": \"x\"}", ""),
+    right.replace("\"1.5\"", "\"1.25\"")
+  ]
+    assert(differs(ExpectReader(wrong).read(), doc, "").isDefined)
+
+@test("every valid TOML 1.0 case of toml-test parses to the values its JSON file gives")
+tomlTestValid()
+  val failures = Buffer[string]()
+  val all = cases("valid/")
+  for path in all
+    val expected = fs.readText(s"$root/${path.stripSuffix(".toml")}.json") match
+      Ok(t) -> ExpectReader(t).read()
+      Err(e) -> fail(s"cannot read the expectation of $path: ${e.message}")
+    toml.parse(readCase(path)) match
+      Ok(doc) -> if differs(expected, doc, "") is Some(d) then failures.addOne(s"$path: $d")
+      Err(e) -> failures.addOne(s"$path: $e")
+  assertEq(failures.toVector, Vector.empty[string]())
+  assert(all.length >= 200)
+
+@test("every valid case written by render reads back to the same values")
+tomlTestValidRoundTrip()
+  val failures = Buffer[string]()
+  for path in cases("valid/")
+    val expected = fs.readText(s"$root/${path.stripSuffix(".toml")}.json") match
+      Ok(t) -> ExpectReader(t).read()
+      Err(e) -> fail(s"cannot read the expectation of $path: ${e.message}")
+    val doc = toml.parse(readCase(path)) match
+      Ok(d) -> d
+      Err(_) -> continue
+    toml.parse(doc.render) match
+      Ok(again) -> if differs(expected, again, "") is Some(d) then failures.addOne(s"$path: $d\n${doc.render}")
+      Err(e) -> failures.addOne(s"$path: $e\n${doc.render}")
+  assertEq(failures.toVector, Vector.empty[string]())
+
+@test("every invalid TOML 1.0 case of toml-test is an error with a line and a column")
+tomlTestInvalid()
+  val accepted = Buffer[string]()
+  val all = cases("invalid/")
+  for path in all
+    toml.parse(readCase(path)) match
+      Ok(doc) -> accepted.addOne(s"$path: accepted as ${doc.render}")
+      Err(e) -> if e.line < 1 || e.column < 1 then accepted.addOne(s"$path: no place in $e")
+  assertEq(accepted.toVector, Vector.empty[string]())
+  assert(all.length >= 500)

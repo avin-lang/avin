@@ -1,0 +1,207 @@
+// `avin.toml`'s derived encoding and decoding: a program's own types read from a document and written
+// back, every built-in type's form, the annotations, defaults and absent fields, the errors with the
+// path to the value at fault, and the round trip.
+
+import avin.toml
+import avin.toml.{Toml, TomlDecoder, TomlEncoder, TomlError, TomlKey, TomlOmit, TomlTag}
+import avin.time.{Date, DateTime, Instant, Time, Zoned, date, dateTime, epochSeconds, fixedZone, minutes, time, utc}
+
+data Database(host: string, port: int = 5432, user: Option[string] = None) derives TomlEncoder, TomlDecoder
+
+data Server(
+    name: string,
+    @TomlKey("listen-port") port: int,
+    ratio: real = 1.0,
+    debug: bool = false,
+    tags: Vector[string] = [],
+    db: Database = Database("localhost"),
+    replicas: List[Database] = [],
+    @TomlOmit secret: string = "unset"
+) derives TomlEncoder, TomlDecoder
+
+@TomlTag("kind")
+data Shape derives TomlEncoder, TomlDecoder
+  Circle(radius: real)
+  @TomlKey("rect") Rectangle(w: real, h: real)
+  Empty
+
+data Times(
+    at: Zoned,
+    when: Instant,
+    local: DateTime,
+    day: Date,
+    clock: Time
+) derives TomlEncoder, TomlDecoder
+
+data Counts(byName: HashMap[string, int], byId: TreeMap[long, string], big: long) derives TomlEncoder, TomlDecoder
+
+data Raw(extra: Toml, maybe: Option[Toml] = None) derives TomlEncoder, TomlDecoder
+
+class TomlPoint(val x: int, val y: int) derives TomlEncoder, TomlDecoder
+
+private decodeErr[A: TomlDecoder](text: string) -> string = toml.decode[A](text) match
+  Ok(_) -> "accepted"
+  Err(e) -> s"$e"
+
+@test("a document decodes into its type, absent fields taking their defaults and an Option None")
+codecDecode()
+  val text = "name = \"api\"\nlisten-port = 8080\ntags = [\"a\", \"b\"]\nratio = 2\n\n[db]\nhost = \"db.local\"\nuser = \"ann\"\n\n[[replicas]]\nhost = \"r1\"\n\n[[replicas]]\nhost = \"r2\"\nport = 6000\n"
+  val s = toml.decode[Server](text).ok.get
+  assertEq(s.name, "api")
+  assertEq(s.port, 8080)
+  assertEq(s.ratio, 2.0)
+  assertEq(s.debug, false)
+  assertEq(s.tags, ["a", "b"])
+  assertEq(s.db, Database("db.local", 5432, Some("ann")))
+  assertEq(s.replicas, [Database("r1"), Database("r2", 6000)])
+  assertEq(s.secret, "unset")
+  assertEq(toml.decode[Server]("name = 'x'\nlisten-port = 1\nsecret = 'given'\nunknown = 3\n").ok.get.secret, "unset")
+
+@test("a value encodes as a table of its fields, None left out, an omitted field not written")
+codecEncode()
+  val s = Server(
+    "api",
+    80,
+    tags = ["t"],
+    db = Database("h", user = Some("u")),
+    replicas = [Database("r")],
+    secret = "s"
+  )
+  assertEq(
+    toml.encode(s),
+    Ok(
+      "name = \"api\"\nlisten-port = 80\nratio = 1.0\ndebug = false\ntags = [\"t\"]\n\n[db]\nhost = \"h\"\nport = 5432\nuser = \"u\"\n\n[[replicas]]\nhost = \"r\"\nport = 5432\n"
+    )
+  )
+  assertEq(toml.encode(Database("h")), Ok("host = \"h\"\nport = 5432\n"))
+  assertEq(toml.toTree(TomlPoint(1, 2)), Ok(Toml.table(("x", Toml.num(1)), ("y", Toml.num(2)))))
+
+@test("every type a program declares reads back to the value it wrote")
+codecRoundTrip()
+  val servers = [
+    Server("a", 1),
+    Server(
+      "ü 名前 😀",
+      -1,
+      -0.5,
+      true,
+      ["", "x y", "\"q\"\n"],
+      Database("d", 0, Some("")),
+      [Database("r1"), Database("r2", 2, Some("u"))]
+    ),
+    Server("big", 2147483647, 1e300, false, [], Database("h"), [])
+  ]
+  for s in servers
+    assertEq(toml.decode[Server](toml.encode(s).ok.get), Ok(s))
+  for shape in [Circle(1.5), Rectangle(2.0, 3.0), Empty]
+    assertEq(toml.decode[Shape](toml.encode(shape).ok.get), Ok(shape))
+  val p = toml.decode[TomlPoint](toml.encode(TomlPoint(-3, 4)).ok.get).ok.get
+  assertEq((p.x, p.y), (-3, 4))
+  val at = Zoned(
+    dateTime(date(2024, 2, 29), time(23, 59, 59, 999999)),
+    minutes(long(-90)),
+    fixedZone(minutes(long(-90)))
+  )
+  val times = Times(
+    at,
+    epochSeconds(1700000000),
+    dateTime(date(1, 1, 1), time(0, 0)),
+    date(9999, 12, 31),
+    time(12, 0, 0, 1)
+  )
+  assertEq(toml.decode[Times](toml.encode(times).ok.get), Ok(times))
+  val counts = Counts(
+    HashMap.empty[string, int]().updated("a b", 1).updated("ж", -2),
+    TreeMap.empty[long, string]().updated(long(-5), "neg").updated(long(7), "x"),
+    long.MinValue
+  )
+  assertEq(toml.decode[Counts](toml.encode(counts).ok.get), Ok(counts))
+
+@test("a type of several variants carries its variant's name under its tag, written first")
+codecVariants()
+  assertEq(toml.encode(Circle(1.0)), Ok("kind = \"Circle\"\nradius = 1.0\n"))
+  assertEq(toml.encode(Rectangle(1.0, 2.0)), Ok("kind = \"rect\"\nw = 1.0\nh = 2.0\n"))
+  assertEq(toml.encode(Empty), Ok("kind = \"Empty\"\n"))
+  assertEq(toml.decode[Shape]("w = 1\nh = 2\nkind = 'rect'\n"), Ok(Rectangle(1.0, 2.0)))
+  assertEq(decodeErr[Shape]("radius = 1.0"), "missing \"kind\", naming the variant")
+  assertEq(decodeErr[Shape]("kind = 'Square'"), "kind: unknown variant \"Square\"")
+  assertEq(decodeErr[Shape]("kind = 1"), "kind: expected a string naming the variant, found an integer")
+  assertEq(decodeErr[Shape]("kind = 'Rectangle'\nw = 1\nh = 2"), "kind: unknown variant \"Rectangle\"")
+
+@test("a decoding error names the path to the value at fault and what was found there")
+codecErrors()
+  assertEq(decodeErr[Server]("listen-port = 1"), "missing field \"name\"")
+  assertEq(decodeErr[Server]("name = 1\nlisten-port = 1"), "name: expected a string, found an integer")
+  assertEq(decodeErr[Server]("name = 'x'\nport = 1"), "missing field \"listen-port\"")
+  assertEq(decodeErr[Server]("name = 'x'\nlisten-port = 3000000000"), "listen-port: 3000000000 does not fit an int")
+  assertEq(decodeErr[Server]("name = 'x'\nlisten-port = 1.0"), "listen-port: expected an integer, found a float")
+  assertEq(decodeErr[Server]("name = 'x'\nlisten-port = 1\ntags = 'a'"), "tags: expected an array, found a string")
+  assertEq(
+    decodeErr[Server]("name = 'x'\nlisten-port = 1\ntags = ['a', 2]"),
+    "tags[1]: expected a string, found an integer"
+  )
+  assertEq(decodeErr[Server]("name = 'x'\nlisten-port = 1\n[db]\nport = 1"), "db: missing field \"host\"")
+  assertEq(
+    decodeErr[Server]("name = 'x'\nlisten-port = 1\n[[replicas]]\nhost = 'a'\n[[replicas]]\nhost = 2"),
+    "replicas[1].host: expected a string, found an integer"
+  )
+  assertEq(decodeErr[Server]("name = 'x'\nlisten-port = 1\ndb = 3"), "db: expected a table, found an integer")
+  assertEq(decodeErr[Server]("name = 'x'\nlisten-port = 1\ndebug = 'yes'"), "debug: expected a boolean, found a string")
+  assertEq(decodeErr[Server]("name = 'x'\nlisten-port = 1\nratio = '1'"), "ratio: expected a float, found a string")
+  assertEq(decodeErr[Server]("name = = 1"), "'=' where a value was expected at line 1, column 8")
+  assertEq(decodeErr[Times]("at = 1979-05-27\n"), "at: expected an offset date-time, found a local date")
+  assertEq(
+    decodeErr[Counts]("big = 1\n[byName]\n[byId]\nx = 'y'"),
+    "byId.x: the key \"x\" is not a key of this map's type"
+  )
+  val e = toml.decode[Server]("name = 'x'\nlisten-port = 'p'").err.get
+  assertEq(e.line, long(0))
+  assertEq(e.pathText(), "listen-port")
+
+@test("encoding refuses a value that is no table, a None that is not a field's and a year TOML cannot write")
+codecEncodeErrors()
+  assertEq(toml.encode(5).err.map(e -> s"$e"), Some("a TOML document is a table, and this value is an integer"))
+  assertEq(
+    toml.encode([Database("h")]).err.map(e -> s"$e"),
+    Some("a TOML document is a table, and this value is an array")
+  )
+  assertEq(
+    toml.toTree([Some(1), None]).err.map(e -> s"$e"),
+    Some("[1]: TOML has no null, so a None is written only as a field, which is left out")
+  )
+  val far = Times(
+    Zoned(dateTime(date(10000, 1, 1), time(0, 0)), minutes(0), utc),
+    epochSeconds(0),
+    dateTime(date(1, 1, 1), time(0, 0)),
+    date(1, 1, 1),
+    time(0, 0)
+  )
+  assertEq(
+    toml.encode(far).err.map(e -> s"$e"),
+    Some("at: TOML writes the years 0 to 9999, and +10000-01-01 is outside them")
+  )
+  assertEq(toml.toTree(Some(3)), Ok(Toml.num(3)))
+
+@test("a Toml field holds any value as it is, and an Option of one is None where it is absent")
+codecRawValues()
+  val r = toml.decode[Raw]("extra = [1, 'two', { three = 3 }]").ok.get
+  assertEq(r.extra.size, 3)
+  assertEq(r.maybe, None)
+  assertEq(
+    toml.decode[Raw](toml.encode(Raw(Toml.table(("a", Toml.num(1))), Some(Toml.str("x")))).ok.get),
+    Ok(Raw(Toml.table(("a", Toml.num(1))), Some(Toml.str("x"))))
+  )
+
+@test("decode reads a part of a tree, and bytes, as it reads text")
+codecDecodeTree()
+  val doc = toml.parse("[servers.alpha]\nhost = 'a'\n[servers.beta]\nhost = 'b'\nport = 1\n").ok.get
+  assertEq(toml.decode[Database](doc.at(["servers", "beta"]).get), Ok(Database("b", 1)))
+  assertEq(toml.decode[HashMap[string, Database]](doc("servers")).map(m -> m.size), Ok(2))
+  assertEq(toml.decode[Database]("host = 'é'".bytes.toArray()), Ok(Database("é")))
+  assertEq(toml.decode[Database]("host = 'x'", maxDepth = 1), Ok(Database("x")))
+  assertEq(decodeErr[Database]("a.b.c = 1\nhost = 'x'").startsWith("accepted"), true)
+  assertEq(toml.decode[Database]("a.b = 1\nhost = 'x'", maxDepth = 1), Ok(Database("x")))
+  assertEq(
+    toml.decode[Database]("a.b.c = 1\nhost = 'x'", maxDepth = 1).err.map(e -> e.message),
+    Some("tables and arrays nested more than 1 deep")
+  )

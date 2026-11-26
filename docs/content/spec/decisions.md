@@ -1865,6 +1865,38 @@ their words are reserved.
   the walk for a type that cannot reach a handle).
   **Review with the user:** `Channel.send` walking each message to move handle ownership costs every
   channel; the compiler skipping the walk for types that cannot reach a handle is the mitigation.
+- Settled on the user's delegation 2026-11-24 (branch `file-threads`): **a channel's send puts what
+  its value reaches in transit, and a lock hands its value's handles on between bodies.** The send
+  half is the decision above, built: every way into a channel (`send`, its timed form, `trySend`, a
+  select's send arm, a hand-over on a channel of capacity zero) gives up the handles the value
+  reaches that the sending code owns before a receiver can see it, and the receiver takes them by
+  using them; a value a send did not deliver (a `trySend` answering `false`) is still the sender's,
+  who takes its handles back the same way. A `Mutex` or `RwLock` gives up its value's handles once
+  when it is made (the code that made the value may never use it) and again whenever a body ends,
+  `update` included, or waits on the mutex's condition (`wait`, `waitFor`, a select's arm), so
+  whichever thread holds the lock takes them by using them. A body only gives up what its own thread
+  owns, so two readers of an `RwLock` cannot share a handle: the second to use it traps. **Only the
+  handles a value's type shows are handed on**: the value is one, or its fields, a tuple's parts, a
+  data type's variants or a standard collection's type arguments are declared to show one; a
+  function value, `Any`, a trait, an open or abstract class, a union and a variant hiding types count
+  as showing none. This is decided per type where the program is compiled (`shows_handles`, the
+  threads' intrinsic beside the actors' `holds_handles`), so a channel or a lock of numbers,
+  strings, plain objects, callbacks or a trait's objects pays nothing. Why the narrower rule than a
+  send's: a lock is entered far more often than an actor is sent to, and the library's own registries
+  (every actor's core, the timers, the exit hooks) are locks of traits and functions — walking them
+  made a lock's every entry cost the whole registry, and ten thousand actors starting took longer
+  than the suite allows. A handle hidden in a closure a lock keeps traps at another thread's use, as
+  it did before (`file_mutex_hidden_trap.avin`). Why: the settled rule made a value inside a `Mutex` usable only by the code
+  that made it, contradicting what a mutex is for, and a connection or file sent on a channel trapped
+  at its receiver, so a server could not hand accepted connections to workers through a queue.
+  Alternatives weighed: claiming every handle for the thread taking the lock, whoever owns it (would
+  take a handle from a thread that got a sendable one out with `get()` and is using it, so two
+  threads could use one counted reference at once); handing over at the receive (the receiver cannot
+  take from the sender safely for the same reason); making the program call `handOff` itself (a step
+  every user of a lock or channel would have to remember, and a trap where one forgets).
+  **Review with the user:** a value in transit is taken by its first user, so a sender that uses a
+  handle again before the receiver does takes it back and the receiver traps, unlike an actor's send,
+  which hands it straight to the actor.
 - Settled on the user's delegation 2026-11-05: [Executors](/spec/threads/#executors) (2026-11-04): `Executor.fixed(n)` keeps at most `n` tasks
   working at once and starts its workers as work comes, as the shared pool does, a worker waiting in
   `await` or `blocking` leaving its place to another; `n` below one traps. After `shutdown()`,
@@ -1958,8 +1990,8 @@ their words are reserved.
     each can fail; `readAll()` is added beside `read` and `readLine`, and `TcpListener` has `close()`.
   - A read, write or `accept` after `close()` answers `Other("the connection is closed")` (or "the
     listener is closed") rather than trapping, as a closed handle's method does.
-  - A host that resolves to no address is `Other(s"no address found for $host")`, not `NotFound`,
-    whose message speaks of files. A port outside 0 to 65535, and `read(max)` with `max` below one,
+  - A host that resolves to no address is `HostNotFound` (`cannot resolve <host>: no address found
+    for the name`), the kind `lookup` answers too, not `NotFound`, whose message speaks of files. A port outside 0 to 65535, and `read(max)` with `max` below one,
     trap at the call, as a `Url`'s `withPort` does with a port it cannot hold.
   - `ConnectionReset` also covers a write to a connection the other end has closed (`EPIPE`).
   - `setTimeout` sets the read and the write limit together, in whole milliseconds rounded up; zero
@@ -4056,8 +4088,8 @@ spelling is better, as each entry says.
   library marks the types shared between owners `@keeps_owners` — `ActorRef`, `Timer`, `Future`,
   `Promise`, `Executor`, `Channel`, `Mutex`, `Condition`, `Once`, `Atomic`, `Thread`, `Scope` — and
   their type records carry the mark, at which every walk (a send, `spawn`, a thread's or a future's
-  body, completing a future) stops: their handles keep their owners, as a channel's values already
-  do. `Behaviour` is walked, since its start's captures are what the new actor owns. The mark is the
+  body, completing a future) stops: their handles keep their owners (a channel's values and a
+  lock's value are handed on by the channel's send and the lock's bodies, 2026-11-24). `Behaviour` is walked, since its start's captures are what the new actor owns. The mark is the
   standard library's alone. Alternatives weighed: a walk the compiler writes for each type (exact,
   but a collection's nodes are untyped to it); a marker trait instead of an annotation (visible to
   every program, which could then hide its own handles from a send).
@@ -4462,10 +4494,19 @@ spec did not settle, each settled on the user's delegation 2026-11-06. Review wi
   ALTERNATIVES: an `OpenMode` argument (one function, but a mode a program can get wrong at runtime
   and a longer call for the common case); only read, create and append (no way to overwrite part of a
   file).
-- Settled on the user's delegation 2026-11-06: **a `File` is not `Sendable`.** WHY: its Sysl handle belongs to the thread that opened it,
-  and a program that wants another thread to use a file opens it there; `TcpStream`'s hand-over
-  machinery buys nothing for a file a program can reopen. ALTERNATIVES: make it `Sendable` with the
-  owner check a `TcpStream` has. Review with the user if a file must move between actors.
+- Settled on the user's delegation 2026-11-24 (branch `file-threads`), replacing "a `File` is not
+  `Sendable`" of 2026-11-06: **a `File` is `Sendable`, and moves between threads as a `TcpStream`
+  does.** It keeps a runtime token named for it (`@sysl("avin.rt.Token", named: "File")`), and every
+  call, on an open file or a closed one, first checks it, so the code that handed the file over traps
+  with "`File` belongs to another thread" before any of the file's own fields (the bytes read ahead,
+  the closed flag) are read. WHY: the earlier rule made a file unusable from any thread but its
+  opener, even behind a `Mutex`, so the log's file sink reopened the file for every line (an open and
+  a close per line) and a server could not hand an open file to a worker; "reopen it there" is not
+  possible for an unlinked or `deleteOnClose` scratch file, and loses the position and read-ahead.
+  ALTERNATIVES weighed: keeping it unsendable and only letting a `Mutex` hand its handles on (fixes the
+  sink, but not a file handed to a worker or an actor); checking only the Sysl file's own handle
+  (a closed file has none, and the read-ahead bytes would be read before any check, as with the
+  connection before `thread-ownership`).
 - Settled on the user's delegation 2026-11-06: **seeking is from the start only, plus `seekToEnd()`; a negative offset is an `Err`, a
   seek past the end is allowed.** WHY: following a log needs "start at the end", and a tail needs
   absolute offsets, which `size()` gives; offsets back from the end are `size() - n`, with no second
@@ -5001,6 +5042,85 @@ spec did not settle, each settled on the user's delegation 2026-11-06. Review wi
   `avin.fs` offers no way to make a link to ask about); `setModified` omitted (Sysl has
   `set_modified`, so it costs a line, and it lets "last used" be recorded without writing).
   Times are microseconds, the library's resolution.
+
+- **Permission bits in `avin.fs`** Settled on the user's delegation 2026-11-23 (branch
+  `fs-permissions`): `Metadata` gains a fifth field, `permissions: int`, the twelve low bits of the
+  mode (the nine `rwx` with setuid, setgid and sticky; never the file type), read by the same one
+  `stat`; `permissions(path)` is its shorthand, as `size` and `modified` are; `setPermissions(path,
+  mode)` sets exactly `mode`, following a link. The mode is an `int` written as an octal literal
+  (`0o600`), which the lexer already reads. **A mode outside `0o0`..`0o7777` is an `Err`** of kind
+  `Other` naming it in octal (`a mode outside 0o0 to 0o7777: 0o10000`), raised before the path is
+  touched, so the file keeps its mode. Setuid, setgid and sticky are accepted, since `permissions`
+  reports them and the two must round trip; where a platform refuses one (macOS: sticky on a plain
+  file for a non-superuser) its error comes back as the platform's. Why: marshal's token file must
+  be owner-only, and the bits belong with the other facts one `stat` gives. Alternatives weighed:
+  a separate `Permissions` type with `ownerRead`-style accessors (more surface than one octal number,
+  which is how every reader already thinks of a mode; can come later over the same int); masking an
+  out-of-range mode silently to `0o7777`, as Sysl's `set_permissions` does (a type bit passed by
+  mistake, `0o100644` from a raw `st_mode`, would succeed quietly); trapping instead of `Err` (a mode
+  read from a config file is input, not a program bug; `File.seek`'s negative offset is the same
+  shape and answers `Err`). Creating a file with a mode from the start is the next entry.
+
+- **Creating files with a mode in `avin.fs`** Settled on the user's delegation 2026-11-24 (branch
+  `fs-create-mode`, on Sysl 0.13.4's `create(path, mode)`, `create_update(path, mode)` and
+  `File.set_permissions`): `create`, `createUpdate`, `writeLines`, `writeTextAtomic` and
+  `writeBytesAtomic` take a last optional `mode: int = 0o666`, the bits a new file is made with, which
+  the umask narrows as every new file is; a file already there keeps its mode. `File.setPermissions
+  (mode)` is `fchmod` on the open file. Both validate as `fs.setPermissions` does: outside `0o0`..
+  `0o7777` is an `Err` of kind `Other` raised before anything is touched (no file made or emptied,
+  no parents made). **An atomic write keeps the exact bits of the file it replaces** (`mode` applies
+  only where there was none): the pending file is made with those bits (so less the umask, never
+  more than the result), written and flushed, then `fchmod`ed to them exactly, since a write clears
+  setuid and setgid and the umask may have taken others. **After the rename the directory is synced**
+  (opened to read and `fsync`ed), so the rename survives a crash; a failure there is an `Err` with the
+  new contents already in place. Why: marshal's remote-API token must be owner-only from the moment
+  it exists, and an atomic rewrite of it must not widen it; the old atomic write gave the replacement
+  default bits. Alternatives weighed: chmod after create (the window the item exists to close); the
+  atomic write taking `mode` even over an existing file (a rewrite would silently change a file's
+  bits, and `writeText` already keeps them); creating the pending file `0o600` and chmod-ing it to
+  the target's bits (as safe, but making it with the target's own bits keeps one rule for the new
+  and the replacing case); ignoring a failed directory sync (the
+  point of the sync is that the caller learns the write may not survive). `writeText`, `writeBytes`,
+  `appendText`, `appendBytes` and `append` take no mode: Sysl's `write_bytes`, `write_text`, `append`
+  and the `append_*` calls take none, and building them on `create(path, mode)` plus a write would
+  report a failed large write as `Other` rather than its kind, since `File`'s latched failure is not
+  public in Sysl; that is a Sysl gap, closed there first. The umask cannot be read or set from Avin, so the tests measure
+  it by making a `0o777` file. Review with the user: the directory-sync failure answering `Err`
+  after the rename, and whether `appendText`/`writeText` should gain `mode` once Sysl offers it.
+
+- **`isFile` means a regular file** Settled on the user's delegation 2026-11-23 (branch
+  `fs-metadata`): `fs.isFile(path)` and `Metadata.isFile` are true for a regular file alone; a FIFO,
+  a socket and a character or block device now answer `false`, where before `isFile` was "exists and
+  is not a directory". Why: every caller in the library, marshal and fettle asks `isFile` before
+  reading, running or sizing a file, and a FIFO there blocks the read and a socket fails it; the
+  `evictOlderThan` example in the chapter would have removed another program's socket. Alternatives
+  weighed: keeping "not a directory" and adding `isRegular` (the common name would keep answering
+  the question no caller means). Review with the user: it changes behaviour, though no test,
+  example or caller found relied on the old meaning.
+
+- **Complete file metadata in `avin.fs`** Settled on the user's delegation 2026-11-23 (branch
+  `fs-metadata`): `Metadata` gains `kind: FileKind`, `accessed`, `changed` (both `Instant`),
+  `owner`, `group`, `links`, `inode` and `device` (all `long`), after its five existing fields, and
+  an `isLink` member; `linkMetadata(path)` reads a link itself; `exists(path, followLinks = true)`
+  asks about a dangling link with `followLinks = false`; `isSameFile(a, b) -> Result[bool, IoError]`
+  compares inode and device; `isReadable`/`isWritable` ask the platform's `access`; and
+  `avin.process` gains `userId()`, `groupId()` and `userName(id)`. `FileKind` is `Regular |
+  Directory | Symlink | Fifo | Socket | CharDevice | BlockDevice | UnknownKind(bits)`, named from
+  the type bits Sysl's `Meta.kind` reports (its `Special(bits)` split into the four POSIX kinds).
+  Why: walking safely, de-duplicating and copying with attributes need the kind, identity and owner
+  of an entry, and they come from the one `stat` already made. Choices: **ids are `long`**, since a
+  user id is unsigned 32-bit and macOS's `nobody` is `4294967294`; inode and device are `long`
+  wrapped from 64 bits, compared, never done arithmetic on. **`Regular` rather than `File`**: `File`
+  is the open-file class of the same module, and a variant is a module-level name. **`isSameFile`
+  is a `Result`**, not `false` for a missing path, since "no such file" is not "a different file".
+  **`exists` takes a named flag** rather than a second name (`existsNoFollow`), as the copy options
+  will. **`isReadable` answers for the user who started the program** (`access(2)`'s real ids), and
+  the superuser is `true` whatever the bits. **Owner names are user names only**, in
+  `avin.process`: Sysl 0.13.2 has `user_name` and no group-name lookup, so `groupName` is left out
+  until it does. Alternatives weighed: a separate `LinkMetadata` type (the fields are the same); a
+  `Permissions`-style object for ids (one number is what every reader thinks in); `accessed` left
+  out because some file systems do not record reads (it is still right after `setModified`, and the
+  chapter says which do not).
 
 - Settled on the user's delegation 2026-11-08 (branch `runner-streaming`): **`avin test` pushes its report out as it goes, and on SIGTERM or
   SIGINT writes out what it holds and names the work in progress.** The report text of a run is
@@ -10748,8 +10868,1311 @@ Settled on the user's delegation 2026-11-11 (built on branch `json-derive`): **J
     whether one second is the right interval, and whether a program should be able to ask for a
     release (a collection) itself, since without one a program that drops a burst and then
     allocates little keeps its pages until enough allocation brings a collection.
+- Settled on the user's delegation 2026-11-23 (branch `http-request-timeout`): **`http.serve`
+  bounds the whole of a request** ([servers](/spec/system-library/#servers)) by `requestTimeout`,
+  60 seconds unless asked, measured from the request's first byte and covering its line, headers
+  and body, chunked or of a length; once spent, the next wait for bytes is answered `408` and the
+  connection closed, freeing its slot among `maxConnections`. *Why*: `readTimeout` bounds each wait
+  alone, so a client sending a byte every few seconds held a connection, and a slot, for ever.
+  - **Each request has its own bound**, begun when its first byte is read; on a connection kept
+    alive the idle wait before it is `idleTimeout`'s and no part of it, and a connection's wait for
+    its first byte stays `readTimeout`'s. A wait is cut to what is left of the bound, so the `408`
+    comes at about the bound and not at the next `readTimeout`. Bytes already read ahead
+    (pipelining) are parsed without a wait, so the bound costs a clock reading per wait only.
+  - **Zero is no limit**, as for the other timeouts; a negative bound traps where the server
+    starts, as a negative `maxBodyBytes` does (a negative timeout is a mistake, not a wish).
+  - **The parameter comes last**, after `errors`, so no call passing the earlier ones by position
+    changes meaning.
+  - **A refusal's drain is bounded in time too**: after a refusal the server read and dropped
+    what the client still sent, each read waiting half a second, up to 1 MiB, so a client trickling
+    on after its `408` kept the connection for as long as it liked. The drain now lasts half a
+    second in all.
+  - Alternatives weighed: a header bound alone (as some servers keep apart from a body's) leaves a
+    trickled body open; a minimum data rate is harder to state and to test; 30 seconds (as
+    `readTimeout`) or 300 seconds for the default. Review with the user: whether 60 seconds suits
+    as the default, since a slow client uploading the default largest body of 1 MiB needs about
+    17 KB/s, and a server taking larger bodies has to raise it; and whether a TLS handshake, whose
+    waits are each `readTimeout`'s, should get a total bound too (it did: the next entry).
+- Settled on the user's delegation 2026-11-23 (branch `tls-handshake-timeout`): **a TLS handshake
+  has a total bound, at both ends, and a client's connecting with it**
+  ([servers](/spec/system-library/#servers), [TLS](/spec/system-library/#tls)). *Why*: each of a
+  handshake's waits was bounded by the connection's limit alone, so a client trickling its
+  ClientHello a byte at a time just inside `readTimeout` held an HTTPS connection, and its slot among
+  `maxConnections`, for ever, as a plain request could before `requestTimeout`; and a client facing
+  a server that trickled its answer, or a resolver that never answered, waited as long.
+  - **`http.serve` takes a separate `handshakeTimeout`, 10 seconds unless asked**, measured from the
+    connection's acceptance (so a client silent from the start is cut by it too), each wait cut to
+    what is left and still at most `readTimeout`. On expiry the connection is closed unanswered, as
+    no HTTP answer can reach a client before TLS is set up, and its slot is freed. Reusing
+    `requestTimeout` was weighed: it is sized for bodies (60 seconds, a 1 MiB upload), while a
+    handshake is a few round trips of a few KB, and a slot held a minute by each trickler is what
+    the bound is there to prevent. It comes last among `serve`'s parameters, after
+    `requestTimeout`, so no call passing earlier ones by position changes meaning. Zero is no limit,
+    a negative one traps where the server starts, with or without `tls`, as `requestTimeout` does.
+  - **`TlsStream.client` and `TlsStream.server` take `timeout`, zero unless asked**: their caller
+    made the connection and owns its timing, and a library default there would change every existing
+    caller's behaviour; `http.serve`, the HTTP client and `WebSocket.connect` pass their own bounds.
+    The connection's own limit is put back after the handshake, done or not, and an expiry is
+    `Transport` of kind `TimedOut`, as a wait running out was.
+  - **`TlsStream.connect` takes `timeout`, 30 seconds unless asked**, covering the lookup, the
+    connecting and the handshake together, so the one call that makes the whole connection has a
+    safe default. **`TcpStream.connect` takes `timeout`, zero unless asked**, covering the lookup
+    and the connecting: the runtime's `socket_connect` and `resolve_host` take a limit, a lookup
+    running out being abandoned as a cancelled one is. Zero there leaves the waits to the system's
+    own limits, which are finite, as before.
+  - **The HTTP client's `Request` gains `connectTimeout`, 30 seconds unless asked**
+    (`withConnectTimeout`), covering the lookup, the connecting and an `https` URL's handshake on
+    each connection it makes, an expiry being `Io` of kind `TimedOut`; the per-wait `timeout` stays
+    `None` unless asked, as before. **`WebSocket.connect`'s `timeout`** (30 seconds) now also
+    bounds its lookup, connecting and `wss://` handshake in all, and a negative one traps.
+  - Alternatives weighed: a minimum data rate for the handshake, harder to state and to test;
+    bounding from the ClientHello's first byte, as `requestTimeout` does from a request's, which
+    would leave a silent client to `readTimeout`; a 30-second server default (as `readTimeout`).
+    Review with the user: whether 10 seconds suits as the server default for clients on slow
+    links, and whether `TcpStream.connect`'s default should be a bound rather than zero.
+
+- Settled on the user's delegation 2026-11-24 (branch `net-socket-options`): **socket options are
+  values, given at `connect` and `bind` and changed on the connection**
+  ([socket options](/spec/system-library/#socket-options)). `TcpOptions(noDelay, keepAlive,
+  sendBuffer, receiveBuffer)` and `KeepAlive(idle, interval, count)` are `data`; `connect` takes
+  `options` as a later parameter with a default, `TcpListener.bind` takes a `ListenOptions(backlog,
+  reuseAddress, reusePort, connections)`, and every connection has a setter and a getter for each
+  option, the getter reading the system's value back. *Why*: an options value is one thing to pass
+  through `TcpServer.start` and `http.serve` (`listen`) and to keep as a constant, so a server's
+  defaults have a name (`http.ServerListen`); a later named parameter keeps `connect(host, port)`
+  and the `timeout` parameter another branch adds both compatible; reading back says what the
+  system granted, which for buffers is not what was asked.
+  - **Defaults are the system's for a bare connection** (no `TCP_NODELAY`, no keep-alive, the
+    system's buffers), so `TcpStream` changes nothing a program did not ask for. **HTTP turns
+    `noDelay` and keep-alive on**: a response goes out in pieces (head, body, chunks) that a client
+    waits on whole, so holding a small piece back only adds latency; keep-alive (60 s idle, every
+    10 s, 6 probes: a dead peer found within two minutes) because a WebSocket or an event stream
+    is never ended by `idleTimeout`. Review with the user: the keep-alive timing, and whether a
+    bare `TcpStream` should default `noDelay` on as well, which several server stacks do.
+  - **`reuseAddress` stays on by default** for listeners, as before (a restart must not wait out
+    `TIME_WAIT`), and can now be turned off; **`reusePort` is off** and set only where asked, so
+    a platform without it fails only the listeners that ask for it. `backlog` defaults to 128,
+    `SOMAXCONN` on both hosted platforms.
+  - **Keep-alive times are whole seconds**, rounded up, since the system keeps seconds; a duration
+    of zero or less, fewer than one probe, a negative buffer size in options, a buffer of less than
+    one byte asked directly or a backlog less than one **trap**, as a negative timeout does: they are
+    mistakes, not wishes. A value past a platform's own limit (Linux takes at most 127 probes) is the
+    system's `Err`, not a limit Avin restates.
+  - **A listener's `connections` options are set on every accepted connection** (buffer sizes on
+    the listener too, before it listens, so a large receive window is agreed from the first byte):
+    which options an accepted socket inherits from its listener differs by platform, so setting
+    them explicitly is the only portable meaning. Plain options cost no system call.
+  - Alternatives weighed: setters alone, with no options value (a server then needs a callback to
+    configure each accepted connection); a builder; `Option[int]` for the buffer sizes rather than
+    zero for the system's (zero is never a valid size, and it matches the timeouts' zero for none);
+    validating `KeepAlive` when it is made (data has no checked constructor; the check runs where
+    the options are used, before any lookup).
+
+- Settled on the user's delegation 2026-11-24 (branch `net-socket-options`): **servers listen on
+  Unix sockets too, through a `Listener[S]` trait.** `TcpServer.startUnix(path, serve, …, backlog,
+  replacing)` and `http.serveUnix(path, handler, …)` serve at a socket path, for a server a proxy on
+  the same machine talks to; `TcpListener` and `UnixListener` are each a `Listener[S: ByteStream]`
+  (`accept`, `close`), and the server's acceptor and connection actor are generic over it. The
+  handle stays a `TcpServer`, its `port()` zero for a Unix socket. `serveUnix` takes no `tls` (a
+  connection that never leaves the machine), and its requests' `remote` is `None`. `UnixStream`
+  gains `peerCredentials()` (user, group and process id as the system vouches for them, through a
+  runtime shim widening the ids to `long`), and `UnixListener.bind` a `backlog`.
+  *Why*: serving HTTP behind nginx or a sidecar over a Unix socket is common, and peer credentials
+  are how such a server authenticates a local client without a password. Alternatives weighed:
+  renaming `TcpServer` to `Server` (clearer, but breaks every caller; review with the user
+  whether to rename while the library is young); a `serve` overload taking any listener (it would
+  have to repeat every parameter too, and binding stays the server's to do).
+  - **Not built here, each blocked on Sysl 0.13.5's `sysl.net`**: `IPV6_V6ONLY` (dual-stack
+    control) and binding several addresses, which on Linux needs `IPV6_V6ONLY` to bind `::` beside
+    `0.0.0.0`; and `sendfile` for file responses. `sysl.net.Socket` has neither option nor call; they
+    are Sysl findings.
+- Settled on the user's delegation 2026-11-24 (branch `http-client-pool`): **the HTTP client keeps
+  its connections, streams responses and follows redirects by their status**
+  ([client](/spec/system-library/#client)). *Why*: the client wrote `Connection: close` and made a
+  connection, and for `https` a TLS handshake, for every request, read every body whole with no
+  limit, and followed redirects of `GET` and `HEAD` alone, so a `POST` answered `303` stopped there.
+  - **A `Client` class holds the connections, per origin, and the module's functions stay one
+    connection a request** (a `Client(keepAlive = false, maxRedirects = 5, maxResponseBytes =
+    long.MaxValue)` made for each call), so code calling `http.get` keeps its behaviour, its
+    `Connection: close` among it, and a program that talks to a server again and again makes one
+    `Client` and shares it between its threads. A module-level shared client was weighed: it would
+    be module-level mutable state every caller reaches, idle connections no one can close, and
+    limits no one chose.
+  - **The pool is the client's own, a `Mutex` over each origin's kept connections and counts, not
+    `threads.Pool`.** A `Pool`'s body is `@isolating` and gives back a sendable value, so it could
+    capture neither the request's `Array[byte]` body nor give back a `Response`; a per-origin `Pool`
+    in a map was weighed and refused for that. The client hands a connection's handles over, as
+    `Pool` does, when it keeps it (`hand_over` to no owner), so a connection one thread made is
+    used by the next thread that borrows it. Kept connections are a stack per origin, the latest
+    back used first, so a quiet period lets the older ones pass their idle timeout.
+  - **Limits and their defaults**: `maxPerHost = 16` connections an origin, lent and kept together;
+    `idleTimeout = 30 s`; `maxLifetime = 10 min`, so an address that changes is looked up again;
+    `maxRedirects = 10`; `maxHeaderBytes = 64 KiB` for the status line and headers, and the
+    trailers; `maxResponseBytes = 64 MiB` for a body `send` reads whole, checked against a
+    `Content-Length` before reading. The wait for a place among an origin's connections is bounded
+    by the request's existing `connectTimeout` (from branch `tls-handshake-timeout`), not a new
+    timeout: it is part of getting a connection, which that limit already bounds.
+  - **`Request.totalTimeout`**, none unless asked (`withTotalTimeout`), bounds the whole request,
+    redirects, reading the body and a `stream` function included, by `threads.withTimeout`, so a
+    connection stopped in the middle is closed by the exchange's deferred return. A wall-clock
+    deadline argument on `send` was weighed; a field keeps the request one value, carried across
+    redirects, beside its other two timeouts.
+  - **Reuse only after a clean exchange**: `HTTP/1.1`, no `Connection: close` from either end, the
+    body framed by length or chunks (not both, not to the close) and read to its end, nothing after
+    it. A body left partly read closes its connection rather than being drained, so a large
+    download abandoned costs nothing more; a redirect's body alone is drained, up to 64 KiB. A kept
+    connection that is readable (closed by the server, or holding bytes nothing asked for) is
+    closed before use; a request on a kept connection that fails before any response byte, other
+    than by a timeout, is sent once more on a new one where its method is idempotent (RFC 9110
+    9.2.2: `GET`, `HEAD`, `OPTIONS`, `TRACE`, `PUT`, `DELETE`). Retrying any method was weighed and
+    refused: a `POST` may have been acted on.
+  - **Streaming is scoped**: `client.stream(request, f)` hands `f` a `StreamedResponse` whose `body`
+    is a `ResponseBodyReader`, an `avin.io.Reader`, and keeps or closes the connection when `f` returns. A
+    response returned with a body still open, to be closed by its caller, was weighed and refused:
+    a forgotten one leaks a connection and its place among the origin's. Request bodies stay
+    `Array[byte]`; a streamed upload is left for later.
+  - **Redirects by status (RFC 9110 15.4)**: `303` becomes `GET` (a `HEAD` stays a `HEAD`); `301`
+    and `302` turn only a `POST` into a `GET`, as every browser does; `307` and `308` repeat method
+    and body. A request turned into a `GET` drops its body and its `Content-*` and
+    `Transfer-Encoding` headers. A redirect to another origin (scheme, host or port) drops
+    `Authorization`, `Proxy-Authorization`, `Cookie` and a given `Host`. Past the limit the redirect
+    is the answer, as the module's functions already did, rather than an error. This changes the
+    module's functions too: a `POST` answered `301` or `302` is now followed as a `GET`.
+  - **The response is parsed strictly**, the client being the side that meets a hostile server:
+    folded header lines, header names that are not tokens, a `Content-Length` that is not digits or
+    says two lengths, and over-long lines are errors; a new `HttpError.TooLarge(text)` names a
+    reply over a limit. A connection's TLS settings are part of its origin's key (the trusted PEMs
+    as text, the protocols offered in their order and the versions allowed), so a connection made trusting one authority is never lent to a request trusting
+    another.
+  - Review with the user: the defaults (16 a host, 30 s idle, 10 min lifetime, 64 MiB bodies), and
+    following a `POST`'s `301`/`302` as a `GET` in the module's functions, which changed what
+    `net_http` printed. A key for `TlsClient` must grow with any setting it gains (client
+    certificates, ALPN).
+  - **The response's reader is `ResponseBodyReader`**, since `BodyReader` in the same module reads
+    a streamed request's body (branch `http-request-stream`). Alternatives weighed: one
+    `BodyReader` for both ends (their framing, limits and connection hand-back differ, and the
+    server's answers a refusal the client's has no use for);
+    renaming the server's (its `ServerRequest.bodyReader()` reads naturally with it). Review with
+    the user: the name.
+- Settled on the user's delegation 2026-11-24 (branch `http-hardening`): **`http.serve` is
+  hardened against a hostile client** ([servers](/spec/system-library/#http-server), its
+  Hardening table), every limit with a default, after a review that played each attack against a
+  real server over TCP.
+  - **`headerTimeout`, 10 seconds**, bounds a request's line and headers. *Why*: `requestTimeout`
+    (60 s) covers a body too, so a slowloris trickling headers held a slot for a minute, and with
+    `requestTimeout = 0` for ever. For a connection's first request it counts from the
+    connection's acceptance, so a client that connects and never sends is closed at 10 s rather
+    than at `readTimeout`'s 30; for a later one from its first byte, the idle wait being
+    `idleTimeout`'s. Zero is no limit; negative traps. Alternatives weighed: counting from the first
+    byte always (a silent connection then holds its slot for `readTimeout`); a minimum data rate
+    (harder to state and to test); folding it into `requestTimeout` (a long upload would need a
+    long header bound too).
+  - **`maxHeaders`, 100 header lines**, else `431`. *Why*: `maxHeaderBytes` alone let 4,000 tiny
+    headers through, each a tuple and two strings to hold and to search. Less than one traps
+    (HTTP/1.1 needs `Host`). Alternatives: no count (the byte bound alone); 50 or 128.
+  - **Strict line framing**: a line ends in `\r\n` only; a bare `\n`, a bare `\r`, or any control
+    character but a tab (NUL, DEL, ESC) in a line is `400`, and a tab in the request line too.
+    This reverses the earlier leniency, which passed a bare `\n` as a line end, as RFC 9112
+    section 2.2 allows. *Why*: a proxy in front that frames by `\r\n` and this server framing by
+    `\n` read one byte stream as different requests, which is how requests are smuggled; and a NUL
+    or bare `\r` in a value reached the handler. The RFC lets a server refuse either. Alternative:
+    replace a bare `\r` with a space, as the RFC also allows (it still hides the client's error).
+  - **`Transfer-Encoding` in HTTP/1.0, or in more than one field line, is `400`** (RFC 9112
+    section 6.1 says the first is faulty framing). The second was a real smuggling hole: the
+    server read only the first line, so `chunked` then `gzip` was read as chunked while a reader
+    joining the lines saw `gzip` last. Alternative: join the lines as one list (then `chunked,
+    gzip` is refused by the coding rule); refusing is simpler and no client sends two.
+  - **The header byte bound counts line ends exactly**: the request line and headers, with their
+    `\r\n`s, may fill `maxHeaderBytes` exactly; before, the last two bytes could not be used.
+  - **No new bound on connections or pipelining**: `maxConnections` (1024) already holds the
+    excess unaccepted in the listener's backlog, which costs the server nothing, rather than
+    accepting and answering `503` (which costs a thread and a write per refused client, under
+    exactly the flood it guards against); a connection's requests are read one at a time with
+    8 KiB read ahead, so pipelining has one request in flight and `writeTimeout` closes a client
+    that never reads. Review with the user: whether `writeTimeout`, which bounds each wait and not
+    a whole response, should gain a whole-response bound or a minimum rate, since a client reading
+    a byte every few seconds holds a connection for as long as a large response lasts.
+
+- Settled on the user's delegation 2026-11-24 (branch `http-client-extras`): **the HTTP client's
+  cookie jar, proxies and `Authorization` helpers** ([client](/spec/system-library/#client)).
+  *Why*: a client talking to a site that logs in by cookie, or from behind a corporate proxy, had to
+  carry cookies and write `CONNECT` itself, and basic authentication was a base64 call by hand.
+  - **A `CookieJar` is opt in, `Client(cookies = Some(jar))`**, never a client's default: a server
+    calling other services should not carry one caller's session into another's request by
+    accident. One jar may serve several clients and threads (a `Mutex` over its list). A jar per
+    client made by default was weighed and refused for that reason.
+  - **RFC 6265bis storage**, reusing `SetCookie.parse` from branch `http-cookies`, so a cookie the
+    server side would refuse to write (a `__Host-` one with a `Domain`, `SameSite=None` without
+    `Secure`, a value with a space) is not stored either; a lenient parser of its own, taking what
+    browsers take, was weighed and refused as a second set of cookie rules. Kept by name, domain,
+    host-only-ness and path; `Max-Age` over `Expires`, both cut to 400 days as 6265bis says; an
+    `http` URL may neither set a `Secure` cookie nor replace or shadow one ("leave secure cookies
+    alone"); the time from an injected `clock`, as `RateLimiter` and `DateHeader` take theirs.
+  - **No public-suffix list.** The jar refuses a `Domain` of one label unless it is the host (which
+    then gets a host-only cookie), and an IP address is a domain only to itself. A suffix of two
+    labels or more (`co.uk`, `github.io`) is not caught, so a host under one may set a cookie for
+    its siblings. Bundling the list (some 10,000 rules, changing monthly) was weighed and left out:
+    it would date with every release, and a client usually talks to a few known services. Review
+    with the user: whether to bundle it, or take one from a file.
+  - **`HttpOnly` and `SameSite` are stored, not enforced**: they guard a page's scripts and its
+    cross-site requests, and a client has neither, so every matching cookie is sent. Ports are not
+    told apart, as RFC 6265 says.
+  - **Limits, with eviction**: 4096 bytes of name and value a cookie, 50 a domain and 3000 in all
+    (6265bis's minimums for a browser); over a limit an expired cookie goes first, then the least
+    recently sent or stored. Refusing the new cookie instead was weighed and refused: a server that
+    sets many short-lived cookies would lock its newest out.
+  - **`Proxy(http, https, noProxy)` is opt in too, `Client(proxy = …)`; `Proxy.fromEnvironment()`
+    reads the environment only when called.** A client reading `HTTP_PROXY` by default was weighed:
+    it is what many command-line tools do, but in a server it lets the environment redirect every
+    outgoing request, and under CGI a request's `Proxy` header becomes `HTTP_PROXY` ("httpoxy"), so
+    `fromEnvironment` also skips `HTTP_PROXY` where `REQUEST_METHOD` is set. Lower case wins over
+    upper case, then `ALL_PROXY`, as tools on the machine read them. Review with the user: whether
+    the default should be the environment.
+  - **`http` by the proxy with an absolute target; `https` through `CONNECT`**, the TLS handshake
+    with the server inside the tunnel, so the proxy sees nothing of the exchange. Only `http://`
+    proxies: a proxy URL of `https://` (TLS to the proxy) or `socks5://` fails the request with
+    `Unsupported`, as does a bad proxy URL with `BadUrl`, rather than going directly, which would
+    leak around a proxy the program asked for. A proxy URL without a scheme is `http`, and its port
+    defaults to 80, the scheme's. Credentials in the proxy URL (percent-decoded) are sent as
+    `Proxy-Authorization: Basic`; a refused `CONNECT` is the new `HttpError.ProxyRefused(status,
+    reason)`, while a `407` for an `http` URL is a response like any other status.
+  - **Pooled connections through a proxy are keyed by the proxy's URL and credentials and the
+    origin**, so a tunnel is never lent to another origin and one client's credentials never reach
+    a connection made with others'. Sharing one plain connection to a proxy across origins was
+    weighed and left out: it saves little and mixes origins on one connection.
+  - **`NO_PROXY` matching**: `*`; names matching themselves and every host under them, a leading `.`
+    or `*.` meaning the same; IP addresses and CIDR networks for both families; an optional `:port`
+    on any entry; entries separated by commas or white space; an entry that is none passed over. A
+    host is matched as written, never resolved, so a name never matches an address entry. A leading
+    `.` matching only the hosts under a name, not the name, was weighed; the tools on the machine
+    disagree, and the wider match only sends more requests directly.
+  - **`Request.withBasicAuth(user, password)` and `withBearer(token)`** replace any `Authorization`
+    and so are dropped on a redirect to another origin by the rule from branch `http-client-pool`.
+    A `user` with `:` or a control character in either part traps (RFC 7617 has no way to write
+    them), and a bearer token must be a `token68` (RFC 6750), or it traps; accepting any header
+    value was weighed and refused, as such a token would not reach a server intact.
+
+- Settled on the user's delegation 2026-11-23 (branch `http-forms`): **form bodies in
+  `avin.net.http`** ([HTTP server](/spec/system-library/#http-server)): `ServerRequest.form()`
+  and `Request.withForm` for `application/x-www-form-urlencoded`, `ServerRequest.multipart(limits)`,
+  `Multipart.parse`, `Multipart.encoded` and `Request.withMultipart` for `multipart/form-data`.
+  - **One urlencoded codec, `Url.formDecode` and `Url.formEncode`**, which `queryParams` now reads
+    through, so a query and a form body decode alike (WHATWG URL's parser and serializer). Decoding
+    is strict where WHATWG is lenient: a malformed `%` escape or bytes that are not UTF-8 are an
+    error (`BadEncoding(UrlError)`, `400`) rather than kept or replaced by U+FFFD, since a silently
+    altered field is worse for a server than a refusal. A `charset` parameter is ignored; the body
+    is read as UTF-8, as WHATWG reads every form. The serializer escapes `~` as WHATWG does, so
+    `formEncode` differs from `Url.encode` there.
+  - **A wrong or missing `Content-Type` is an error (`NotAForm`, `415`)**, never an empty form.
+    `form()` and `multipart()` are methods with parentheses, since each parses the body anew.
+  - **Multipart is read strictly by RFC 2046 lines**: CRLF only (a body of bare line feeds has no
+    delimiter); a delimiter followed by anything but `--` or optional spaces/tabs and CRLF is body
+    content, so binary bytes resembling the boundary stay in the part; a body without the closing
+    delimiter is `BadMultipart`; a body of no parts (`--b--`) is an empty `Multipart`. Every part
+    needs `Content-Disposition: form-data` with a `name` (RFC 7578 §4.2); a part's type defaults
+    to `text/plain` (§4.4). Header lines must be `token: value` in UTF-8; folded lines are refused.
+  - **Names and filenames are read as the WHATWG HTML standard writes them**: a quoted value runs
+    to the next `"`, and `%22`, `%0D`, `%0A` become `"`, CR, LF; there is no backslash escaping
+    (browsers send Windows paths with raw backslashes). The builder writes the same way, so the
+    round trip is exact. A `boundary` in the `Content-Type` is read as an RFC 9110 parameter
+    (quoted-pair escapes honoured) and must be 1–70 `bchars` not ending in a space (`NoBoundary`).
+  - **`filename*` (RFC 5987) in UTF-8 or ISO-8859-1 is preferred to `filename`**, as RFC 6266
+    prefers it; one in another charset or malformed is ignored (falling back to `filename`, or no
+    filename). RFC 7578 says senders should not use it, so the builder never writes it.
+  - **Filenames are untrusted and nothing writes them to disk**: `Part.filename` is the sender's
+    text as given, documented so; the library offers no "save upload" helper that could use it.
+  - **Limits, `MultipartLimits(maxParts = 1000, maxHeaderBytes = 8192, maxBytes = 10485760)`**:
+    a part count (`TooManyParts`), the bytes of one part's header block (`PartHeadersTooLarge`)
+    and the whole body (`FormTooLarge`), each `413`. The body is first bounded by the server's own
+    `maxBodyBytes` (1 MiB by default), so `maxBytes` binds only where a program raises that; it is
+    there so a streaming reader can enforce the same limits. 1000 parts follows common server
+    defaults for form fields and files.
+  - **Streaming is a later addition, not a change**: request bodies are buffered today, so `parse`
+    takes the whole body; a streaming reader will be a separate entry point (a reader yielding
+    each part's head and then its body as a stream) beside `Multipart.parse`, sharing
+    `MultipartLimits`, `FormError` and the header and disposition readers, so nothing here changes
+    shape when it comes.
+  - The client: `withMultipart(form)` uses `Multipart.newBoundary()` (`avin-` and 32 hex digits
+    from `SecureRandom`); `withMultipart(form, boundary)` and `encoded(boundary)` trap on a boundary
+    RFC 2046 refuses or one a part's body holds. Both builders replace any `Content-Type` the
+    request had. `Request.header(name)` was added beside `Response.header`.
+  - Alternatives weighed: lenient urlencoded decoding as WHATWG (silent corruption); accepting LF
+    line ends in multipart (looser than the RFC, invites ambiguity with binary bodies); RFC 9110
+    backslash escapes in disposition values (mangles Windows paths browsers send); refusing a
+    malformed `filename*` (one bad optional parameter failing a whole upload); a `form` returning a
+    plain vector like `queryParams` (a `Form` with `value`/`values` reads better in handlers, and
+    `pairs` keeps the vector). Review with the user: the default limits, and whether a `formAs[T]`
+    mirroring `queryAs[T]` is wanted.
+
+- Settled on the user's delegation 2026-11-24 (branch `http-request-stream`): **streamed request
+  bodies on the server** ([system library](/spec/system-library/#http-server), *Streamed request
+  bodies*).
+  - **The opt-in is the route's, told to the server by a predicate**: `route.streaming()` marks a
+    route, and `serve(…, streamsBody: @sendable (ServerRequest) -> bool = bufferedBodies)` is asked
+    of each request once its head is read, `router.streamsBody` answering for the route `handle`
+    would choose. *Why*: the server must decide before it reads the body, and a `Handler` is a
+    function the server cannot look into; a predicate keeps `Handler`, middleware and every existing
+    `serve` call as they were, and lets a program without a `Router` decide by method or path.
+    *Alternatives*: a lazily read `body` (the buffered path's `413`/`400` would turn into traps or
+    silent failures inside handlers); a second handler type (middleware written twice); a `serve`
+    overload taking a `Router` (thirteen parameters repeated, and it would bind `serve` to
+    `Router`); one server-wide switch (every route would lose the buffered body). Review with the
+    user: forgetting `streamsBody = router.streamsBody` leaves a streaming route reading a buffered
+    body within `maxBodyBytes`, which works but is not what was asked.
+  - **`BodyReader` is an `io.Reader`**, its failures `IoError`s, so `json.decode`, a file copy or a
+    `MultipartReader` reads an upload as it arrives. *Alternatives*: a reader of its own error type
+    (no reuse by any `Reader` consumer).
+  - **The limit is the handler's, per request**: `bodyReader(maxBytes = 104857600)`, counted over the
+    whole body, in place of `maxBodyBytes`, which keeps bounding the routes that did not ask. *Why*:
+    the route that opts in is the one that knows how large its uploads are; 100 MiB is a finite
+    default for code that has asked for large bodies. *Alternatives*: a server-wide
+    `maxStreamedBodyBytes` (one more knob, and still the wrong size for most routes); no default
+    limit (unbounded by default). Review with the user: the 100 MiB default.
+  - **`100 Continue` is sent at the first read, and only where the length fits**, so a handler
+    refusing a request (authentication, a type it does not take) never invites the body. RFC 9110
+    lets a server answer without it.
+  - **A failed body is answered by the server, in place of the handler's response**: `413`, `400`,
+    `431` or `408` through the error page, as the buffered path answers, the connection closed; a
+    client gone closes it unanswered. *Why*: the handler cannot go on with a broken body, the
+    connection's framing is lost, and one place answers these the same way for both paths.
+    *Alternatives*: the handler answers (each would have to map `IoError`s to statuses, and a `200`
+    sent after a framing error would be wrong).
+  - **`requestTimeout` covers the whole request, the handler's time between reads included**, as it
+    bounds a buffered request from its first byte. A slow consumer (a proxy) raises it.
+    *Alternatives*: pausing the budget while the handler runs (a client could be held open by a slow
+    handler indefinitely).
+  - **A body left unread is dropped if at most 64 KiB is left, else the connection is closed** after
+    the response, gently (shut, then read and drop for half a second), as is one whose client waits
+    for a `100 Continue` it was never sent and one under a streamed response (whose write function
+    may still read it). *Why*: the next request on the connection must never be read out of a body;
+    64 KiB keeps the connection for handlers that refuse small bodies without reading them, and stops
+    a server reading a large upload nobody wants. *Alternatives*: always closing (loses keep-alive for
+    every early refusal); always draining (a server reads gigabytes to throw away).
+  - **A streamed request's `body` is empty**, `bodyStreamed` saying why, rather than trapping, so
+    middleware that logs a body's size runs unchanged. A request with no source (made by a program,
+    or on a route that did not ask) answers a `bodyReader` over its buffered body, each reader from
+    its start, so a handler written for a stream serves both.
+  - **Multipart streams as the forms decision planned**: `MultipartReader` (`next()` → `PartHead`,
+    `read(max)`, `readAll()`) beside `Multipart.parse`, sharing `MultipartLimits`, `FormError` and the
+    head and disposition readers (`partHeadOf`), over any `io.Reader`, `request.multipartReader`
+    passing `bodyReader(limits.maxBytes)`. Every multipart case of the forms tests is read by both,
+    at source pieces of 1, 2, 3, 5, 64 and 65536 bytes, and must agree. Where they may differ, by
+    design: a fault is named where it is read (a malformed body with two faults may be refused for
+    the other one); the epilogue past the closing delimiter is not read, so not counted against
+    `maxBytes`; a delimiter's line may carry at most 1024 spaces and tabs (beyond that,
+    `BadMultipart`), so a hostile run of padding cannot make the reader hold or rescan it without
+    bound. A source failure is the new `FormError.BodyUnreadable(IoError)`, `400`. *Alternatives*: a
+    callback per part (inverts control; a handler cannot stop between parts); a part body as an
+    `io.Reader` (its failures would have to be `IoError`s, losing `FormError`'s statuses).
+
+- Settled on the user's delegation 2026-11-23 (branch `avin-log`): **`avin.log`, structured logging
+  in the standard library** ([system library](/spec/system-library/#avinlog)).
+  - **The central API: a `Sendable` class `Logger`, reached as a given.** The record functions
+    `trace` … `error(message, fields)` are a logger's methods and also module functions taking
+    `using logger: Logger = DefaultLogger`; a program declares a given at its module's top level, and
+    a request's handler a `child` as a given of its own block. **There is no global logger to set**:
+    the default is a fixed `val` (`Info`, text, standard error), and configuration is a given, so no
+    module-level mutable state exists and a test's logger can never leak into another's. Alternatives
+    weighed: a given only, with no default (every library function logging would demand one of every
+    caller); a settable global default (mutable shared state, and two configurations racing in a
+    test run); a logger passed explicitly everywhere (what contextual parameters exist to remove).
+    Review with the user: the central API, the name of the module functions (`log.info(…)` reads
+    well, but `debug` and `error` imported by name hide the prelude's `debug` of a value and read
+    like the `Error` trait), and whether a settable process-wide default is wanted after all.
+  - **Laziness by by-name parameters.** The message (`-> string`) and the fields
+    (`-> Vector[Field]`) are by-name, so a record below the threshold evaluates neither; the
+    threshold is one `Level` comparison. Measured at `-O2`, 10 million disabled `debug` calls with an
+    interpolated message and two fields take about 17 ns each beside 0.4 ns for the bare loop, and
+    2.8 ns each behind `if logger.enabled(Level.Debug)`: the difference is the two delayed
+    arguments' closures being made, which the by-name chapter's representation says live on the
+    caller's stack where they cannot escape. Alternatives: a closure parameter `() -> string`
+    (heavier to write at every call), a string built always (the cost a disabled record must not
+    pay), a macro (the language has none).
+  - **A field is `(string, Any)`**: any value can be written without conversion, a number and a
+    `bool` keep their kind in JSON and anything else is its `Display`. An `Option` is not unwrapped:
+    a type pattern cannot match an `Option` of any element type held in an `Any` (`Option[_]` is
+    refused as an open constructor), so a field not known is left out (the access log leaves out an
+    unknown length or address). Alternatives: a union of the JSON kinds (every other value converted
+    by hand at the call); a `LogValue` trait (an impl for every type a program logs).
+  - **A logger's own fields are rendered when it is made**, in its format, and held as text, which
+    keeps the logger `Sendable` (an `Any` is not) and makes a child free per record. A key written
+    twice, by a child and a record, is written twice rather than replaced.
+  - **Text lines**: RFC 3339 time (`Instant`'s display), the upper-case level padded to five
+    columns, the message with its control characters escaped, then `key=value` with a value or key
+    quoted as a JSON string where it is empty or holds a space, a control character, `"`, `=` or `\`.
+    Colour paints only the level's name, only where `colour` is asked and the sink takes it (the
+    standard sinks: a terminal, `NO_COLOR` unset, `TERM` not `dumb`, through `sysl.posix.tty`).
+  - **Sinks** are a `Sendable` `Sink(write, colours)` called once a line with its `\n`, so one call
+    is one write and lines never interleave, as `println` keeps them. A line that cannot be written
+    is dropped: logging never stops the program it reports on.
+  - Settled on the user's delegation 2026-11-24 (branch `file-threads`), replacing a file opened for
+    each line: **the file sink keeps one `File` open in a `Mutex`**, writing and flushing each line,
+    so a line is one write and is in the file when the record's call returns. **At most once every
+    `recheck` (default one second) it compares the device and inode `path` names with the file it
+    opened**, and opens `path` again where a rotator moved the file away or put another there, keeping
+    the open file where the new open fails; a `recheck` of zero or less looks before every line.
+    Why: an open and a close per line cost two system calls and a path lookup per record, and the
+    reopen-per-line had been forced by the file's thread ownership, which a `Mutex` now hands on
+    ("a channel's send puts what its value reaches in transit, and a lock hands its value's handles
+    on", 2026-11-24). Alternatives weighed: reopening per line (as before; correct but slow); never looking
+    again, with a `reopen()` for the program to call on a signal (a sink then needs a handle the
+    program keeps, and a rotator that does not signal leaves the log writing into a moved file for
+    ever); a writer thread owning the file behind a channel (a thread to start and stop, and lines
+    not yet written when the call returns). Review with the user: the one-second default, and that a
+    rotation is noticed only by the next line after it.
+  - **The HTTP access log** gains an overload `accessLog(logger, clock, ids)`, writing an `Info`
+    record `request` with its fields; the sink form is unchanged.
+- **File conveniences in `avin.fs` (branch `fs-conveniences`).** Settled on the user's delegation
+  2026-11-23: `readLines`/`lines`/`writeLines`, `writeTextAtomic`/`writeBytesAtomic`, a
+  `createParents = false` argument on every write, `removeAll` and `removeIfExists`.
+  - Lines end at `\n` or `\r\n`; the last line needs no terminator; a final terminator ends the
+    last line rather than starting an empty one (so an empty file has no lines). `writeLines` always
+    writes `\n`, so a file it writes ends in a newline.
+  - `lines(file)` answers `Result[Lines, IoError]`: an open failure is immediate, a read failure
+    mid-stream is the last item. `Lines` is an iterator and an `io.Close`. The file closes when the
+    iterator is exhausted or fails; an early stop is `close()` (`defer`), and a forgotten one is
+    closed by the collector like any `File`. Alternatives weighed: closing on garbage collection
+    alone (descriptors held for an unbounded time); a callback form `withLines(file, f)` (does not
+    compose with iterator adapters).
+  - `createParents` is a default argument rather than twin functions, since the language has
+    default arguments; the default is `false`, so existing calls are unchanged.
+  - Atomic writes: a uniquely named file beside the target (its name from the system layer, unique
+    per call and per process), written, `fsync`ed, closed, and renamed over the target; any failure
+    removes it and leaves the target untouched. The directory itself is not synced after the rename,
+    and the replacement has default permissions rather than the old file's.
+  - `removeAll` removes a file, a link (never followed) or a tree, and a missing path is `NotFound`;
+    `removeIfExists` returns `Result[bool, IoError]` (`Ok(false)` for nothing there) rather than a
+    bare `bool`, since removal can fail for other reasons and a `bool` would hide them. Review with
+    the user: whether `removeAll` of a missing path should rather succeed, as `removeDirAll` does.
+
+- Settled on the user's delegation 2026-11-23 (branch `fs-walk`): **`avin.fs` walks lazily, with
+  options** ([system library](/spec/system-library/#paths)).
+  - **`walker(root, …)` is an `Iterator[Result[Entry, IoError]]`**, the shape `io.inputs` already
+    has for a lazy sequence whose steps can fail; each directory is listed (whole, as `listDir`
+    sorts it) when the walk reaches it. **`walk(root)` keeps its name, result and behaviour** and
+    takes the same named options, gathering `walker`; nothing is deprecated. Alternatives: changing
+    `walk` to answer the iterator (breaks every caller's `match` on its `Result`), and a separate
+    options value (named, defaulted parameters read as well at the call and need no new type).
+  - **Options: `maxDepth` (no limit by default; 0 the root alone; negative fails at the call),
+    `includeRoot`, `postOrder`, `followLinks`, `prune`, `stopOnError`.** `prune` is asked about each
+    directory the walk is about to go into, never the root (a hidden or oddly named root would
+    otherwise end a walk before it starts) and never a directory at `maxDepth` (it would not be gone
+    into anyway); a pruned directory is still an entry.
+  - **An unreadable directory: reported by default, failing on request.** By default it is an entry
+    with the reason in `error` and the walk goes on, as `walk` always did; with `stopOnError` it is
+    an `Err`, the walk's last element. A root that cannot be listed is an `Err` either way. A root
+    that is not a directory is `NotADirectory` (as `walk` always answered) unless `includeRoot` asks
+    for it, when it is the one entry.
+  - **Following links, a loop is found by canonical path**: a link naming a directory whose
+    `canonicalize` equals that of a directory on the walk's own way down is an entry carrying
+    `Other("file system loop")` and is not gone into; `stopOnError` makes it the `Err`. Only
+    ancestors count, so two links to one directory are both walked. Device and inode would avoid a
+    `realpath` per directory, but `Metadata` does not carry them yet (branch `fs-metadata` adds
+    them); switching is a change inside `Walker` with no change to what a program sees. Canonical
+    paths are asked only when `followLinks` is on. Alternatives: a global visited set (would skip a
+    second link to a directory outside any cycle), a dedicated `ErrorKind` (adds a variant every
+    exhaustive match of `ErrorKind` would have to name).
+  - **`Entry` keeps its fields**; its kind is `isDir` and `isLink`, two calls per entry as before.
+    A `kind` field joins it when `Metadata.kind` lands. A followed link to a directory has both true.
+  - **`find(root, p, …)` answers paths** (as `glob` does), and has a pattern overload matched
+    against `relative`; it takes the options but `includeRoot` and `postOrder`.
+  - **`{a,b}` alternation in `matches`, `matcher` and `glob`**, written out before the pattern is
+    split into components, so an alternative may hold `/`, `**` and further braces. `{a}` is `a`,
+    `{}` and `{,x}` have the empty alternative, an unclosed `{` is literal, as an unclosed `[` is,
+    and braces escaped or inside a class are literal. The hidden-name rule applies to each written-out
+    pattern, so `{.git,src}` fits `.git`. Alternatives: `{a}` kept literal (some shells do; no
+    pattern reads better for it), and alternation inside a component only (forbids
+    `{src,lib}/**`). Review with the user: overlaps the path-helpers item, which also lists `{a,b}`.
+  - **`matcher(pattern)` is a function value** reading the pattern once. Alternative: a `Glob`
+    class; a function value is all a walk filter needs.
+- Settled on the user's delegation 2026-11-24 (branch `fs-copy-move`): **`avin.fs` copies and moves
+  files, links and trees** ([system library](/spec/system-library/#copying-and-moving)).
+  - **`copy(from, to, replace = true, attributes = false, followLinks = true, createParents =
+    false)`, `copyAll(from, to, merge = false, replace, attributes, followLinks = false,
+    createParents)`, `move(from, to, replace = true, createParents = false)`**: named, defaulted
+    options, as `walker` takes them. `copyAll` of something that is not a directory is `copy` of it,
+    so one call copies whatever is at a path and the cross-device `move` needs nothing else.
+    `copy` follows links by default (copying a link to a file means its bytes), `copyAll` does not (a
+    tree's links stay links and nothing outside the tree is reached). Alternatives: one `copy` with a
+    `recursive` flag (two functions document their different defaults better), an options value
+    (named parameters read as well and need no type).
+  - **Never half-written under the destination's name.** A file is copied to a `pending_name` beside
+    `to` and renamed onto it once whole; a tree copied without `merge` is built under a pending
+    directory and renamed onto `to` in one step, so `to` is the whole copy or as it was, and a
+    failure removes everything the copy made (opening read-only directories it copied, so they do not
+    keep their entries). Merging cannot be one step: it stops at the first failure, keeps the entries
+    already copied (each whole), and names the entry. Alternatives: writing in place (a reader or a
+    crash sees a prefix), rolling a merge back (would have to remember and restore what it replaced).
+    A copy is not synced to the device: `writeBytesAtomic` is the durable write, and a sync per
+    file of a tree costs more than most copies want. Review with the user: a `sync` option is cheap
+    to add if a program asks for durability across a power loss.
+  - **`replace = false` is race-free for files and links**, without waiting for Sysl's exclusive
+    open or `rename_no_replace`: a copied file is placed by a hard link from its pending name (`link`
+    fails with `EEXIST` atomically) and a copied link by `symlink`, which refuses an existing name;
+    `move` of a file links `from` at `to` and then removes `from`, removing the new link again if
+    that fails. A directory (`copyAll` without `merge`, and `move`) can only be checked just before
+    its rename, so a directory another program makes at `to` in that moment can be replaced; the
+    docs say so. It needs hard links, which every local file system avin runs on has. Alternatives:
+    an `Err` for `replace = false` until Sysl ships `rename_no_replace` (the audit's preference;
+    the hard link gets the same guarantee now for the common case), an exists-check for every kind
+    (a race for files too). Switching directories to `rename_no_replace` when it ships changes no
+    behaviour a program sees beyond closing the window.
+  - **Permissions: the nine `rwx` bits always come along; `attributes` adds setuid, setgid, sticky
+    and the modification time** (the access time is set to the same instant until independent times
+    land). A copy that took default bits would turn a `0o600` secret into a world-readable file,
+    which is the wrong default for a server's library; setuid is not carried by default, as copying
+    a program should not make a privileged one. The file is `0o600` while its bytes go in, and a
+    new directory `0o700` until its contents are, so nothing is readable early. The owner is never
+    carried (only the superuser could set it; the ownership item adds `setOwner`). A link's own bits
+    and times are the platform's. Directories get their bits after their contents, so a read-only
+    one still copies. A directory merged into keeps its own bits unless `attributes`. Alternatives:
+    default bits (`sysl.fs.copy_file`'s choice, which leaves the caller to remember), carrying the
+    setuid bit always.
+  - **`to` is replaced as `rename` replaces it**: a file or link by a file or link, an empty
+    directory by a directory; a full directory is `DirectoryNotEmpty`, a directory onto a file
+    `NotADirectory` and a file onto a directory `IsADirectory`, each found before anything is copied.
+    The entry is replaced, so a hard link to the old file keeps the old bytes and a link at `to` is
+    replaced rather than written through. Merging replaces a file by a directory with `replace`, but
+    never removes a directory to put a file there. A file copied onto itself (or onto another name
+    for it) changes nothing, as `rename` does; it never truncates the source.
+  - **Refusals**: a FIFO, a socket or a device is `Other("not a regular file: a FIFO")`, found from
+    the metadata before anything is opened (opening a FIFO would wait for a writer); a destination
+    inside the source (canonical paths, so links and `..` count) is `Other("the destination is
+    inside the source")` before anything is made; following links, a link back to a directory
+    above is `Other("file system loop")`, by device and inode. Errors read `cannot copy <from> to
+    <to>: …`, naming the entry inside a tree, never a pending name. Alternatives: skipping special
+    files (silently partial), copying a FIFO as a new FIFO (needs a `mkfifo` binding; no program has
+    asked).
+  - **`move` across file systems** is `copyAll(attributes = true)` with links as links, then
+    `removeAll(from)`; it runs only when the rename fails with `EXDEV`. A failure while copying
+    leaves `to` as it was and `from` whole; a failure while removing is `cannot finish moving <from>
+    to <to>: …`, `to` then being complete and what could not be removed still at `from`. Hard links
+    inside a tree become separate files, and the owner is not carried. Its test attaches a small disk
+    image on macOS (no privileges needed) and uses `/dev/shm` on Linux; a machine with neither fails
+    the test rather than skipping it. Alternatives: failing on `EXDEV` (every caller would write the
+    same fallback), removing `from` entry by entry as it is copied (a failure would split the tree
+    across two file systems).
+
+- Settled on the user's delegation 2026-11-24 (branch `fs-poll-watch`): **`avin.fs` watches by
+  polling, behind a face a native engine can take over** ([system
+  library](/spec/system-library/#watching)).
+  - **A `Watcher` is a channel and a thread.** `w.events` is a `Channel[WatchEvent]`, so a thread
+    waits on it alone or in a `select`; the readings run on a lightweight thread of the watcher's
+    own, which `close` stops and joins. What finds changes is that thread alone, so platform
+    notification (kqueue, inotify; fs audit item 17, waiting on Sysl) replaces its loop with no change
+    to `watch`, `WatchEvent`, `events`, `check` or `close`. Alternatives: an iterator the caller
+    pulls (cannot sit in a `select` beside a server's other work), a callback (runs user code on
+    the watcher's thread), a `Readiness` descriptor (no descriptor exists for a poll).
+  - **Deterministic driving: a `ticks` overload and `check()`.** `watch(paths, ticks)` reads on each
+    value of a `Channel[Instant]` instead of a clock, and `check()` reads now and answers once that
+    reading's events are sent, with their count, so a test knows a reading that found nothing has
+    ended. Alternatives: a fake clock (still leaves "has the reading after this tick ended?"
+    unanswerable without a sleep), a synchronous `scan()` returning the events (a second path for
+    events, and a race with the thread's own readings).
+  - **Events: `Created`, `Modified`, `Removed`, `Renamed`, `Overflowed`, each with `isDir`**, in
+    code-point order of their paths within a reading. A file is `Modified` when any of kind, size,
+    mtime, ctime, permissions, owner, group, device or inode differs (ctime catches a write whose
+    mtime was set back); a directory only when its permissions or owner change, since its own times
+    move with every entry it gains or loses and those entries have events of their own. A path that
+    changes kind is `Removed` then `Created`. Alternatives: reporting directory mtime changes
+    (doubles every event, and differs by platform), `Modified` for a change of kind (hides that a
+    directory became a file).
+  - **Renames by identity**: a gone entry and a new one with the same device and inode, and for a
+    file the same size and mtime, which a rename keeps and a reused inode seldom matches. A rename
+    onto an existing path is that path's `Modified` and the old name's `Removed`. Review with the
+    user: pairing a replaced path as `Renamed(from, to)` is possible, at the cost of a `Renamed` whose
+    `to` already existed.
+  - **Bounds: `maxEntries` (100,000) and `capacity` (1,024).** The trees growing past `maxEntries`
+    is an `Err` from `watch` and later an `Overflowed` event that ends the watch, since watching part
+    of a tree silently is worse than stopping loudly. A full events channel holds the watcher back
+    (it reads nothing while it waits to send), so a slow receiver gets no unbounded backlog and the
+    next reading still sees every change. Alternatives: watching the first `maxEntries` entries in
+    walk order (entries past it become spurious `Created` events as the tree shrinks), dropping events
+    on a full channel (loses changes a poll would otherwise still see).
+  - **Paths must exist at the start** (`watch` answers the `Err`); later a root may go and come back.
+    A directory that cannot be listed keeps what the last reading found in it, rather than reporting
+    everything inside as removed. Links below a root are not followed; a root that is a link is.
+  - **`interval` counts from the end of one reading to the start of the next** (an `after` per
+    wait, not a `Ticker`), so a slow reading never queues the next one behind it.
+
+- Settled on the user's delegation 2026-11-24 (branch `resilience`): **`avin.resilience`: retry,
+  circuit breaker, general rate limiter** ([system library](/spec/system-library/#avinresilience)).
+  - **A module of its own**, not `avin.threads`: none of it is a thread primitive, and a program
+    reaching for retries should find them by name. Alternative: `avin.threads` beside `Semaphore`
+    (the audit's heading), which would crowd the threads chapter with policy.
+  - **Work is `() -> Result[T, E]`, and the answer is the last result.** Failure in Avin is a
+    `Result`, and a trap ends the program, so there is nothing else to catch. Giving up answers the
+    last `Err` itself rather than a wrapper with the attempt count: a caller's `?` and `match` stay
+    as they were without retry. Alternative: `RetryError(attempts, last)`; review with the user if
+    callers turn out to want the count (a hook would serve them better).
+  - **Backoff `initialDelay × multiplierⁿ⁻¹` capped at `maxDelay`, with `jitter` a share from 0 to
+    1** taken off at random (1.0, the default, is "full jitter", 0.5 "equal jitter", 0 none). One
+    number covers the common schemes. Defaults: 3 attempts, 100ms, ×2, 10s cap, full jitter, no
+    elapsed bound. Alternatives: an enum of jitter schemes, and decorrelated jitter (stateful across
+    attempts; a later addition if wanted).
+  - **Deadline awareness: a retry is made only where its wait ends strictly before the context's
+    deadline**, read from `Context.current().remaining()`; the first attempt is always made, since
+    there is no `E` to answer without one. `maxElapsed` bounds the policy on its own clock, the
+    attempts' time counted. Alternative: sleep and let the deadline cancel the wait (it still does,
+    as a backstop), which turns a known-futile wait into a cancellation.
+  - **`retryable: (E) -> bool` is a second overload**, not a policy field, so a policy is not
+    generic in the error type and one policy serves many calls. `policy.run(…)` is the same loop as
+    the module's `retry(policy, …)`.
+  - **The breaker counts consecutive failures** (`failureThreshold`, default 5), opens for
+    `openFor` (30s), then admits `trialCalls` (1) concurrent trials; one trial failing reopens it,
+    all succeeding close it. Alternative: a failure rate over a sliding window with a minimum call
+    count, more robust under mixed traffic but with more knobs; review with the user if a service
+    wants it.
+  - **Outcomes are counted only in the state the call was admitted in** (a generation number), and
+    a call cancelled mid-flight frees its trial place through a `defer`. Without these a slow call
+    from before an opening could close a breaker, and a cancelled trial would wedge it half open.
+  - **`call` answers `Result[T, BreakerError[E]]`** (`BreakerOpen(retryIn)` or `CallFailed(e)`), the
+    shape `PoolError` has, and `isFailure: (E) -> bool` lets an answer like not-found count as
+    health. `onChange(from, to)` is told after the lock is released. Alternatives: a nested
+    `Result[Result[T, E], BreakerOpen]` (clumsier to match); separate `acquire`/`record` calls
+    (easy to misuse; the generation would leak into user code).
+  - **The token bucket moved from `avin.net.http` to `avin.resilience.RateLimiter`**, and the HTTP
+    limiter keeps its API and messages and delegates to it. The general one adds a keyless form and
+    `acquire`, which waits for a token and answers `false` at once where the token comes no sooner
+    than the deadline. Alternatives: duplicating the bucket (two copies to keep alike), and a
+    `Semaphore`-based bulkhead, which `Semaphore.acquireFor` already is.
+  - **Every source of time and chance is an injectable named parameter** (`clock`, `pause`,
+    `random`), as the HTTP limiter's `clock` was, so the tests are deterministic and sleep only in
+    the one test of cancellation by a real deadline.
+
+- Settled on the user's delegation 2026-11-24 (branch `config-toml`): **`avin.toml`, TOML 1.0 in the
+  standard library, and layered configuration on `avin.cli`** ([system
+  library](/spec/system-library/#avintoml), [configuration
+  files](/spec/system-library/#configuration-files-and-the-environment)).
+  - **Pure Avin, in the standard library.** The reader, the writer and the derivations are Avin,
+    about 1,400 lines. Alternatives weighed: binding `sysl:toml` (another Sysl package every program
+    reading a configuration links, a value tree converted across the boundary, and its errors and
+    limits not ours to set); a package `dev.avinlang.toml` as JSON is (configuration is what nearly
+    every server reads at startup, and `avin.cli`'s layering needs it, so the standard library cannot
+    leave it out). Review with the user: JSON is a package by the user's decision of 2026-11-13,
+    and TOML now is not; the reasons differ (the CLI layer depends on it), but the two formats sit
+    on different sides of that line.
+  - **Conformance is toml-test's own suite**, vendored: the 717 files `files-toml-1.0.0` lists
+    (208 valid documents with their JSON, 509 invalid ones), from commit
+    96fd088448ec0f4d9f061c730ed7854399c46faf, in `tests/fixtures/toml-test` with its MIT licence
+    (copyright the TOML authors), which permits copying with the notice kept. About 100 KB.
+    Alternative: a hand-written set alone (it is there too, `library/tests/toml.avin`, pinning each
+    message; the suite catches the readings nobody thought to write).
+  - **The value tree is `Toml`**, mirroring `Json`: `Str`, `Integer(long)`, `Float(real)`, `Bool`,
+    the four date-time kinds, `Arr`, `Table(members)` keeping the text's order. The date-times are
+    `avin.time`'s `Zoned` (in the offset's fixed zone), `DateTime`, `Date` and `Time`. A fraction
+    past microseconds is cut off, which TOML allows; a leap second is refused, since a `Time` cannot
+    hold it. `-00:00` reads as UTC. Alternatives: types of the module's own for the date-times (two
+    sets of calendar types to convert between); keeping the fraction's text (a value no other
+    library type reads).
+  - **Limits**: 128 deep by default (`maxDepth`), counting every part of a dotted key or a header
+    as well as arrays and inline tables, so no input reaches the reader's or the writer's stack
+    limit; an integer outside 64 bits and a float with no finite `real` are errors. Alternative:
+    JSON's 512 (a configuration file is not a message, and the derivation walks recursively).
+  - **Errors name the key from the document's top**: `t.x` for an `x` defined twice in `[t]`, an
+    inline table's own key included, at the line and column the key starts.
+  - **Derivations as JSON's, on the tree**: the same `@…Key`, `@…Tag`, `@…Omit`, the same `type`
+    discriminator written first, defaults and `whenMissing`, unknown keys skipped. A decoder reads a
+    `Toml` (`static decode(value: Toml)`), since a TOML document must be read whole before its tables
+    are known. An encoder answers a `Result`: TOML has no null, so a field holding `None` is left out
+    and any other `None` is an error, and a date outside the years 0 to 9999 cannot be written.
+    There is no `@TomlOmitNone`, every `None` field being left out. Alternatives: an encoder that
+    traps on those (a program's data, not its mistake, decides them); `None` as an empty string.
+  - **`render` writes a table's plain keys first**, then `[tables]`, then `[[arrays of tables]]`;
+    arrays and tables inside arrays inline; a float always with a point or an exponent; strings as
+    basic strings with only the control characters, `"` and `\` escaped. A tree read back has the
+    same values, a table's keys perhaps in another order; `Toml`'s equality is the order-sensitive
+    one of its members. Alternative: an order-insensitive equality for tables (unusual for a `data`
+    type, and the order is the text's).
+  - **Layers on `avin.cli`**: `parseLayered(args, file, fileRequired, envPrefix, env)`,
+    `parseWithConfig(args, config, source, …)` and `parseLayeredOrExit`; the command line wins over
+    the environment, the environment over the file, the file over the defaults; `Args.origin(name)`
+    answers an `Origin` (`CommandLine`, `Environment(variable)`, `ConfigFile(path)`, `Default`), and
+    `given` is now true of a value any layer gave. Keys are option names, a dotted name also a
+    nested table; a key that is no option is an error with a suggestion; an empty prefix reads no
+    environment; a flag's variable is `true`/`false`/`1`/`0`; a repeated option takes one value from
+    its variable. Only the top parser's options are layered. `--help` and `--version` are answered
+    even when a layer is broken. Alternatives: unknown keys ignored (a misspelt setting silently
+    lost); a comma-split list from an environment variable (ambiguous with a value holding a comma);
+    layering a command's options from a table named after it (more rules for a case no program
+    here has yet). `Origin`, not `Source`, since `avin.io` has a `Source`. Review with the user:
+    strict unknown keys, which means a file shared with another program needs its own table.
+
+- **A delayed argument lives in the caller's frame; capturing a by-name parameter copies it to the
+  heap** (by-name chapter, § Representation). Settled on the user's delegation 2026-11-24 (branch
+  `byname-stack`). Every delayed argument used to be a heap closure, so a disabled
+  `logger.debug(message, fields)` cost about 14 ns and 16 bytes against 1.8 ns for the guarded
+  call. Now a delayed argument written at a call of a program function (by name, through a method
+  table, or of a function value) is a `StackObject` in the caller's frame, and a `Keep` after the
+  call keeps what it holds alive, since the collector does not follow references into frames (the
+  disabled call: 3.3 ns, no allocation). Escape is decided where it can happen rather than by an
+  analysis across functions: a closure that captures a by-name value copies it to the heap
+  (`avin_rt_keep_delayed`, a shallow copy) where the closure is made, so no closure ever holds one
+  in a frame, and no function's code depends on what another function's body does, which keeps
+  the instance cache's keys local. The cost lands on code that keeps the expression or captures it
+  in a further delayed argument (`twice(value + 1)`): one allocation, as before. A self tail call,
+  lowered as a jump that reuses the frame, and an operation the compiler lowers in place keep heap
+  closures. Alternatives: an interprocedural escape analysis that would also put the nested case on
+  the stack, but makes a caller's code depend on its callees' bodies, a fixpoint over the program
+  and a cache dependency on every callee; teaching the collector to trace objects in frames, which
+  needs a way to tell a frame object from any other pointer outside the heap; a deep copy that
+  follows by-name fields, which needs the descriptor to say which fields are delayed expressions.
+  Review with the user: the nested capture still allocates, and the deep copy would remove that.
+- Settled on the user's delegation 2026-11-24 (branch `fs-ownership`): **`fs.setOwner(file, owner,
+  group)` takes numeric ids as `long` and sets both; `fs.ownerName(file)` names the owner.** Ids
+  outside `0`..`0xffffffff` are an `Err` of kind `Other` before the path is looked at (the
+  platform's "leave unchanged" id of -1 is not offered: a caller passes the id `metadata` reported).
+  A symbolic link is followed, as `setPermissions` does; `setLinkOwner` (lchown) waits on a Sysl
+  binding. Non-superusers get the platform's `PermissionDenied` for another user. `ownerName` is
+  `metadata` then `process.userName`, so it shares its `NotFound` for an id with no entry. Group
+  names are left out: Sysl has no `group_name`, `user_id` or `group_id` lookup yet. Alternatives
+  weighed: `Option[long]` ids for "unchanged" (a second shape for a rare need; `metadata` already
+  gives the current id); a private `user_name` binding in `avin.fs` (a duplicate of
+  `process.userName`).
+
+- Settled on the user's delegation 2026-11-24 (branch `redis`): **a Redis client,
+  `avin.net.redis`** ([Redis](/spec/system-library/#redis)), written in Avin over `TcpStream` and
+  `TlsStream`, with no C library.
+  - **A standard-library module, not a package.** A server reaches Redis as often as it reaches a
+    database, the client is pure Avin with no dependency beyond `avin.net` and `avin.threads`, and
+    it builds on the library's own `Pool`, which a package would reach only through the same
+    public API. Alternatives: a package `dev.avinlang.redis` (what the audit first named; versioned
+    apart from the language, but every server would add it), binding hiredis (a C dependency for
+    what is a small protocol, and its reader would sit outside Avin's limits and its threads).
+    Review with the user: whether clients for outside services belong in the standard library or
+    in packages as a rule; `pg` is a package.
+  - **One `Value` type for both RESP versions**, a variant per RESP3 type, RESP2's `$-1` and `*-1`
+    read as `Null`, RESP2's flat maps read by `asEntries`, and a blob string's bytes an
+    `ArraySeq[byte]` so that a value, and an error carrying one, is sendable and comes back out of
+    a pool's `use`. Alternatives: `Array[byte]` (not sendable, so no reply could leave a pooled
+    call), separate RESP2 and RESP3 types (every caller would handle both).
+  - **The parser is incremental and its failures final.** It holds bytes fed to it and answers
+    `None` until a value is whole, so a read that times out mid-frame loses nothing and a
+    subscriber's timed wait resumes the frame; after bytes that are not RESP nothing more is read.
+    Streamed strings and aggregates (`$?`, `*?`) are read whole. A value that has not all arrived
+    is parsed again from its start; the client reads until the parser holds twice as much before
+    parsing again, so a reply in many pieces costs a few parses, not one a piece. Alternative: a
+    resumable parser with an explicit stack (no re-parsing, much more code).
+  - **Limits with defaults:** `maxBulkBytes` 512 MiB (what a Redis server itself stores in one
+    string, so no legitimate value is refused), `maxDepth` 64 (Redis's deepest replies nest a few
+    levels), `maxAggregateLength` 16777216 items, `maxLineBytes` 1 MiB. Each length is checked as
+    its header is read, before its bytes arrive, and nothing is allocated for a claimed length.
+    Review with the user: 512 MiB lets a hostile server make a client hold that much; a lower
+    default would refuse real values.
+  - **The handshake is `HELLO 3` with `AUTH` and `SETNAME` in it**, falling back to RESP2 with
+    `AUTH` and `CLIENT SETNAME` where the server answers `NOPROTO` or an unknown command; a
+    password without a username is the `default` user's. `protocol = 2` never sends `HELLO`. Any
+    other error answering `HELLO` (a wrong password) fails the connection.
+  - **Reconnecting is lazy and never repeats a command.** A command that fails because the
+    connection broke, timed out or read something not RESP answers that failure, since it may or
+    may not have run, and the connection is closed; the next command makes it again, trying
+    `reconnectAttempts` times (3) with `reconnectDelay` (100 ms) doubling up to 5 s. A server's
+    refusal while reconnecting (a changed password) is answered at once. An error reply leaves the
+    connection as it is. A timed-out command breaks the connection rather than leaving its late
+    reply to be skipped. Alternatives: retrying the command (runs `INCR` twice), retrying only
+    commands known to be idempotent (a table to keep in step with Redis), discarding late replies
+    on the same connection (a dead server costs a timeout per command).
+  - **Timeouts:** `connectTimeout` (10 s) bounds TCP, TLS and the handshake together, through
+    `withTimeout`; `timeout` (30 s) bounds each wait after, as the stream's own timeout.
+  - **Pipelines and transactions are built in a callback**, `pipeline(p -> …)` and
+    `transaction(t -> …)`, and answer each reply as its own `Result`. A pipeline is written a batch
+    of at most 64 KiB at a time, its replies read before the next batch, so a long pipeline never
+    fills the socket both ways at once. A transaction is `MULTI`, the commands and `EXEC` sent as one
+    pipeline; every reply is read, so the connection stays in step whatever failed; `EXEC`'s null
+    (a watched key changed) is `None` and `EXECABORT` an `Err`.
+  - **Pub/sub is a `Subscriber` of its own**, never a mode of a `Redis`, so a subscribed connection
+    cannot be given a command it cannot run. `subscribe` waits for each confirmation, keeping
+    messages that arrive meanwhile; `unsubscribe` does not wait. Messages come by `receive`,
+    `receive(timeout)` and `messages()`, an iterator ending at a failure (`lastFailure`). A broken
+    connection is made again and every channel and pattern subscribed again; what was published
+    meanwhile is lost. A push on a command connection (client tracking's invalidations) is passed
+    over. Alternatives: a channel fed by a thread of the subscriber's own (a thread per subscriber,
+    and subscribing from another thread races it); an `Iterator` is enough to feed one.
+  - **The pool is `avin.threads.Pool`**, `Redis.pool(…)` setting `validate` to `isOpen` and
+    `destroy` to `close`, so a connection broken while lent is not lent again.
+  - **Typed commands answer what the reply means** (`Option[string]`, `long`, `bool`, `Expiry`,
+    `Map[string, string]`), RESP2's and RESP3's shapes alike, and a value that is not UTF-8 is
+    `UnexpectedReply` from `get` and read by `getBytes`; `ttl` is `PTTL` and `expire` and `set`'s
+    expiry are milliseconds, a part of one counting as one. Scans are iterators of `Result`s, a
+    failure their last element.
+
+- Settled on the user's delegation 2026-11-24 (branch `uuid-v7`): **`Uuid.v7()` follows RFC 9562
+  section 6.2 method 1: a 12-bit counter in `rand_a`, 62 random bits in `rand_b`.** Each new
+  millisecond starts the counter at a random value below 2048, so 2048 identifiers fit before it
+  carries. The last stamp (48-bit milliseconds above the 12-bit counter, one number) lives in an
+  `Atomic[long]` advanced by compare-and-set: no lock, and a thread that loses a race retries on the
+  new stamp. Identifiers made by one process are strictly increasing and never repeat, from any thread.
+  Alternatives: method 3 (a replaced counter in `rand_a` plus extra counter bits in `rand_b`: more
+  headroom, but the random bits shrink to 50 and the layout is no longer the plain one tools show),
+  method 2 (a fixed-length random counter: the same headroom as 1 with more bookkeeping), and a
+  mutex around the generator (simple, but every identifier in the process queues on it).
+  - **Counter overflow and a clock that stands still or steps back share one rule**: when the clock's
+    millisecond is not above the last stamp, the stamp is incremented, so the counter counts up and an
+    overflowing counter carries into the milliseconds, as the RFC allows. The timestamp bits then run
+    at most a few milliseconds ahead of the clock in a burst, or stay at their last value while the clock
+    is behind, and the sequence stays strictly increasing. Alternatives: waiting for the clock to move
+    (blocks a caller, and for ever across a large step back), refusing (an identifier is wanted, not an
+    error), and drawing a fresh random one on a step back (breaks the order the type promises).
+  - **`UuidGenerator.next(instant)` is the sequence made visible**, so a test can drive a clock it
+    controls; `Uuid.v7()` is a shared generator fed `now()`. **`v7At(instant)` is separate**: it keeps no
+    counter (random bits fill `rand_a`), does not touch the shared sequence, and so is for
+    backfills and tests. An instant outside the 48-bit range is clamped, not trapped.
+    `Nil` and `Max` keep their capitalized names, which the type already had.
+- Settled on the user's delegation 2026-11-24 (branch `crypto-sign`): **signatures, keys,
+  authenticated encryption, HKDF, SHA-224/384 and HMAC-SHA-1/224/384 in `avin.crypto`.**
+  - **The signing and the ciphers are OpenSSL's libcrypto, through a Sysl package the standard
+    library carries** (`library/sysl-packages/avincrypto`, named by directory in `library.hocon`), not
+    through `sysl:openssl` 0.2.5's `sign.sysl`. That file is shaped for JOSE (an `Algorithm` enum that
+    fixes P-521 to SHA-512 and answers ECDSA as `r || s`, PEM only) and has no Ed25519, no key
+    generation, no DER, no AEAD; extending it meant a release of another repository for every change.
+    The package is a small set of stateless calls over bytes, linked only into a program that reaches
+    one (as TLS is). Alternatives weighed: extending `sysl:openssl` (the better long-term home; the
+    package can move there unchanged, which needs only the binding targets renamed); `@c` bindings in
+    the library (the library's manifest has no `c-libraries`, and out-parameters such as `EVP_PKEY **`
+    want Sysl's pointers anyway); Ed25519 from `sysl:monocypher` and the rest from OpenSSL (two
+    libraries for one module). Review with the user: whether the package should become a
+    `sysl:openssl` release.
+  - **A key is a value, held as its DER and parsed again at each use** (`opaque type PrivateKey =
+    KeyParts`, the kind and the PKCS#8 or SubjectPublicKeyInfo bytes). A key read at startup is then
+    used by every thread at once, needs no `close`, and has no finalizer. The price is one DER parse
+    per signature: a few microseconds, beside an RSA signature's millisecond but comparable to an
+    Ed25519 one's tens. Alternatives weighed: a handle on an `EVP_PKEY` (one owner thread by the handle
+    rules, so a server's shared signing key traps on its second thread); a process-wide table of
+    parsed keys (a lock on every signature, and keys that are never freed). Review with the user: a
+    shared parsed form once handles may be shared between threads.
+  - **Nine named schemes rather than a key kind plus a digest plus a padding**: `Ed25519`,
+    `EcdsaP256Sha256`, `EcdsaP384Sha384`, `RsaPkcs1Sha256/384/512`, `RsaPssSha256/384/512`, the TLS
+    1.3 and JOSE set. The caller always names the scheme; nothing reads it from the data. P-521,
+    secp256k1, Ed448 and RSA-PSS-restricted keys are refused (`InvalidKey`). Alternatives: separate
+    parameters (lets a program pair P-256 with SHA-512, which no protocol asks for); P-521 (no
+    server protocol in common use needs it; a variant can be added).
+  - **`verify` is `Result[bool, CryptoError]`**: `Ok(false)` for every signature that does not check,
+    malformed ones included, and `Err(KeyMismatch(kind, scheme))` for a scheme the key does not sign
+    with, checked in Avin before the call. Alternatives: `bool` with a mismatch trapping (a key from a
+    JWKS of the wrong kind would bring a server down) or answering `false` (a misconfiguration would
+    read as a forgery).
+  - **ECDSA signatures are DER**, with `ecdsaFixedSignature`/`ecdsaDerSignature` for the fixed-width
+    form, which accept only one canonical DER signature of non-negative integers that fit. DER is what
+    X.509, TLS and WebAuthn carry and what OpenSSL makes. Alternative: the fixed form by default
+    (JOSE's), or a scheme per encoding (eighteen schemes).
+  - **PSS uses a salt the digest's length and MGF1 over the same digest**, in signing and checking;
+    other salt lengths do not check. Alternative: `RSA_PSS_SALTLEN_AUTO` on verify (accepts any
+    salt; RFC 8017 leaves it to the application, and every protocol here fixes it).
+  - **Limits**: RSA from 2048 to 16384 bits, read and made; generation outside that traps (a constant
+    in the program), reading answers `InvalidKey`. Encrypted keys are refused with a reason, never asked
+    a passphrase. PEM is read in Avin (the first block of an accepted label; a body with RFC 1421
+    headers is an encrypted key), so OpenSSL only ever sees DER and never prompts.
+  - **Key generation is a `blocking` binding**, so the collector runs for the other threads while an
+    RSA key is made.
+  - **`Display` of a key is its kind** (`PrivateKey(RSA 2048)`, `AeadKey(AES-256-GCM)`); an opaque
+    type derives no `Debug`, so nothing prints the bytes. `toPem`, `toDer` and `toBytes` are the only
+    ways out. The runtime does not wipe a key's bytes when it is collected (they are ordinary
+    collected memory); decryption wipes its own buffer when a tag does not check.
+  - **AEAD is AES-128-GCM, AES-256-GCM and ChaCha20-Poly1305 with 12-byte nonces and 16-byte tags**,
+    as an `Aead` data type whose `key(bytes)` answers `InvalidKey` for a wrong length and an opaque
+    `AeadKey`. `seal`/`open` put a random nonce in front (`nonce || ciphertext || tag`);
+    `sealWithNonce`/`openWithNonce` take the caller's, and a nonce that is not 12 bytes traps (a
+    constant of the protocol). Alternatives weighed: XChaCha20-Poly1305 (24-byte nonces, safe to draw
+    at random without limit; OpenSSL has no HChaCha20, so it would be a Sysl implementation of its
+    own, the earlier `crypto-aead` item's plan, still open); AES-GCM-SIV (not in OpenSSL's EVP for
+    every version shipped); nonces as a counter kept by the key (state in a value meant to be shared).
+    Review with the user: XChaCha20-Poly1305 as the random-nonce default once it exists.
+  - **HKDF over SHA-256, SHA-384 and SHA-512, whole and in halves**, bound to `sysl.crypto`; a length
+    below 1 or past 255 digests traps, as PBKDF2's does, and Expand traps on a pseudorandom key shorter
+    than a digest (RFC 5869 § 2.3's requirement). HKDF-SHA-1 and -SHA-224 are left out (no protocol in
+    use wants them). SHA-224 and SHA-384 come with streaming `Sha224`/`Sha384`; HMAC-SHA-1 (TOTP),
+    -SHA-224 and -SHA-384 join HMAC-SHA-256 and -SHA-512.
+
+- Settled on the user's delegation 2026-11-24 (branch `ops-health`): **health routes, a graceful
+  drain and a log reopen on a signal.**
+  - **Checks run at once, each on a thread of its own with its own timeout counted from its start**;
+    a check still running at its time is reported `timed out after Nms` and left to end by itself,
+    since a thread cannot be cancelled from outside. Alternatives: run them one after another (a
+    slow check delays every other and the route's answer by their sum); one timeout for the route
+    (a quick check can be starved by a slow one's allowance).
+  - **The body is plain text, `ok` or `failed`, with the per-check lines only under `?verbose`.** A
+    probe's reason can name hosts and addresses, so the default answer to any caller leaks nothing. Alternatives: JSON (a parser for a supervisor that only reads the status code);
+    always verbose.
+  - **Readiness is an `Atomic[bool]` the program flips, and not ready answers `503` without running
+    the checks**: a draining server should not probe its dependencies for a supervisor that has
+    already been told to go away. Liveness has no checks by default, since a failing dependency must
+    not get a process killed. Alternative: one list of checks for both (restarts a healthy process
+    when a database is down).
+  - **`http.serve` handles no signal; draining is opt-in** (`drain`, `drainOnSignal`). A library
+    that takes `Terminate` by default would change what every existing program does on it. The
+    drain order is not ready, grace (still accepting), stop accepting, in flight finish within a
+    deadline; it answers whether it was clean and does not end the program or close the
+    stragglers' connections, which the caller decides. Alternative: closing the stragglers at the
+    deadline (needs a way to cancel a handler mid-request that the server does not have).
+  - **Log reopen is `Sink.reopen()` plus `reopenOnSignal(sink, sig = Hangup)`**, which runs a
+    watching thread the program stops with the `Reopener`. The file sink's `reopen` forces the open
+    that its periodic look-again makes, so the rotation check is not duplicated. Alternative: the
+    runtime reopening every sink on `Hangup` itself (a hidden global that takes the signal from
+    programs that want it for settings).
+
+- Settled on the user's delegation 2026-11-24 (branch `smtp`): **mail messages in `avin.net.mail`,
+  an SMTP client in `avin.net.smtp`, quoted-printable in `avin.encoding`**
+  ([mail messages](/spec/system-library/#mail-messages), [SMTP](/spec/system-library/#smtp)).
+  - **Two modules under `avin.net`**: the message builder is of use without SMTP (a message
+    written to a file, or handed to another transport) and SMTP is of use with messages written
+    elsewhere (`sendData`), as `avin.net.http`'s forms are beside its client. Alternatives: one
+    module (`avin.net.smtp` holding `Message`), or a top-level `avin.mail` or `avin.mime`, which
+    would add a module beside `avin.net` for a protocol family that lives on the network.
+    Quoted-printable is an encoding of bytes as text, so it joins base64 in `avin.encoding`.
+  - **A `Message` is a `data` type with named, defaulted fields**, rendered by `render()` into a
+    `string` with CR LF line breaks, rather than a builder with setters: a message is a value, and
+    the defaults read as a builder's calls would. `date`, `messageId` and `boundary` are fields so
+    that a rendering can be reproduced (the golden tests rely on it); unset, they are `now()`, a
+    random UUID at the sender's domain (`localhost` for a domain beyond ASCII) and a random UUID's
+    hex. Alternative: a builder, which would add a type for nothing a value cannot say.
+  - **A line break in anything that goes into a header is an `Err`, never stripped or encoded**:
+    header injection is a vulnerability, and an error tells the caller its data is not what it
+    thought. Values that are not printable ASCII are encoded (RFC 2047) rather than refused.
+  - **Encoded-words are always UTF-8 and base64**, the whole value encoded where any of it needs
+    it, each word at most 39 bytes of text (64 characters) and holding whole characters, so a word
+    after `Subject: ` keeps the line within RFC 2047's 76. Alternatives: `Q` encoding, more
+    readable for mostly-Latin text and longer for everything else; encoding only the words that
+    need it, smaller output for a cost in rules about which spaces survive. Text that looks like an
+    encoded-word (`=?`) is encoded too, so a reader cannot be misled.
+  - **A body is `7bit` where it can be, quoted-printable otherwise, never `8bit`**: every message
+    is 7-bit clean, so it goes to any server; the only bytes beyond ASCII ever written are those
+    of an address beyond ASCII, which needs SMTPUTF8 anyway. A body is `7bit` where it is ASCII
+    without NUL, its lines at most 998, and it holds no `=_`, the boundaries' prefix, which
+    quoted-printable and base64 can never write — so no content can hold a boundary. Alternative:
+    `8bit` with 8BITMIME, saving a third on non-Latin text and needing two renderings.
+  - **The structure is the common one**: `multipart/alternative` (plain first, as RFC 2046 orders
+    by increasing faithfulness), wrapped with inline parts in `multipart/related`, wrapped with
+    attachments in `multipart/mixed`; no body at all is an empty `text/plain`.
+  - **Filenames are RFC 2231 where not short printable ASCII**, with numbered sections for long
+    ones, in both `Content-Type`'s `name` and `Content-Disposition`'s `filename`. Alternative: RFC
+    2047 words in a quoted `filename`, which RFC 2047 forbids but many senders write.
+  - **`decodeHeaderValue` decodes `B` and `Q` words in UTF-8, US-ASCII and ISO-8859-1** and keeps
+    any other word as it is, as RFC 2047 says; it is there to read back what is written and the
+    commonest of what others write. Review with the user: whether a fuller reader of messages
+    (parsing a whole message, more character sets) belongs in the library.
+  - **Security is `StartTls` by default, and a server not offering it is an error**; there is no
+    opportunistic mode that falls back to the clear, since a network attacker strips STARTTLS from
+    `EHLO`'s reply. `ImplicitTls` is port 465's; `Unencrypted`, by name, port 25's to a local relay.
+    Bytes after the `220` to STARTTLS are a `Protocol` error (the response-injection attack). A
+    password goes only over TLS unless `authWithoutTls`.
+  - **AUTH PLAIN, else LOGIN**, the mechanism asked for winning; PLAIN with its initial response,
+    and the empty `334` prompt of a server that takes none answered. Alternatives weighed: CRAM-MD5
+    and SCRAM, which no common submission server needs over TLS, and XOAUTH2, which needs a token
+    flow outside the library. Review with the user: whether XOAUTH2 (a bearer token in place of a
+    password) is wanted for the big mail providers.
+  - **Every line break in the data is sent CR LF**, a lone CR or LF included, and dot-stuffed, so a
+    message cannot end its data early with `\n.\n` or `\r\n.\r` (the SMTP smuggling attack); a line
+    over 998 bytes is an error rather than being broken, since breaking it would change the
+    message.
+  - **One recipient refused refuses the message**, the transaction reset with `RSET`: for the mail a
+    program sends, a partial delivery is a failure the program should see. Alternative: send to the
+    recipients accepted and report the refused, as some clients do. Review with the user: whether a
+    partial-delivery mode is wanted for bulk mail.
+  - **Timeouts**: `connectTimeout` 30 seconds (as `TlsStream.connect`'s on the
+    `tls-handshake-timeout` branch) for the lookup and connection, by `withTimeout`, and for each
+    wait of a TLS handshake; `commandTimeout` 5 minutes and `dataTimeout` 10 minutes, RFC 5321
+    § 4.5.3.2's suggestions, each the whole of a reply's wait from its command, so a server
+    trickling bytes cannot hold a session; zero no limit, negative a trap. Review with the user: a
+    handshake's bound becomes total once `TlsStream.client` takes one.
+  - **Replies are bounded**: a line of at most `maxReplyLine`, 1000 bytes (RFC 5321's 512 doubled,
+    with room for servers that exceed it), and at most `maxReplyLines`, 100, lines; past either is a
+    `Protocol` error. The client reads replies itself, by `read`, so a line never grows past the
+    bound in memory.
+  - **Errors carry the class**: `Rejected(command, Reply)` with the code and RFC 3463's enhanced
+    status, `transient` for 4xx and for transport failures, `permanent` otherwise. A password is
+    never part of an error. No PIPELINING: a session sends a command and waits, which keeps the
+    error for each command exact. Alternative: pipelining MAIL and RCPT, a round trip or two saved.
+
+- Settled on the user's delegation 2026-11-24 (branch `fs-mmap`): **memory-mapped files in
+  `avin.fs`** ([system library](/spec/system-library/#memory-mapped-files)).
+  - **Two classes, `MappedBytes` (read-only) and `MutableMappedBytes` (shared and writable)**, made
+    by `mapFile(path)`, `mapFileMutable(path)`, `File.map()` and `File.mapMutable()`, over Sysl's
+    `map_file`, `File.map` and `File.map_mut` (a mutable map of a path opens it for update and
+    closes it, as `map_file` does). Each is an Avin class holding a Sysl handle on Sysl's `Mapped` or
+    `MappedMut`, so the collector's finalizer for the handle unmaps a mapping the program forgot,
+    and `close()` unmaps at once. Alternatives: one class with a `writable` flag (a read-only map
+    would carry `update` and `flush` that could only fail); the handle itself as the public type
+    (it could not be an `io.Close` or carry the bounds checks).
+  - **Offsets are `long`, with `int` overloads** of `apply`, `update`, `slice` and `writeAt`;
+    `length` is a `long`. A mapped file is routinely past 2 GiB, which `Array`'s `int` indices
+    cannot reach, and `int` does not widen to `long` implicitly, so the overloads keep `m(i)` with an
+    `int` loop variable working. A slice longer than an array can hold traps.
+  - **No array ever aliases the mapping.** Bytes leave only by copy (`apply`, `slice`, `toArray`)
+    and enter only by copy (`update`, `writeAt`), so an `Array[byte]` the program keeps can never
+    read unmapped memory. Alternative: an `Array` view over the mapping — the collector would have
+    to know such an array does not own its storage, and it would outlive `close`.
+  - **Every access is bounds-checked in Avin before Sysl is reached** (Sysl's own slice check stays
+    behind it); an offset outside `0 ..< length` traps, as an array index does, and `writeAt` traps
+    before writing any byte when its range runs past the end.
+  - **Use after `close` traps** (the handle's own "`MappedBytes` is closed" trap, at the call):
+    every call but `close`, `length` and `flush` included; a second `close` does nothing. A trap
+    rather than an `Err` because `apply` answers a byte, and one rule for every call is simpler to
+    state. Alternative: `File`'s `Err` for every call on a closed file (would need a `var` flag,
+    which would make the classes not sendable, and a `Result` from `apply`).
+  - **Sendable, by hand-over.** The classes have only `val` fields and a Sysl handle, so they are
+    `Sendable`, and a mapping given to a thread's body moves to that thread as every handle does;
+    using it from the thread that gave it away traps. Alternative: not sendable, as `File` is; a
+    mapping is often made once and handed to a worker, and the handle rules already keep it to one
+    owner at a time.
+  - **Mappings bring on collections.** A dropped mapping is unmapped only by its finalizer, and a
+    mapping holds one small heap object, so a loop that maps and drops would exhaust the address
+    space (about 2040 mappings of a 64 GiB file on macOS) or Linux's 65530 map entries long before
+    the heap's own budget collected. The runtime counts mappings made since the last collection and
+    collects at 1024 of them or 1 TiB mapped (`charge_mapping` in `heap.sysl`, called by `avin.fs`
+    after each mapping, outside the waiting call). Alternatives: a public "collect now" call
+    (moves the burden to every program); charging the mapped bytes to the heap's budget (a 64 GiB
+    mapping would then collect at every allocation).
+  - **A file cut short under its mapping is a trap, not silent corruption.** The platform answers a
+    touch of a page past the file's new end with `SIGBUS` (for a read-only, private mapping macOS
+    may instead go on answering the old bytes, which corrupts nothing); the runtime's fault handler,
+    which already turns a stack overflow into a trap, now reports any other `SIGBUS` as
+    `avin: trap: bus error: …` and stops the program. Avin cannot make the access succeed or fail softly, since it is an
+    ordinary load or store. Alternatives: a registry of mapped ranges consulted by the handler (more
+    exact, but a lock-free table for a message that already names the one cause Avin code has); a
+    check of the file's size before each access (a system call per byte). Review with the user:
+    whether a program should be able to recover from a cut-short mapping (it cannot, today).
+  - **Left out:** `advise` (Sysl has it on `Mapped` only), a mapping of part of a file, and growing
+    a mapping; a program `setLength`s the file and maps it again.
+- Settled on the user's delegation 2026-11-24 (branch `actor-segv`): **a trap drops the frames of
+  the code that trapped before anything that may wait**, and the context keeps the trap's reason as
+  a root in their place. A trap is no collection point, so a frame there may hold a slot not yet
+  stored to; a collection another thread made while the trap was reported read it, and an actor
+  restarting under load crashed (`actor_router_restart` at `-O2`, killed by a segmentation fault).
+  The thread goes on from the turn's recorded frame where the trap is contained and from none where
+  it stops the program, so the exit hooks run on an empty shadow stack. Alternatives: count every
+  trap, and every call of a function that may trap, as a point where the frame must be consistent,
+  which sets more slots to null on entry in almost every function (overflow checks trap) and costs
+  every call to keep a guarantee only a dead frame needs; and clearing whole frames on entry, which
+  costs more still.
+- Settled on the user's delegation 2026-11-24 (branch `actor-segv`): **whether the program is
+  stopping is a flag only the first thread to stop it sets**, separate from the lock the others
+  wait on. Asking took and gave back that lock, so a thread asking at the moment `main` returned made
+  `main` believe another thread was stopping the program, and the program hung at its end.
+  Alternative: a second lock for asking; a flag read and a compare-and-set are simpler and never
+  wait.
+
+- **`avin.sqlite`, SQLite in the standard library** (branch `sqlite`, 2026-11-24;
+  [`avin.sqlite`](/spec/system-library/#avinsqlite)). Each entry below is settled on the user's
+  delegation 2026-11-24.
+  - **A module of the standard library, not a package.** The user's goal of 2026-11-23, that the
+    standard library have everything a server needs, is the later word on what belongs there, and an
+    embedded database is the store a server reaches for first; the cost the JSON and PostgreSQL
+    packages avoided does not arise, since a program that never imports `avin.sqlite` builds and links
+    nothing of SQLite's (its Sysl package joins a program only where a binding reaches it, as
+    OpenSSL's does). Alternatives: the package `dev.avinlang.sqlite` in its own repository (the JSON
+    and `pg` precedent; a dependency to add for what a server takes as given, and a repository and
+    release of its own). **Review with the user**: the JSON decision of 2026-11-13 moved a module out
+    of the library, and this one goes the other way.
+  - **The machine's SQLite, through a Sysl package of the library's own** (`library/sysl/sqlite`,
+    named by its directory in `library/library.hocon`; `pkg-config sqlite3` finds it). macOS ships
+    3.43 or newer in its SDK and every Linux distribution packages it, so nothing is compiled; 3.37 is
+    the floor, for `STRICT` tables, `sqlite3_changes64` and the constraint codes `DataType` and
+    `Pinned`, and has `RETURNING` (3.35) and the JSON functions (built in since 3.38, an option
+    before). The package is the library's own because the binding needs what `sysl:sqlite3` does not
+    have (named parameters, extended result codes, `prepare_v3`, deferred finalizing) and a change
+    there is another repository's. Alternatives: `sysl:sqlite3` (above, and its floor is Sysl
+    0.6.0); a vendored `sqlite3.c` compiled by C `sources` (pins the version and every feature, but
+    only a package's manifest has `sources`, not the library's, and it adds 9 MB of C and a long
+    compile to every first build); Avin C bindings straight to `libsqlite3` (the library's manifest
+    has no `c-libraries`, and a library entry would have to be reached per module rather than linked
+    into every program; `SQLITE_TRANSIENT` needs C glue either way). **Review with the user**:
+    vendoring for a pinned SQLite, which would also need `sources` for the library's manifest.
+  - **A connection belongs to one owner at a time, and a call that waits is `blocking`.** The
+    connection and its statements are Sysl handles, so the owner check every handle has keeps two
+    threads off one connection; threads use a connection each or a `threads.Pool` of them. `open`,
+    `prepare`, `step` and `executeScript` are `blocking`, so a statement waiting out the busy timeout
+    or the disk leaves its worker to other lightweight threads and holds up no collection. The
+    connection is opened serialized (`SQLITE_OPEN_FULLMUTEX`). Alternatives: a connection shared by
+    threads behind SQLite's mutex (the owner check would have to be lifted, and a busy wait would hold
+    every thread using it); a thread of its own serving each connection (a hand-off per statement).
+  - **A statement the collector frees is finalized without waiting.** A finalizer runs on the
+    collecting thread while the statement's connection may be in a blocking call on another, holding
+    the connection's mutex for up to the busy timeout; finalizing there would hold up the collection,
+    and every thread with it. So the finalizer takes the connection's mutex only where it is free
+    (`sqlite3_mutex_try`), and otherwise puts the statement on the connection's pending list, under
+    a lock of its own never held across a wait, which the connection finalizes at its next `prepare`,
+    `executeScript` or `openStatements`. A statement holds its connection, so a connection closes only
+    after its statements, with `sqlite3_close_v2`. Alternatives: finalizing in the finalizer (the
+    stall above); a connection with no mutex (a finalizer racing a call).
+  - **Defaults for a server**: `wal` on (readers and the writer do not block one another; a
+    read-only connection and `:memory:` are left as they are), `foreignKeys` on (SQLite's own default
+    is off only for compatibility), `busyTimeout` 5 seconds (SQLite's is 0, failing at the first
+    lock), a statement cache of 64. Alternatives: SQLite's own defaults throughout (a server's
+    concurrent writers then fail with `Busy` at once and its foreign keys go unchecked). **Review with
+    the user**: WAL by default leaves `-wal` and `-shm` files beside the database and does not suit a
+    database on a network file system.
+  - **One statement per call.** `execute` and the queries refuse SQL holding a second statement, or
+    a zero byte, as a `Misuse`, rather than run the first and drop the rest as `sqlite3_prepare`
+    does; `executeScript` runs several, without parameters. Alternatives: SQLite's behaviour (a
+    statement silently not run); running every statement (parameters would have no clear owner).
+  - **Parameters by position must all be given, and by name all named.** A count that differs, a
+    name the statement lacks, or a named parameter left out is a `ParameterRange`, since SQLite would
+    bind NULL to what is left out with nothing said. Names may be given without their `:`, `@` or
+    `$`. Alternatives: SQLite's leniency.
+  - **Errors** are one data type, `SqliteError(code, extendedCode, message)`, the code a `SqliteCode`
+    named after SQLite's primary result codes (`Failed` for `SQLITE_ERROR`, since `Error` is the
+    trait; `ParameterRange` for `SQLITE_RANGE`, since `Range` is the library's type) and a broken
+    constraint `Constraint(kind)`, so a unique violation is matched as `Constraint(Unique)`. The
+    module's own failures take the code SQLite gives the same mistake (`Misuse`, `ParameterRange`,
+    `Mismatch`, `Abort`). Alternatives: a variant per module failure beside SQLite's (two ways to say
+    one mistake); the extended code alone (a number to match on).
+  - **Values and rows follow `pg`**: `SqlValue` is the five storage classes, `ToSql` and `FromSql`
+    the conversions, `Row` with `get[T]` by index or name, and `derive FromRow` with `@SqlColumn`, as
+    `dev.avinlang.pg` has them, so code moves between the two. `bool` is 1 and 0 and reads only from
+    those; a `real` reads from an integer a real holds exactly; text that is not UTF-8 is a
+    `Mismatch`, read with `cast(… as blob)`. Alternatives: lenient reads as SQLite's own `column_*`
+    functions do (`'apple'` read as an integer is 0, with nothing said).
+  - **Transactions as `pg`'s**: `transaction(f)` commits on `Ok`, rolls back on `Err` or
+    cancellation, and nests as savepoints; `transaction(mode, f)` takes `Deferred`, `Immediate` or
+    `Exclusive`; `savepoint(f)` is a savepoint anywhere. A body answering `Ok` after SQLite rolled the
+    transaction back by itself answers an `Abort`. The body's error is a `SqliteError`, as `pg`'s is a
+    `PgError`. Alternatives: a body of any error type (then `BEGIN` and `COMMIT`'s own failures need
+    a conversion into it).
+- Settled on the user's delegation 2026-11-24 (branch `sqlite`, a bug `avin.sqlite` met): **a
+  collection literal given to an overloaded function is tried against each candidate's parameter
+  where no candidate takes it as checked by itself.** `execute(sql, {":b": "x"})`, with overloads
+  taking `ToSql*` and `Map[string, ToSql]`, was refused: the literal was checked alone, as a
+  `Map[string, string]`, and only literals built around integers were tried again against the
+  candidates, though [overloading](/spec/declarations/#default-and-named-arguments) says a literal
+  argument fits any overload whose parameter it can become, as it does a single function's. Now a
+  sequence, set or map literal that leaves no candidate fitting is tried against each, and the one
+  that takes it is chosen; where two can, the call is still refused. Alternatives: trying every
+  collection literal against every candidate first (a literal that fits as it stands would then
+  choose differently than it did).
+- Settled on the user's delegation 2026-11-24 (branch `idna`): **Internationalized domain names are
+  `avin.net.idna`, in Avin, from tables of Unicode 17.0.0, and a `Url` holds a host beyond ASCII in
+  its ASCII form** ([system library](/spec/system-library/#internationalized-domain-names)).
+  - **Unicode 17.0.0**, the version `string.normalize` answers from (its utf8proc), so a name is
+    mapped by the same database it is normalized by. Alternatives: the latest IDNA table with an
+    older normalizer (a mapped character could then come out of NFC unnormalized), or binding a C
+    library (macOS ships none for UTS #46; libidn2 is IDNA2008 without UTS #46's mapping by
+    default, and a dependency for one table).
+  - **Tables generated, not bound.** `scripts/idna_tables.avin` reads `IdnaMappingTable.txt` and
+    `DerivedBidiClass.txt`, `DerivedJoiningType.txt`, `DerivedCombiningClass.txt` and writes
+    `library/avin/net/idna/idna_tables.avin`: the mapping as runs of a status, a constant offset
+    merging runs of case pairs, or a sequence; the properties CheckBidi and CheckJoiners read (the
+    bidirectional class, the joining type, a virama) as runs of one value. Each table is decoded
+    once, on first use, into `ArraySeq`s searched by halving, as the display-width table is. A
+    combining mark at a label's start is read from `sysl.unicode.is_mark`, the same database. The
+    generated file is 36 KB of source (a 30 KB mapping string and a 4 KB property string); the Unicode License v3 is repeated in it and in
+    `tests/fixtures/unicode/LICENSE.txt`, beside the vendored `IdnaTestV2.txt`. Alternatives: a
+    dense array per plane (far larger), the tables as `Array[int]` literals (slower to compile than
+    one string).
+  - **Non-transitional processing only**, as the WHATWG URL standard and UTS #46 since 15.1
+    recommend: `ß`, `ς`, ZWJ and ZWNJ are valid and kept, so `faß.de` is `xn--fa-hia.de`, not
+    `fass.de`. A `transitional` flag was weighed and left out: it exists for compatibility with
+    IDNA2003 registrations and no current client uses it. Review with the user: whether a caller
+    might still need transitional processing.
+  - **The flags are named parameters with the URL standard's values** (`checkHyphens = false`,
+    `checkBidi = true`, `checkJoiners = true`, `useStd3AsciiRules = false`, `verifyDnsLength =
+    false`), so `idna.toAscii(name)` is what a browser does and the strict form is one argument
+    away. `toUnicode` has no `verifyDnsLength`: UTS #46 gives it none, and the conformance file's
+    `X4_2` (an empty label reported by `toUnicode`) is a compatibility code it does not need.
+  - **Errors as a `Result` with the first error and its label**, rather than UTS #46's string with
+    U+FFFD substituted plus a flag: a caller that has a `Result` cannot use the half-converted name
+    by mistake. `toUnicode` therefore does not give a best-effort display of an invalid name; a
+    display falls back to the ASCII form (below).
+  - **`MaxLabelLength`, 1024 code points, for a label beyond ASCII or in Punycode, whatever the
+    flags.** Punycode's decoder inserts into the label for every character and its encoder scans
+    the label per distinct character, so the work grows with the square of a label's length; a
+    host in a hostile URL could otherwise cost seconds. DNS allows 63, so no resolvable name is
+    refused. An ASCII label, whose processing is linear, has no limit. Alternatives: no limit (the
+    URL standard sets none), 63 always (refuses names the standard accepts with `beStrict` off).
+    Punycode itself (`encodePunycode`, `decodePunycode`) takes any length, and checks every
+    addition and multiplication against `int`'s range, answering `Overflow` rather than trapping.
+  - **`Url` converts a registered name holding a character beyond ASCII (as written or in
+    percent-escapes) or a label beginning `xn--`, in every scheme**, with `idna.toAscii`'s
+    defaults, after decoding its escapes; the result must hold only RFC 3986's unescaped name
+    characters (so `℀`, mapped to `a/c`, is `BadHost`). An ASCII name without such a label is
+    kept as written, escapes and all, as before, and an address in brackets is never converted.
+    `parse`, `resolve` and `withHost` all hold the ASCII form, so `Url("http://bücher.example/")`
+    equals `Url("http://xn--bcher-kva.example/")` and the HTTP and WebSocket clients look up,
+    connect to, send `Host:` with, and over TLS name (SNI) and verify the ASCII form with no change
+    of their own. Alternatives: converting only the WHATWG standard's special schemes (`http`,
+    `https`, `ws`, `wss`, `ftp`, `file`), since it keeps other schemes' hosts opaque; but this
+    `Url` reads every scheme as RFC 3986 does, whose registered names are DNS names, and RFC 3987
+    maps them to A-labels likewise. Holding the Unicode form and converting at connection time was
+    weighed and refused: two URLs for one host would compare unequal.
+  - **`unicodeHost` and `unicodeText` for display**, decoding each `xn--` label with
+    `idna.toUnicode`; a name that does not decode to a valid one is shown in ASCII, so a person is
+    never shown a name the URL does not reach. `display` stays ASCII, the form that round-trips.
 
 ## Proposed
+
+- Settled on the user's delegation 2026-11-24 (branch `fs-content-type`): **`avin.fs` has
+  `probeContentType(file) -> Result[Option[string], IoError]`, `contentTypeOfName(name) -> Option[string]`,
+  `sniffContentType(bytes) -> Option[string]`, and one shared extension table `fs.contentTypes`
+  (`HashMap[string, string]`).** The extension decides first and needs no disk; only a name the table
+  does not know is opened and its first 512 bytes sniffed (PNG, JPEG, GIF, WebP, WAV, PDF, ZIP,
+  gzip, WebAssembly, ELF, Mach-O thin forms, then UTF-8 text as `text/plain; charset=utf-8`: no NUL
+  or control character but tab, LF, FF, CR, ESC, and a character cut off by the 512th byte
+  allowed). An empty file is `Ok(None)`; a name that is not known and cannot be opened is `Err`.
+  Why: a probe that answers from the name is what a server wants per request, and sniffing is the
+  fallback for files saved without an extension. *One table for two users:* `http-static`'s
+  `MimeTypes.standard` in `avin.net.http` carries the same web table; to keep a single source,
+  `fs.contentTypes` holds exactly that table (entry for entry), so `MimeTypes.standard` becomes
+  `MimeTypes(fs.contentTypes)` (one line, replacing its `HashMap(...)` literal; `files.avin`
+  already imports `avin.fs`). Alternatives weighed: a table inside `avin.net.http` (then `fs`
+  would import the network layer, the wrong way round); a third shared module (a new module for one
+  value); sniff first (reads the disk for every file and lets file contents override a deliberate
+  name). Not sniffed: universal Mach-O/Java `CAFEBABE` (ambiguous), BMP's `BM` (two letters match
+  too much text), UTF-16 (no charset to name in the table's form); `Result[Option]` over a bare
+  `Option` because a missing or unreadable file is a failure, not "unknown".
+- Settled on the user's delegation 2026-11-24 (branch `net-dns-udp`): **`avin.net` has `lookup`,
+  `IpAddress` and `UdpSocket`.** The choices, each with what was weighed:
+  - `lookup(host) -> Result[Vector[IpAddress], IoError]`, not a bare vector: a resolver fails in
+    more ways than "no address". It reuses the runtime's `resolve_host` (helper threads, a
+    cancellation ending the wait), unchanged; addresses come back deduplicated, in the platform's
+    order. A numeric address is parsed in Avin and answered at once, asking no helper.
+  - **A new `ErrorKind`, `HostNotFound`** ("no address found for the name"), for a name with no
+    address, `TcpStream.connect`'s and `bind`'s resolving included. Alternatives: `NotFound`, whose
+    sentence speaks of files and would print `cannot look up x: no such file or directory`; or
+    `Other("no address found")`, which a program can only tell apart by its text. Review with the
+    user: a new case of a shared error type, as `NoTerminal` was.
+  - **Names refused before the resolver sees them**: empty (which the system's resolver answers
+    with the loopback), longer than `HostNameMost` = 254 bytes (the DNS's 253 and a trailing dot),
+    or holding white space, a control character or a zero byte (which would cut the name short in
+    C). Alternative: pass everything through, as the system does.
+  - `IpAddress` is a class with private fields (the bytes, four or sixteen, and a numeric scope),
+    made by `parse`, `fromBytes`, `v4` and the four constants. `parse` is strict: no leading zeros,
+    no short forms like `127.1` or `0x7f.0.0.1` that the C resolver accepts, no brackets or ports,
+    and a zone only as an interface number (`%4`), never a name (`%en0`), since turning a name into
+    a number is a system call the system layer does not offer. Display is the system layer's RFC
+    5952 text. An IPv4-mapped IPv6 address is an IPv6 address, not equal to the IPv4 one.
+    Alternatives: a `data` type (its constructor would take any vector, and its fields would be
+    the API), and a text-backed address.
+  - `UdpSocket.bind(host | IpAddress, port, reusePort = false)` binds at once, as `TcpListener.bind`
+    does; there is no unbound socket. A socket of one version refuses an address of the other with
+    an `Err` naming both, rather than mapping IPv4 into IPv6. `sendTo` and `connect` also take a
+    host's name, using its first address of the socket's version.
+  - **Truncation is reported** by receiving into one byte more than asked: a datagram that filled
+    the extra byte was longer, and is cut back to `max` with `truncated = true`. The length of the
+    whole datagram is not known (the system layer's `recv_from` has no `MSG_TRUNC`). Receives go
+    through the carrier's buffer, so a `receiveFrom(65535)` of a small datagram costs what the
+    datagram does. `max` below one traps, as `TcpStream.read`'s does.
+  - **A send longer than the version carries (65507 over IPv4, 65527 over IPv6) fails in the
+    library**, without reaching the platform: macOS accepts an IPv6 send of 65536 bytes and more,
+    and a server should get the same answer everywhere. **A new socket's send buffer is raised to at
+    least 69632 bytes** where the platform's default is smaller (9216 on macOS), so any legal
+    datagram can be sent; the receive buffer is left to the platform and `setReceiveBufferSize`.
+  - Not offered: multicast groups, broadcast, the hop limit, and reverse lookups (an address to a
+    name). The system layer the runtime binds (`sysl.net`) has none of them, and reaching past it
+    with raw `setsockopt` calls and per-platform constants is the workaround the project's rules
+    forbid; each is a `sysl.net` item first. Review with the user: mDNS/DNS-SD needs multicast.
+- Settled on the user's delegation 2026-11-23 (branch `fs-handle`): **`File` has positioned
+  `readAt`/`writeAt`, `setLength` (alias `truncate`), `sync`/`syncData`/`fullSync` and
+  `deleteOnClose`.** Positioned calls never move the position and hand over or give up what the
+  handle buffered (written bytes are drained, read-ahead dropped), so they mix freely with `read`
+  and `write`. `readAt` loops until `max` bytes or the end, so a short answer only means the end;
+  `writeAt` loops over partial writes, so it writes all or answers `Err`. `syncData` on macOS is
+  `fsync`; `fullSync` is the one that empties the drive's cache. `deleteOnClose` is a flag on the
+  handle that `close` honours by removing the name (a file the collector frees is not removed),
+  built in Avin on `remove`, with no new Sysl function. Why: positioned I/O is what random-access
+  files, stores and concurrent writers need; one handle per lightweight thread keeps the "a file
+  belongs to the thread that opened it" rule. Alternatives weighed: a `Result[long]` partial
+  write (every caller would loop); marking at open time (`createTemp`), which would need a new
+  open variant. Review with the user: whether delete-on-close should instead be an open option
+  once Sysl exposes `open_with`.
 
 - Settled on the user's delegation 2026-11-19 (branch `train-ax`): **inside brackets whose commas separate items a comma
   after a `select`'s one-line arm ends the arm, the `select` and the item, as it does a match's**,
@@ -11223,6 +12646,21 @@ Settled on the user's delegation 2026-11-11 (built on branch `json-derive`): **J
   Avin's decoder is stricter than Sysl's (above), and encoding is a few lines of byte arithmetic with
   no platform behind it. Alternative weighed: binding `sysl.encoding`'s encoders and writing only the
   checks in Avin (two passes over the text, and a second implementation of the alphabet anyway).
+- Settled on the user's delegation 2026-11-23: **`avin.encoding` gains base32** (RFC 4648 alphabet `A`–`Z`, `2`–`7`): `toBase32`
+  (padded with `=` to a multiple of eight), `toBase32Unpadded`, `toBase32Lower` (lower case, no
+  padding), each over a `Vector[byte]` or a `string`, and one `fromBase32`. The decoder reads either
+  case (also mixed) and padded or unpadded text, because a digit's case and a trailing `=` carry no
+  bits; it stays strict otherwise, with the same `DecodeError` cases and check order as base64: a
+  padded text needs the right count of `=` (`Truncated` when the length is not a multiple of eight,
+  `BadPadding` for a misplaced `=` or more than six), an unpadded one must end on 0, 2, 4, 5 or 7
+  digits past a multiple of eight (`Truncated` otherwise), and a last digit with unused bits set is
+  `UnusedBits`. Why: marshal writes a 128-bit token as 26 lower-case characters (`toBase32Lower`),
+  and a token read back from a case-folding source (a URL host, a file name) must still decode.
+  Alternatives weighed: an options argument or default arguments for case and padding (the base64
+  family has one function per spelling, and `fromBase64Url` shows the unpadded form as its own
+  name); four encoders (padded lower case has no user); a decoder strict about case (a token typed
+  or lower-cased in transit would fail for no gain in uniqueness a caller relies on). Review with the
+  user: base32 decoding is therefore not one-spelling-per-value as base64's is (case and padding vary).
 - Settled on the user's delegation 2026-11-15: **`constantTimeEquals(a, b)` in `avin.crypto`**, for `Vector[byte]` and for `string`
   (compared as UTF-8 bytes, so `"é"` and `"e\u{301}"` differ), bound to Sysl's `sysl.crypto.verify`,
   which reads every byte and branches only on the lengths. Why: Sysl pins that function's
@@ -12561,6 +13999,41 @@ Settled on the user's delegation 2026-11-11 (built on branch `json-derive`): **J
   (more than this item needs; `observe` covers counting another way); labelling by status code rather
   than class (more series for little gain). Review with the user: a handler that traps leaves the
   in-flight gauge one too high, for the same lack of unwinding.
+- Settled on the user's delegation 2026-11-24 (branch `metrics`): **`avin.metrics`, a general
+  registry, and the HTTP metrics re-based on it.** `Registry` holds `Counter`, `Gauge` and
+  `Histogram` families (and `gaugeOf`, read at render time), each a family of series by label values,
+  rendered in the Prometheus text exposition format 0.0.4, families in the order made, series by
+  their label values. Values are `real`s: a series is one `Atomic[real]` updated by a
+  compare-and-set loop (a histogram: an `Atomic[long]` a bucket plus one for its sum), and the series
+  map is a persistent `HashMap` in an `Atomic`, read without a lock and replaced under the family's
+  lock only when a series is made. Measured at `-O2`: about 8 ns an increment of a kept series,
+  12 ns a histogram observation into 11 buckets, 125 ns finding a series by two labels and
+  incrementing it, 100 ns an increment with four threads on one series. A histogram's count is the
+  sum of its buckets, so `+Inf` and `_count` agree in every render. Why: counters of seconds and
+  bytes need fractions, and a `real` compare-and-set costs what an integer add does; lock-free reads
+  keep the hot path to one atomic update. Alternatives weighed: `long` counters (exact, but no
+  fractional amounts, and a second type for each kind); one lock per family (simple, but every
+  increment would take it); a separate atomic count for histograms (a render could then show `+Inf`
+  above `_count`); OpenMetrics 1.0 text with content negotiation (the 0.0.4 text is what every
+  scraper reads, and `# EOF` and `_created` add nothing yet; a later addition); a process-wide default
+  registry (a hidden global; a program passes its registry as it does a logger). **The cardinality
+  guard** is a per-family `maxSeries`, 10000 by default, past which every new label set is one
+  overflow series whose labels are all `_overflow`, rendered last. Alternatives: trapping (a
+  client's input would stop the server), dropping the counts (totals would be wrong), refusing with
+  a `Result` (every `labels` call would grow error handling for what is a safety net), a limit on
+  the whole registry (one noisy family would starve the rest). The HTTP metrics label a method HTTP
+  does not define `_other`, so made-up methods cannot fill the guard. `Metrics` keeps its names and
+  API, gains `registry` and `maxSeries`, and its series are now ordered by label values (method
+  first) rather than by route. **The server's own metrics** are a `ServerMetrics` given to
+  `http.serve(metrics = Some(…))`: requests by method and status class, durations by method, in
+  flight, and refusals before any handler by status code, under the names `http_server_*` so they sit
+  beside a `Metrics` in one registry. The server holds each request's `InFlight` by its connection's
+  hash, so a handler that traps, which runs no deferred code, is still counted as `500` and leaves
+  the gauge exact when the connection's failure is reported. Alternatives: hooks as callbacks on
+  `serve` (a general hook API is a larger design, and the counting it would serve is this one);
+  counting refusals in `http_server_requests_total` with an empty method (a refused request has no
+  trustworthy method, and its exact code says which limit was hit). Review with the user: whether a
+  process-wide default registry is wanted after all, and OpenMetrics negotiation.
 - Settled on the user's delegation 2026-11-15 (built on branch `api-observe`): **rate limiting.**
   `RateLimiter(rate, per, burst, key, maxKeys, clock, errors)` is a token bucket per key, computed as
   each bucket's next-token time in integer microseconds (the generic cell rate algorithm, exactly a
@@ -12573,6 +14046,42 @@ Settled on the user's delegation 2026-11-11 (built on branch `json-derive`): **J
   smooth, more state). Review with the user: evicting a bucket that is not full forgives that
   client's debt, which an attacker cycling more than `maxKeys` addresses can use; and the default
   key, the client's address, puts every client behind one proxy in one bucket.
+- Settled on the user's delegation 2026-11-23 (built on branch `http-cors`): **CORS middleware.**
+  `Cors(origins, allowOrigin, methods, headers, exposed, credentials, maxAge)` with a `middleware`.
+  Origins match exactly (a browser's origin is serialized in lower case, and its own check is
+  exact); `*` with credentials traps at construction; with credentials the origin is echoed, never
+  `*`, and `Vary: Origin` is merged into the handler's. A preflight is always answered `204` by the
+  middleware, granting nothing (no CORS header) for an origin, method or header not allowed, which
+  is how a browser is told to refuse; empty `headers` reflects the requested ones. Defaults are
+  the safe ones: methods `GET, HEAD, POST`, no credentials, no max age. A disallowed origin's
+  actual request is still handled (it carries `Vary: Origin` so a cache keeps the answers apart).
+  Alternatives weighed: forwarding a disallowed origin's preflight to the handler (the handler would
+  answer a route's `405`, a confusing signal and extra work); case-insensitive origin matching (not
+  what a browser does); a wildcard that echoes with credentials (the Fetch standard forbids
+  `*` there, and an echo of any origin with credentials is an open door, so `allowOrigin` must be
+  asked for). Review with the user: empty `headers` reflecting any requested header is the
+  common default but allows more than a closed list would.
+- Settled on the user's delegation 2026-11-24 (built on branch `http-trusted-proxy`): **Trusted-proxy
+  middleware.** `TrustedProxies(trusted, maxHops = 32)` with a `middleware`, `Cidr` blocks, a
+  `Forwarding` value carried on the request, and `ServerRequest.forwarding`, `scheme`, `host`,
+  `withRemote` and `withHeaderRemoved`. The default trusts nothing. Headers from an untrusted peer
+  are removed rather than merely ignored, so no later code reads a spoofed one. The client is the
+  first untrusted address walking from the nearest hop, so a prepended entry never wins; scheme and
+  host come from the entry the outermost trusted proxy wrote (as many places from the end as there
+  are trusted hops), not from the front of the list, which a client controls. `Forwarded` wins over
+  `X-Forwarded-*`. The client's address is normalised (shortest IPv6, mapped IPv4 as IPv4, port
+  dropped) so one client is one rate-limit key; `remote` is replaced by it so the access log and
+  rate limiter work unchanged, and the socket's address stays in `forwarding.peer`. A malformed
+  walked entry, `unknown`/obfuscated nodes, or bad `Forwarded` syntax make the headers worthless
+  (peer is the client) rather than guessing; a bad scheme or host alone is just not given. A hop
+  limit bounds the list a client can make long. Alternatives weighed: a trust-everything flag or a
+  hop count instead of CIDR blocks (a count trusts whatever the first hop is, and cannot tell a
+  proxy from a client that connects directly); the leftmost address as the client (a client sets
+  it); trusting the leftmost scheme or host (same); keeping the headers on untrusted requests;
+  skipping a malformed entry and reading on (it lets a client choose where the walk resumes);
+  `scheme` as a string defaulting to `http` (the server cannot see whether its own listener is TLS,
+  so `None` is the honest answer). Review with the user: the rule that a malformed entry makes the
+  whole header worthless trades availability of the real address for safety.
 - Settled on the user's delegation 2026-11-15 (built on branch `resolve-blocking`): **which library
   bindings are [blocking](/spec/sysl-bindings/#calls-that-wait).** Name resolution
   (`sysl.net.resolve`, which `TcpStream.connect` calls; since 2026-11-16 made on a helper thread
@@ -12990,3 +14499,295 @@ Settled on the user's delegation 2026-11-11 (built on branch `json-derive`): **J
   resumed on, changing the buffer's count there while the buffer's own carrier used it, which
   freed it under other threads (a crash in `malloc`, or corrupted bytes, with thousands of threads
   reading at once).
+- Settled on the user's delegation 2026-11-23 (branch `http-date`): **HTTP-dates live in `avin.time`
+  as `Instant.toHttpDate()` and `parseHttpDate(text[, now])`.** They sit beside the ISO 8601 text and
+  parse, share `TimeParseError`, and `avin.net.http` imports them. Writing is IMF-fixdate only, drops
+  the fraction toward the earlier second, and traps outside years 0000 to 9999 (the form has four
+  digits; it matches `date(...)` trapping out of range, and no real header value is outside it).
+  Parsing is exact: a day name that is not the date's is refused (`OutOfRange(text, "weekday")`), names
+  and `GMT` are case-sensitive as RFC 9110's ABNF is, widths are fixed, extra whitespace anywhere is
+  refused, `asctime`'s day under ten must be space-padded, a second of `60` is refused as in every
+  other parse. A two-digit RFC 850 year follows RFC 9110's fifty-year rule against `now`, which is an
+  argument of the two-argument form so the rule is testable and the one-argument form reads the
+  clock. Alternatives weighed: a lenient parser ignoring the day name or case (what some servers do;
+  it accepts corrupt dates and hides client bugs, and a caller can always trim or fold case first);
+  `Option` instead of `Result` (every other parse here says why); the format as a method on `Zoned`
+  (an HTTP-date is always UTC, so an `Instant` method has no zone to get wrong). Review with the
+  user: strict weekday and case checking on `If-Modified-Since`, where a lenient server would
+  answer 200 instead of ignoring a malformed date, which RFC 9110 also allows.
+- Settled on the user's delegation 2026-11-23 (branch `http-date-header`): **`http.serve` sends a
+  `Date` header on every response, switched off by `date: bool = true`.** RFC 9110 section 6.6.1
+  requires it of an origin server with a clock in 2xx, 3xx and 4xx and allows it in 1xx and 5xx; it
+  is sent on every status the server writes (5xx and its own `400`/`503` included, since a client or
+  cache gains from the clock there too) and not on the `101` of an upgrade, which the protocol
+  switched to has its own say on. A `Date` the handler set, in any case of the name, is kept, as
+  `Last-Modified` and the like are the handler's. The text comes from `DateHeader(clock = now)`, a
+  public class so its rollover is testable with a clock of the test's own: one `Atomic` holds the
+  latest second and its text, a read compares the clock's second with it, and a thread that finds the
+  second over formats and stores the next (two threads doing so store equal texts, and a store
+  racing a later one is corrected by the next read, each answer being right for its own clock
+  read). Alternatives weighed: a mutex around the text (a lock on every request's path); a timer
+  actor refreshing the text (a thread idling in every server, and a stale text if it is starved);
+  formatting on every response (about a microsecond of calendar arithmetic per request); a
+  `Duration`-valued setting naming a refresh period (the second is what the header can show). The
+  switch is a bool named `date`, as the header is. Tests that read raw heads pass `date = false`.
+- Settled on the user's delegation 2026-11-23 (branch `http-cookies`): **cookies in `avin.net.http`**
+  (`Cookie`, `SetCookie`, `SameSite`, `CookieError`; `ServerRequest.cookies()`/`cookie(name)`,
+  `Response.setCookie`/`cookies()`). Choices: (1) reading a `Cookie` header is lenient and per pair: a
+  malformed pair is skipped and the others kept (one bad cookie must not hide the session cookie), with
+  a value read only if every octet is a RFC 6265 cookie octet (commas and spaces in values are skipped,
+  not accepted as some servers do); duplicates are all kept in order. (2) Making a `SetCookie` traps on
+  a bad name/value/domain/path, on a broken `__Host-`/`__Secure-` rule (prefixes compared without
+  regard to case, as browsers do) and on `SameSite=None` or `Partitioned` without `Secure` — the library's
+  convention for a programmer-supplied header value (as `withHeader`), nothing escaped or cut; the secure
+  default is that `Secure` is never implied, only demanded. (3) The `SameSite` variant for `None` is
+  `Unrestricted`, since `None` is `Option`'s and would make `Some(None)` ambiguous; it is written
+  `SameSite=None`. (4) `Max-Age` of zero or less is accepted and written `0` (the grammar has no negative
+  and the meaning is the same). (5) `SetCookie.parse` (client) is an `Err` for what a browser would
+  reject (bad name/value, prefix rules, `SameSite=None`/`Partitioned` without `Secure`) and ignores
+  attributes it cannot read; `Expires` is read only as an HTTP-date (via `parseHttpDate`), not by RFC
+  6265's lenient date algorithm. Alternatives weighed: `Result` constructors (a second constructor path
+  for every cookie a handler writes); quoting values that need it (mangling); treating a pair without
+  `=` as an empty-named cookie (6265bis; no server needs it). A cookie jar (domain/path matching,
+  expiry, public suffixes) is a later item. Review with the user: strict value octets on `Cookie`
+  (a client sending `a=b,c` loses that cookie).
+- Settled on the user's delegation 2026-11-23 (branch `http-static`): **static files are served by
+  `FileServer` in `avin.net.http`, mounted by `server.at(prefix)`, a `GET` route of the new last
+  pattern segment `*name`.** `*name` binds the rest of the path joined by `/`; the server itself
+  reads the request's decoded segments past the mount (from `request.route`), never the joined text,
+  so an escaped `/` inside a segment is still seen and refused. A `*name` before the last segment
+  traps; a bare `*` stays literal. Choices, each the smallest safe one:
+  the **ETag is weak**, `W/"<size hex>-<mtime micros hex>"`, needing no read of the file, so by RFC
+  9110's strong comparison `If-Match` succeeds only for `*` and an `If-Range` entity tag never keeps
+  the range (the whole file is sent, which is always correct); an `If-Range` date keeps it when it
+  equals `Last-Modified` and that is at least a second old (RFC 9110 §13.1.5's strong-date rule).
+  **Several ranges are answered `200` with the whole file**, not `multipart/byteranges` (RFC 9110
+  lets a server ignore `Range`; multipart is rarely used, costs a boundary writer and a length
+  computed over parts, and is a known amplification vector); a malformed `Range`, another unit, or a
+  zero-length file asked for a non-zero suffix is likewise `200`. **Traversal**: a decoded segment
+  `.`, `..`, or holding `/`, `\` or NUL is `400` (a client normalizes dot segments before sending, so
+  one that arrives is an attack or a broken client); links are followed while their canonical target
+  stays under the canonical root, and one leading outside is `403` unless `linksOutside` (the index
+  file is held to the same check); **dotfiles are `404` by default**, `.well-known` included, unless
+  `dotfiles`. A directory asked for without its final `/` is redirected `301` (relative links in its
+  index need it), leading `//` folded to one `/` in the `Location` so it cannot name another host.
+  **Listing is off by default**; on, it is a plain HTML list with names escaped. Every `text/` type
+  in the table carries `; charset=utf-8`; JSON, XML and the rest carry none (their media types define
+  their own encoding). `HEAD` never opens the file; a `GET` opens it in the handler, so a file that
+  cannot be opened is answered `403`/`404` before the head is sent. Alternatives weighed: a strong
+  ETag from the same fields (what several servers send, but the bytes may change within the mtime's
+  resolution without the tag changing, which a strong tag promises cannot happen); a content hash
+  (reads the whole file per request, or needs a cache); `multipart/byteranges`; serving `..` by
+  normalizing it (accepts attack traffic quietly); refusing every link (breaks deployments that link
+  into a release directory). Review with the user: the weak ETag's effect on `If-Range` resumption
+  (date-based `If-Range` still works), and dotfiles hidden including `.well-known`.
+- Settled on the user's delegation 2026-11-23 (branch `http-static`): **a sendable method value is
+  held to its receiver's value, not to what the receiver expression uses.** The receiver is
+  evaluated where the value is made, so `Router([FileServer(dir.path).at("/")]).handle` is accepted
+  though `dir` is not sendable (it was refused), and `Counter().bump`, a receiver that is not
+  sendable built on the spot, is refused (it was accepted, since the expression used nothing from
+  around it). The error names it as "it carries its receiver, a `Counter`, ...".
+- Settled on the user's delegation 2026-11-24 (branch `fs-listing-dirs`): **directory listing with
+  paths and kinds, and the well-known directories.** (1) `fs.list(dir, pattern = None, skipInvalid =
+  false)` answers `Vector[DirEntry(name, path, kind)]`, sorted as `listDir`; `kind` is the entry's own
+  (an `lstat`, so a link is `Symlink`), which lists a dangling link and never hides a loop; it costs one
+  `lstat` per entry, which is what the directory's own `d_type` would save but sysl does not expose.
+  (2) Laziness is where it is cheap: `fs.entries` reads the names in one `readdir` pass (a directory
+  stream held open across fiber switches would pin a descriptor, and sysl offers no streaming
+  listing) and stats each entry as the iterator reaches it; an entry vanished meanwhile is skipped.
+  (3) A non-UTF-8 name fails the listing by default, as `listDir` and sysl do (a silently missing entry
+  is a wrong answer that looks right: a copy that leaves a file behind); `skipInvalid = true` is the
+  explicit way through a hostile directory. Alternatives weighed: lossy names (a path that no longer
+  names the file), always skip, a byte-string name type (a second path type for the whole library).
+  (4) A vanished entry is skipped by `list`, any other `lstat` error fails it. (5) The pattern is the
+  existing `matches` grammar applied to the name, so hidden names need a literal `.`. (6) The
+  well-known directories live in `avin.process` beside `homeDir` and `currentDir` (they are facts about
+  where the program runs, and `avin.fs` stays about paths): `tempRoot`, `cacheDir`, `configDir`,
+  `dataDir`, `setCurrentDir`. macOS follows its conventions (`~/Library/Caches`, `~/Library/Application
+  Support` for both configuration and data) and ignores XDG; elsewhere an XDG variable counts only when
+  absolute (the freedesktop rule), else the home leaf. They only name a path and make nothing.
+  `tempRoot` is `TMPDIR` if absolute else `/tmp`, taken as written (no trailing-slash trimming). The
+  Windows spellings are not offered since paths are POSIX. (7) `fs.hardLink` and
+  `process.setCurrentDir` are thin bindings; `setCurrentDir` is process-wide, documented as a
+  program's call, never a library's.
+- Settled on the user's delegation 2026-11-24 (branch `fs-path-helpers`): **path helpers in `avin.fs`**
+  (`root`, `isHidden`, `withFileName`, `withExtension`, `sibling`, `startsWith`, `endsWith`; glob
+  alternation was already in). All are pure text, written in Avin over the existing path bindings.
+  (1) `startsWith`/`endsWith` compare components, never characters (`/ab` does not start with `/a`),
+  and never normalize: `a/../b` does not start with `b`'s directory, since resolving `..` without the
+  file system can name another file. `startsWith` also requires equal absoluteness; an absolute suffix
+  must be the whole of an absolute path. (2) `withFileName` uses `name` as written and a path with no
+  file name (`/`, `.`, `..`) has it appended, so the function is total and never loses the directory;
+  an empty name leaves the directory. `sibling` is `join` of the parent and the name, so an absolute
+  name wins, as in `join`; the two differ only there. (3) `withExtension` takes the extension without
+  its dot, an empty one removes it, a path with no file name is unchanged, and a dotfile gains one
+  (`.profile.bak`), matching `stem`. (4) `root` is `Option[string]` (`Some("/")` or `None`), as POSIX
+  has one root and the `Option` matches `parent` and `fileName`. Alternatives weighed: `Result` for a
+  name holding `/` or an empty extension (every caller then unwraps for what is sometimes wanted);
+  normalizing before comparing (silently wrong across links); a `string` root (`""`) for relative paths
+  (cannot tell "no root" from a root written empty).
+- Settled on the user's delegation 2026-11-24 (branch `caches`): **`avin.cache`, an `LruCache` and a
+  `TtlCache`.** Choices: (1) One module of its own, written on the public `Mutex` with `@isolating`
+  bodies over a `LinkedMap` (no `@trusted_sendable` class), both caches sharing one private core.
+  (2) One capacity measured by a weigher defaulting to one an entry, instead of a separate count bound
+  and weight bound: a count is the weight of one each, and two bounds would raise which-wins questions.
+  An entry heavier than the whole capacity is not stored (emptying the cache for it would be worse),
+  and its put still drops the key's old value, so a put never leaves a stale one. (3) Nothing of the
+  caller's runs under the lock: the weigher and the clock are read before it is taken, and a loader
+  runs on its caller's thread outside it, so a loader may use the cache and a slow loader holds up
+  only its own key. (4) Singleflight per key: the first miss records a flight and runs the loader;
+  later misses wait on the flight's future. `getOrTry[E]`'s flight is typed by its error, and a caller
+  of another error type joining it (the same key loaded with two loaders) takes its value where it
+  gave one and loads again itself where it failed, by a reified type test, so no error is ever cast.
+  (5) An `Err` is handed to that flight's waiters and never stored; caching failures is asked for by
+  the value type, a cache of `Result`s filled by `getOrLoad`, rather than by a flag, which would need
+  the error type in the cache's own type. (6) A write of a key during its load wins: `put`, `remove`
+  and `clear` mark the flight stale, and its value is handed to its waiters but not stored over the
+  newer one. (7) A load whose thread is cancelled ends its flight with no outcome (a `defer`), and its
+  waiters load again rather than share a failure that is no failure of the loader. (8) The TTL is
+  after write, not after access, measured from the end of a load; lookups keep LRU order, so expiry is
+  lazy (on lookup, when room is made, and by `purgeExpired()`), not a sweep thread; expired entries
+  count toward the capacity until dropped, and the capacity bounds them. The deadline saturates.
+  (9) The clock is `@sendable () -> Duration`, the monotonic clock by default, as `Logger`'s is a
+  function; there is no `Clock` type to inject. (10) Counts kept under the lock, read as one
+  consistent `CacheStats`; a waiter on a load counts one miss however often it looks again. (11) One
+  lock a cache, not striped, so the LRU order and the capacity are exact. Measured at `-O2`: an
+  uncontended hit is about 130 ns, 17 ns of it the lock; eight threads hitting one cache fall from 7.7
+  to about 0.26 million operations a second between them, and a bare contended `Mutex` falls the same
+  way (60 to under 2 million), since the runtime's lock hands itself to the oldest waiter, parking and
+  waking a thread on every contended release. The cure for that is the lock's, for every lock in the
+  library, and striping the cache would only make contention rarer. Review with the user: whether the
+  runtime lock should spin briefly, or let a running thread take a lock just let go, before it parks
+  (fairness against throughput), and whether a sharded cache is wanted besides. Alternatives weighed:
+  a sharded cache (approximate LRU; worth it only past the contention measured, and a later option of
+  the same API); expire-after-access (an idle-session cache wants it; a later `TtlCache` setting); a
+  background sweeper (a thread a cache in every server, for memory the capacity already bounds);
+  storing failures with a negative-caching time (needs `E` in the cache's type); a loader given at
+  construction (the per-call loader is the more general form, and a fixed one is a closure over it).
+  Review with the user: no self-detection of a loader asking for its own key (it waits for ever, as a
+  self-join does; detecting it needs the thread's identity, which `avin.threads` keeps private).
+- Settled on the user's delegation 2026-11-24 (branch `tls-options`): **ALPN and the version range
+  are fields of the settings, `TlsClient` and `TlsServer`**, set by `offer(names)` and
+  `versions(min, max)`, each answering new settings, as `trust` does; the connection reads what was
+  settled as `s.protocol -> Option[string]` and `s.version -> TlsVersion`. Alternatives weighed:
+  named parameters on `TlsStream.connect`/`client`/`server` (would have to be repeated at every call,
+  and `http.send`, `WebSocket.connect` and `serve` would each grow them too, where the settings
+  already travel); a separate options type (a second value to pass beside the settings). Both
+  bindings over sysl:openssl 0.2.5's `offer`, `versions`, `protocol` and `version`; no sysl change.
+- Settled on the user's delegation 2026-11-24 (branch `tls-options`): **`TlsVersion` names TLS 1.2
+  and TLS 1.3 alone**, defaults `Tls12` to `Tls13`, so the floor of TLS 1.2 cannot be lowered: an
+  insecure range is not representable rather than refused. OpenSSL's own mirror with TLS 1.0 and 1.1
+  stays private. The ceiling is set explicitly to TLS 1.3 (OpenSSL's default has none); a newer
+  version joins `TlsVersion` and the default together. A `min` newer than `max` traps (in `versions`,
+  and at the first connection of settings made directly), as a negative timeout does: it is the
+  program's mistake, and no `TlsError` variant is added that every exhaustive match would have to
+  name. Alternatives: the four-version mirror public with 1.0/1.1 refused at the call (a trap for a
+  value the type offers); `Option` for "no ceiling" (a value nobody needs to write).
+- Settled on the user's delegation 2026-11-24 (branch `tls-options`): **ALPN names are checked
+  where they are given**: one empty or over 255 bytes (bytes, not characters), or a list over the
+  65535 bytes RFC 7301's `ProtocolNameList` carries with each name's length byte, traps in `offer`,
+  and at the first connection of settings made directly. The server's order wins (sysl:openssl's
+  choice) and no protocol in common fails the handshake with `no_application_protocol`, as RFC 7301
+  asks; a server or client offering none leaves `protocol` `None`. Duplicate names are not refused.
+- Settled on the user's delegation 2026-11-24 (branch `tls-options`): **certificate reload is a
+  `TlsSource`, asked for its `current` settings as each handshake begins**, with
+  `ReloadableTlsServer` holding them in an `Atomic` and a `TlsServer` its own source; `http.serve`'s
+  `tls` became an `Option[TlsSource]`, which every `Some(server)` already written still is. Because
+  each connection makes its OpenSSL context from the settings it took (as it always has), a reload
+  touches no open connection: nothing is swapped under a live session. `reload(certificate, key)`
+  checks the pair before it replaces anything, keeps the protocols and versions, and retries by
+  `compareAndSet` so a whole-settings reload made meanwhile is not lost. Alternatives: a mutable
+  `TlsServer` (its builders answer new values, so a reload of the old one would silently miss the
+  new); a callback (`() -> TlsServer`) as the source (a trait names the role and lets a provider
+  keep state, a certificate store or an ACME client); the library watching `Hangup` itself (a
+  program chooses its own reload trigger; the example in the chapter watches `Hangup`). Review with
+  the user: each connection still parses its PEM into a fresh context, which a cached context per
+  `TlsServer` would avoid; that is a performance item, not a correctness one.
+- Settled on the user's delegation 2026-11-24 (branch `tls-options`): **`http.serve` offers
+  `http/1.1` by ALPN where the settings offer no protocol of their own**, since it serves HTTP/1.1
+  alone: a client offering `h2` and `http/1.1` is told `http/1.1`, and one offering `h2` alone is
+  refused in the handshake rather than answered in a protocol it did not ask for. Settings with
+  protocols of their own are used as they are. The `http` client offers no protocol yet, which every
+  server accepts. Alternatives: leaving ALPN off under `serve` (a
+  client offering `h2` alone would get HTTP/1.1 bytes); always replacing the settings' list (would
+  override a program's choice silently).
+- Settled on the user's delegation 2026-11-24 (branch `html-escape`): **`avin.html` escapes per
+  context, and `html"…"` is a contextual auto-escaping template whose output is the trusted `Html`.**
+  (1) Five escapers, each for one context, each safe on its own: `escapeHtml` (the five characters
+  `& < > " '`, for text and quoted attributes; `'` as `&#39;`, which every HTML version reads),
+  `escapeAttribute` (every ASCII non-alphanumeric as `&#xHH;`, the OWASP rule for any attribute value,
+  unquoted too), `escapeJs` (every character but ASCII letters and digits as `\xHH`/`\uHHHH`, so the
+  output is pure ASCII and cannot end a string, comment, template, regular expression or the
+  `<script>` element, U+2028/9 included), `jsString` (that in double quotes) and `safeUrl` (relative
+  URLs and `http`, `https`, `mailto`, `tel` kept; anything else `about:invalid#unsafe-url`, the scheme
+  read as a browser reads it, after stripping leading C0/space and inner tab/newline). (2) `Html` is
+  `data Html(text)`: the constructor is the explicit act of trust, since Avin has no private
+  constructors to funnel it through a named `Html.trusted`. (3) `html"…"` is a library interpolator
+  (trait + `impl` for `StringContext`) that runs a small HTML tokenizer over the template's parts and
+  writes each hole for its context: text → `escapeHtml` (an `Html` raw); quoted attribute →
+  `escapeHtml`; a URL attribute's start → `safeUrl` then escaped, later in the value → percent-encoded;
+  script and `on*` attributes → `jsString`, a whole literal; everywhere else (names, unquoted values,
+  comments, `style`, `srcdoc`, raw text elements) it traps. A template must end in text, so `Html` from
+  `html"…"` always composes. `Html.render(parts, args)` answers `Result` for the same work. (4) Holes in
+  scripts become whole string literals rather than escaped string contents, so no JavaScript lexer is
+  needed: with every non-alphanumeric escaped, even a misjudged context (a hole inside a string the
+  template author opened) yields a syntax error or a harmless `in` expression, never code; a hole just
+  after a quote traps to catch that mistake. (5) A template's context is checked when it renders, not
+  when it compiles: an interpolator is an ordinary method, and the language has no way for a library
+  to inspect a literal's parts at compile time (`f"…"` is checked by the compiler itself). WHY: the
+  smallest design that is safe by default in every context a server page meets, with raw output only
+  through a named type. ALTERNATIVES weighed: one escaper for everything (unsafe in URLs and scripts);
+  a non-contextual `html"…"` that only escapes text (silent XSS through `href` and `onclick`); a
+  template language in its own files with a compiler (a large item, likely a package); a JavaScript
+  lexer to escape inside the author's quotes (more code, more ways to misjudge); allowing unquoted
+  attribute holes with `escapeAttribute` (an empty value swallows the next attribute); escaping rather
+  than refusing `Html` in a script (it is trusted as markup, not as code). Review with the user: a
+  compile-time hook for interpolators (checking a template's parts as it compiles, as `f"…"` is), which
+  would move every template mistake from first render to compile time; and private constructors, which
+  would let `Html` be made only through a named trusting function.
+- Settled on the user's delegation 2026-11-24 (branch `crypto-password`): **password hashing is
+  `avin.crypto.password`, over the Argon2 reference implementation and Openwall's crypt_blowfish,
+  vendored as C sources in a Sysl package the standard library carries** (`library/sysl/password`,
+  named by directory in `library.hocon`). The source was picked in the order the item set: (1)
+  OpenSSL's Argon2 KDF: the installed OpenSSL (4.1) has `ARGON2ID`, but sysl:openssl 0.2.5 binds no
+  `EVP_KDF` call, and binding one means a release of that package, outside this repository; it would
+  also tie password hashing to OpenSSL 3.2 or later, which many current Linux releases do not ship.
+  (2) The reference implementation (phc-winner-argon2, CC0) as vendored C: taken. Avin's own C-source
+  support (`c-libraries.sources`) is a package manifest's, and the standard library's `library.hocon`
+  carries only `sysl-dependencies`, so the C is reached the way the library already reaches OpenSSL:
+  through a Sysl package, here one in the library's own tree whose `c` block compiles the upstream
+  files byte for byte, with one C shim (`shim.c`) that fills Argon2's context from scalars and gives
+  bcrypt's C strings their NULs. A program that never imports `avin.crypto.password` never builds
+  it. (3) Pure Avin was not needed. bcrypt verification uses crypt_blowfish 1.3 (public domain), the
+  implementation most C libraries' `crypt` use for `$2b$`. *Alternatives weighed*: sysl:monocypher
+  0.4.1, which binds Argon2id too (the audit row saying "Argon2i only" is out of date) and is audited,
+  but computes lanes one after another and is not the source the item named; libsodium or libargon2
+  installed through a package manager (a dependency to install everywhere); a library manifest that
+  carries `c-libraries` (a compiler feature for something a Sysl package already does). Review with
+  the user: whether the standard library should grow `c-libraries` of its own, which would make the
+  Sysl package unnecessary.
+- Settled on the user's delegation 2026-11-24 (branch `crypto-password`): **the password API.**
+  `hashPassword(password, params = Argon2Params(), secret = [])` returns a PHC string;
+  `verifyPassword(password, encoded, secret = [], limits = PasswordLimits()) -> Result[bool,
+  PasswordHashError]`, where `Ok(false)` is a wrong password and `Err` a hash that could not be checked
+  (`Malformed`, `Unsupported`, `OverLimit`, `Failed`), so a corrupted row never reads as an intruder;
+  `needsRehash(encoded, params)`; `argon2(...)` the raw primitive; `parseArgon2Hash` and
+  `Argon2Hash.encode` for the PHC string. Choices: (1) defaults are OWASP's first Argon2id setting,
+  19456 KiB, t=2, p=1, 16-byte salt, 32-byte hash. (2) `needsRehash` is true when any parameter
+  differs (variant, version, m, t, p, salt and hash length), not only when one is lower, as other
+  libraries do, so a server may lower a cost too; every bcrypt hash needs rehashing. (3) Verification
+  limits are checked before anything is computed: 1 GiB, 32 passes, 16 lanes, bcrypt cost 16 by
+  default, so a forged or corrupted string cannot pin a login for minutes. (4) There is no password
+  length limit: Argon2 reads the password once through BLAKE2b, so a long one costs microseconds, and
+  a request body is already bounded by the server. (5) Version 1.0 hashes (`v=16`, or no `v=`) are
+  verified, never written. (6) The PHC reader is strict: fields in the order `m,t,p`, decimals with no
+  sign or leading zero and at most ten digits, canonical unpadded base64, no `keyid`/`data`; anything
+  else is `Malformed`. (7) bcrypt accepts `2a`, `2b` and `2y` and refuses `2x` (the setting that
+  reproduces a sign-extension bug) as `Unsupported`; it compares only the 31 hash characters, so a
+  salt whose last character carries nonzero unused bits still verifies; a key ends at its first zero
+  byte and at 72 bytes, as bcrypt defines. (8) Both bindings are `blocking`: the hashing thread is safe
+  for the collector and the scheduler moves the other lightweight threads off its worker. Lanes are
+  computed on at most 16 threads. (9) Argon2's `secret` (a pepper) is a parameter of hash and verify;
+  bcrypt ignores it. *Alternatives weighed*: `verifyPassword -> bool` (hides malformed rows);
+  `needsRehash` only on weaker costs; a `Result` from `hashPassword` (its parameters are the server's
+  own, so a bad one is a programming error and traps, as `pbkdf2HmacSha256`'s do).

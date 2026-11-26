@@ -1,0 +1,135 @@
+module avin.rt
+@tests
+
+import sysl.raw.ptr_cast
+import sysl.sync.*
+import sysl.threads.{Thread, spawn}
+
+// What a trap leaves of its thread's frames, and who stops the program when several threads try at
+// once.
+
+private var trapping: Context = new_context()
+
+// Frames of two actors' turns, the second's turn run from the first's code, and one of the code that
+// traps.
+private var turn_frame: Frame = Frame(null, 0)
+private var inner_turn_frame: Frame = Frame(null, 0)
+private var code_frame: Frame = Frame(null, 0)
+
+// The records `guarded` makes as each turn calls its actor's code.
+private var outer: Recovery = recovery_at(0)
+private var inner: Recovery = recovery_at(0)
+
+// A record `guarded` makes as the turn calls the actor's code, the thread then inside `doubt`
+// regions.
+private recovery_at(doubt: u32) -> Recovery = Recovery([0u64; 64], null, null, 0, doubt, null, null, null, null, 0, null, 0)
+
+// The thread in the code `outer`'s turn runs, inside `doubt` regions.
+private in_turn(doubt: u32)
+    outer = recovery_at(0)
+    outer.top = &turn_frame
+    code_frame.prev = &turn_frame
+    trapping.top = &code_frame
+    trapping.doubt = doubt
+    trapping.recovery = &outer
+
+@test("a trap outside any actor's code leaves its thread no frame")
+trap_outside_an_actor()
+    trapping.recovery = null
+    trapping.doubt = 0
+    code_frame.prev = null
+    trapping.top = &code_frame
+    assert(surviving_frames(&trapping) == null)
+
+@test("a trap an actor's turn contains leaves its thread the turn's frames, not the code's")
+trap_inside_an_actor()
+    in_turn(0)
+    assert(surviving_frames(&trapping) == &turn_frame)
+    trapping.recovery = null
+
+@test("a trap in a region in doubt the turn began in is contained; one the turn did not begin in leaves no frame")
+trap_in_doubt()
+    in_turn(1)
+    outer.doubt = 1
+    assert(surviving_frames(&trapping) == &turn_frame)
+    trapping.doubt = 2
+    assert(surviving_frames(&trapping) == null)
+    trapping.doubt = 0
+    trapping.recovery = null
+
+@test("a nested turn's trap leaves the frames of the innermost turn")
+trap_in_a_nested_turn()
+    in_turn(0)
+    inner = recovery_at(0)
+    inner_turn_frame.prev = &code_frame
+    inner.top = &inner_turn_frame
+    inner.previous = &outer
+    trapping.recovery = &inner
+    assert(surviving_frames(&trapping) == &inner_turn_frame)
+    trapping.recovery = null
+
+@test("dropping the trapped code's frames keeps the reason in the context")
+leaving_trapped_code()
+    in_turn(0)
+    trapping.trap_reason = null
+    leave_trapped_code(&trapping, ptr_cast(&code_frame))
+    assert(trapping.top == &turn_frame)
+    assert(trapping.trap_reason == ptr_cast(&code_frame))
+    trapping.trap_reason = null
+    trapping.recovery = null
+
+// A thread that asks over and over whether the word is claimed, as a trapping actor asks whether
+// the program is stopping, until `halt` is raised.
+private struct Asker
+    word: Atomic[u32]
+    halt: Atomic[u32]
+    asked: usize
+
+private var asker: Asker = Asker(Atomic(0), Atomic(0), 0)
+
+private ask(a: *Asker) -> unit
+    while a.halt.load() == 0
+        if claimed(&a.word) then a.asked += 1
+
+@test("the first claim to stop the program succeeds while another thread keeps asking whether it is claimed")
+claim_beside_an_asker()
+    asker.word.store(0)
+    asker.halt.store(0)
+    asker.asked = 0
+    val t = spawn(&ask, &asker).unwrap()
+    for _ in 0..<20000
+        asker.word.store(0)
+        assert(!claimed(&asker.word))
+        assert(claims_first(&asker.word), "asking whether the stop was claimed made the first claim fail")
+        assert(claimed(&asker.word))
+        assert(!claims_first(&asker.word), "a second claim succeeded")
+    asker.halt.store(1)
+    assert(t.join())
+
+@test("only one of several threads claiming at once is the first")
+claims_race()
+    for _ in 0..<500
+        racers.word.store(0)
+        racers.firsts.store(0)
+        racers.go.store(0)
+        var threads: [4]Option[Thread] = [None; 4]
+        for i in 0..<4
+            threads[i] = spawn(&race, &racers)
+        racers.go.store(1)
+        for i in 0..<4
+            threads[i] match
+                Some(t) -> assert(t.join())
+                None -> assert(false, "a thread did not start")
+        assert_eq(racers.firsts.load(), 1u32)
+
+private struct Racers
+    word: Atomic[u32]
+    firsts: Atomic[u32]
+    go: Atomic[u32]
+
+private var racers: Racers = Racers(Atomic(0), Atomic(0), Atomic(0))
+
+private race(r: *Racers) -> unit
+    while r.go.load() == 0
+        ()
+    if claims_first(&r.word) then _ = r.firsts.add(1)
