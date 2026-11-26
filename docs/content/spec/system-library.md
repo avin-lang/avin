@@ -124,6 +124,26 @@ knows is asked for by name, and a program's own settings are its own values.
 | `environment() -> Map[string, string]` | Every environment variable and its value, read when called. A variable set to nothing is there with `""`. |
 | `currentDir() -> Result[string, IoError]` | The directory relative paths are read from. |
 | `homeDir() -> Option[string]` | The user's home directory, `None` where the platform names none. |
+| `setCurrentDir(dir) -> Result[unit, IoError]` | Makes `dir` the directory relative paths are read from, for the whole program; `NotFound`, `NotADirectory` or `PermissionDenied` leave it as it was. |
+| `tempRoot() -> string` | The directory for temporary files: `TMPDIR` when it is an absolute path, else `/tmp`. |
+| `cacheDir()`, `configDir()`, `dataDir()` `-> Option[string]` | Where the machine keeps a program's cache, settings and data; see below. A path only: nothing is made. |
+
+**Well-known directories follow the platform's convention.** On macOS `cacheDir()` is
+`~/Library/Caches`, and `configDir()` and `dataDir()` are both `~/Library/Application Support`: the
+platform draws no line between settings and data, and the XDG variables are not read. Elsewhere each
+is its freedesktop variable (`XDG_CACHE_HOME`, `XDG_CONFIG_HOME`, `XDG_DATA_HOME`) when that is set
+to an **absolute** path, and otherwise a leaf under the home directory: `~/.cache`, `~/.config`,
+`~/.local/share`. A variable that is empty or relative is ignored, as the specification requires. All
+three are `None` when no home is known and the variable does not answer (`HOME` unset or empty).
+`homeDir` joins its leaf with exactly one `/`. A program adds its own name:
+
+```text
+import avin.fs
+import avin.process
+
+settingsFile() -> Option[string] =
+  process.configDir().map(d -> fs.join([d, "myprogram", "settings.conf"]))
+```
 | `executable() -> Option[string]` | The absolute path of the running program's file, where the platform can tell. |
 | `processors() -> int` | How many processors the program may run on: the number the futures' pool grows to. |
 | `pid() -> long` | The process's identifier. |
@@ -860,6 +880,7 @@ data ErrorKind
   ConnectionReset
   TimedOut
   NoTerminal
+  HostNotFound
   Other(text: string)
 ```
 
@@ -876,6 +897,7 @@ data ErrorKind
 | `ConnectionReset` | The other end reset or closed a connection while it was in use. | `connection reset by peer` |
 | `TimedOut` | A read or write on a connection waited past its timeout. | `timed out` |
 | `NoTerminal` | The program has no controlling terminal to read from or write to. | `there is no terminal` |
+| `HostNotFound` | A host's name stands for no address: the resolver found none, or the name could not be a host's (see [`lookup`](#ip-addresses-and-lookups)). | `no address found for the name` |
 | `Other(text)` | Any other failure, described in words. | `text` |
 
 **An `IoError` names its subject.** `operation` is what was being done, in words that follow
@@ -1272,10 +1294,10 @@ copyNotes(from: string, to: string) -> Result[unit, IoError]
 | `writeBytes(file, bytes) -> Result[unit, IoError]` | As `writeText`, with bytes. |
 | `appendBytes(file, bytes) -> Result[unit, IoError]` | As `appendText`, with bytes. |
 | `writeText(file, text, createParents = false)`, `writeBytes(file, bytes, createParents = false)` | With `createParents`, the directories above the file that are missing are made first (`createDirAll` of its parent). |
-| `writeTextAtomic(file, text, createParents = false) -> Result[unit, IoError]`, `writeBytesAtomic(file, bytes, createParents = false)` | Writes to a new file beside `file`, syncs it to the device and renames it over `file`: a reader sees the whole old contents or the whole new, and a failure leaves `file` as it was and removes the new file. The new file's name is unique per call and per process. The replacement takes default permissions, not the old file's. |
+| `writeTextAtomic(file, text, createParents = false, mode = 0o666) -> Result[unit, IoError]`, `writeBytesAtomic(file, bytes, createParents = false, mode = 0o666)` | Writes to a new file beside `file`, syncs it to the device, renames it over `file` and syncs the directory, so the new name survives a crash: a reader sees the whole old contents or the whole new, and a failure before the rename leaves `file` as it was and removes the new file (a failed directory sync is an `Err` with the new contents in place). The new file's name is unique per call and per process. The result keeps the exact permission bits of the file it replaces, setuid and bits the umask would take included; where there was none it has `mode`, less the umask. Either way the new file never has more bits than it ends with. |
 | `readLines(file) -> Result[Vector[string], IoError]` | Every line without its terminator. `\n` and `\r\n` both end a line; a last line with no terminator is kept; a final terminator does not start an empty line, so an empty file has no lines and `"\n"` has one empty line. Invalid UTF-8 becomes U+FFFD. |
 | `lines(file) -> Result[Lines, IoError]` | The same lines, lazily: `Lines` is an `Iterator[Result[string, IoError]]` holding one line at a time. The file closes when the iterator gives its last item (a line, or the `Err` that ended it). To stop early, `close()` it (`defer reader.close()`); one forgotten is closed by the collector. |
-| `writeLines(file, lines, createParents = false) -> Result[unit, IoError]` | Writes each line followed by `\n` to a made or emptied file, so the file ends in a newline; an empty collection leaves an empty file. |
+| `writeLines(file, lines, createParents = false, mode = 0o666) -> Result[unit, IoError]` | Writes each line followed by `\n` to a made or emptied file, so the file ends in a newline; an empty collection leaves an empty file. A file it makes has `mode`, as `create` makes one. |
 | `exists(file, followLinks = true) -> bool` | Whether anything, file or directory, is at the path. A dangling link answers `false`; with `followLinks = false` the link itself is asked about, so it answers `true`. |
 | `isDir(file) -> bool` | Whether the path names a directory, one the program may not read included. |
 | `isFile(file) -> bool` | Whether the path names a regular file: not a directory, and not a FIFO, a socket or a device either. |
@@ -1295,6 +1317,8 @@ copyNotes(from: string, to: string) -> Result[unit, IoError]
 | `linkMetadata(file) -> Result[Metadata, IoError]` | As `metadata`, but a symbolic link is described rather than followed: its `kind` is `Symlink`, its `size` the length of the path it holds, and a dangling one answers `Ok`. |
 | `permissions(file) -> Result[int, IoError]` | The permission bits of the file or directory: the nine `rwx` bits with setuid `0o4000`, setgid `0o2000` and the sticky bit `0o1000`, never the file type. |
 | `setPermissions(file, mode) -> Result[unit, IoError]` | Sets the permission bits to exactly `mode`, `0o0` to `0o7777`; not a mask added to what is there, and the umask plays no part. A mode outside that range is an `Err` of kind `Other` naming it, before the path is looked at, and changes nothing. |
+| `setOwner(file, owner, group) -> Result[unit, IoError]` | Sets the owner and group to the numeric ids `owner` and `group` (`0` to `4294967295`; both are set, so pass the one to keep as `metadata` reports it). A program that is not the superuser may name its own ids and gets `PermissionDenied` for any other user; an id outside the range is an `Err` of kind `Other` naming it, before the path is looked at. A symbolic link is followed. |
+| `ownerName(file) -> Result[string, IoError]` | The name the system's user database gives the file's owner (`process.userName(metadata(file).owner)`); an owner with no entry is `NotFound`. Group names are not offered. |
 | `size(file) -> Result[long, IoError]` | The size of the file in bytes. |
 | `modified(file) -> Result[Instant, IoError]` | When the contents of the file or directory last changed, to the file system's resolution. |
 | `setModified(file, when) -> Result[unit, IoError]` | Sets the modification time (the access time moves with it); reading it back may round to the file system's resolution. |
@@ -1328,6 +1352,35 @@ Recording that an entry was used is `fs.setModified(file, time.now())`, which wr
 `m.isFile` is true for a regular file alone, so a socket or a FIFO another program left in the
 directory is passed over rather than removed.
 
+### Copying and moving
+
+A copy is never seen half-written: each file is written under a new name beside its destination and
+renamed onto it once whole, and a tree copied anew is built the same way and renamed into place in one
+step. Publishing a release directory and keeping the previous one:
+
+```text
+import avin.fs
+import avin.io.IoError
+
+publish(build: string, live: string) -> Result[unit, IoError]
+  val previous = live + ".previous"
+  fs.removeIfExists(previous)?
+  if fs.exists(live) then fs.move(live, previous)?
+  fs.copyAll(build, live, attributes = true)
+```
+
+| Function | Meaning |
+| --- | --- |
+| `copy(from, to, replace = true, attributes = false, followLinks = true, createParents = false) -> Result[unit, IoError]` | Copies one file. A reader of `to` sees the old entry or the whole copy; a failure at any point leaves `to` as it was and removes the new file. `replace` puts the copy in place of a file or link at `to` (the entry is replaced: a hard link to the old file keeps the old bytes, a link at `to` is not written through); without it anything at `to` is `AlreadyExists`, checked and placed in one step. A directory at `to` or `from` is `IsADirectory`. The nine `rwx` bits of `from` always come along; `attributes` adds setuid, setgid, sticky and the modification time (the access time is set to the same instant); the owner never does. `followLinks = false` copies a link as a new link holding the same path. A FIFO, a socket or a device is an `Err` of kind `Other`, opening nothing. A file copied onto itself, by any name, changes nothing. |
+| `copyAll(from, to, merge = false, replace = true, attributes = false, followLinks = false, createParents = false) -> Result[unit, IoError]` | Copies a directory with everything in it, `copy`'s options applying to each entry; anything else at `from` is copied as `copy` copies it. Links stay links unless `followLinks`, which refuses a link back to a directory above it (`Other("file system loop")`). Without `merge`, `to` is replaced as `rename` replaces it (absent, or an empty directory with `replace`; a full directory is `DirectoryNotEmpty`, a file `NotADirectory`), and holds the whole copy or is left as it was. With `merge`, the tree is copied into the directory at `to` (made if missing), directories merged by name, files replaced or (without `replace`) `AlreadyExists`; a failure stops at that entry, keeping those copied before it. Each directory the copy makes gets the source's `rwx` bits once its contents are in. A destination inside the source is an `Err`. Hard links inside become separate files. |
+| `move(from, to, replace = true, createParents = false) -> Result[unit, IoError]` | `rename` within one file system. Across file systems, `copyAll` with `attributes` and links as links, then `removeAll(from)`: a failure while copying leaves `to` as it was and `from` whole; a failure while removing is an `Err` whose operation is `finish moving`, `to` being complete. Without `replace`, anything at `to` is `AlreadyExists`: in one step for a file, by a check just before the rename for a directory or a link. |
+
+**On failure part way**, `copy`, `copyAll` without `merge`, and the copying half of a cross-device
+`move` leave nothing behind and `to` untouched. `copyAll` with `merge` stops at the entry that failed,
+named in the error (`cannot copy src/a/locked to out/a/locked: permission denied`), with every entry
+before it copied whole and none after it started. A copy is not synced to the device; a file that
+must survive a power loss is written with `writeBytesAtomic`.
+
 ### File metadata
 
 A `Metadata` is everything one `stat` answered, so its fields describe one entry:
@@ -1353,9 +1406,34 @@ remembers each directory's `(inode, device)` so a link back up is seen.
 **Permissions** are written as octal literals, `fs.setPermissions(file, 0o600)`, and read back the
 same way: `fs.permissions(file)` is `Ok(0o600)`, and `f"${p}%o"` prints it as `600`. A file the
 library creates asks for `0o666`, which the process umask narrows; rewriting a file with
-`writeText` or `writeBytes` keeps the mode it has, so a file set to `0o600` stays so. Where the
+`writeText` or `writeBytes` keeps the mode it has, so a file set to `0o600` stays so.
+
+**A file can be made with its mode from the start.** `create`, `createUpdate`, `writeLines`,
+`writeTextAtomic` and `writeBytesAtomic` take `mode = 0o666`: a new file has those bits, less the
+umask, from the moment it exists, so a secret written as `fs.writeTextAtomic(token, secret, mode =
+0o600)` is never readable by others, not even between being made and being set. A file already
+there keeps its mode, whatever `mode` asks (an atomic write keeps the replaced file's exact bits). A
+mode outside `0o0` to `0o7777` is an `Err` of kind `Other` before anything is touched: no file is
+made or emptied and no directory is made. `appendText`, `appendBytes`, `append`, `writeText` and
+`writeBytes` take no mode yet. An open file's bits are set with `f.setPermissions(mode)`, which
+changes the file the handle holds even after it is renamed. Where the
 platforms differ the platform decides and the answer says so: macOS refuses the sticky bit on a
 plain file to anyone but the superuser (an `Err`, the mode unchanged), and Linux keeps it.
+
+**Ownership** is numeric. Giving a file away is privileged, so a program that is not the superuser
+may set only its own ids, which changes nothing, and the platform's `PermissionDenied` answers any
+other user:
+
+```avin
+import avin.fs
+import avin.process
+
+main()
+  val file = fs.createTempDir("owner").getOrElse("") + "/token"
+  _ = fs.writeText(file, "x")
+  println(fs.setOwner(file, process.userId(), process.groupId()))
+  println(fs.ownerName(file) == process.userName(process.userId()))
+```
 
 **A temporary directory is the program's to remove.** `createTempDir` makes the directory rather than
 inventing a name, so no other program can take it in between, and nothing removes it at the end:
@@ -1375,6 +1453,30 @@ listing `InvalidUtf8` rather than leaving that name out.
 ```text
 for name in fs.listDir(dir)?
   if name.endsWith(".txt") then println(name)
+```
+
+**A listing with paths and kinds.** `list(dir, pattern = None, skipInvalid = false)` answers a
+`Vector[DirEntry]`, `DirEntry(name, path, kind)`, sorted by name as `listDir` sorts. `path` is the
+directory joined with the name, and `kind` is the entry's own `FileKind` as `linkMetadata` reads it, so
+a symbolic link is `Symlink` (a dangling one too) and `isDir` is false for a link to a directory;
+`DirEntry` also has `isDir`, `isFile` and `isLink`. `pattern` keeps the entries whose name fits it, as
+`matches` reads a pattern (`*.{c,h}`; a name starting with `.` needs a pattern starting with a literal
+`.`). A name that is not UTF-8 is `InvalidUtf8` for the whole listing, as in `listDir`, unless
+`skipInvalid` is true, which leaves such names out. An entry removed while the listing is made is left
+out; another error reading an entry (a directory that can be read but not entered) is the listing's
+`Err`. `hardLink(existing, fresh)` makes a second name for a file.
+
+`entries(dir, pattern, skipInvalid) -> Result[Iterator[Result[DirEntry, IoError]], IoError]` is the
+lazy form: the names are read at once, in one pass over the directory, and each entry's kind is asked
+for when the iterator reaches it, so taking the first few entries of a huge directory asks the file
+system about those few. An entry removed before the iterator reaches it is skipped, and an error
+reading one is an `Err` element.
+
+```text
+import avin.fs
+
+for entry in fs.list(dir, Some("*.log"))?
+  if entry.isFile then println(entry.path)
 ```
 
 ### Paths
@@ -1404,6 +1506,19 @@ backupOf(file: string) -> string
 | `stem(p) -> Option[string]` | The file name without its extension and its dot: `a.tar` for `a.tar.gz`, `.profile` for `.profile`. |
 | `normalize(p) -> string` | `.` and `..` resolved in the text, doubled and trailing `/` dropped. A `..` at the root is dropped (`/..` is `/`), one leading a relative path is kept (`a/../..` is `..`), and a path that cancels to nothing is `/` or `.`. |
 | `relativeTo(p, base) -> Option[string]` | `p` written from `base`, both normalized: `../c` for `/a/c` from `/a/b`, `.` for a path from itself. `None` when one is absolute and the other not, or when `base` climbs above what it names with `..`. |
+| `root(p) -> Option[string]` | `Some("/")` for an absolute path, `None` for a relative one. |
+| `isHidden(p) -> bool` | Whether the file name starts with a dot: `a/.git` is hidden, `a/b`, `.`, `..` and the root are not. |
+| `withFileName(p, name) -> string` | `p` with its file name replaced by `name` as written: `/a/b.txt` and `c` give `/a/c`. A path with no file name (`/`, `""`, `.`, `..`, `a/..`) has `name` added after it; an empty `name` leaves the directory alone. |
+| `withExtension(p, ext) -> string` | `p` with the extension of its file name replaced by `ext`, given without its dot: `a.tar.gz` and `xz` give `a.tar.xz`, `a` and `txt` give `a.txt`; an empty `ext` removes the extension; a dotfile such as `.profile` gains one (`.profile.bak`). A path with no file name is returned unchanged. |
+| `sibling(p, name) -> string` | `join` of the parent of `p` and `name`: `/a/b` and `c` give `/a/c`, `b` and `c` give `c`. An absolute `name` is the answer; `name` may hold separators. A path with no file name has `name` joined after it. |
+| `startsWith(p, prefix) -> bool` | Whether the components of `prefix` begin those of `p`, and both are absolute or neither is: `/a/b` starts with `/a` and `/`, not with `/ab` or `a`. Doubled and trailing `/` do not matter; `.` and `..` are not resolved. |
+| `endsWith(p, suffix) -> bool` | Whether the components of `suffix` end those of `p`: `/a/b/c` ends with `c`, `b/c` and `/a/b/c`, not with `bc` or `/c`. An absolute `suffix` must be the whole of an absolute `p`. |
+
+```text
+import avin.fs
+
+reportFor(source: string) -> string = fs.withExtension(fs.sibling(source, "out/" + fs.stem(source).getOrElse("x")), "html")
+```
 
 The questions below ask the file system.
 
@@ -1511,6 +1626,92 @@ for file in fs.glob("tests/**/*.avin")
   println(file)
 ```
 
+### Watching
+
+`watch(paths, …)` reads the trees at `paths` and reads them again every `interval`, sending what
+changed between two readings to the watcher's `events` channel, which any thread receives from, alone
+or as an arm of a [`select`](/spec/threads/#select). The readings run on a lightweight thread of the
+watcher's own; a `Watcher` is sendable and an `io.Close`.
+
+| Function or member | Meaning |
+| --- | --- |
+| `watch(paths, interval, recursive, maxEntries, capacity) -> Result[Watcher, IoError]` | Reads `paths` now, then every `interval` (1 s) after the last reading ends. |
+| `watch(paths, ticks, recursive, maxEntries, capacity) -> Result[Watcher, IoError]` | The same, reading on each value received from `ticks`, a `Channel[Instant]`, rather than on a clock; a closed `ticks` ends the watch. |
+| `w.events: Channel[WatchEvent]` | The changes, in order. `None` once the watch has ended and every event sent is received. |
+| `w.check() -> Option[int]` | Reads now and answers once that reading's events are sent: how many. `None` once the watch has ended. |
+| `w.close() -> Result[unit, IoError]` | Ends the watch and waits for its thread; always `Ok`, and closing again does nothing. |
+| `w.isClosed -> bool` | Whether the watch has ended: closed, overflowed or out of ticks. |
+
+A `WatchEvent` is `Created(path, isDir)`, `Modified(path, isDir)`, `Removed(path, isDir)`,
+`Renamed(from, to, isDir)` or `Overflowed(limit)`, written qualified (`fs.Created`). `path` is the
+watched path joined with the entry's path below it, as `walker` makes it.
+
+- **What counts as a change.** A reading keeps a stamp of each entry: kind, size, modification and
+  change times, permissions, owner, group, device and inode. A file is `Modified` when any of them
+  differs, so a write that keeps the size, and a time set back, are both seen; a directory is
+  `Modified` only when its permissions or owner change, since what it gains and loses is reported as
+  those entries' own events. A path that changes what it is, a file that becomes a directory, is a
+  `Removed` and then a `Created`. A file created and removed between two readings is never seen.
+- **Renames, where they can be seen.** An entry gone from `from` and one new at `to` with the same
+  device and inode (for a file, the same size and modification time too) is one `Renamed`. A
+  directory renamed is a `Renamed` for it and for every entry below it. A file renamed onto a path
+  that was already there replaces it: that path is `Modified`, and the old name, where a reading saw
+  it, `Removed`.
+- **Order.** A reading's events come in code-point order of their paths, `to` for a rename, so a
+  directory comes before what it holds; for one path, `Removed` before `Created`.
+- **What is watched.** Each path must exist when the watch starts, or `watch` answers its `Err`
+  (`NotFound`, say); later it may go and come back, which is a `Removed` for it and everything below
+  and a `Created` again. A directory is watched with every entry below it, or with `recursive =
+  false` its own entries alone. Links below a watched path are watched as links and never followed;
+  a watched path that is a link is followed. A directory that cannot be listed keeps what the last
+  reading found in it, so a `chmod 000` is one `Modified` and not the loss of everything inside.
+- **The first reading is made before `watch` answers**, so every change after it is reported, and
+  `check` makes the reading a test or a "look now" needs: when it answers, that reading's events are
+  in `events`.
+
+**The cost is bounded and grows with the tree, not with time.** Each reading lists every watched
+directory and reads every entry's metadata, a few system calls an entry: on a laptop's SSD a reading
+of 20,000 entries takes about 0.15 s of one thread, so a tree that size read every second keeps a
+sixth of a core busy; a longer `interval`, or `recursive = false`, is cheaper. Between readings the
+watcher holds one stamp for each entry (nine numbers, the path and its slot in a map), and a reading
+builds the next set beside it, leaving the old one and the walk's own values to the collector: the
+same 20,000 entries grew the process by about 1.2 KB an entry over the first reading, garbage
+included. `maxEntries` (100,000) bounds both sets. More entries than that is an `Err` from `watch`
+and, later, an `Overflowed` event that ends the watch. The `events` channel holds at most `capacity` events (1,024; `0` hands
+each over): while it is full the watcher waits and reads nothing, so a receiver that lags is never
+handed a backlog bigger than that, and the next reading sees every change made meanwhile. An
+`interval` of zero or less, a `maxEntries` below one and a negative `capacity` trap.
+
+```text run
+import avin.fs
+import avin.threads.Channel
+import avin.time.Instant
+
+main()
+  val dir = fs.createTempDir("watch-example").getOrElse(fail("no directory"))
+  val w = fs.watch(Vector(dir), Channel[Instant]()).getOrElse(fail("cannot watch"))
+  _ = fs.writeText(fs.join(dir, "app.conf"), "port = 8080")
+  println(w.check())
+  w.events.tryReceive() match
+    Some(fs.Created(p, _)) -> println(s"created ${fs.fileName(p).getOrElse("")}")
+    _ -> println("something else")
+  _ = w.close()
+  _ = fs.removeDirAll(dir)
+```
+
+```text output
+Some(1)
+created app.conf
+```
+
+A server reloading its configuration waits on the watcher beside its other work:
+
+```text
+serve(conf: string, jobs: Channel[Job], w: fs.Watcher) = select
+  w.events.receive() as Some(e) -> reload(conf)
+  jobs.receive() as Some(j) -> run(j)
+```
+
 ### Open files
 
 A file held open is a `File`, for a program that reads or writes a file piece by piece, follows one
@@ -1532,10 +1733,10 @@ follow(log: string) -> Result[unit, IoError]
 | Function | Meaning |
 | --- | --- |
 | `open(file) -> Result[File, IoError]` | The existing file, for reading, at its start; `IsADirectory` for a directory. |
-| `create(file)` | For writing, made if it is not there and emptied if it is. |
+| `create(file, mode = 0o666)` | For writing, made if it is not there and emptied if it is. A file it makes has the bits `mode`, less the umask, from the moment it exists; one already there keeps its mode. A mode outside `0o0` to `0o7777` is an `Err` that touches nothing. |
 | `append(file)` | For writing, made if it is not there; every write goes to the end, whatever other handles append to the same file. |
 | `openUpdate(file)` | The existing file, for reading and writing, keeping what it holds. |
-| `createUpdate(file)` | For reading and writing, made if it is not there and emptied if it is. |
+| `createUpdate(file, mode = 0o666)` | For reading and writing, made if it is not there and emptied if it is; `mode` as for `create`. |
 | `readBytesFrom(file, offset) -> Result[Array[byte], IoError]` | Every byte from `offset` on, empty at or past the end: what was appended since a program last read to `offset`. A negative offset traps. |
 | `readTail(file, maxBytes) -> Result[string, IoError]` | The last `maxBytes` bytes as text, reading only those. |
 | `readTailLines(file, count) -> Result[Vector[string], IoError]` | The last `count` lines, without terminators, fewer where there are fewer. |
@@ -1554,6 +1755,7 @@ follow(log: string) -> Result[unit, IoError]
 | `setLength(length)`, `truncate(length)` | Cuts the file to `length` bytes or extends it with zeros; the position does not move and may end up past the end. A negative length, or a file not open for writing, is an `Err`. |
 | `sync()`, `syncData()`, `fullSync()` | Hands over what is written and asks the device to keep it. `syncData` skips details a reader of the contents does not need where the platform can; on macOS it is `sync`, which reaches the drive but not its write cache. `fullSync` also empties the drive's cache (`F_FULLFSYNC` on macOS) and is the slowest. A closed file is an `Err`; a file opened only to read may be synced. |
 | `deleteOnClose()` | Marks the file so `close` removes its name after releasing it; a failed removal is the `Err` of `close`. A file the collector frees without a `close` is not removed. |
+| `setPermissions(mode)` | Sets the permission bits of the file the handle holds to exactly `mode`, as `fs.setPermissions` does for a path, whatever name the file has now. A file open only to read may be changed by its owner; the handle keeps writing after its bits lose write permission. A mode outside `0o0` to `0o7777` or a closed file is an `Err` that changes nothing. |
 
 Positioned calls on one file from several lightweight threads belong to separate handles, one per
 thread, opened on the same path: each call is the platform's own positioned read or write, so
@@ -1564,14 +1766,163 @@ file has buffered ahead are never lost to a `seek`, a `write` or a `read`. **A r
 not end the file's life**: a file that grew meanwhile gives the new bytes to the next read, so no
 reopening is needed to follow it. **A file closed by `close` answers every call with an `Err`**, as does
 reading a file opened only to write and writing one opened only to read; none of them is an empty
-answer that looks like the end of the file. A forgotten file is closed when the collector frees it. A
-file belongs to the thread that opened it and is not handed to another. Calls that read and write wait
+answer that looks like the end of the file. A forgotten file is closed when the collector frees it.
+**A file belongs to one thread at a time and moves as a connection does**: it is sendable, so it
+goes to a thread or a future whose body reaches it, with a message to an actor, and on a channel,
+whose receiver takes it by using it; and a file a `Mutex` keeps belongs to whichever thread holds
+the mutex. Every call, on an open file or a closed one, first checks that the code running owns it,
+so the code that handed it over traps (`` `File` belongs to another thread ``). Calls that read and write wait
 as the calls of `avin.fs` above do, which is to say they do not park a lightweight thread.
+
+```text run
+import avin.fs
+import avin.threads.{Channel, Mutex, scope, spawn}
+
+main()
+  val dir = fs.createTempDir("files").ok.get
+  val log = Mutex(fs.append(dir + "/app.log").ok.get)
+  scope(s ->
+    for t in 0 ..< 4
+      s.spawn(() ->
+        _ = log.with(f -> f.writeText(s"thread $t\n").isOk)
+        ()))
+  _ = log.with(f -> f.flush().isOk)
+  println(fs.readText(dir + "/app.log").ok.get.split("\n").filter(l -> !l.isEmpty).length)
+  val files = Channel[fs.File]()
+  val writer = spawn(() ->
+    val f = files.receive().get
+    f.writeText("received\n").isOk && f.close().isOk)
+  files.send(fs.create(dir + "/sent.txt").ok.get)
+  println(writer.join())
+  print(fs.readText(dir + "/sent.txt").ok.get)
+  _ = fs.removeDirAll(dir)
+```
+
+```text output
+4
+true
+received
+```
 
 **A tail starts at a whole character.** When `readTail` begins in the middle of a UTF-8 sequence it
 skips the rest of that sequence, so the text never starts with a stray byte; bytes that are not UTF-8
 elsewhere become U+FFFD, since a log's last lines are read to be looked at and not to be refused.
 Lines are decoded the same way, a `\r` before the `\n` going with it.
+
+### Content types
+
+| Call | Meaning |
+|---|---|
+| `probeContentType(file) -> Result[Option[string], IoError]` | The type of `file`: by its name's extension where `contentTypes` knows it, touching no disk; otherwise by the signature of its first `SniffBytes` (512) bytes. `Ok(None)` where neither knows, and for an empty file; `Err` where the name is unknown and the file cannot be opened or read. |
+| `contentTypeOfName(name) -> Option[string]` | The type by extension alone: the text after the last `.` of the last segment, neither its first character nor its last, compared without regard to case. |
+| `sniffContentType(bytes) -> Option[string]` | The type by signature: PNG, JPEG, GIF, WebP, WAV, PDF, ZIP, gzip, WebAssembly, ELF and Mach-O; else `text/plain; charset=utf-8` for UTF-8 text with no NUL and no control character but tab, line feed, form feed, carriage return and escape (a character cut off by the 512th byte does not spoil it); else `None`. |
+| `contentTypes: HashMap[string, string]` | The table of extensions (lower case, no `.`) to types; every `text/` type names `charset=utf-8`. |
+
+```avin
+import avin.fs
+
+main()
+  println(fs.contentTypeOfName("site/app.JS").getOrElse("unknown"))
+  println(fs.sniffContentType("hello\n".utf8).getOrElse("unknown"))
+  println(fs.contentTypeOfName("README").getOrElse("unknown"))
+```
+
+```text
+text/javascript; charset=utf-8
+text/plain; charset=utf-8
+unknown
+```
+
+### Memory-mapped files
+
+A mapped file's bytes are read and written where they lie, a page at a time as they are touched,
+rather than read into an array first: mapping a file of any size costs the same few calls, and a byte
+never touched is never read from the device. It suits an index or a table read at scattered offsets,
+a file larger than the memory a program wants to hold, and a record updated in place.
+
+```avin run
+import avin.fs
+import avin.io.IoError
+
+main() -> Result[unit, IoError]
+  val dir = fs.createTempDir("mapped")?
+  val table = dir + "/table"
+  fs.writeText(table, "id=0042 state=new")?
+  val m = fs.mapFileMutable(table)?
+  println(s"${m.length} bytes, state ${string.fromUtf8Lossy(m.slice(14, 17))}")
+  m.writeAt(14, Array(byte(int('o')), byte(int('l')), byte(int('d'))))
+  m(6) = byte(int('3'))
+  m.flush()?
+  m.close()?
+  println(fs.readText(table)?)
+  val ro = fs.mapFile(table)?
+  println(ro(3) == byte(int('0')))
+  ro.close()?
+  fs.removeDirAll(dir)
+```
+
+```text output
+17 bytes, state new
+id=0043 state=old
+true
+```
+
+| Function | Meaning |
+| --- | --- |
+| `mapFile(file) -> Result[MappedBytes, IoError]` | The file mapped read-only. The file is closed before this answers: the mapping does not need it, and keeps the bytes it reads when the file is renamed over or removed. `IsADirectory` for a directory, `NotFound` for a missing file; an empty file is an empty mapping. |
+| `mapFileMutable(file) -> Result[MutableMappedBytes, IoError]` | The file mapped shared and writable over its whole length: a write through the mapping is a write to the file. The file must exist and be readable and writable. |
+| `File.map()`, `File.mapMutable()` | The same for a file already open, what was written through it handed over first. `mapMutable` needs a file open for reading and writing (`openUpdate`, `createUpdate`); any other, and a closed file, is an `Err`. The mapping outlives the file: closing the file takes nothing from it. |
+
+| Method | Meaning |
+| --- | --- |
+| `length -> long`, `isEmpty` | How many bytes are mapped: the file's length when it was mapped. The mapping does not follow the file as it grows; `setLength` it first and map it again. |
+| `m(i) -> byte` | The byte at offset `i`, a `long` or an `int`. An offset outside `0 ..< length` traps. |
+| `m(i) = b` | Writes the byte at offset `i` (writable only), with the same check. |
+| `slice(from, until) -> Array[byte]`, `toArray()` | A **new** array of the bytes from `from` up to `until`, or of them all. Offsets out of order or outside the mapping trap, and so does a range longer than an array holds. |
+| `writeAt(offset, bytes)` | Writes every byte of `bytes` from `offset` on (writable only); a range running past the end traps before any byte is written. |
+| `flush() -> Result[unit, IoError]` | Writes what was written through the mapping to the file and returns once it is there (writable only). `File.syncData` after it asks the device to keep it. |
+| `close()` | Unmaps the bytes; a second `close` does nothing. A mapping is an [`io.Close`](#close). |
+
+**No array shares a mapping's memory.** Bytes leave a mapping only by copy, through `m(i)`, `slice`
+and `toArray`, and enter only by copy, so an array a program keeps never reads memory that has since
+been unmapped. **Every offset is checked** against the length before the mapping is touched.
+
+**A mapping is unmapped by `close` or, if the program forgot, when the collector frees it**, so a
+program that maps a file in a loop and drops each mapping does not run out of address space. A call
+on a closed mapping, other than `close`, traps:
+
+```text
+avin: trap: `MappedBytes` is closed at main.avin:9:11
+```
+
+**A mapping belongs to one thread at a time**, as every handle on a Sysl value does. It is `Sendable`
+and moves to a thread whose body it is given to; the thread that gave it away traps if it uses it
+again before it is handed back. Threads that each read a file map it for themselves.
+
+**What a write promises.** A write through a writable mapping is in the file as far as every other
+reader is concerned at once on the same machine; closing the mapping or ending the program loses
+none of it. Only `flush` says it has reached the file, and `File.syncData` or `fullSync` after it
+that the device keeps it through a power cut. A read-only mapping made before a write through
+another mapping of the same file may or may not show it, as the platform decides; read the file
+again, or map it again, to be sure.
+
+**A file cut shorter while it is mapped** leaves pages of the mapping with nothing behind them. The
+platform answers a touch of such a page of a writable mapping with a bus error rather than an error
+value, so the program stops with a trap that says why, and never writes into memory nothing reads:
+
+```text
+avin: trap: bus error: touched a page with nothing behind it (a mapped file cut short under its mapping)
+```
+
+A read-only mapping is private to the program, and what touching such a page does is the platform's
+choice: Linux answers the same bus error, while macOS may go on answering the bytes the file had.
+Either way no memory of the program's is read or overwritten. A program that maps a file another
+program may truncate, and must see the truncation, reads it with `readAt` instead.
+
+**A mapping counts towards the next collection.** Each holds little of the heap but much address
+space, and one of the system's map entries, until it is unmapped, so every thousand mappings made,
+or every tebibyte mapped, since the last collection brings one on, and the mappings the program
+dropped are unmapped by it.
 
 ## `avin.time`
 
@@ -1720,9 +2071,10 @@ since nothing could stand in for them.
 
 ## `avin.crypto`
 
-Content digests and keyed digests: SHA-256, SHA-512, SHA-1 and MD5, HMAC over the first two,
-PBKDF2, comparison of secrets in constant time, SASLprep for passwords, and hexadecimal text for any
-digest.
+Content digests and keyed digests: SHA-224, SHA-256, SHA-384, SHA-512, SHA-1 and MD5, HMAC over
+SHA-1 and the SHA-2 family, PBKDF2 and HKDF, comparison of secrets in constant time, SASLprep for
+passwords, and hexadecimal text for any digest; then [signatures and their keys](#signatures-and-keys)
+and [authenticated encryption](#authenticated-encryption).
 
 ```text
 import avin.crypto.{sha256, hmacSha256, toHex, Sha256}
@@ -1742,14 +2094,18 @@ or a cache, and is written as text only on request. Text is hashed as its UTF-8 
 | Function | Meaning |
 | --- | --- |
 | `sha256(x)`, `sha512(x)` | The 32-byte and 64-byte digest of `x`, a `Vector[byte]` or a `string`. |
+| `sha224(x)`, `sha384(x)` | The 28-byte and 48-byte digest of `x` (FIPS 180-4), the truncated members of the family. |
 | `sha1(x)`, `md5(x)` | The 20-byte and 16-byte digest of `x`. **Broken for security** (below). |
 | `hmacSha256(key, message)`, `hmacSha512(key, message)` | The 32-byte and 64-byte HMAC (RFC 2104) of `message` under `key`, both `Vector[byte]` or both `string`. Any key length is allowed, the empty key included; one longer than the algorithm's block is hashed first, as the RFC says. |
+| `hmacSha224`, `hmacSha384`, `hmacSha1` | HMAC over SHA-224 (28 bytes), SHA-384 (48 bytes) and SHA-1 (20 bytes), taking what `hmacSha256` takes. HMAC-SHA-1 is what HOTP and TOTP (RFC 4226, RFC 6238) name. |
+| `hkdfSha256(secret, salt, info, length)`, `hkdfSha384(...)`, `hkdfSha512(...)` | `length` bytes of key (RFC 5869 HKDF) from `secret`, with `salt` (empty is the standard's default) and `info`, all `Vector[byte]`. `length` below 1 or over 255 digests (8160, 12240, 16320 bytes) traps. |
+| `hkdfExtractSha256(salt, secret)`, `hkdfExpandSha256(prk, info, length)` and the SHA-384 and SHA-512 pairs | HKDF's two halves (§ 2.2 and § 2.3), for a protocol that keeps the pseudorandom key, as TLS 1.3's key schedule does. Extract is the HMAC of `secret` under `salt`; Expand traps on a `prk` shorter than a digest, and on the lengths `hkdfSha256` traps on. |
 | `pbkdf2HmacSha256(password, salt, iterations, length)`, `pbkdf2HmacSha512(...)` | `length` bytes of key (RFC 8018 PBKDF2 over HMAC-SHA-256 or -SHA-512) as a `Vector[byte]`; `password` and `salt` both `Vector[byte]` or both `string` (UTF-8), either empty. `iterations` below 1, `length` below 1, or `length` over 8160 (SHA-256) or 16320 (SHA-512) trap. |
 | `constantTimeEquals(a, b) -> bool` | Whether `a` and `b`, both `Vector[byte]` or both `string` (compared as UTF-8 bytes), are the same, taking as long wherever they first differ. Different lengths answer `false` at once. |
 | `toHex(bytes) -> string` | Lower-case hexadecimal, two digits for each byte: [`avin.encoding`](#avinencoding)'s, which this module offers too. |
 
 **A hasher takes its input in pieces**, for data too large to hold whole, such as a file read in
-chunks. `Sha256()`, `Sha512()`, `Sha1()` and `Md5()` each have `update(bytes)` and `update(text)`,
+chunks. `Sha224()`, `Sha256()`, `Sha384()`, `Sha512()`, `Sha1()` and `Md5()` each have `update(bytes)` and `update(text)`,
 any number of times, and `finish()`, the digest of everything added. `finish()` answers the same
 digest each time it is called, and `update` after `finish` traps. Hashing in any pieces gives the
 one-shot digest. A hasher belongs to the thread that made it, as a handle does.
@@ -1757,7 +2113,17 @@ one-shot digest. A hasher belongs to the thread that made it, as a handle does.
 **`sha1` and `md5` are for formats that already use them**: a checksum in a listing, a cache key
 nobody attacks. Two different inputs with the same digest can be made for both, so neither signs,
 authenticates or names untrusted content; use `sha256` or `sha512` for those. HMAC does not rest on
-collision resistance, but only the SHA-2 variants are offered.
+collision resistance, so `hmacSha1` remains sound for the protocols that name it (TOTP above all);
+a new design takes `hmacSha256`.
+
+**HKDF turns a secret that is already unguessable into keys**: a Diffie-Hellman result, a random
+master key. It adds no cost to guessing, so a password goes to `pbkdf2HmacSha256` instead. `info`
+keeps the keys one secret gives apart, so each purpose names its own:
+
+```text
+val encryption = hkdfSha256(master, salt, "app v1 encryption".bytes, 32)
+val signing = hkdfSha256(master, salt, "app v1 signing".bytes, 32)
+```
 
 **A secret someone sent is compared with `constantTimeEquals`, never with `==`.** `==` stops at the
 first byte that differs, so how long a rejection takes tells a patient attacker how much of a guessed
@@ -1819,6 +2185,212 @@ may a client written with this: `saslPrep(password).getOrElse(password)`.
 The digests, the key derivation and the comparison are bound to Sysl's `sysl.crypto`, so they are the
 same code Sysl programs use.
 
+### Signatures and keys
+
+A `PrivateKey` signs and a `PublicKey` checks, in one of nine `SignatureScheme`s: `Ed25519` (RFC
+8032), `EcdsaP256Sha256` and `EcdsaP384Sha384` (FIPS 186-5), and RSA (RFC 8017) with PKCS#1 v1.5
+padding, `RsaPkcs1Sha256`, `RsaPkcs1Sha384` and `RsaPkcs1Sha512`, or PSS, `RsaPssSha256`,
+`RsaPssSha384` and `RsaPssSha512`. They are the schemes TLS 1.3 and JOSE name (EdDSA, ES256, ES384,
+RS256, PS256 and the rest). The signing is OpenSSL's libcrypto, which the program links only where
+it signs, checks, reads a key or seals.
+
+```text run
+import avin.crypto.{generatePrivateKey, publicKeyFromPem, Ed25519Key, Ed25519}
+
+main()
+  val key = generatePrivateKey(Ed25519Key)
+  val signature = key.sign(Ed25519, "the release notes").getOrElse(Vector())
+  val public = publicKeyFromPem(key.publicKey.toPem()).getOrElse(key.publicKey)
+  println(public.verify(Ed25519, "the release notes", signature))
+  println(public.verify(Ed25519, "the release notes, changed", signature))
+  println(signature.length)
+  println(key)
+```
+
+```text output
+Ok(true)
+Ok(false)
+64
+PrivateKey(Ed25519)
+```
+
+| Function or method | Meaning |
+| --- | --- |
+| `privateKeyFromPem(text)`, `publicKeyFromPem(text)` | The key in the first `PRIVATE KEY` (PKCS#8), `RSA PRIVATE KEY` or `EC PRIVATE KEY` block, or `PUBLIC KEY` (SubjectPublicKeyInfo) block, among any other text; `Result[PrivateKey, CryptoError]` and `Result[PublicKey, CryptoError]`. |
+| `privateKeyFromDer(bytes)`, `publicKeyFromDer(bytes)` | The same from DER, which must be the whole of `bytes`. |
+| `generatePrivateKey(kind)` | A new key of `kind`, from the operating system's randomness. |
+| `ed25519PrivateKey(seed)`, `ed25519PublicKey(raw)` | An Ed25519 key from its 32 bytes (RFC 8032's encoding, a JWK's `d` and `x`). |
+| `key.sign(scheme, message) -> Result[Vector[byte], CryptoError]` | The signature over `message`, a `Vector[byte]` or a `string` (UTF-8). |
+| `public.verify(scheme, message, signature) -> Result[bool, CryptoError]` | Whether `signature` is the key's over `message`. |
+| `key.publicKey`, `key.kind`, `public.kind` | The public half, and what each key is: `Ed25519Key`, `EcP256Key`, `EcP384Key` or `RsaKey(bits)`. |
+| `toPem()`, `toDer()` | The key written out: PKCS#8 for a private key, SubjectPublicKeyInfo for a public one, PEM in lines of 64 (RFC 7468). |
+| `public.ed25519Bytes() -> Option[Vector[byte]]` | The 32 bytes of an Ed25519 key, `None` for another kind. |
+| `scheme.fits(kind) -> bool` | Whether a key of `kind` signs with `scheme`. |
+| `ecdsaFixedSignature(der, scheme)`, `ecdsaDerSignature(fixed, scheme)` | An ECDSA signature between DER and the fixed-width form, `Option[Vector[byte]]`. |
+
+**The caller names the scheme, always.** Nothing reads it from the data being checked, so a token or
+a message cannot choose how it is verified; that is how `alg: none` and the RSA-key-as-HMAC-secret
+confusions work elsewhere. A scheme the key does not sign with is `Err(KeyMismatch(kind, scheme))`
+from both `sign` and `verify`: a mistake in the program, told apart from a signature that does not
+check.
+
+**`verify` answers `Ok(false)` for every signature that does not check**: forged, made by another key
+or over other bytes, of the wrong length, or not even well-formed, since the signature is bytes
+somebody sent. An ECDSA signature is checked in strict DER, so BER and trailing bytes do not check;
+Ed25519 refuses a non-canonical `S`, so a signature cannot be altered into a second valid one.
+
+**An ECDSA signature is DER**, the form X.509, TLS and WebAuthn carry. JOSE (ES256), COSE and
+WebCrypto carry the two integers side by side, each in the curve's width (64 bytes for P-256, 96 for
+P-384): `ecdsaFixedSignature` turns `sign`'s answer into that, and `ecdsaDerSignature` turns one back
+for `verify`. Either is `None` unless its input is exactly one signature of the scheme's width, in
+canonical DER for the first. ECDSA and RSA-PSS signatures are randomised, so two signatures over one
+message differ and both check; Ed25519 and PKCS#1 v1.5 give the same signature every time.
+
+**PSS** uses MGF1 over the scheme's digest and a salt as long as the digest, in signing and in
+checking (RFC 8017's recommendation, and what TLS 1.3 and JOSE fix); a PSS signature with another
+salt length does not check.
+
+**What is read is limited**: Ed25519 keys, elliptic-curve keys on P-256 and P-384, and RSA keys of
+2048 to 16384 bits. Anything else is `Err(InvalidKey(reason))`: another curve (P-521, secp256k1),
+Ed448, X25519, an RSA key under 2048 bits or restricted to PSS, bytes left after the key, and an
+encrypted key, which is refused rather than asked a passphrase (`openssl pkey` decrypts one). A
+traditional `RSA PRIVATE KEY` or `EC PRIVATE KEY` reads as the key it holds and writes as PKCS#8.
+`generatePrivateKey(RsaKey(bits))` traps outside 2048 to 16384 bits; an RSA key takes a moment to
+make, seconds from 4096 bits, and the collector carries on for the program's other threads meanwhile.
+
+**A key is a value.** It holds its DER encoding and parses it again for each `sign` and `verify`, so a
+key read once at startup is used from any thread at once, belongs to none, and costs nothing to
+keep; the parse is small beside the signature. Two public keys are `==` when they are the same key.
+A key's text is its kind, `PrivateKey(RSA 2048)`, and nothing of the key: `toPem` and `toDer` are
+the only ways the key itself comes out. The DER the key holds is ordinary memory, which the runtime
+does not wipe when the key is collected.
+
+### Authenticated encryption
+
+An `AeadKey` seals a message, encrypting it and authenticating it together with associated data that
+travels in the clear (a header, a record's id), and opens it only if neither was changed. The
+ciphers (`Aead`) are `Aes128Gcm` and `Aes256Gcm` (NIST SP 800-38D) and `ChaCha20Poly1305` (RFC
+8439), each with a 12-byte nonce and a 16-byte tag; ChaCha20-Poly1305 is the fast one where the
+processor has no AES instructions.
+
+```text run
+import avin.crypto.{Aes256Gcm, Unauthentic}
+
+main()
+  val key = Aes256Gcm.generateKey()
+  val sealed = key.seal("attack at dawn", "msg-1".bytes)
+  println(sealed.length)
+  println(key.open(sealed, "msg-1".bytes).map(b -> string.fromUtf8Lossy(b.toArray())))
+  println(key.open(sealed, "msg-2".bytes) is Err(Unauthentic))
+  println(key)
+```
+
+```text output
+42
+Ok(attack at dawn)
+true
+AeadKey(AES-256-GCM)
+```
+
+| Function or method | Meaning |
+| --- | --- |
+| `aead.generateKey() -> AeadKey` | A new key from the operating system's randomness. |
+| `aead.key(bytes) -> Result[AeadKey, CryptoError]` | The key whose bytes are `bytes`, `keyLength` long (16 for `Aes128Gcm`, 32 for the others), `InvalidKey` otherwise. |
+| `key.seal(plaintext, aad = Vector())` | `plaintext` (a `Vector[byte]` or a `string`) sealed under a fresh random nonce: the nonce, the ciphertext and the tag, 28 bytes more than the message. |
+| `key.open(sealed, aad = Vector()) -> Result[Vector[byte], CryptoError]` | What `seal` made, opened, or `Err(Unauthentic)`. |
+| `key.sealWithNonce(nonce, plaintext, aad = Vector())`, `key.openWithNonce(nonce, sealed, aad = Vector())` | The same under a nonce the caller gives, which must be 12 bytes (anything else traps): the ciphertext and the tag, without the nonce. |
+| `key.aead`, `key.toBytes()` | The cipher, and the key's bytes, the secret itself. |
+| `aead.keyLength`, `aead.nonceLength`, `aead.tagLength` | 16 or 32, 12, and 16. |
+
+**A message that does not open gives nothing back**: `Unauthentic` is the whole answer for a changed
+ciphertext, tag, nonce or associated data, a message cut short or lengthened, and one sealed under
+another key or cipher. Decryption writes into a buffer the program never sees until the tag has
+checked, and wipes it when the tag does not; no part of an unauthenticated message is ever returned.
+
+**A nonce is never used twice with one key**; one reuse gives away both messages and lets anyone
+forge new ones. `seal` draws each nonce from `SecureRandom` and puts it in front, which is safe for
+2^32 messages under one key; past that, change the key. `sealWithNonce` is for a protocol that fixes
+its nonces (a record counter), which then answers for never repeating one. A key's text is its
+cipher, `AeadKey(AES-256-GCM)`, and nothing of the key.
+
+## `avin.crypto.password`
+
+Password hashing for a server: Argon2id (RFC 9106) in the PHC string format, which every Argon2
+implementation reads and writes, and bcrypt verification for hashes carried over from another
+system.
+
+```text run
+import avin.crypto.password.{hashPassword, verifyPassword, needsRehash}
+
+main()
+  val stored = hashPassword("correct horse battery staple")
+  println(stored.startsWith("$argon2id$v=19$m=19456,t=2,p=1$"))
+  println(verifyPassword("correct horse battery staple", stored))
+  println(verifyPassword("Tr0ub4dor&3", stored))
+  println(needsRehash(stored))
+  println(verifyPassword("U*U", "$2a$05$CCCCCCCCCCCCCCCCCCCCC.E5YPO9kmyuRGyh0XouQYb4YMJKvyOeW"))
+```
+
+```text output
+true
+Ok(true)
+Ok(false)
+Ok(false)
+Ok(true)
+```
+
+| Function | Meaning |
+| --- | --- |
+| `hashPassword(password, params = Argon2Params(), secret = [])` | The PHC string of `password` (a `string`, hashed as UTF-8, or a `Vector[byte]`) under `params`, with a new salt from `SecureRandom`: `$argon2id$v=19$m=19456,t=2,p=1$<salt>$<hash>`, salt and hash in base64 without padding. Parameters Argon2 cannot compute with trap. |
+| `verifyPassword(password, encoded, secret = [], limits = PasswordLimits()) -> Result[bool, PasswordHashError]` | Whether `password` is the one `encoded` was made from, the hash recomputed and compared in constant time. `encoded` is an Argon2 PHC string (`argon2id`, `argon2i`, `argon2d`; version 19, or 16 written `v=16` or left out) or a bcrypt hash (`$2b$`, `$2a$`, `$2y$`). `Ok(false)` is a wrong password; `Err` is a hash that could not be checked. |
+| `needsRehash(encoded, params = Argon2Params()) -> Result[bool, PasswordHashError]` | Whether `encoded` was made with anything other than `params` (variant, version, memory, passes, lanes, salt or hash length), or is bcrypt. |
+| `argon2(password, salt, params = Argon2Params(), secret = [], associatedData = []) -> Vector[byte]` | Raw Argon2 version 1.3: `params.hashLength` bytes, every input a `Vector[byte]`. Costs Argon2 cannot compute with and a salt shorter than 8 bytes trap. |
+| `parseArgon2Hash(encoded) -> Result[Argon2Hash, PasswordHashError]` | The parts of an Argon2 PHC string; `Argon2Hash.encode` writes them back. |
+
+**`Argon2Params(variant, memoryKiB, passes, lanes, hashLength, saltLength)`** defaults to OWASP's
+first recommendation: `Argon2id`, 19456 KiB (19 MiB), 2 passes, 1 lane, a 32-byte hash and a 16-byte
+salt. Memory is at least 8 KiB a lane, passes at least 1, lanes 1 to 16777215 (computed on up to 16
+threads), the hash at least 4 bytes and the salt at least 8. `Argon2d` and `Argon2i` are there for
+hashes other systems wrote; Argon2id is the one to use.
+
+**The parameters travel in the string**, so raising them leaves every stored hash valid. After a
+successful login, while the plaintext is at hand, a server hashes again whatever `needsRehash` names:
+
+```text
+if verifyPassword(attempt, user.hash)? && needsRehash(user.hash)?
+  user.hash = hashPassword(attempt)
+```
+
+**A stored string is not trusted to name its own cost.** `verifyPassword` refuses a hash asking for
+more than `PasswordLimits(maxMemoryKiB = 1048576, maxPasses = 32, maxLanes = 16, maxBcryptCost =
+16)` with `OverLimit` before computing anything, so a forged or corrupted row cannot hold a login for
+minutes or take gigabytes. The defaults admit every common setting; a server that stores heavier
+hashes passes its own limits.
+
+**`PasswordHashError`** says why a hash could not be checked: `Malformed(reason)` for text that is not
+a hash this module reads (fields out of order, a number with a sign or a leading zero, padded or
+non-canonical base64, a salt under 8 bytes, a bcrypt cost outside 04–31); `Unsupported(scheme)` for
+another scheme (`scrypt`, `pbkdf2-sha256`), bcrypt's `2x` or an Argon2 version other than 16 and 19;
+`OverLimit(parameter, value, limit)`, with `parameter` one of `m`, `t`, `p` and `cost`; and
+`Failed(reason)` where the computation itself failed, as when its memory cannot be allocated. Each
+has a `message`.
+
+**A `secret`** is Argon2's key input: a pepper the server keeps somewhere its database is not, so a
+stolen table is no use without it. It is not stored in the string, so the same secret is given to
+`verifyPassword`; bcrypt takes none and ignores it.
+
+**bcrypt is as bcrypt defines it**: a password is read up to its first zero byte and to 72 bytes at
+most, and only the 31 characters of hash are compared, so a salt written with nonzero unused bits
+still verifies. There is no bcrypt `hashPassword`: a hash is moved to Argon2id at the next login.
+
+**Hashing is blocking work.** The thread computing a hash is safe for the collector while it runs,
+and the scheduler moves other lightweight threads off its worker, so a login being hashed holds up
+no other request.
+
+The C is the Argon2 reference implementation (phc-winner-argon2, CC0) and Openwall's crypt_blowfish
+1.3 (public domain), carried in the library's `sysl/password` package and compiled, with nothing to
+install, into a program that imports this module and no other.
+
 ## `avin.uuid`
 
 Universally unique identifiers (RFC 9562), 128 bits written as 32 hexadecimal digits in groups of
@@ -1831,6 +2403,10 @@ main()
   val id = Uuid.random()
   println(id)
   assertEq(Uuid.parse(id.toString()), Some(id))
+  val first = Uuid.v7()
+  val second = Uuid.v7()
+  assert(first < second)
+  assert(first.timestamp().isDefined)
 ```
 
 `Uuid` is a value: it compares and hashes by its bits, orders by them as sixteen unsigned bytes
@@ -1839,6 +2415,10 @@ main()
 | Member | Meaning |
 | --- | --- |
 | `Uuid.random()` | A version 4 identifier from `SecureRandom`, with the version and variant bits set. |
+| `Uuid.v7() -> Uuid` | A version 7 identifier: the wall clock's Unix milliseconds in the first 48 bits, a 12-bit counter, 62 random bits from `SecureRandom`. Identifiers made in one process sort strictly in the order they were made, from any thread, even when the clock stands still or steps back. No lock is taken. |
+| `Uuid.v7At(instant) -> Uuid` | A version 7 identifier stamped `instant`, for tests and backfills. It has random bits where `v7()` has its counter, so it does not order against others of the same millisecond. An instant outside 1970 to the year 10889 reads as the nearest one inside. |
+| `UuidGenerator()`, `next(instant) -> Uuid` | The sequence `v7()` draws from, made on its own: `next` gives an identifier above every earlier one of that generator whatever `instant` is. A test feeds it a clock it controls. |
+| `timestamp() -> Option[Instant]` | The millisecond a version 7 identifier was stamped; `None` for any other version. |
 | `Uuid.parse(text) -> Option[Uuid]` | The canonical 8-4-4-4-12 form in either case; `None` for anything else (braces, a `urn:uuid:` prefix, missing hyphens and white space are not accepted). |
 | `Uuid.fromBytes(bytes) -> Option[Uuid]` | Sixteen bytes, the first most significant; `None` for any other length. |
 | `Uuid.Nil`, `Uuid.Max` | All zero bits and all one bits. |
@@ -1997,6 +2577,8 @@ main()
 | `toBase32Unpadded(x) -> string` | `x` in base32 with no padding. |
 | `toBase32Lower(x) -> string` | `x` in base32 in lower case (`a`–`z`, `2`–`7`) with no padding: sixteen bytes are 26 characters. |
 | `fromBase32(text) -> Result[Vector[byte], DecodeError]` | The bytes base32 spells, in upper, lower or mixed case, padded to a multiple of eight or not padded at all. |
+| `toQuotedPrintable(x) -> string` | `x` in quoted-printable (RFC 2045 § 6.7), for a mail body: a CR LF stays a line break; printable ASCII but `=` is itself, a space or tab too except at a line's end; every other byte, a lone CR or LF included, is `=XX` in capitals; a line is broken by a soft break, `=` CR LF, to at most 76 characters, never inside an `=XX`. |
+| `fromQuotedPrintable(text) -> Result[Vector[byte], DecodeError]` | The bytes quoted-printable spells, as RFC 2045 says to read it: `=XX` in either case, `=` and optional spaces before a line break or the end as a soft break, spaces and tabs before a line break or the end dropped. An `=` followed by anything else is `BadCharacter` at the `=`, one with a single digit before the end `Truncated`. |
 
 Encoding never fails, and the empty input encodes as the empty text and decodes back from it.
 
@@ -2008,7 +2590,9 @@ bytes, which matters for a token or a signature carried as text. Text wrapped ac
 line breaks taken out before it is decoded. `fromBase32` is as strict, except that a digit's case
 carries no bits, so either case is read, and the `=` padding is optional: a padded text must be padded
 to a multiple of eight with the right number of `=`, and an unpadded one must end on a whole number of
-bytes (2, 4, 5 or 7 digits past a multiple of eight, not 1, 3 or 6).
+bytes (2, 4, 5 or 7 digits past a multiple of eight, not 1, 3 or 6). Quoted-printable is the
+exception: RFC 2045 has a reader drop the spaces a mail relay may add at a line's end, so its decoder
+is as lenient as the RFC asks and no more.
 
 **A refusal is a `DecodeError`**, an `Error` whose `at` is a byte offset in the text. The checks run
 in order, the characters first, then the padding, the length and the unused bits, so the offset
@@ -2020,6 +2604,100 @@ named is of the first thing wrong.
 | `BadPadding(at)` | An `=` where padding cannot stand: before the last two characters, followed by a character that is not `=`, more than two of them, or any in base64url. |
 | `Truncated(at)` | The text ends inside a unit: an odd number of hexadecimal digits, base64 whose length is not a multiple of four, base64url one character past one, base32 whose digits past a multiple of eight are 1, 3 or 6 or whose padding is not completed to eight. `at` is the text's length. |
 | `UnusedBits(at)` | The last digit of the data sets bits no bytes would set. |
+
+## `avin.html`
+
+Text made safe to stand in HTML, and markup built from templates that escape every value they are
+given. An `Html` is markup trusted as it stands; the `html"…"` interpolator builds one, reading its
+template as a browser will and writing each hole escaped for the place it stands in.
+
+```text
+import avin.html.{Html, escapeHtml, escapeAttribute, jsString, safeUrl}
+
+data Link(title: string, url: string)
+
+item(link: Link) -> Html = html"<li><a href=\"${link.url}\" title=\"${link.title}\">${link.title}</a></li>"
+
+page(user: string, links: Vector[Link]) -> Html =
+  html"<h1>Hello, $user</h1><ul>${Html.join(links.map(item))}</ul><script>greet($user)</script>"
+
+main()
+  val links = [Link("Docs & <more>", "https://avin.dev/docs?a=1&b=2"), Link("Click", "javascript:alert(1)")]
+  println(page("<b>Ann</b>", links))
+  println(escapeHtml("a < b & \"c\""))
+  println(escapeAttribute("x onmouseover=1"))
+  println(jsString("</script>"))
+  println(safeUrl(" JavaScript:alert(1)"))
+```
+
+prints the page with the user's name escaped as text in the heading and as a string literal in the
+script, the first link's URL kept and the second's refused, and then:
+
+```text
+a &lt; b &amp; &quot;c&quot;
+x&#x20;onmouseover&#x3D;1
+"\x3C\x2Fscript\x3E"
+about:invalid#unsafe-url
+```
+
+### Escaping
+
+Each escaper answers text for one context, and the browser reads what it writes back as the text it
+was given. Each keeps the empty text empty and every character it does not name as it is, Unicode
+included, and answers its argument itself when nothing needs escaping.
+
+| Function | Meaning |
+| --- | --- |
+| `escapeHtml(text) -> string` | `&`, `<`, `>`, `"` and `'` written `&amp;`, `&lt;`, `&gt;`, `&quot;` and `&#39;`. Safe as an element's text, `<textarea>`'s and `<title>`'s too, and as an attribute's value in double or single quotes. |
+| `escapeAttribute(text) -> string` | Every ASCII character but a letter or digit written as a hexadecimal reference (`&#x20;` for a space). Safe as an attribute's value quoted or unquoted; an empty unquoted value takes the next attribute as its own, so an unquoted one still needs a character. |
+| `escapeJs(text) -> string` | Every character but an ASCII letter or digit written as a script escape: `\xHH` within ASCII, `\uHHHH` beyond it, a character beyond U+FFFF as its two surrogate escapes. Safe inside a string literal in double quotes, single quotes or backticks, in a `<script>` element and in an event handler attribute: no character of it can end a string, a comment, a template or the element, U+2028 and U+2029 included. |
+| `jsString(text) -> string` | `escapeJs(text)` in double quotes: a whole string literal. |
+| `safeUrl(url) -> string` | `url` itself when it is relative or its scheme is `http`, `https`, `mailto` or `tel`; otherwise `about:invalid#unsafe-url`, which goes nowhere. Not escaped: write it into an attribute with `escapeHtml`. |
+
+**`safeUrl` reads a scheme as a browser does.** It drops the spaces and control characters at the
+start and every tab and line break within, and takes the text before the first `:` that comes before
+any `/`, `?` or `#`, in either case. So ` JavaScript:`, `java\tscript:`, `data:` and `vbscript:` are
+all refused, and `/a/b:c` and `?q=a:b` are relative. A scheme part holding anything else
+(`java&script:`, `java script:`) is refused too, since no allowed scheme is spelled so. A character reference in
+the URL stays text, since the URL is escaped after it is checked: `javascript&colon;x` and
+`jav&#x09;ascript:x` (whose `#` begins a fragment) are kept, and written into an attribute as
+`javascript&amp;colon;x` and `jav&amp;#x09;ascript:x`, relative URLs.
+
+### `Html` and templates
+
+`Html(text)` is markup trusted as it stands: making one says that `text` is safe, so it is written
+only of text the program wrote itself or an escaper made. `Html.empty` is no markup,
+`Html.escaped(text)` is `Html(escapeHtml(text))`, and `Html.join(items, separator = Html.empty)` joins
+markup. An `Html` displays as its markup, so it prints and interpolates into `s"…"` as it is, and
+`Response.html(status, page)` sends it as a response of the type `text/html; charset=utf-8`.
+
+**`html"…"` writes each hole for the place it stands in**, in scope wherever `avin.html` or one of its
+declarations is imported. A hole may be any `Display` value:
+
+| Where the hole stands | What is written |
+| --- | --- |
+| An element's text, `<textarea>`'s and `<title>`'s included | An `Html` as it is; any other value escaped by `escapeHtml`. |
+| An attribute's value in double or single quotes | The value, an `Html`'s markup included, escaped by `escapeHtml`. |
+| The start of a URL attribute's value (`href`, `src`, `action`, `formaction`, `xlink:href` and the others whose value a browser follows) | The value passed through `safeUrl`, then escaped. Blanks written before it in the template are not text of the value. |
+| A URL attribute's value after text of it, as in `href="/search?q=$q"` | The value percent-encoded, every byte of its UTF-8 but a letter, a digit, `-`, `.`, `_` and `~`, then escaped. |
+| A `<script>` element, or an event handler attribute (`onclick`, any name beginning `on`) | The value as `jsString` writes it, a whole string literal, then, in an attribute, escaped. |
+
+**A hole where no escaping makes it safe traps**, naming why: a hole in a tag's name or among its
+attributes, an attribute's name, an unquoted attribute value (write it in quotes), a comment, a
+declaration such as `<!doctype>`, a `style` or `srcdoc` attribute, the content of `<style>`,
+`<noscript>`, `<iframe>`, `<xmp>`, `<noembed>`, `<noframes>` and everything after `<plaintext>`; a hole
+in a script written just inside quotes (`f('$x')`: write `f($x)`, since the hole becomes the whole
+literal); and an `Html` in a script, which is trusted as markup, not as script. A template whose
+script holds `<!--`, which changes where the browser ends it, traps, and so does one that ends
+anywhere but in an element's text, inside a tag, a comment or a script, so markup made by `html"…"`
+can always be joined to more. `Html.render(parts, args)` is the interpolator as a function: the
+markup, or the reason as an `Err` where `html"…"` traps.
+
+**The template is read as the program runs**, each time it renders, as the HTML tokenizer reads it:
+tag and attribute names in either case, the end of a script or a style only at its own end tag, a
+`<` not followed by a letter, `/`, `!` or `?` as text. Its escapes are decoded first, as `s"…"`
+decodes them. A mistake in a template is found the first time it renders, not as the program
+compiles.
 
 ## `avin.toml`
 
@@ -2212,13 +2890,293 @@ stops the program it reports on.
 | `atLevel(level) -> Logger` | The same logger with another threshold, its fields kept. |
 | `level`, `format` | What the logger was made with. |
 | `DefaultLogger` | `Logger()`: `Info` and above, as text, to standard error. |
-| `Sink(write, colours = false)` | A sink calling `write: @sendable (string) -> unit` once a line, the line ending in `\n`; `colours` says it takes colour. |
+| `Sink(write, colours = false, again = () -> ())` | A sink calling `write: @sendable (string) -> unit` once a line, the line ending in `\n`; `colours` says it takes colour; `again` is what `reopen` runs. |
+| `sink.reopen()` | Makes the sink look at where it writes afresh: a file sink opens its file again at once, whatever its `recheck`, making the file where a rotator moved it away; any other sink does nothing. |
+| `reopenOnSignal(sink, sig = signal.Hangup) -> Result[Reopener, IoError]` | Watches `sig` on a thread of its own and `reopen`s `sink` each time it arrives, which is what a log rotator asks for after moving the log. An `Err` for a signal that cannot be watched. While it runs the signal no longer ends the program. |
+| `reopener.stop()` | Stops watching and waits for the thread to end; stopping again does nothing. |
 | `stderrSink()`, `stdoutSink()` | The standard streams, each line in one write, taking colour on a colour terminal. |
-| `fileSink(path) -> Result[Sink, IoError]` | Appends to `path`, creating it; an `Err` where it cannot be opened. Each line is appended and on disk when the record's call returns, under a lock, the file opened for it, so a file a rotator moved away is made again by the next line. |
+| `fileSink(path, recheck = seconds(1)) -> Result[Sink, IoError]` | Appends to `path`, creating it; an `Err` where it cannot be opened. The file stays open behind a lock, and each line is one write, handed to the platform before the record's call returns. At most once every `recheck` (before every line where it is zero or less) the sink looks at what `path` names, and opens it again where a rotator moved the file away or put another in its place. |
 | `writerSink(target: Mutex[W])` | Any `Writer`, each line written whole under its mutex. |
 
 The access log of [`avin.net.http`](#http-server) writes through a logger as well: see
 `http.accessLog(logger)` there.
+
+## `avin.cache`
+
+Bounded caches of computed values that one program's threads share: an `LruCache`, which drops the
+entry used least recently to make room, and a `TtlCache`, which does the same and also lets each
+entry expire a fixed time after it was stored. Both are `Sendable`, their keys and values sendable
+too, so one cache serves every thread of a server.
+
+```text
+import avin.cache.{LruCache, TtlCache}
+import avin.time.seconds
+
+data User(id: long, name: string)
+
+fetch(id: long) -> Result[User, string] =
+  if id > 0 then Ok(User(id, s"user $id")) else Err(s"no user $id")
+
+main()
+  val users = LruCache[long, User](10000)
+  println(users.getOrTry(7, fetch))
+  println(users.getOrTry(7, fetch))
+  println(users.getOrTry(-1, fetch))
+  println(users.stats())
+  val pages = TtlCache[string, string](seconds(30), 1048576, (k, v) -> long(k.byteLength + v.byteLength))
+  pages.put("/", "<h1>home</h1>")
+  println(pages.get("/"))
+  println(pages.weight())
+```
+
+```text
+Ok(User(7, user 7))
+Ok(User(7, user 7))
+Err(no user -1)
+CacheStats(1, 2, 2, 1, 0, 0)
+Some(<h1>home</h1>)
+14
+```
+
+**Bounds.** A cache holds at most `capacity` worth of entries, each weighing what its `weigher`
+says: one an entry unless told otherwise, so the capacity is a count of entries, or the bytes of a
+key and its value where the weigher measures them. Storing an entry beyond the capacity drops the
+least recently used ones until the weight is within it again, as many as a heavy entry needs. An
+entry heavier than the whole capacity is not stored, and a put of it drops the key's old value all
+the same; a capacity of zero stores nothing. A negative capacity, and a weigher giving a negative
+weight, trap. `get` and the loaders make the entry they find the most recently used; `peek` reads it
+without that and without counting.
+
+**Loaders and one load a key.** `getOrLoad(key, load)` gives the cached value, or else runs
+`load(key)` and stores what it gives. Threads that miss on one key at once share a single load: the
+first runs the loader and the others wait for its value, so a burst of requests for a cold key costs
+one query, not one each. `getOrTry(key, load)` takes a loader that may fail: its `Ok` value is stored,
+and its `Err` is handed to every caller waiting on that load but **not stored**, so the next call
+loads again. A cache that should remember failures too holds `Result`s and is filled with
+`getOrLoad`. A loader runs on its caller's thread, outside the cache's lock: nothing of a caller's,
+loader, weigher or clock, ever runs under the lock, so a loader may use the cache, its other keys
+included. A loader asking for the very key it is loading waits for itself, as a thread joining
+itself does. A `put`, `remove` or `clear` of a key while its load runs wins: the load's value is
+handed to its waiters but not stored over the newer write. A load whose thread is
+[cancelled](/spec/threads/#cancellation) ends with no value, and a thread waiting on it loads
+again. Waiting on a load is waiting on a future, and so a cancellation point.
+
+**Expiry.** A `TtlCache`'s entry expires `ttl` after it was stored, or after its load ended, by
+`put(key, value, life)` a time of its own; it is live while the clock reads less than that and
+expired from the reading on. The clock is the monotonic clock unless the cache is made with another,
+`clock: @sendable () -> Duration`, which is how a test moves time by hand. An expired entry is never
+given back. It stays held until a lookup finds it, room is made past it, or `purgeExpired()` drops
+every expired entry, so `size()` may count expired entries that none of those has reached; the
+capacity bounds them all the same. A time to live, or a life, that is not positive traps.
+
+**Counts.** `stats()` gives a `CacheStats(hits, misses, loads, loadFailures, evictions,
+expirations)`: lookups by `get` and the loaders that found a live value and that did not (a call
+waiting on another's load among the misses, counted once however often it looks), loads run and
+those that failed or were cancelled, entries dropped to make room, and entries dropped for having
+expired. `requests` and `hitRate` are derived from them.
+
+**Cost.** Every operation takes the cache's one lock for a few map operations, amortized constant
+time. Measured at `-O2` on an Apple M-series machine with 4096 entries, one thread: a hit about
+130 ns (the lock about 17 ns of it, the map's lookup and move to the newest the rest), a put
+replacing a value about 230 ns, a `TtlCache` hit with the monotonic clock about 270 ns. Threads
+contending for one cache wait for its lock in turn, each handed it by the one before: eight threads
+hitting one cache at once reach about 0.26 million operations a second between them, against 7.7
+million for one thread alone, so a cache that many threads hit at once costs microseconds an
+operation; a bare `Mutex` contended the same way falls the same way.
+
+| Member | Meaning |
+| --- | --- |
+| `LruCache[K, V](capacity: long, weigher = (_, _) -> 1)` | A cache of at most `capacity` by weight, dropping the least recently used. `K: Eq & Hash & Sendable`, `V: Sendable`; `weigher: @sendable (K, V) -> long`. |
+| `TtlCache[K, V](ttl: Duration, capacity: long, weigher = (_, _) -> 1, clock = monotonic)` | The same, each entry expiring `ttl` after it was stored, by `clock: @sendable () -> Duration`. |
+| `get(key) -> Option[V]` | The live value, made the most recently used and counted. |
+| `peek(key) -> Option[V]` | The live value, neither made recent nor counted. |
+| `put(key, value)` | Stores the value, making room for it; on a `TtlCache`, `put(key, value, life)` gives it a life of its own. |
+| `getOrLoad(key, load: (K) -> V) -> V` | The value, or else `load(key)`'s, stored; one load for every thread missing on the key at once. |
+| `getOrTry[E: Sendable](key, load: (K) -> Result[V, E]) -> Result[V, E]` | The same with a loader that may fail; an `Err` is handed to the load's waiters, not stored. |
+| `remove(key) -> Option[V]` | Drops the entry, giving back its value where it was live. |
+| `clear()` | Drops every entry; the counts stay. |
+| `purgeExpired() -> int` | On a `TtlCache`: drops every expired entry, answering how many. |
+| `size() -> int`, `weight() -> long` | The entries held and the sum of their weights. |
+| `capacity`, `ttl` | What the cache was made with. |
+| `stats() -> CacheStats` | The counts since the cache was made; `requests` and `hitRate` (0 with no request). |
+
+## `avin.resilience`
+
+Keeping a program working while what it depends on fails for a while. `retry` runs work again
+after a growing, spread-out wait, inside the deadline the calling code runs under; a
+`CircuitBreaker` stops calling what keeps failing, and lets a trial call through once it has had
+time to recover; a `RateLimiter` holds any work to a rate. Work is a function answering a `Result`,
+and an `Err` is the failure each of them reacts to.
+
+```text run
+import avin.resilience.{BreakerOpen, CallFailed, CircuitBreaker, RateLimiter, RetryPolicy, retry}
+import avin.time.{millis, seconds}
+
+main()
+  var calls = 0
+  val policy = RetryPolicy(maxAttempts = 5, initialDelay = millis(1))
+  println(retry(policy, (e: string) -> e.startsWith("busy"), () ->
+    calls += 1
+    if calls < 3 then Err(s"busy $calls") else Ok(s"done after $calls")))
+
+  val breaker = CircuitBreaker(failureThreshold = 2, openFor = seconds(30))
+  for _ in 0 ..< 3
+    val reply = breaker.call(() -> Err[int, string]("refused")) match
+      Ok(n) -> s"answered $n"
+      Err(BreakerOpen(_)) -> "open: not called"
+      Err(CallFailed(e)) -> s"failed: $e"
+    println(reply)
+  println(breaker.state)
+
+  val limiter = RateLimiter(2, seconds(1))
+  println([limiter.admit("feed").isOk, limiter.admit("feed").isOk, limiter.admit("feed").isOk])
+```
+
+```text output
+Ok(done after 3)
+failed: refused
+failed: refused
+open: not called
+Open
+[true, true, false]
+```
+
+**Retrying.** `RetryPolicy(maxAttempts = 3, initialDelay = 100ms, maxDelay = 10s, multiplier =
+2.0, jitter = 1.0, maxElapsed = None)` makes at most `maxAttempts` attempts, the first included.
+Before retry `n` (counted from one) it waits the backoff `initialDelay × multiplierⁿ⁻¹`, at most
+`maxDelay` (`policy.backoff(n)`), less a random part of it: `jitter` is the share that may be taken
+off, so `1.0` spreads a wait anywhere from zero to the backoff, `0.5` over its upper half, and `0.0`
+waits the backoff exactly (`policy.delay(n)` draws one). `retry(policy, body)` retries every `Err`;
+`retry(policy, retryable, body)` only those `retryable` accepts, answering any other at once, so a
+refused password is not tried again. Either answers the last result `body` gave, and
+`policy.run(…)` is the same loop. The first attempt is always made. A retry is not made where its
+wait would end more than `maxElapsed` after the first attempt began, the attempts' own time
+counted, nor where the wait would reach the deadline the calling code runs under
+([`withDeadline`](/spec/threads/#request-context)): a retry needs time left after its wait, and
+the deadline cancels a wait it does reach. A `maxAttempts` below one, a negative `initialDelay` or
+`maxElapsed`, a `maxDelay` below `initialDelay`, a `multiplier` below one or not finite, and a
+`jitter` outside zero to one trap where the policy is made.
+
+**Circuit breaking.** `CircuitBreaker(failureThreshold = 5, openFor = 30s, trialCalls = 1)` is
+`Closed` to begin with and makes every call; `failureThreshold` failures in a row open it (a success
+clears the count, `failures` reads it). `Open`, it makes no call for `openFor`, answering
+`BreakerOpen(retryIn)` at once, `retryIn` the time until it will try again. Then it is `HalfOpen`
+and lets `trialCalls` calls through at once, answering the rest `BreakerOpen(0s)`: one trial
+failing opens it again for another `openFor`, and `trialCalls` succeeding close it.
+`breaker.call(body)` counts every `Err` as a failure and answers `Result[T, BreakerError[E]]`,
+`CallFailed(e)` wrapping the call's own error; `call(isFailure, body)` counts only the errors
+`isFailure` accepts, an answer such as not-found showing the service is up. A call cancelled before
+it answers counts neither way and frees its place as a trial, and an outcome arriving after the
+breaker has changed state since the call began counts neither way either. `state` reads where it stands, `reset()` closes
+it and `trip()` opens it by hand, and `onChange: (from, to) -> unit` is told of each change, after
+the breaker's lock is free. A `failureThreshold` or `trialCalls` below one and a negative `openFor`
+trap. `BreakerError[E]` is an `Error` where `E` is, a failed call's error its `cause`.
+
+**Rate limiting.** `RateLimiter(rate, per, burst = rate, maxKeys = 10000)` is the token bucket the
+[HTTP middleware](#http-server) uses, for any work: a bucket per key of `burst` tokens filled again at
+`rate` every `per`. `admit(key)` takes a token or answers `Err` of the time until the next, never
+waiting; `acquire(key)` waits for the token and answers `true`, or answers `false` at once where the
+next token comes no sooner than the calling code's deadline. Both have a keyless form, the one bucket
+`""`. Its bound on buckets and its traps are the HTTP limiter's.
+
+**Time of one's own.** Each reads the time through a named parameter `clock: () -> Duration` (the
+monotonic clock); the policy and the limiter wait through `pause: (Duration) -> unit`
+(`threads.sleep`), and the policy draws through `random: () -> real` (the shared generator's
+`nextReal`). A test gives its own, and drives a policy, a breaker or a limiter on a clock it moves
+itself, with nothing sleeping. The deadline is still the real one, read from `Context.current()`.
+
+## `avin.metrics`
+
+Metrics a program keeps about itself for a scraper to read: counters, gauges and histograms, each a
+**family** of **series** told apart by the values of its labels, held by one `Registry` and rendered
+in the Prometheus text exposition format, version 0.0.4. Every type is `Sendable`: one registry
+serves every thread.
+
+```text
+import avin.metrics.Registry
+import avin.time.millis
+
+main()
+  val registry = Registry()
+  val jobs = registry.counter("jobs_total", "Jobs finished, by queue.", ["queue"])
+  val mail = jobs.labels("mail")
+  mail.inc()
+  mail.inc()
+  jobs.labels("print").add(3.0)
+  val depth = registry.gauge("queue_depth", "Jobs waiting.")
+  depth.set(4.0)
+  val took = registry.histogram("job_seconds", "Time a job took.", buckets = [0.1, 1.0])
+  took.observe(millis(250))
+  print(registry.render)
+```
+
+```text
+# HELP jobs_total Jobs finished, by queue.
+# TYPE jobs_total counter
+jobs_total{queue="mail"} 2
+jobs_total{queue="print"} 3
+# HELP queue_depth Jobs waiting.
+# TYPE queue_depth gauge
+queue_depth 4
+# HELP job_seconds Time a job took.
+# TYPE job_seconds histogram
+job_seconds_bucket{le="0.1"} 0
+job_seconds_bucket{le="1"} 1
+job_seconds_bucket{le="+Inf"} 1
+job_seconds_sum 0.25
+job_seconds_count 1
+```
+
+**The hot path.** `labels(values*)` finds a series by one value for each label, in order, making it
+the first time; the series map is read without a lock and replaced whole, under the family's lock,
+only when a series is made. A series counts with one atomic compare-and-set of its value, so a
+program that keeps the series it counts often (`mail` above) pays that alone. Measured at `-O2` on
+an Apple M-series machine, 20 million times each: `inc` on a kept series or on a family without
+labels about 8 ns, a gauge's `inc` about 8 ns, a histogram's `observe` into 11 buckets about 12 ns,
+and `labels("GET", "2xx").inc()`, finding the series by two labels each time, about 125 ns. Four
+threads incrementing one series at once take about 100 ns an increment between them, the cost of
+the value's cache line passing from core to core; series of their own each avoid it.
+
+**The cardinality guard.** Each family holds at most `maxSeries` series (`defaultMaxSeries`, 10000,
+unless given another). Past it, every new label set is the family's **overflow series**, each label
+`OverflowValue` (`"_overflow"`), made the first time one is refused and rendered last, so a label
+taken from what clients send cannot grow a program's memory and a scrape without bound, while the
+totals stay whole. The series already held still count as before; `size` says how many a family
+holds, the overflow series among them.
+
+**The format.** A registry renders its families in the order they were made, each as its `# HELP`
+line (a backslash and a line end escaped), its `# TYPE` line and its series ordered by their label
+values. A label value escapes a backslash, a quote and a line end and keeps every other character,
+Unicode included. A number is written whole without a fraction (`3`), otherwise in its shortest
+decimal form (`0.25`), and infinities and `NaN` as `+Inf`, `-Inf` and `NaN`. A histogram writes each
+bucket's count of the observations at or below its bound (`_bucket{le="…"}`), then `+Inf`, `_sum`
+and `_count`; its count is the buckets' total, so `+Inf` and `_count` always agree, even while other
+threads observe.
+
+**Names.** A metric name is a letter, `_` or `:`, then letters, digits, `_` or `:`; a label name the
+same without `:`, and not beginning `__`; a histogram's labels do not include `le`, which its buckets
+are written with. A name is made once in a registry. A name or label name not allowed, a label named
+twice, a name made again, or a `maxSeries` below one traps where the family is made.
+
+| Member | Meaning |
+| --- | --- |
+| `Registry()` | The families of a program or a part of it. |
+| `counter(name, help, labels = [], maxSeries = defaultMaxSeries) -> Counter` | A counter family. |
+| `gauge(name, help, labels = [], maxSeries = defaultMaxSeries) -> Gauge` | A gauge family. |
+| `histogram(name, help, labels = [], buckets = defaultBuckets, maxSeries = defaultMaxSeries) -> Histogram` | A histogram family; `buckets` are finite upper bounds in increasing order, else it traps. |
+| `gaugeOf(name, help, read: @sendable () -> real)` | A gauge of one series without labels, `read` each time the registry renders. |
+| `render -> string`, `names -> Vector[string]` | The registry in the format; its families' names in the order made. |
+| `Counter`, `Gauge`, `Histogram` | A family: `name`, `help`, `labelNames`, `labels(values*)`, `size`, `render`; made alone, it renders alone. Without labels, its own methods are its one series'; with labels they trap. |
+| `CounterSeries` | `inc()`, `add(amount)`, `value`: `amount` finite and at least zero, else it traps. |
+| `GaugeSeries` | `set(v)`, `inc()`, `dec()`, `add(amount)`, `sub(amount)`, `value`. |
+| `HistogramSeries` | `observe(v: real)`, `observe(took: Duration)` in seconds, `count`, `sum`, `cumulative` (each bucket's count with those below it, then the count). A `NaN` is counted past every bound and makes the sum `NaN`. |
+| `defaultBuckets` | 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1, 2.5, 5 and 10 seconds. |
+| `linearBuckets(start, width, count)`, `exponentialBuckets(start, factor, count)` | `count` bounds from `start`, `width` apart or each `factor` times the last; a `count` below one, a `width` not above zero, a `start` not above zero or a `factor` not above one (exponential) traps. |
+| `number(v) -> string` | A number as the format writes it. |
+| `TextContentType` | `text/plain; version=0.0.4; charset=utf-8`. |
+
+[`avin.net.http`](#http-server) serves a registry (`metricsHandler`, `metricsRoute`) and keeps its
+request metrics in one (`Metrics`, `ServerMetrics`).
 
 ## `avin.net`
 
@@ -2245,7 +3203,7 @@ uses it again.
 
 | Function | Meaning |
 | --- | --- |
-| `TcpStream.connect(host: string, port: int) -> Result[TcpStream, IoError]` | A connection to the first of the host's addresses that answers; where none does, the last one's error. |
+| `TcpStream.connect(host: string, port: int, timeout: Duration = Duration.Zero, options: TcpOptions = TcpOptions()) -> Result[TcpStream, IoError]` | A connection to the first of the host's addresses that answers; where none does, the last one's error. The lookup and the connecting, to every address tried, must be done within `timeout`, else the error is `TimedOut`; zero leaves the waits to the system's own limits, and a negative `timeout` traps. Its socket is given `options` before it connects; see [socket options](#socket-options). |
 | `s.read(max: int) -> Result[Array[byte], IoError]` | Up to `max` bytes, at least one, waiting for at least one; empty when the other end has finished sending. |
 | `s.readLine() -> Result[Option[string], IoError]` | The next line, as standard input reads one, `None` at the end. |
 | `s.readAll() -> Result[Array[byte], IoError]` | Everything until the other end has finished sending. |
@@ -2260,9 +3218,11 @@ uses it again.
 | `s.writable() -> bool` | Whether a write would send something now, without waiting: the socket has room, or the connection has failed or is closed. Never waits. A [`select`](/spec/threads/#select)'s `s.writable()` arm waits for it. |
 | `s.writabilityDescriptor() -> int` | The descriptor that arm watches; `-1` once closed. |
 | `s.split() -> (StreamReader, StreamWriter)` | The connection divided into a reading half and a writing half, for two threads to use at once; see [split connections](#split-connections). |
-| `TcpListener.bind(host: string, port: int) -> Result[TcpListener, IoError]` | Listens on the host's first address (`127.0.0.1` for this machine alone, `0.0.0.0` for all of its addresses); port `0` lets the platform choose. |
+| `s.localAddress() -> Result[string, IoError]`, `s.localPort() -> Result[int, IoError]` | This end's address, numerically without its port, and its port. |
+| `TcpListener.bind(host: string, port: int, options: ListenOptions = ListenOptions()) -> Result[TcpListener, IoError]` | Listens on the host's first address (`127.0.0.1` for this machine alone, `0.0.0.0` for all of its addresses); port `0` lets the platform choose. It is given `options` before it binds. |
 | `l.port() -> int` | The port it listens on. |
-| `l.accept() -> Result[TcpStream, IoError]` | Waits for the next connection. |
+| `l.options -> ListenOptions`, `l.reusePort() -> Result[bool, IoError]` | The options it was bound with, and whether it shares its port, as the system says. |
+| `l.accept() -> Result[TcpStream, IoError]` | Waits for the next connection, which is given `options.connections`. |
 | `l.close() -> Result[unit, IoError]` | Stops listening and answers `Ok`; closing again does nothing. |
 
 ```text
@@ -2280,6 +3240,55 @@ main()
     Err(e) -> eprintln(e.message)
 ```
 
+### Socket options
+
+A connection's options are a `TcpOptions` given to `connect`, or to a listener for every connection
+it accepts, and each has a method on the connection that changes it and one that reads it back from
+the system, so what a read answers is what the socket has.
+
+| Type or member | Meaning |
+| --- | --- |
+| `data TcpOptions(noDelay = false, keepAlive: Option[KeepAlive] = None, sendBuffer = 0, receiveBuffer = 0)` | A connection's options. A buffer size of zero leaves the system's own. |
+| `data KeepAlive(idle = seconds(60), interval = seconds(10), count = 6)` | Probing an idle connection (`SO_KEEPALIVE`): the first probe after `idle` with nothing received, the next every `interval`, and `count` unanswered ones end the connection, its next read or write failing. |
+| `data ListenOptions(backlog = 128, reuseAddress = true, reusePort = false, connections = TcpOptions())` | A listener's options. |
+| `s.setNoDelay(on: bool)`, `s.noDelay() -> Result[bool, IoError]` | Sending each write at once (`TCP_NODELAY`) rather than holding a small one back to join the next. |
+| `s.setKeepAlive(k: Option[KeepAlive])`, `s.keepAlive() -> Result[Option[KeepAlive], IoError]` | Probing while idle, or not for `None`; read back in whole seconds. |
+| `s.setSendBuffer(bytes: int)`, `s.sendBuffer() -> Result[int, IoError]` | The send buffer asked for, and the size the system gave. |
+| `s.setReceiveBuffer(bytes: int)`, `s.receiveBuffer() -> Result[int, IoError]` | The same for the receive buffer. |
+| `s.configure(options: TcpOptions) -> Result[unit, IoError]` | Every option at once: `noDelay` and `keepAlive` as they say, each buffer size that is not zero. |
+
+- **A new connection holds small writes back and is not probed**, the system's defaults; a
+  listener's `connections` changes that for every connection it accepts, and `http.serve` turns
+  both on (see [HTTP server](#http-server)).
+- **Keep-alive times are whole seconds**, a part of one counting as one: `millis(1500)` is two.
+  An `idle` or `interval` of zero or less, or a `count` less than one, traps where the options are
+  used; a value past the platform's own limit is its `Err`.
+- **The system may give a buffer of another size than asked**: Linux doubles it and caps it,
+  macOS caps it. `connect` sets the buffer sizes before it connects and a listener before it
+  listens, so a large receive buffer is in place when the connection's window is agreed. A
+  negative size in options, or a size less than one asked of a connection, traps.
+- **`reuseAddress`** (`SO_REUSEADDR`) lets a listener take a port a listener stopped a moment ago
+  still holds, so a server restarts at once; it is on unless turned off. **`reusePort`**
+  (`SO_REUSEPORT`) lets several listeners, in one program or several, bind the same address and
+  port, each of them setting it, the system sharing the connections among them; one that does not
+  set it is refused the port. **`backlog`** is how many connections the system queues before they
+  are accepted, lowered to the platform's own limit where it is larger; less than one traps.
+- Options no socket can be given trap before anything is looked up. A closed or split connection,
+  and a closed listener, answers each option's read and change with an error.
+
+```text
+import avin.net.{KeepAlive, ListenOptions, TcpListener, TcpOptions, TcpStream}
+import avin.time.seconds
+
+main()
+  val fast = TcpOptions(noDelay = true, keepAlive = Some(KeepAlive(idle = seconds(30))))
+  val l = TcpListener.bind("127.0.0.1", 0, ListenOptions(reusePort = true, connections = fast)).ok.get
+  val c = TcpStream.connect("127.0.0.1", l.port(), options = fast).ok.get
+  println(c.noDelay(), c.keepAlive().map(k -> k.map(a -> a.idle)))
+  _ = c.close()
+  _ = l.close()
+```
+
 ### Unix domain sockets
 
 A `UnixStream` and a `UnixListener` connect two programs on one machine by a path in the file system
@@ -2292,8 +3301,9 @@ safe for the collector, as TCP's are.
 | Function | Meaning |
 | --- | --- |
 | `UnixStream.connect(path: string) -> Result[UnixStream, IoError]` | A connection to the program listening at `path`; a path with nothing at it is `NotFound`, and a socket file nobody listens on any more is `ConnectionRefused`. |
-| `UnixListener.bind(path: string) -> Result[UnixListener, IoError]` | Listens at `path`, which must name nothing yet: a path already holding anything is `AlreadyExists`. |
-| `UnixListener.bindReplacing(path: string) -> Result[UnixListener, IoError]` | As `bind`, but a socket file left behind by a program that is gone (a connection to it is refused) is removed first. A live listener's path and anything that is not a socket file is `AlreadyExists` and untouched. |
+| `UnixListener.bind(path: string, backlog = 128) -> Result[UnixListener, IoError]` | Listens at `path`, which must name nothing yet: a path already holding anything is `AlreadyExists`. The system queues up to `backlog` connections, lowered to its own limit; less than one traps. |
+| `UnixListener.bindReplacing(path: string, backlog = 128) -> Result[UnixListener, IoError]` | As `bind`, but a socket file left behind by a program that is gone (a connection to it is refused) is removed first. A live listener's path and anything that is not a socket file is `AlreadyExists` and untouched. |
+| `s.peerCredentials() -> Result[PeerCredentials, IoError]` | Who is at the other end, as the system vouches for it: `data PeerCredentials(user: long, group: long, process: Option[long])`, the ids `process.userId()` and `process.groupId()` answer and the peer's process id, `None` where the system does not say. How a server learns which user of the machine talks to it, with no password; a closed or split connection answers an error. |
 | `l.path() -> string` | The path it listens at. |
 | `l.accept() -> Result[UnixStream, IoError]` | Waits for the next connection. |
 | `l.close() -> Result[unit, IoError]` | Stops listening and answers `Ok`; closing again does nothing. The socket file stays; `fs.remove` or `bindReplacing` clears it. |
@@ -2328,7 +3338,8 @@ listener a thread is parked on traps, as any use of it from there does.
 cannot be stopped halfway, so the runtime makes each lookup on a helper thread of its own, and the
 `connect` or `bind` that asked waits for the answer as it waits on a socket: a lightweight thread
 parks, `main` waits safe for the collector, and a [cancellation](/spec/threads/#cancellation) or a
-`withTimeout`'s deadline stops the thread at once, so a connect's time limit covers the lookup too.
+`withTimeout`'s deadline stops the thread at once, so a connect's time limit covers the lookup too;
+`connect`'s own `timeout`, running out, abandons the lookup the same way and fails as `TimedOut`.
 The lookup it abandoned runs on to the resolver's answer, which is thrown away. At most 64 helpers
 run at once, which bounds how many abandoned lookups can still be running; a lookup asked for while
 all 64 are busy waits for one to come free, and that wait too is ended by a cancellation. A numeric
@@ -2440,6 +3451,67 @@ beyond what its caller asked for and the line reading over them, is public for a
 one's own: `pending` says whether any are still to be read, and `keep(bytes)` adds bytes that
 arrived before anything asked for them.
 
+### IP addresses and lookups
+
+An `IpAddress` is a value: version 4 or version 6, without a port, equal to another and hashing
+alike where both are of one version with the same bytes and, for version 6, the same scope. It is
+sendable, so it is a `Map` key or a `Set` member as it stands and crosses to any thread. It displays
+in the numeric form RFC 5952 sets out (`127.0.0.1`, `::1`, `2001:db8::1`, `fe80::1%4`,
+`::ffff:10.0.0.1`), and its `Debug` form is `IpAddress(::1)`.
+
+| Function | Meaning |
+| --- | --- |
+| `lookup(host: string) -> Result[Vector[IpAddress], IoError]` | Every address `host` stands for, in the order the platform prefers them, each once. A numeric address is its own answer and asks nothing of the network. A name the resolver finds nothing for is `HostNotFound`, and so is one that could not be a host's, refused before anything is asked: empty, longer than `HostNameMost` (254) bytes, or holding white space or a control character. The lookup runs on one of the runtime's helper threads and is waited for as a socket is: a lightweight thread parks, and a cancellation or a `withTimeout` deadline ends the wait at once. |
+| `IpAddress.parse(text: string) -> Option[IpAddress]` | The address `text` writes: dotted decimal, four parts of at most 255 with no leading zeros; or eight groups of one to four hexadecimal digits in either case, one run of zero groups written `::`, the last two groups perhaps an IPv4 address, then perhaps `%` and the number of the interface it is scoped to. `None` for anything else: brackets, a port, white space, a short form such as `127.1`, or an interface named rather than numbered. |
+| `IpAddress.v4(a: int, b: int, c: int, d: int) -> IpAddress` | The address `a.b.c.d`; a part outside 0 to 255 traps. |
+| `IpAddress.fromBytes(bytes: Vector[byte]) -> Option[IpAddress]` | The address of four bytes or sixteen, the most significant first; `None` for any other number. |
+| `IpAddress.Localhost`, `LocalhostV6`, `Unspecified`, `UnspecifiedV6` | `127.0.0.1`, `::1`, `0.0.0.0` and `::`. |
+| `a.isIpv4`, `a.isIpv6 -> bool` | Its version. |
+| `a.bytes() -> Vector[byte]` | Its four or sixteen bytes, the most significant first. |
+| `a.scopeId -> int` | The interface a version 6 address is scoped to, zero for none. |
+| `a.isLoopback`, `a.isUnspecified`, `a.isMulticast -> bool` | Whether it is in `127.0.0.0/8` or is `::1`; is `0.0.0.0` or `::`; is in `224.0.0.0/4` or `ff00::/8`. |
+
+### UDP
+
+A `UdpSocket` sends and receives datagrams: each `sendTo` is one datagram and each `receiveFrom`
+takes one whole, with who sent it. A datagram may be lost, two may arrive in either order, and one
+longer than the room a receive gives loses its rest, which the `Datagram` says. A socket is sendable
+and owned by one thread at a time, as a TCP connection is, and a receive, or a send waiting for room,
+parks a lightweight thread on the runtime's poller, ended by a cancellation like any other wait.
+
+| Function | Meaning |
+| --- | --- |
+| `UdpSocket.bind(host: string, port: int, reusePort: bool = false) -> Result[UdpSocket, IoError]` | A socket bound to `port` on the host's first address: `127.0.0.1` or `::1` for this machine alone, `0.0.0.0` or `::` for all of its addresses; port `0` lets the platform choose. With `reusePort`, several sockets that each ask for it share one port, the platform dividing the datagrams among them. |
+| `UdpSocket.bind(address: IpAddress, port: int, reusePort: bool = false)` | The same, on an address. |
+| `u.port() -> int`, `u.localAddress() -> IpAddress` | Where it is bound. |
+| `u.sendTo(bytes: Array[byte], to: IpAddress, port: int) -> Result[unit, IoError]` | Sends `bytes` as one datagram, empty ones included. The address must be of the socket's own version. A datagram longer than the version carries, `DatagramMostIpv4` (65507) or `DatagramMostIpv6` (65527) bytes, fails without being sent. |
+| `u.sendTo(bytes: Array[byte], host: string, port: int)` | The same, to the host's first address of the socket's version. |
+| `u.receiveFrom(max: int) -> Result[Datagram, IoError]` | Waits for the next datagram and answers up to `max` of its bytes in a `Datagram(bytes, sender, senderPort, truncated)`; `truncated` says it was longer and the rest is lost. `max` is at least one (zero traps); a `max` of `DatagramMost` (65535) or more never truncates. |
+| `u.connect(to: IpAddress, port: int)`, `u.connect(host: string, port: int)` `-> Result[unit, IoError]` | Points the socket at one peer: `send` goes there, and only its datagrams arrive. A port there that nothing listens on may make a later receive answer `ConnectionRefused`. |
+| `u.connectedTo() -> Option[(IpAddress, int)]` | Where `connect` pointed it. |
+| `u.send(bytes: Array[byte]) -> Result[unit, IoError]` | Sends one datagram to where it is connected; an `Err` where it is not. |
+| `u.setTimeout(d: Duration)`, `u.timeout` | As a TCP connection's: a receive or a send that waits longer fails with `TimedOut`; zero or less takes the limit away. |
+| `u.setReceiveBufferSize(bytes: int)`, `u.receiveBufferSize()`, `u.setSendBufferSize(bytes: int)`, `u.sendBufferSize()` | Asks the platform for buffers of a size, and says what it gave. A new socket's send buffer has room for the longest datagram. |
+| `u.readable()`, `u.readinessDescriptor()`, `u.writable()`, `u.writabilityDescriptor()` | As a TCP connection's, for a [`select`](/spec/threads/#select)'s `u.readable()` and `u.writable()` arms. |
+| `u.close() -> Result[unit, IoError]` | Closes it and answers `Ok`; closing again does nothing, and every other operation afterwards answers an `Err`. |
+
+```text
+import avin.io.IoError
+import avin.net.{IpAddress, UdpSocket}
+import avin.threads.spawn
+
+main() -> Result[unit, IoError]
+  val server = UdpSocket.bind("127.0.0.1", 0)?
+  val port = server.port()
+  val echo = spawn(() ->
+    server.receiveFrom(1500).flatMap(d -> server.sendTo(d.bytes, d.sender, d.senderPort)))
+  val client = UdpSocket.bind(IpAddress.Localhost, 0)?
+  client.sendTo("ping".utf8, IpAddress.Localhost, port)?
+  val reply = client.receiveFrom(1500)?
+  println(s"${string.fromUtf8Lossy(reply.bytes)} from ${reply.sender}")
+  echo.join()
+```
+
 ### TLS
 
 `avin.net.tls` is TLS over a `TcpStream`, at either end, by OpenSSL, which the library reaches
@@ -2464,15 +3536,28 @@ main() -> Result[unit, TlsError | IoError]
 
 | Member | Meaning |
 | --- | --- |
-| `TlsStream.connect(host, port, settings: TlsClient = TlsClient()) -> Result[TlsStream, TlsError]` | A TCP connection as `TcpStream.connect` makes one, then TLS as the client, the certificate checked for `host`. |
-| `TlsStream.client(tcp: TcpStream, host, settings = TlsClient()) -> Result[TlsStream, TlsError]` | TLS as the client over a connection the caller made, its handshake waiting with `tcp`'s limit. Where it fails, `tcp` is the caller's to close. |
-| `TlsStream.server(tcp: TcpStream, settings: TlsServer) -> Result[TlsStream, TlsError]` | TLS as the server over an accepted connection, presenting the settings' certificate. |
+| `TlsStream.connect(host, port, settings: TlsClient = TlsClient(), timeout = seconds(30)) -> Result[TlsStream, TlsError]` | A TCP connection as `TcpStream.connect` makes one, then TLS as the client, the certificate checked for `host`. The lookup, the connecting and the handshake together must be done within `timeout`, else the connection is closed and the error is `Transport` of kind `TimedOut`. The connection made has no limit on its waits until `setTimeout` gives it one. |
+| `TlsStream.client(tcp: TcpStream, host, settings = TlsClient(), timeout = Duration.Zero) -> Result[TlsStream, TlsError]` | TLS as the client over a connection the caller made, each of its handshake's waits with `tcp`'s limit and the whole handshake within `timeout`, else `Transport` of kind `TimedOut`; `tcp`'s limit is put back afterwards. Where it fails, `tcp` is the caller's to close. |
+| `TlsStream.server(tcp: TcpStream, settings: TlsServer, timeout = Duration.Zero) -> Result[TlsStream, TlsError]` | TLS as the server over an accepted connection, presenting the settings' certificate, its handshake bounded as `client`'s is. |
+
+A handshake's waits are each bounded by the connection's own limit, but a peer sending a byte just
+inside that limit, again and again, would hold a handshake open for ever; the `timeout` bounds the
+whole of it, each wait cut to what is left. Zero takes the bound away, as it does for the low-level
+`client` and `server` unless asked, since their caller owns the connection and its timing; a
+negative `timeout` traps.
 | `s.read`, `readLine`, `readAll`, `write`, `writeText`, `setTimeout` | As a `TcpStream`'s, of plaintext; the limit is the TCP connection's, for each of its waits. |
 | `s.readable() -> bool`, `s.readinessDescriptor() -> int` | Whether a read of plaintext would answer now: plaintext is buffered or TLS holds some decrypted, a whole record of it has arrived, or the peer has closed TLS or the connection. It hands TLS the ciphertext already on the socket, so part of a record is not taken for plaintext, and never waits for more; a failure it meets is answered by the next read. The descriptor is the TCP connection's. |
 | `s.shutdownOutput()` | Closes TLS (a `close_notify`) and the TCP connection's sending side; reading goes on. |
 | `s.close() -> Result[unit, IoError]` | Closes TLS as far as the peer can be told without waiting, then the connection; the `Err` is a failure to send that notice, the connection being closed either way. Again does nothing and answers `Ok`. |
 | `TlsClient(trusted = [])`, `c.trust(pem: string) -> TlsClient` | The machine's trusted authorities and those added: `trust` answers a client that also trusts the certificates in `pem`. |
 | `TlsServer(certificate, key)`, `TlsServer.of(certificate, key) -> Result[TlsServer, TlsError]` | A server's certificate (a chain, leaf first) and private key as PEM text; `of` checks they can be used and go together, and one made directly is checked at its first connection. |
+| `c.offer(names: Vector[string])`, `server.offer(names)` | The settings offering the application protocols `names` by ALPN, most preferred first, in place of those offered before; `[]` offers none, the default. A name empty or over 255 bytes long, or names over 65535 bytes in all, each with its length byte, trap. |
+| `c.versions(min: TlsVersion, max: TlsVersion)`, `server.versions(min, max)` | The settings speaking the protocol versions from `min` to `max`, both included; `Tls12` to `Tls13` by default. A `min` newer than `max` traps. |
+| `protocols`, `minVersion`, `maxVersion` | The settings' fields, also parameters of `TlsClient(…)` and `TlsServer(…)` after their own, defaulted; one made directly with a name ALPN cannot carry, or `minVersion` newer than `maxVersion`, traps at its first connection. |
+| `s.protocol -> Option[string]`, `s.version -> TlsVersion` | The application protocol the two ends agreed on, `None` where one offered none or the server chose none, and the protocol version spoken; still known after `close` and `split`. |
+| `TlsVersion`: `Tls12`, `Tls13`; `v.name` | A protocol version, its `name` and display `TLS 1.2` or `TLS 1.3`. Nothing older can be named. |
+| `trait TlsSource`, `source.current -> TlsServer` | Where a server's settings come from, asked as each connection's handshake begins. A `TlsServer` is its own, the same every time. |
+| `ReloadableTlsServer(initial: TlsServer)`, `r.reload(next: TlsServer)`, `r.reload(certificate, key) -> Result[unit, TlsError]` | Settings that may be replaced while a server runs, from any thread. Each connection keeps the settings it began with, so a reload changes the connections that follow and none already open. `reload(certificate, key)` keeps the protocols and versions; `Credentials`, the settings unchanged, where the two cannot be used together. |
 
 **What a client checks, and what cannot be turned off.** The server's certificate must chain to an
 authority the client trusts: the machine's store, read through OpenSSL's default paths (on macOS
@@ -2481,6 +3566,43 @@ must cover the host connected to, a name or an address. The host's name is sent 
 choose a certificate by, and the oldest protocol spoken is TLS 1.2. `trust` only adds: there is no
 way to accept a certificate these refuse, a private authority, a corporate one and a test's own
 being the same case. The choices are [proposed](/spec/decisions/#proposed).
+
+**Versions and application protocols.** Either end speaks TLS 1.2 and TLS 1.3 unless `versions`
+narrows that, to TLS 1.3 alone for instance; nothing widens it below TLS 1.2, and two ends whose
+ranges do not meet fail the handshake as `Handshake`. Each end may offer application protocols by
+ALPN. Where both do, the server chooses the first of its own the client offered, so its order wins,
+and where none is offered by both the handshake fails as `Handshake`, as RFC 7301 asks; where either
+offers none, or the server chooses none, the connection's `protocol` is `None` and it goes on.
+Names are compared byte for byte: `h2` is not `H2`, nor `h2c`.
+
+**Reloading a certificate.** A `ReloadableTlsServer` holds a server's settings and may be
+replaced while it serves, a renewed certificate for instance; `http.serve` takes one as its `tls`,
+as it takes a `TlsServer`. Each connection takes the settings current as its handshake begins and
+keeps them, so the connections accepted after a reload present the new certificate and every
+connection already open goes on, unbroken. A certificate and key that do not go together are
+refused and the old settings kept:
+
+```text
+import avin.fs
+import avin.io.IoError
+import avin.net.http
+import avin.net.http.Response
+import avin.net.tls.{ReloadableTlsServer, TlsError, TlsServer}
+import avin.signal
+
+main() -> Result[unit, TlsError | IoError]
+  val identity = TlsServer.of(fs.readText("cert.pem")?, fs.readText("key.pem")?)?
+  val tls = ReloadableTlsServer(identity.offer(["http/1.1"]))
+  _ = http.serve("0.0.0.0", 8443, r -> Response.text(200, "hello"), tls = Some(tls))?
+  // A hangup reads the certificate and key again; the connections open go on as they were.
+  val hangup = signal.watch(signal.Hangup)?
+  while true
+    hangup.wait()
+    tls.reload(fs.readText("cert.pem")?, fs.readText("key.pem")?) match
+      Ok(_) -> println("reloaded")
+      Err(e) -> println(s"kept the old certificate: ${e.message}")
+  Ok(())
+```
 
 **After the handshake a connection is a `ByteStream`**: a failure of TLS itself while reading or
 writing is an `IoError` of kind `Other` whose text begins `TLS:`, and the connection's end, by the peer's
@@ -2496,7 +3618,7 @@ host", "the certificate has expired", "the certificate is not yet valid", "the c
 trusted", "the certificate was refused (code N)"); `Handshake(text)`, the two ends did not agree,
 as with a peer that does not speak TLS or ends the connection in the handshake; and
 `Credentials(text)`, a certificate or key given to this end cannot be used. `message` says it in
-words. Each `TlsStream`, `TlsClient` and `TlsServer` is sendable, a stream belonging to one thread
+words. Each `TlsStream`, `TlsClient`, `TlsServer` and `ReloadableTlsServer` is sendable, a stream belonging to one thread
 at a time as a `TcpStream` does.
 
 ### Servers
@@ -2517,8 +3639,10 @@ main()
 
 | Member | Meaning |
 | --- | --- |
-| `TcpServer.start(host, port, serve: @sendable (TcpStream, TcpServer) -> unit, maxConnections = 1024, timeout = Duration.Zero, failed: @sendable (TcpStream) -> unit = _ -> ()) -> Result[TcpServer, IoError]` | Listens as `TcpListener.bind` does and serves each connection by `serve`, given the connection and the server. |
-| `s.port() -> int` | The port it listens on, the one the platform chose for port 0. |
+| `TcpServer.start(host, port, serve: @sendable (TcpStream, TcpServer) -> unit, maxConnections = 1024, timeout = Duration.Zero, failed: @sendable (TcpStream) -> unit = _ -> (), listen = ListenOptions()) -> Result[TcpServer, IoError]` | Listens as `TcpListener.bind` does with the [options](#socket-options) `listen`, and serves each connection by `serve`, given the connection and the server. |
+| `TcpServer.startUnix(path, serve: @sendable (UnixStream, TcpServer) -> unit, maxConnections = 1024, timeout = Duration.Zero, failed: @sendable (UnixStream) -> unit = _ -> (), backlog = 128, replacing = false) -> Result[TcpServer, IoError]` | Listens at a Unix socket as `UnixListener.bind` does with `backlog`, or `bindReplacing` where `replacing`, and serves each connection as `start` does. The socket file stays once it stops. |
+| `trait Listener[S: ByteStream]: Sendable, io.Close` | What a server accepts from, with `accept() -> Result[S, IoError]`: `TcpListener` is a `Listener[TcpStream]`, `UnixListener` a `Listener[UnixStream]`. |
+| `s.port() -> int` | The port it listens on, the one the platform chose for port 0; zero for a Unix socket's. |
 | `s.connections() -> int` | How many connections it holds now. |
 | `s.isStopping() -> bool` | Whether it has been asked to stop, for code serving a connection to finish early. |
 | `s.idle[T: Sendable](@sendable wait: () -> T) -> Option[T]` | Runs `wait`, a connection's wait for its next piece of work, on a thread of its own; `Some` of its result, or `None` where the server stops first, which cancels `wait`. |
@@ -2581,9 +3705,20 @@ main()
 `type Handler = @sendable (ServerRequest) -> Response` names what answers a request.
 `http.serve(host, port, handler: Handler, maxConnections = 1024,
 readTimeout = seconds(30), writeTimeout = seconds(30), idleTimeout = seconds(5), maxHeaderBytes =
-16384, maxBodyBytes = 1048576, tls: Option[TlsServer] = None, errors: ErrorPage = plainError,
-date: bool = true, requestTimeout = seconds(60)) -> Result[TcpServer, IoError]` listens as
-`TcpServer.start` does. **Each
+16384, maxBodyBytes = 1048576, tls: Option[TlsSource] = None, errors: ErrorPage = plainError,
+date: bool = true, requestTimeout = seconds(60), handshakeTimeout = seconds(10), listen: ListenOptions
+= http.ServerListen, streamsBody: @sendable (ServerRequest) -> bool = http.bufferedBodies,
+headerTimeout = seconds(10), maxHeaders = 100, metrics: Option[ServerMetrics] = None) ->
+Result[TcpServer, IoError]` listens as `TcpServer.start` does, with the
+[socket options](#socket-options) `listen`; with `metrics` it counts every request it reads,
+answers or refuses (**Metrics**, below). **`http.ServerListen`** is the listener's defaults with
+each connection's `noDelay` on, since a response is written in pieces a client waits on whole, and
+`keepAlive` `Some(KeepAlive())`, so a connection whose client vanished, a stream of events or a
+WebSocket above all, which no idle timeout ends, is found out within two minutes. A server behind a
+proxy on the same machine serves at a Unix socket with **`http.serveUnix(path, handler, …)`**, which
+takes every parameter of `serve` but `host`, `port`, `tls`, `handshakeTimeout` and `listen`, and
+`backlog = 128` and `replacing = false` as `TcpServer.startUnix` does; its requests' `remote` is
+`None`. **Each
 response carries a `Date` header** (RFC 9110 section 6.6.1), the time it is sent as an IMF-fixdate
 (`Sun, 06 Nov 1994 08:49:37 GMT`, as `Instant.toHttpDate()` writes it), on every status: a
 handler's, the server's own `400` or `503`, sized, chunked, closing and event-stream responses
@@ -2596,8 +3731,15 @@ wait while a request is read may last `readTimeout`, each wait while a response 
 whole of a request, its line, headers and body, must arrive within `requestTimeout` of its first
 byte, so a client trickling bytes just faster than `readTimeout` cannot hold a connection, and its
 slot among `maxConnections`, for ever. Each request on a kept-alive connection has a bound of its
-own, and the idle wait before it is no part of it. Zero takes any of these limits away. A
-`maxHeaderBytes` less than one, a `maxBodyBytes` less than zero or a negative `requestTimeout` traps.
+own, and the idle wait before it is no part of it. A request's line and headers must arrive within
+`headerTimeout`, counted for a connection's first request from its acceptance, so a client that
+connects and never sends is closed then, and for a later one from its first byte. With `tls`, each
+connection's TLS handshake, from the connection's acceptance, must be done within
+`handshakeTimeout`, each of its waits also bounded by `readTimeout`; a connection whose handshake
+runs out of time is closed unanswered, since no HTTP answer can reach it before TLS is set up, and
+its slot freed. Zero takes any of these limits away. A `maxHeaderBytes` or `maxHeaders` less than
+one, a `maxBodyBytes` less than zero or a negative `requestTimeout`, `headerTimeout` or
+`handshakeTimeout` traps.
 A server taking bodies larger than the default `maxBodyBytes` from slow clients raises
 `requestTimeout` with it. The
 wait for a connection's next request, its first among them, is made through `idle`, so a shutdown
@@ -2610,7 +3752,11 @@ presenting the `TlsServer`'s certificate, each of its waits lasting at most `rea
 serves its requests over the `TlsStream` exactly as over TCP, kept alive and pipelined alike. A
 connection whose handshake fails, a client speaking plain HTTP among them, is closed, and the server
 goes on. A handler that traps on a TLS connection has it closed without the `500`, since the answer
-would have to be written through TLS the handler's turn held.
+would have to be written through TLS the handler's turn held. `tls` is a `TlsSource`, a `TlsServer`
+or a `ReloadableTlsServer`, whose settings each handshake takes as it begins, so a reload while the
+server runs changes the connections that follow and leaves those open as they were. Settings that
+offer no application protocol of their own offer `http/1.1` by ALPN, so a client offering `h2` and
+`http/1.1` is answered `http/1.1`, and one offering `h2` alone is refused in the handshake.
 
 A `ServerRequest` has its `method`, its `target` as the request line gave it, its `version`
 (`HTTP/1.1` or `HTTP/1.0`), its `headers` in order with `header(name)` looking one up without regard
@@ -2655,7 +3801,9 @@ a bad name or value, a broken prefix rule, or `SameSite=None` / `Partitioned` wi
 method and a pattern; a method that is not a token or a pattern not beginning with `/` traps.
 `Router(routes)` tries its routes in order. A pattern's segments match a request's decoded segments
 one for one, a segment `:name` matching any one that is not empty and binding it, so Unicode paths
-route whether escaped or not. A `GET` route answers `HEAD` too where no `HEAD` route matches. A path
+route whether escaped or not. A last segment `*name` matches the rest of the path, none of it or
+several segments, binding them joined by `/` (`/files/*path` binds `a/b` for `/files/a/b`, and `""`
+for `/files` and `/files/`); a `*name` before the last segment traps, and a bare `*` is a literal. A `GET` route answers `HEAD` too where no `HEAD` route matches. A path
 no route matches is answered `404`, and one that routes match for other methods only `405`, with
 `Allow` naming those methods, `HEAD` beside `GET`.
 
@@ -2715,10 +3863,9 @@ closing one is skipped, every line ends in CRLF, a delimiter's line may end in s
 bytes that resemble the boundary but are not followed by `--` or the end of the line stay in the
 part. A name or filename is read as the WHATWG HTML standard writes one, quoted with `%22`, `%0D`
 and `%0A` standing for `"`, CR and LF and no backslash escapes; a `filename*` (RFC 5987) in UTF-8 or
-ISO-8859-1 is preferred to `filename`, and one in another charset or malformed is ignored. The body
-is read whole, as the server has buffered it; a streaming reader for large uploads will come beside
-`parse`, with the same limits and errors
-([decided](/spec/decisions/#settled)).
+ISO-8859-1 is preferred to `filename`, and one in another charset or malformed is ignored. `parse`
+and `multipart()` read a body whole; a large upload is read a part at a time by a `MultipartReader`
+on a streamed body, under the same rules, limits and errors (see *Streamed request bodies* below).
 
 ```text
 upload(r: ServerRequest) -> Result[Response, ToResponse]
@@ -2819,25 +3966,47 @@ makes none, though the request id is still found, passed on and answered.
 2026-11-23T10:20:30.5Z INFO  request svc=web id=4f1c…e2 method=GET path=/items/7 status=200 bytes=12 micros=1500 remote=127.0.0.1
 ```
 
-**Metrics.** `Metrics(buckets = defaultBuckets, clock = monotonic)` counts the requests its
-`middleware` passes on, shared by every connection's actor under a lock of its own:
+**Metrics.** Request metrics are families of an [`avin.metrics`](#avinmetrics) `Registry`, so a
+program's own counters are served beside them. `Metrics(buckets = defaultBuckets, clock = monotonic,
+registry = Registry(), maxSeries = 10000)` counts the requests its `middleware` passes on:
 `http_requests_total` by `method`, `route` (the route's pattern, `""` where none was chosen) and
 `status` class (`2xx`); `http_request_duration_seconds`, a histogram of `buckets` (5 ms to 10 s by
 default), a time equal to a bound counted in that bound's bucket, with its `_sum` and `_count`; and
-the gauge `http_requests_in_flight`. `render` is the Prometheus text format, series ordered by route,
-method and status class; `handler` answers it as `200` of the type `MetricsContentType`
-(`text/plain; version=0.0.4; charset=utf-8`), and `route(pattern = "/metrics")` mounts it.
-`observe(method, route, status, took)` counts a request answered another way, and `inFlight` is the
-gauge's value. Buckets not in increasing order, or one not above zero, trap.
+the gauge `http_requests_in_flight`. A method HTTP defines (`GET`, `HEAD`, `POST`, `PUT`, `DELETE`,
+`CONNECT`, `OPTIONS`, `TRACE`, `PATCH`) is its own label and any other is `_other`
+(`methodLabel(method)`), so made-up methods make no new series; each family holds at most
+`maxSeries` series, the rest counted in its overflow series. `render` is the registry in the
+Prometheus text exposition format, every family in it; `handler` answers it as `200` of the type
+`MetricsContentType` (`text/plain; version=0.0.4; charset=utf-8`), and `route(pattern = "/metrics")`
+mounts it; `metricsHandler(registry)` and `metricsRoute(registry, pattern = "/metrics")` serve any
+registry. `observe(method, route, status, took)` counts a request answered another way, and
+`inFlight` is the gauge's value. Buckets not in increasing order, or one not above zero, trap, and so
+does a second `Metrics` in one registry.
+
+**The server's own metrics.** `ServerMetrics(buckets = defaultBuckets, clock = monotonic, registry =
+Registry())`, given to `serve` as `metrics = Some(…)`, counts every request the server reads, by
+method and status class, in `http_server_requests_total`; the time from the request read to its
+response written, a streamed body included, in `http_server_request_duration_seconds` by method;
+the requests being answered in `http_server_requests_in_flight`; and the requests refused before
+any handler saw them (`400`, `408`, `413`, `414`, `431`) in `http_server_rejected_total` by status
+code. A handler that traps is counted as answering `500`, its time and its place in flight ending
+with its connection, over TCP and TLS alike, so this gauge is exact where a middleware's cannot be;
+an upgrade is counted as its `101`.
+`started(method) -> InFlight` and `rejected(status)` count a request served another way; an
+`InFlight`'s first `finish(status)` counts it and answers `true`, any later one nothing.
 
 ```text
-val metrics = Metrics()
-val router = Router(Route.group("/api", routes, metrics.middleware) :+ metrics.route())
+val registry = Registry()
+val orders = registry.counter("shop_orders_total", "Orders placed, by payment.", ["payment"])
+val metrics = Metrics(registry = registry)
+val router = Router(Route.group("/api", routes, metrics.middleware) :+ metricsRoute(registry))
+val server = http.serve("0.0.0.0", 8080, router.handle, metrics = Some(ServerMetrics(registry = registry)))
 ```
 
 Wrapping a group or a route labels each request by its route; wrapping a router's `handle` counts the
-`404`s and `405`s too, every request labelled `""`. A handler that traps is not counted, and leaves the
-gauge one higher.
+`404`s and `405`s too, every request labelled `""`. A handler that traps is not counted by the
+middleware, and leaves its gauge one higher, since a trap runs nothing after it; the server's own
+metrics count it.
 
 **Rate limiting.** `RateLimiter(rate, per, burst = rate, key = clientAddress, maxKeys = 10000, clock =
 monotonic, errors = plainError)` gives each key a token bucket of `burst` tokens filled again at
@@ -2848,6 +4017,7 @@ one. `admit(key) -> Result[unit, Duration]` takes a token directly, `Err` saying
 next. At most `maxKeys` buckets are held (`size` says how many): making one more forgets every bucket
 full again, which a new one would equal, and where none is, the one nearest to full. A rate, burst
 or `maxKeys` below one traps, and so does a `per` too short to give each token a whole microsecond.
+The buckets are [`avin.resilience`](#avinresilience)'s `RateLimiter`, which limits work of any kind.
 The three middlewares compose as any do: `h -> metrics.middleware(limiter.middleware(h))` counts the
 `429`s the limiter answers.
 
@@ -2866,6 +4036,88 @@ echoed back) it carries `Access-Control-Allow-Methods`, `-Allow-Headers`, `-Max-
 seconds) and the origin and credentials headers; asking for more, or from an origin not allowed, it
 carries none. `*` together with `credentials`, and a negative `maxAge`, trap where the policy is
 made.
+
+**Trusted proxies.** `TrustedProxies(trusted = [], maxHops = 32)` is a middleware (`.middleware`)
+that reads where a request came from behind a reverse proxy. `trusted` is a list of CIDR blocks
+(`Cidr` texts: `10.0.0.0/8`, `2001:db8::/32`, or one address); a block that is not one traps where
+the middleware is made, as does a `maxHops` below one. Forwarding headers are believed only from a
+connection whose address is in `trusted`; on any other request (or one with no known address) they
+are removed, so `Forwarded` and the `X-Forwarded-` headers are never a client's claim downstream.
+From a trusted peer, `Forwarded` (RFC 7239: `for`, `proto`, `host`, quoted values, several
+elements) is read where present, else `X-Forwarded-For`, `-Proto` and `-Host`; several header lines
+are one list and empty entries are skipped. The client is found by walking the addresses from the
+nearest hop towards the first, each trusted address being another proxy and the first untrusted
+one the client, so entries a client prepended are never believed. An address is IPv4, IPv6 (in
+brackets or not) with an optional port that is dropped, and is given in its shortest form, IPv4-mapped
+as IPv4. The scheme (`http` or `https`) and the host (a name or IP literal with an optional port)
+are those the outermost trusted proxy wrote, in lower case; an invalid one is not given. An entry
+walked that is not an address (`unknown`, `_hidden`), more than `maxHops` entries, or malformed
+`Forwarded` syntax makes the headers worthless: the client is the peer and no scheme or host is
+given. The request handed on has `remote` set to the client, and `forwarding` (`Option[Forwarding]`:
+`peer`, `address`, `scheme`, `host`), `scheme` and `host` (the forwarded one, else the `Host`
+header) answer on every `ServerRequest`; `withRemote` and `withHeaderRemoved` make the changed
+copies. `Cidr(text)` has `network`, `prefix` and `contains(address)`; an IPv4 address and its
+`::ffff:` form are one address, the bits past the prefix are ignored, and a zone or a prefix out of
+range traps. `trusted.isTrusted(address)` asks the list.
+
+```avin
+import avin.net.http.{Handler, Response, ServerRequest, TrustedProxies}
+
+main()
+  val proxies = TrustedProxies(["10.0.0.0/8"])
+  val handler: Handler = r -> Response.text(200, s"${r.remote.getOrElse("-")} ${r.scheme.getOrElse("http")}")
+  val app = proxies.middleware(handler)
+  val headers = [("X-Forwarded-For", "6.6.6.6, 203.0.113.9"), ("X-Forwarded-Proto", "https")]
+  println(app(ServerRequest("GET", "/", headers, remote = Some("10.0.0.5"))).text)
+  println(app(ServerRequest("GET", "/", headers, remote = Some("198.51.100.7"))).text)
+```
+
+This prints `203.0.113.9 https`, then `198.51.100.7 http`: the second peer is not a proxy.
+
+**Health and graceful drain.** `http.health(checks = [], live = [], ready = true, livePath =
+"/livez", readyPath = "/readyz")` answers what a supervisor asks. `http.check(name, probe, timeout =
+seconds(2))` is a named check: `probe` answers `Ok(())` or `Err(reason)` and runs on a thread of its
+own; every check of a route is started at once, each is given its `timeout` counted from its start,
+and one still running by then is reported as timed out and left to end by itself. A probe answers its
+failures as `Err`: a trap in it stops the program, as any thread's does. A `name` that is empty or
+holds a control character, a `timeout` of zero or less, and a path not beginning with `/` trap.
+`health.live(request)` and `health.ready(request)` are handlers, and `health.routes()` the two `GET`
+routes for a `Router`. Liveness runs the `live` checks (none by default: a process that answers is
+alive), readiness the `checks`; each answers `200` where every check passes and `503` otherwise, with
+`Cache-Control: no-store`. The body is plain text: `ok` or `failed`, and with `?verbose` one line a
+check before it, `[+] db ok`, `[-] cache failed: connection refused` or `[-] slow timed out after
+50ms`, a reason cut to one line of at most 200 characters. `health.setReady(false)` makes readiness
+answer `503` at once without running its checks (`[-] ready failed: not ready` in the verbose form),
+and `setReady(true)` undoes it; `ready = false` starts a program not ready; `isReady()` asks.
+
+`http.drain(server, health = None, deadline = seconds(30), grace = Duration.Zero)` stops a server in
+the order a load balancer needs: `health` stops being ready, the server waits `grace` still
+accepting, so the balancer sees it, then stops accepting, and the requests in flight have `deadline`
+to finish. It answers whether every connection had ended by then; where not, the stragglers go on
+running and the caller decides whether to end the program. `http.serve` itself handles no signal.
+`http.drainOnSignal(server, health = None, deadline, grace, signals = [Terminate, Interrupt])`
+watches the signals, waits for one (or for the server to be stopped by other code), then drains,
+answering `Result[bool, IoError]`. While it waits the signals no longer end the program.
+
+```avin
+import avin.net.http
+import avin.net.http.{Response, Route, Router}
+import avin.time.seconds
+
+main()
+  val db = http.check("db", () -> Ok(()))
+  val health = http.health([db])
+  val hello = Route.get("/", _ -> Response.text(200, "hello\n"))
+  val router = Router(hello +: health.routes())
+  http.serve("127.0.0.1", 8080, router.handle) match
+    Ok(server) -> println(http.drainOnSignal(server, Some(health), grace = seconds(5)))
+    Err(e) -> println(e.message)
+```
+
+**Reopening the log.** A file sink opened by `fileSink` follows a log rotator by itself, looking
+again every `recheck`. A rotator that signals the program wants the file reopened at once:
+`log.reopenOnSignal(sink)` does so on every `Hangup`, through `sink.reopen()`, until the `Reopener`
+it answers is stopped.
 
 **Streamed responses.** `Response.stream(status, contentType, write)` answers a response whose body
 `write` writes as it goes, through the `BodyWriter` it is given, each write sent to the client at
@@ -2888,6 +4140,59 @@ id holding a line break trapping; `comment(text)` sends a comment, which a clien
 write)` sets how often a comment is sent while `untilStopped` waits, fifteen seconds by default and
 none for zero, so a client that has gone is noticed and one still there keeps the stream open.
 
+**Static files.** `FileServer(root, index = Some("index.html"), listing = false, dotfiles = false,
+linksOutside = false, cacheControl = None, types = MimeTypes.standard, chunkBytes = 65536, errors =
+plainError)` serves the files under the directory `root`; `server.at(prefix)` is the `GET` route
+`prefix/*path` serving them below `prefix` (`at("/")` serves every path), and `server.handle` is the
+handler itself, which serves the whole request path. It answers `GET` and `HEAD`, any other method
+`405` with `Allow: GET, HEAD`:
+
+```text
+import avin.net.http
+import avin.net.http.{FileServer, Router}
+
+main()
+  val site = FileServer("public", cacheControl = Some("public, max-age=3600"))
+  http.serve("0.0.0.0", 8080, Router([site.at("/static")]).handle).ok.get.join()
+```
+
+A file is answered `200` with its type, its length, `Accept-Ranges: bytes`, a weak `ETag`
+(`W/"<size>-<modified>"`, the size in bytes and the modification time in microseconds, both in
+hexadecimal), its `Last-Modified` as an HTTP-date, and `Cache-Control` where `cacheControl` gives
+one. Its body is streamed from the file `chunkBytes` at a time with `Response.stream`, so memory does
+not grow with the file; `HEAD` has the same headers and no body, and does not open the file.
+
+Conditional requests follow RFC 9110 §13.2.2: an `If-Match` that does not match strongly, or with no
+`If-Match` an `If-Unmodified-Since` the file has changed since, answers `412`; an `If-None-Match` that
+matches weakly, or with no `If-None-Match` an `If-Modified-Since` the file has not changed since
+(compared in whole seconds), answers `304` with the `ETag`, `Last-Modified` and `Cache-Control` and
+no body. A date that is not an HTTP-date is ignored. Because the tag is weak, only `If-Match: *`
+matches it strongly. A `Range` is honoured on `GET` after the conditions: one byte range (`bytes=0-0`,
+`bytes=500-`, `bytes=-500`, a last position past the end held at the end, the unit compared without
+regard to case) is answered `206` with `Content-Range: bytes first-last/length`; one starting at or
+past the end, or a suffix of zero bytes, `416` with `Content-Range: bytes */length`. A `Range`
+that is malformed, of another unit or of several ranges is ignored and the whole file is sent `200`.
+An `If-Range` keeps the range only where it is the file's `Last-Modified` exactly, a date at least a
+second old; an entity tag there never matches the weak tag, so the whole file is sent.
+
+A path naming a directory without its final `/` is redirected there with `301`, the query kept; a
+directory is answered with its `index` file, or, without one, with an HTML listing of its entries
+where `listing`, otherwise `404`. The path is refused `400` where a decoded segment is `.` or `..` or
+holds `/`, `\` or NUL (so `%2e%2e`, `%2F` and `%00` are refused as plainly written ones are); a name
+beginning with `.` anywhere in the path is `404` unless `dotfiles`; a path whose links resolve
+outside `root` is `403` unless `linksOutside`, a directory's index file included; a file that cannot
+be read is `403`; a missing one, a file asked for with a final `/`, and anything that is neither file
+nor directory are `404`. Empty segments (`//`) are passed over. The error responses are rendered by
+`errors`.
+
+`MimeTypes.standard` gives the types of the web by a file's extension, compared without regard to
+case: pages, styles and scripts (`text/html`, `text/css`, `text/javascript`, each with `;
+charset=utf-8`, as every `text/` type there is), data (`application/json`, `xml`, `yaml`, `wasm`,
+...), images, fonts, audio, video and archives, and `application/octet-stream` for a name it does not
+know or one with no extension (`.bashrc` has none). `types.typeOf(name)`, `types.get(extension)`,
+`types.with(extension, contentType)` (an empty extension, one holding `.` or `/`, or a type holding a
+line break traps) and `types.withFallback(contentType)` read and extend a table.
+
 **Waiting in a handler.** `request.isStopping()` says whether the server that read the request is
 stopping, and `request.untilStopped(wait)` runs `wait`, a `@sendable () -> T`, on a thread of its own
 and answers `Some` of its result, or `None` where the server stops first, cancelling `wait` wherever
@@ -2899,7 +4204,9 @@ be sent. A request made without a server never stops, and `wait` is then run as 
 **The connection.** Requests are read one after another, so several are kept alive on one
 connection and pipelined ones are answered in order: in HTTP/1.1 unless either side says
 `Connection: close`, in HTTP/1.0 only on `Connection: keep-alive`, which the response then repeats.
-Empty lines before a request line are passed over, and a line may end in a bare `\n`. A body is read
+Empty lines before a request line are passed over. Every line ends in `\r\n`: a bare `\n`, a bare
+`\r` or another control character than a tab is refused, so no two readers frame a request
+differently (RFC 9112 sections 2.2 and 5). A body is read
 by `Content-Length` or chunked (extensions and trailers passed over); an `Expect: 100-continue` is
 answered `100 Continue` once the body is known to fit. The server writes `Content-Length` and
 `Connection` itself, in place of any the handler gave, every response as `HTTP/1.1`, and no body for
@@ -2912,21 +4219,126 @@ lost to a reset and a client that goes on trickling is closed all the same.
 
 | Status | When |
 | --- | --- |
-| `400` | A request line that is not three words, a method that is not a token, a malformed version, a target that is not one (a fragment, an escape that is not UTF-8 among them), no `Host` in HTTP/1.1 or two, a header without a colon, with a name that is not a token or folded onto a second line, a `Content-Length` that is not digits or two that differ, one beside `Transfer-Encoding`, a coding list not ending in `chunked`, a malformed chunk |
-| `408` | A wait while a request is read outlasts `readTimeout`, or the request is not read whole within `requestTimeout` of its first byte |
+| `400` | A request line that is not three words split by single spaces, a method that is not a token, a malformed version, a target that is not one (a fragment, an escape that is not UTF-8 among them), no `Host` in HTTP/1.1 or two, a header without a colon, with a name that is not a token or folded onto a second line, a line ended by a bare `\n` or holding a bare `\r`, a NUL, DEL or another control character than a tab (a tab in the request line too), a `Content-Length` that is not digits or two that differ, one beside `Transfer-Encoding`, a `Transfer-Encoding` in HTTP/1.0 or in two field lines, a coding list not ending in `chunked`, a malformed chunk |
+| `408` | A wait while a request is read outlasts `readTimeout`, the request's line and headers are not read within `headerTimeout`, or the request is not read whole within `requestTimeout` of its first byte |
 | `413` | A body longer than `maxBodyBytes`, by its length before it is read, or as its chunks arrive |
 | `414` | A request line longer than `maxHeaderBytes` |
 | `417` | An `Expect` other than `100-continue` |
-| `431` | The request line and headers together, or a chunked body's trailers, longer than `maxHeaderBytes` |
+| `431` | The request line and headers together, with their line ends, or a chunked body's trailers, longer than `maxHeaderBytes`, or more than `maxHeaders` header lines |
 | `500` | The handler traps: it fails its connection alone, as a `TcpServer`'s `serve` does (over TLS, or once a streamed response's head is sent, the connection is closed unanswered) |
 | `501` | A transfer coding besides `chunked` |
 | `503` | A request read once the server is stopping |
 | `505` | A version other than 1.0 and 1.1 |
 
-A connection waiting for a first request waits `readTimeout`, and for a later one `idleTimeout`,
-then is closed without an answer. **Shutting down**, the server answers the request in flight with
+**Streamed request bodies.** A route made with `route.streaming()` (kept through `wrap`, `under` and
+`group`) takes its body as a stream, once the server is told so: `serve(…, streamsBody =
+router.streamsBody)`, a `@sendable (ServerRequest) -> bool` asked of each request once its head is
+read, answering for the route `handle` would choose (a `GET` one for `HEAD`). The handler is called
+with the body still on the connection, `request.bodyStreamed` true and `request.body` empty, and
+reads it through `request.bodyReader(maxBytes = 104857600)`, a `BodyReader`: an `io.Reader` whose
+`read(max)` answers up to `max` bytes, waiting for at least one, and an empty array at the end, by
+`Content-Length` or chunked; `length` is the `Content-Length` (zero without a body, `None` when
+chunked) and `readAll()` the rest within the limit. The limit is the handler's, counted over the whole
+body, in place of `maxBodyBytes`, which still bounds every route that did not ask; each wait lasts at
+most `readTimeout`, and the whole request, the handler's time between reads included, `requestTimeout`
+from its first byte. A `Content-Length` over the limit fails the first read before any of the body is
+asked for, so an `Expect: 100-continue` is answered `100 Continue` at the first read and only where the
+body fits: a handler that answers without reading never tells the client to send it. A read that
+fails (over the limit, a malformed chunk, a wait too long, the client gone) fails every read after
+it, and once the handler returns **the server answers the failure itself, `413`, `400`, `431` or
+`408` as for a buffered body, in place of the handler's response**, or closes the connection
+unanswered where the client went. A body left unread when the handler returns is read and dropped
+where at most 64 KiB of it is left, so the connection carries the next request; one longer, one
+whose client was never told to continue, or one under a streamed response is not, and the
+connection is closed after the response, so no byte of a body is ever read as a request. A request
+made without a server, or whose route did not ask, has a `bodyReader` over its buffered body, so a
+handler written for a stream serves both.
+
+`request.multipartReader(limits)` reads a streamed (or buffered) `multipart/form-data` body a part at
+a time through `bodyReader(limits.maxBytes)`, and `MultipartReader.over(source, contentType, limits)`
+reads any `io.Reader`. `next()` answers the next part's `PartHead` (`name`, `filename`,
+`contentType`, `headers`, `header(name)`, `isFile`), passing over what was left of the part before,
+and `None` past the closing delimiter; `read(max)` and `readAll()` read that part's body. It reads by
+`Multipart.parse`'s rules and limits, counted as it goes: parts as each begins, a head's bytes as it
+grows, and every byte taken from the source, the epilogue after the closing delimiter, never read,
+not counted. A fault is named where it is read, so a body with two may be refused for another than
+`parse` names; a source that fails is `FormError.BodyUnreadable(IoError)` (`400`); every read after a
+fault fails alike; and a delimiter's line may carry at most 1024 spaces and tabs after its boundary.
+
+```avin
+import avin.net.http
+import avin.net.http.{Response, Route, Router, ServerRequest, ToResponse}
+
+// Counts an upload's file bytes as they arrive, holding at most 64 KiB of it at once.
+upload(r: ServerRequest) -> Result[Response, ToResponse]
+  val parts = r.multipartReader()?
+  var total = 0
+  loop
+    val head = parts.next()? match
+      Some(h) -> h
+      None -> break
+    if head.isFile
+      loop
+        val piece = parts.read(65536)?
+        if piece.length == 0 then break
+        total += piece.length
+  Ok(Response.text(200, s"$total bytes\n"))
+
+main()
+  val router = Router([Route.post("/upload", upload).streaming()])
+  http.serve("127.0.0.1", 0, router.handle, streamsBody = router.streamsBody) match
+    Ok(server) ->
+      println("serving")
+      server.shutdown()
+    Err(e) -> println(e.message)
+```
+
+A connection waiting for a first request waits `readTimeout` or `headerTimeout`, whichever is
+shorter, and for a later one `idleTimeout`, then is closed without an answer. **Shutting down**, the
+server answers the request in flight with
 `Connection: close`, and one arriving on a kept-alive connection `503`; a connection waiting for its
 next request ends when its idle limit runs out, and `join()` waits for that.
+
+**Hardening.** Everything a client controls is bounded, by default, so a server started with no
+options is safe to face the open network. Each limit is a parameter of `serve`:
+
+| Limit | Default | What a hostile client meets |
+| --- | --- | --- |
+| `maxConnections` | 1024 | Connections past it wait unaccepted in the listener's backlog until one ends; none is accepted and then refused, so a flood costs the server no memory and no thread past the limit |
+| `headerTimeout` | 10 s | A request line and headers trickled a byte at a time (slowloris) are `408` at the bound; a connection that never sends is closed then |
+| `readTimeout` | 30 s | Each wait for a byte while a request is read; `408` |
+| `requestTimeout` | 60 s | The whole of a request, body included, from its first byte; `408` |
+| `idleTimeout` | 5 s | The wait for the next request on a kept-alive connection; closed unanswered |
+| `writeTimeout` | 30 s | Each wait while a response is written: a client that pipelines and never reads is closed once one write cannot finish |
+| `maxHeaderBytes` | 16 KiB | A request line longer is `414`; the line and headers together longer, with their line ends, `431` |
+| `maxHeaders` | 100 | More header lines are `431` |
+| `maxBodyBytes` | 1 MiB | A body longer is `413`, by its length before it is read |
+
+Requests on one connection are read and answered one at a time, the server reading at most 8 KiB
+ahead, so a client pipelining without end has one request in flight and its unread responses held
+by the socket buffers, not by the server. A request refused is answered and its connection closed,
+the drain after it half a second in all. A connection's memory is what its one request holds:
+requests kept alive one after another leave none behind.
+
+```avin
+import avin.net.http
+import avin.net.http.Response
+import avin.time.{millis, seconds}
+
+main()
+  // A server for slow clients on a trusted network: a longer header bound, a shorter idle one.
+  val server = http.serve(
+    "127.0.0.1",
+    0,
+    _ -> Response.text(200, "ok"),
+    idleTimeout = millis(500),
+    headerTimeout = seconds(30),
+    maxHeaders = 50
+  )
+  server match
+    Ok(s) -> s.shutdown()
+    Err(e) -> println(e.message)
+```
 
 **Upgrades.** `Response.upgrade(protocol, take)` answers `101 Switching Protocols` with `Upgrade:
 protocol` and `Connection: Upgrade` (the protocol a token, else it traps), and once that head is
@@ -2972,7 +4384,8 @@ and middleware alike, and it works over TLS as every route does.
 `WebSocket.connect(url, headers = [], protocols = [], tls = TlsClient(), timeout = seconds(30),
 maxMessageBytes = 1048576, outboxSize = 64) -> Result[WebSocket, WebSocketError]` opens `ws://` and `wss://` URLs,
 the latter over TLS checked as an `https` request's is, sending `headers` and offering `protocols`
-in the handshake; `timeout` limits each wait of the handshake and each write after it.
+in the handshake; `timeout` limits each wait of the handshake and each write after it, and the
+lookup, the connecting and a `wss://` URL's TLS handshake together. A negative `timeout` traps.
 
 A `WebSocket` sends `send(text)` and `send(bytes)` as one message each, a message over 65536 bytes in
 fragments of that many written one after another, `ping(payload = [])` (at most
@@ -3079,7 +4492,17 @@ one**: `http://h?` has the query `Some("")` and `http://h` has `None`; `file:///
 written, percent-escapes and all, and `Url.decode` turns one into text. A host is a name, an IPv4
 address, or an address in brackets, kept with them: an IPv6 address, with an optional zone written
 `%25` and its name (`[fe80::1%25eth0]`), or an address of a later form (`[v7.x]`). A component may
-hold characters beyond ASCII other than controls and spaces, kept as they are.
+hold characters beyond ASCII other than controls and spaces, kept as they are, except the host.
+
+**A host name beyond ASCII is held in the ASCII form DNS carries**, as the WHATWG URL standard holds
+it: a name holding a character beyond ASCII, written as it is or in percent-escapes, or a label
+beginning `xn--` in any case, is taken through [`idna.toAscii`](#internationalized-domain-names)
+with its defaults, so `Url("http://Bücher.example/")` has the host `xn--bcher-kva.example` and
+equals `Url("http://xn--bcher-kva.example/")`. A name that is not a valid one, or whose ASCII form
+holds a character a name may not (`℀` is mapped to `a/c`), is `BadHost`. `parse`, `resolve` and
+`withHost` all hold the ASCII form, so the HTTP and WebSocket clients look the name up, connect to
+it, send it as `Host:` and, over TLS, send it as the server name and verify the certificate against
+it. An ASCII name with no `xn--` label is kept as written, escapes and all.
 
 The scheme and host are held in lower case (a zone's name and a host's percent-escapes as written),
 and a port that is the scheme's default is held as `None`, so URLs differing only in those are
@@ -3089,6 +4512,8 @@ equal, and a `Url` displays as the text it was read from with exactly those diff
 | Member | Meaning |
 | --- | --- |
 | `u.portOrDefault -> Option[int]` | The port, or where none is written the scheme's default: 80 for `http` and `ws`, 443 for `https` and `wss`. |
+| `u.unicodeHost -> Option[string]` | The host for a person to read: each `xn--` label decoded, as `idna.toUnicode` gives it (`bücher.example`). A name that does not decode to a valid one is kept in ASCII, so a person is never shown a name the URL does not reach. |
+| `u.unicodeText -> string` | The URL written as it displays, with `unicodeHost` for the host: `http://bücher.example/`. |
 | `u.queryParams -> Vector[(string, string)]` | The query split at each `&` (an empty piece skipped) and each piece at its first `=`, decoded, a `+` standing for a space as a form writes one; no `=` gives an empty value, no query no pairs. |
 | `u.resolve(ref: string) -> Result[Url, UrlError]` | The reference, relative or absolute, resolved against `u` by RFC 3986 §5.2: its missing components taken from `u` and its dot segments removed, strictly, so `http:g` stays `http:g`. |
 | `u.resolve(ref: Url) -> Url` | An absolute reference with its dot segments removed. |
@@ -3105,6 +4530,75 @@ equal, and a `Url` displays as the text it was read from with exactly those diff
 URL**, so `parse` refuses `http://h/%FF` with `InvalidUtf8(9)` and `queryParams` never fails on a
 `Url` it read.
 
+### Internationalized domain names
+
+`import avin.net.idna` brings in the conversion between a domain name written in any script,
+`bücher.example`, and the ASCII form DNS carries, `xn--bcher-kva.example`, in which each label beyond
+ASCII is `xn--` and its Punycode (RFC 3492).
+
+```text run
+import avin.net.Url
+import avin.net.idna
+
+main()
+  println(idna.toAscii("Bücher.example"))
+  println(idna.toUnicode("xn--bcher-kva.example"))
+  println(idna.toAscii("faß.de"))
+  println(idna.toAscii("a\u{200d}b.example"))
+  val u = Url("https://Bücher.example/katalog")
+  println(u)
+  println(u.unicodeText)
+```
+
+```text output
+Ok(xn--bcher-kva.example)
+Ok(bücher.example)
+Ok(xn--fa-hia.de)
+Err(a zero-width joiner not allowed in label 0)
+https://xn--bcher-kva.example/katalog
+https://bücher.example/katalog
+```
+
+`toAscii` and `toUnicode` process a name as UTS #46 defines, with the tables of Unicode 17.0.0, the
+version `normalize` answers from. Each character is mapped: upper case to lower case, fullwidth and
+compatibility forms to their plain letters, the ideographic full stop `。` to `.`, and a few, such
+as the soft hyphen, removed. The result is put in normalization form NFC and split into labels at
+`.`, a label beginning `xn--` is decoded from Punycode, and each label is checked. **Processing is
+non-transitional**, as the WHATWG URL standard's is: `ß`, `ς` and the zero-width joiners are kept,
+so `faß.de` is `xn--fa-hia.de` and not `fass.de`.
+
+| Function | Meaning |
+| --- | --- |
+| `idna.toAscii(domain, checkHyphens = false, checkBidi = true, checkJoiners = true, useStd3AsciiRules = false, verifyDnsLength = false) -> Result[string, IdnaError]` | The name processed and each label beyond ASCII written as `xn--` and its Punycode, or the first error found. |
+| `idna.toUnicode(domain, checkHyphens = false, checkBidi = true, checkJoiners = true, useStd3AsciiRules = false) -> Result[string, IdnaError]` | The name processed, each label in Punycode decoded, or the first error found. |
+| `idna.encodePunycode(text) -> Result[string, PunycodeError]` | The text in Punycode: its ASCII characters, `-` where there were any, then the others as digits; `bücher` is `bcher-kva`. |
+| `idna.decodePunycode(text) -> Result[string, PunycodeError]` | The text Punycode encodes; digits are read in either case. |
+
+**The defaults are the URL standard's**, so `toAscii(name)` converts a name as a browser does, and
+the strict form is an argument away. A name is always refused where a label holds a character UTS
+#46 disallows (unassigned, private use, U+FFFD …), begins with a combining mark, or is Punycode that
+does not decode to a valid label: one that decodes to nothing, to ASCII only, to text not in NFC, or
+to characters mapping would have changed. `checkJoiners` refuses a zero-width joiner or non-joiner
+where RFC 5892's rules do not allow one (after a virama, or a non-joiner between letters that join);
+`checkBidi` applies RFC 5893's six rules to every label of a name holding a right-to-left one, so
+`àא` is refused. `checkHyphens` adds that a label neither begins nor ends with `-` nor has `--` in
+its third and fourth places; `useStd3AsciiRules` that its ASCII is lower-case letters, digits and
+`-` only (without it a name may hold `_` or a space); `verifyDnsLength` that each label of the ASCII
+form is 1 to 63 characters and the name at most 253, a final `.` not counted.
+
+**`MaxLabelLength`, 1024 code points, bounds a label beyond ASCII or in Punycode whatever the
+flags say**: such a label is `LabelLength`. Punycode's work grows with the square of a label's
+length, and DNS has no use for a label past 63, so the limit only refuses names no server could
+answer to. An ASCII label, whose processing is linear, has none.
+
+`IdnaError` names what is wrong and the index of the label, from 0: `Disallowed(label)`,
+`BadPunycode(label)`, `Hyphens(label)`, `LeadingMark(label)`, `Joiners(label)`, `Bidi(label)`,
+`LabelLength(label)` and `DomainLength`. `PunycodeError` is `InvalidInput(at)` (a character that is
+not ASCII before the last `-`, one that is not a digit after it, or text ending inside a number, at
+its byte offset), `Overflow` (a number past `int`'s range: text no encoder writes, or text to encode
+with some two thousand characters before a high code point) or `InvalidCodePoint(value)` (a value
+that is not a Unicode scalar value). Both have `message`.
+
 ### `http`
 
 | Function | Meaning |
@@ -3115,7 +4609,9 @@ URL**, so `parse` refuses `http://h/%FF` with `InvalidUtf8(9)` and `queryParams`
 | `http.post(url: string, body: string, contentType: string, headers = []) -> Result[Response, HttpError]` | Sends `body`, as UTF-8, and answers the response. |
 | `http.put(url, body, contentType, headers = [])` | The same with `PUT`. |
 | `http.patch(url, body, contentType, headers = [])` | The same with `PATCH`. |
-| `http.send(request: Request) -> Result[Response, HttpError]` | Any method, headers, body, timeout and TLS settings, built from `Request(method, url, headers)` with `withHeader`, `withHeaders`, `withQueryParam`, `withBody`, `withTimeout` and `withTls`. |
+| `http.send(request: Request) -> Result[Response, HttpError]` | Any method, headers, body, timeouts and TLS settings, built from `Request(method, url, headers)` with `withHeader`, `withHeaders`, `withQueryParam`, `withBody`, `withTimeout`, `withTls`, `withConnectTimeout`, `withTotalTimeout`, `withBasicAuth` and `withBearer`. |
+| `http.stream[R](request: Request, f: (StreamedResponse) -> R) -> Result[R, HttpError]` | Sends the request and answers what `f` makes of the response, its body read as it arrives. |
+| `Client(...)` | A client that keeps its connections for the requests after the first, with the same verbs, `send` and `stream` as methods ([below](#client)). |
 
 Every verb answers a `Result[Response, HttpError]`, and `headers`, a `Vector[(string, string)]`, are
 sent after the ones the client writes, in order. `post`, `put` and `patch` send `Content-Type:
@@ -3136,21 +4632,32 @@ A `Response` has its `status` and `reason`, its `headers` as a vector of name an
 `header(name)` looking a name up without regard to case, its `body` as an `Array[byte]` and `text`
 reading that as UTF-8, a sequence that is not read as U+FFFD. **A status is an answer, not a failure**: `404` is an `Ok`. `HttpError` is `Io(IoError)`,
 `BadUrl(UrlError)`, `Malformed(text)` for a reply that is not HTTP, `Unsupported(text)` for a scheme
-other than `http` and `https`, and `Tls(TlsError)` for TLS that could not be set up (a connection
-that could not be made, broke or timed out being `Io`, for `https` as for `http`). The
-client speaks HTTP/1.1, one request to a connection, reads bodies by `Content-Length`, chunked or to
-the connection's end, and follows up to five redirects of a `GET` or `HEAD` (statuses 301, 302,
-303, 307 and 308), each `Location` resolved against the URL that answered by `Url.resolve`; the sixth
-is the answer. It writes `Host`, `Content-Length` (for a body, and for a `POST`, a `PUT` and a
-`PATCH` even when theirs is empty) and `Connection: close` unless the request gives them, then the
-request's own headers in order. `HEAD`, an interim
+other than `http` and `https`, `Tls(TlsError)` for TLS that could not be set up (a connection
+that could not be made, broke or timed out being `Io`, for `https` as for `http`),
+`TooLarge(text)` for a reply over the client's limits, and `ProxyRefused(status, reason)` for a
+proxy that would not open a tunnel ([below](#client)). The module's functions speak HTTP/1.1 on a
+connection of their own for each request, closed after its response, read bodies by
+`Content-Length`, chunked or to the connection's end, and follow up to five redirects as a
+[`Client`](#client) does; the sixth is the answer. They write `Host`, `Content-Length` (for a body,
+and for a `POST`, a `PUT` and a `PATCH` even when theirs is empty) and `Connection: close` unless
+the request gives them, then the request's own headers in order; a `Client` writes no `Connection`
+of its own. `HEAD`, an interim
 `1xx` (which is skipped for the answer after it), `204` and `304` have no body. A method is a token
 and a header's name one too, and a header's value holds no line break; a request where one does not
 traps as it is made, whether the header came to `Request`'s constructor, to a verb, or by
-`withHeader` or `withHeaders`, so nothing is sent. A request's timeout bounds each read and write on its connection.
+`withHeader` or `withHeaders`, so nothing is sent. A request's timeout bounds each read and write on
+its connection. Its `connectTimeout`, 30 seconds unless `withConnectTimeout(d)` (or the constructor)
+sets another, bounds looking the host up, connecting and an `https` URL's TLS handshake together, on
+each connection the request makes, redirects included, failing with `Io` of kind `TimedOut`; zero
+takes the bound away, and a negative one traps as the request is made. Its `totalTimeout`, none
+unless `withTotalTimeout(d)` sets one, bounds the whole of it, from the call until the answer:
+getting a connection, writing, every redirect and reading the response, its body included, or for
+`stream`, the function given the response; once it runs out, the request is stopped where it is,
+its connection closed, and it fails with `Io` of kind `TimedOut`.
 
 **An `https` URL just works**: the client makes the TCP connection to the URL's port, 443 where it
-gives none, sets the request's timeout on it, so the handshake's waits are bounded too, and speaks
+gives none, sets the request's timeout on it, so the handshake's waits are bounded too, the whole
+handshake within what is left of the request's `connectTimeout`, and speaks
 the request over a [`TlsStream`](#tls), the certificate checked for the URL's host against the
 machine's trusted authorities and those of the request's `TlsClient`, which `withTls(client)` sets
 (`TlsClient()` unless it is set). A redirect between `http` and `https` is followed like any other,
@@ -3158,6 +4665,597 @@ keeping the request's TLS settings. TLS lives in the Sysl package `openssl`, whi
 names in `library/library.hocon`, its own `sysl-dependencies`; a program's shims depend on it only
 where a binding the program compiles reaches it, which `avin.net.http` and `avin.net.tls` do and
 `avin.net` alone does not ([proposed](/spec/decisions/#proposed)).
+
+#### Client
+
+**A `Client` keeps its connections.** It is made once and used for every request, by every thread
+(it is sendable), and sends each request on a connection kept from an earlier one to the same
+origin, its scheme, host and port (and for `https` its `TlsClient`'s settings, the authorities it
+trusts, the protocols it offers and the versions it allows), so a connection, and its TLS
+handshake, is paid for once:
+
+```text run
+import avin.net.http
+import avin.net.http.{Client, Request, Response}
+
+main()
+  val server = http.serve("127.0.0.1", 0, r -> Response.text(200, "hello, world")).ok.get
+  val base = s"http://127.0.0.1:${server.port()}"
+  val client = Client()
+  for _ in 1 .. 3
+    println(client.get(s"$base/").ok.get.text)
+  val length = client.stream(Request("GET", s"$base/"), r -> r.body.readAll().ok.get.length).ok.get
+  println(s"$length bytes, streamed")
+  println(client.stats())
+  client.close()
+  server.stop()
+```
+
+```text output
+hello, world
+hello, world
+hello, world
+12 bytes, streamed
+ClientStats(1, 3, 1, 0)
+```
+
+`Client(maxPerHost = 16, idleTimeout = seconds(30), maxLifetime = minutes(10), maxRedirects = 10,
+maxHeaderBytes = 65536, maxResponseBytes = 67108864, keepAlive = true, cookies: Option[CookieJar] =
+None, proxy = Proxy())` has `get`, `head`,
+`delete`, `post`, `put`, `patch` and `send` as the module has, and:
+
+| Method | Meaning |
+| --- | --- |
+| `client.stream[R](request, f: (StreamedResponse) -> R) -> Result[R, HttpError]` | Hands `f` the response once its head has come, its `body` a `ResponseBodyReader` read as it arrives, and answers what `f` returns. |
+| `client.stats() -> ClientStats` | `ClientStats(opened, reused, idle, active)`: connections made in all, requests sent on a connection an earlier one used, connections kept now and lent now. |
+| `client.evictIdle() -> int` | Closes the kept connections past `idleTimeout` or `maxLifetime` now, answering how many. |
+| `client.close()` | Closes the kept connections; one lent now closes when it comes back, and a request afterwards fails with `Io`, making no connection. |
+
+**Limits.** An origin has at most `maxPerHost` connections, lent and kept together. A request
+that finds them all lent waits for one, within its `connectTimeout`, which also bounds making a new
+one, and fails with `Io` of kind `TimedOut` (`cannot wait for a connection to
+http://host:port: timed out`) when it runs out. A connection kept longer than `idleTimeout`, or
+older than `maxLifetime` (so a host whose address changes is looked up again), is closed instead of
+used; zero takes either away. A response's status line and headers together, and its trailers,
+may be at most `maxHeaderBytes` long, and a body `send` reads whole at most `maxResponseBytes`
+(found from its `Content-Length` before any of it is read, where it has one); over either is
+`TooLarge`. A `maxPerHost` or `maxHeaderBytes` below one, or a negative `maxRedirects`,
+`maxResponseBytes`, `idleTimeout` or `maxLifetime`, traps as the client is made. `keepAlive =
+false` keeps nothing: each request writes `Connection: close` and has its own connection, as the
+module's functions do (they are a `Client(maxRedirects = 5, maxResponseBytes = long.MaxValue,
+keepAlive = false)` made for each call).
+
+**A connection is used again only after a clean exchange**: the request was written whole, the
+response is `HTTP/1.1`, neither it nor the request says `Connection: close`, its body's end was
+found by its `Content-Length` or its chunks (not both, and not by the connection's close) and the
+body was read to that end, and nothing came after it. Anything else closes it: an error or a
+timeout, a body left partly read or not read at all, a trap or a cancellation in the middle, a
+`101`. A kept connection is checked before it is used: one with something to read, the server
+having closed it or sent what nothing asked for, is closed and another found. Where a request on a
+kept connection fails anyway, other than by a timeout, before any byte of its response comes (the
+server's close having crossed it), a request whose method may be repeated (`GET`, `HEAD`,
+`OPTIONS`, `TRACE`, `PUT`, `DELETE`) is sent once more on a new connection; any other fails.
+
+**The response is read strictly.** A header line beginning with a space (an obsolete folded
+line), a header name that is not a token (`Bad Name:`), a `Content-Length` that is not digits or
+says two lengths (`5, 6`; `3, 3` is one), and a chunk size past `int.MaxValue` are `Malformed`. A
+`Transfer-Encoding` whose last coding is `chunked` reads chunks, whatever `Content-Length` says, and
+one with any other coding reads to the close.
+
+**Redirects.** A `301`, `302`, `303`, `307` or `308` with a `Location` is followed, the location
+resolved against the URL that answered, up to `maxRedirects` times; the redirect after them is the
+answer, and with zero none is followed. A `303` asks again with `GET` (a `HEAD` stays a `HEAD`), and
+`301` and `302` turn a `POST`, and only a `POST`, into a `GET`; a request turned into a `GET` loses
+its body and its `Content-Type`, `Content-Length`, `Content-Encoding`, `Content-Language`,
+`Content-Location` and `Transfer-Encoding`. `307` and `308`, and `301` and `302` of any other
+method, send the same method and body again. A redirect to another origin drops `Authorization`,
+`Proxy-Authorization`, `Cookie` and a `Host` the request gave; one to the same origin keeps them. A
+`Location` that is not a URL is `BadUrl`, one to a scheme other than `http` and `https` is
+`Unsupported`, and a redirect with no `Location` is the answer. A redirect's body, up to 64 KiB, is
+read and dropped so its connection is kept.
+
+**Streamed responses.** `StreamedResponse` has the `status`, `reason`, `headers` and `header(name)`
+a `Response` has, and its `body`, a `ResponseBodyReader` (named apart from the server's
+`BodyReader`, which reads a request's body), is a [`Reader`](#avinio): `read(max)` answers what has
+come of the body, up to `max` bytes, and an empty array at its end, so `io.copy(r.body, file)`
+saves it; `readAll()` reads the rest, `readAll(limit)` the rest or `TooLarge`, and `discard(limit)`
+reads and drops it, stopping past `limit` bytes, answering whether its end was reached;
+`isComplete` says whether it was read to its end. A body that breaks off, or whose chunks are not
+HTTP's, answers an `Err`, as every read after it does. The response belongs to `f`: once `f`
+returns, the body is not read again, and its connection is kept or closed as above.
+
+**Cookies.** A client keeps cookies only when it is given a `CookieJar`: `Client(cookies =
+Some(jar))` stores every response's `Set-Cookie` headers in `jar`, each redirect's too, and sends
+each request, each redirect's included, the cookies `jar` holds for its URL in one `Cookie` header,
+after the cookies of any `Cookie` header the request gives. A jar is safe to share between threads
+and clients:
+
+```text run
+import avin.net.http
+import avin.net.http.{Client, CookieJar, Request, Response}
+
+main()
+  val server = http.serve("127.0.0.1", 0, r -> r.target match
+    "/login" -> Response.empty(302).withHeader("Location", "/home").withHeader("Set-Cookie", "sid=abc; Path=/; HttpOnly")
+    _ -> Response.text(200, s"cookie: ${r.header("Cookie").getOrElse("none")}")).ok.get
+  val base = s"http://127.0.0.1:${server.port()}"
+  val jar = CookieJar()
+  val client = Client(cookies = Some(jar))
+  println(client.get(s"$base/login").ok.get.text)
+  println(client.send(Request("GET", s"$base/").withBearer("t0ken")).ok.get.text)
+  println(jar.header("http://127.0.0.1/"))
+  println(jar.all().map(c -> s"${c.name} ${c.domain} ${c.path} hostOnly=${c.hostOnly} httpOnly=${c.httpOnly}"))
+  server.stop()
+```
+
+```text output
+cookie: sid=abc
+cookie: sid=abc
+Some(sid=abc)
+[sid 127.0.0.1 / hostOnly=true httpOnly=true]
+```
+
+`CookieJar(maxCookieBytes = 4096, maxPerDomain = 50, maxCookies = 3000, clock = now)` follows RFC
+6265bis, reading each header with `SetCookie.parse` (so a cookie breaking its rules is not stored):
+
+| Method | Meaning |
+| --- | --- |
+| `jar.setCookie(url: string, header: string) -> bool` | Stores the cookie of a `Set-Cookie` value from a response to `url`; answers whether it was taken (stored, or removing the one it names where it has already expired). |
+| `jar.receive(url: Url, headers)` | Stores every `Set-Cookie` among a response's headers. |
+| `jar.cookies(url) -> Vector[Cookie]`, `jar.header(url) -> Option[string]` | The cookies a request to `url` carries, in order, and its `Cookie` header; `url` is a `string` or a `Url`. |
+| `jar.all() -> Vector[StoredCookie]`, `jar.size` | The cookies held and not expired, in the order first stored: `StoredCookie(name, value, domain, path, hostOnly, secure, httpOnly, sameSite, expires, created)`. |
+| `jar.clear()`, `jar.clearSession()` | Removes every cookie, or those with no `Max-Age` or `Expires`. |
+
+A cookie without `Domain` goes back to the host that set it only (`hostOnly`); one with `Domain`
+to that domain and the hosts under it, and it is refused unless the host setting it is the domain
+or under it. **The jar has no public-suffix list**: it refuses a `Domain` of one label (`com`)
+unless that is the host itself (`localhost`, which then gets a host-only cookie), so a public
+suffix of two labels or more (`co.uk`) is not caught. An IP address is a domain only to itself, and
+cookies, as RFC 6265 has them, do not tell ports apart. A cookie without a `Path` (or with one not
+beginning with `/`) takes the request path up to its last `/`; a request's path matches a cookie's
+path where they are equal or the cookie's is a prefix of it ending at a `/`. `Max-Age` (seconds)
+wins over `Expires`, either is cut to 400 days, and an expiry already past removes the stored
+cookie of that name, domain and path; the time is read from `clock`. A `Secure` cookie, which every
+`__Secure-` and `__Host-` cookie is, is stored only from an `https` URL and sent only over `https`,
+and a cookie from an `http` URL may not replace a `Secure` one of its name whose domain and path it
+overlaps. A cookie of the same name, domain, host-only-ness and path replaces the stored one and
+keeps its creation time. A request carries the matching cookies with the longer paths first, then
+the earlier created. `HttpOnly` and `SameSite` are stored and shown but hold no cookie back: they
+are rules for a browser's scripts and its cross-site requests, and a client has neither. **The jar
+is bounded**: a cookie whose name and value together are over `maxCookieBytes` is refused, and once a
+domain holds more than `maxPerDomain` cookies, or the jar more than `maxCookies`, an expired one goes
+first, then the one least recently sent or stored. A limit below one traps.
+
+**Proxies.** `Client(proxy = p)` sends each request by the proxy `p` names for its URL; the default
+`Proxy()` names none, so a client goes directly unless it is told otherwise, the environment
+included. `Proxy(http: Option[string] = None, https: Option[string] = None, noProxy = "")` holds a
+proxy URL for `http` URLs and one for `https` URLs and the hosts reached directly; `Proxy.to(url,
+noProxy = "")` sends both schemes by one proxy, and `Proxy.fromEnvironment()` reads the variables
+other tools on the machine read: `http_proxy`, else `HTTP_PROXY`; `https_proxy`, else
+`HTTPS_PROXY`; either, where those leave it unset, from `all_proxy`, else `ALL_PROXY`; and
+`no_proxy`, else `NO_PROXY`. An empty variable is unset, and under CGI (where `REQUEST_METHOD` is
+set) `HTTP_PROXY` is not read, since a request's `Proxy` header arrives as it.
+`Proxy.fromEnvironment(lookup)` reads them through `lookup` instead of the process's environment.
+`p.forUrl(url) -> Option[string]` answers the proxy a URL goes by and `p.bypasses(url)` whether
+`noProxy` sends it directly.
+
+A proxy URL is `http://host:port`, `http://` and port `80` where it leaves them out; a user and
+password in it (`http://user:secret@proxy:3128`, each percent-encoded) are sent as
+`Proxy-Authorization: Basic`. An `http` URL is asked of the proxy with the whole URL as the request's
+target, and the proxy's credentials on every request (a `Proxy-Authorization` the request gives
+itself is sent instead); a `407` is then the answer, as any status is. An `https` URL goes through a
+tunnel: the client sends `CONNECT host:port` with the credentials, and once the proxy answers `2xx`
+makes the TLS handshake with the server through it, so the proxy sees neither request nor response.
+The `CONNECT` and its answer count against the request's `connectTimeout`, its answer's head against
+`maxHeaderBytes`; any other status fails the request with `ProxyRefused(status, reason)`, and bytes
+the proxy sends after a `2xx` with `Malformed`. A proxy URL of another scheme (`https://`,
+`socks5://`) fails the request with `Unsupported`, and one that is not a URL with `BadUrl`; neither
+sends it directly. Connections through a proxy are kept like any other, apart from the direct ones
+and by the proxy and its credentials as well as by the origin.
+
+`noProxy` is a list separated by commas or spaces, compared without regard to case: `*` alone is
+every host; a name (`example.com`, written also `.example.com` or `*.example.com`) is that host and
+every host under it, `api.example.com` but not `badexample.com`; an IP address (`10.1.2.3`, `::1`
+or `[::1]`) is that address, and a CIDR network (`10.0.0.0/8`, `fe80::/10`) every address in it;
+and any of these but `*` may end in `:port`, matching that port only (`[::1]:8080` for IPv6). An
+entry matches the URL's host as written, a name never matching an address entry and no name looked
+up, and an entry that is none of these is passed over.
+
+**Credentials.** `request.withBasicAuth(user, password)` sets the request's only `Authorization` to
+`Basic` and `user:password` in UTF-8 and base64 (RFC 7617), trapping where `user` holds `:` or
+either holds a control character; `request.withBearer(token)` sets it to `Bearer token` (RFC 6750),
+trapping where `token` is empty or not a `token68`. Like any `Authorization`, either is dropped on a
+redirect to another origin and kept on one to the same origin.
+
+### Redis
+
+`avin.net.redis` is a client of a Redis server (and of the servers that speak its protocol), written
+in Avin over a [`TcpStream`](#tcp) or a [`TlsStream`](#tls) ([settled](/spec/decisions/#settled)).
+`Redis.connect` opens a connection and asks for RESP3 with `HELLO 3`, sending the credentials and
+the client's name in it, and speaks RESP2 where the server has no `HELLO`; `command` sends any
+command and answers its reply as a `Value`, and the typed methods send the common commands and
+answer what their replies mean, the same over either protocol.
+
+```text
+import avin.net.redis.{Redis, RedisError, RedisOptions}
+import avin.time.minutes
+
+visit(page: string) -> Result[long, RedisError]
+  val r = Redis.connect("127.0.0.1", 6379, RedisOptions(password = Some("s3cret")))?
+  r.set(s"last:$page", "now", minutes(10))?
+  val counts = r.pipeline(p ->
+    p.command("INCR", s"views:$page")
+    p.command("EXPIRE", s"views:$page", "86400"))?
+  val views = counts(0)?
+  _ = r.close()
+  Ok(views.asLong.getOrElse(0))
+```
+
+| `RedisOptions(…)` | Meaning |
+| --- | --- |
+| `username`, `password` | Authenticate, in `HELLO` or by `AUTH`; a password with no username is the `default` user's. |
+| `database = 0` | Chosen by `SELECT` once connected; zero sends nothing. |
+| `tls`, `tlsHost` | A `TlsClient` makes the connection TLS, its certificate checked for `tlsHost`, or the host connected to. |
+| `clientName` | The connection's name, as `CLIENT LIST` shows it. |
+| `protocol = 3` | 3 asks for RESP3 and falls back to RESP2 where the server answers `NOPROTO` or has no `HELLO`; 2 never asks. |
+| `connectTimeout = 10 s` | Bounds TCP, TLS and the handshake together. |
+| `timeout = 30 s` | Bounds each wait for the server after that; zero or less is none. |
+| `reconnectAttempts = 3`, `reconnectDelay = 100 ms`, `maxReconnectDelay = 5 s` | How the next command makes a broken connection again: so many tries, the wait doubling between them. |
+| `limits = RespLimits()` | What the server may send (below). |
+
+A protocol other than 2 or 3, a negative database or a negative number of attempts traps.
+
+**A failure is a `RedisError`**: `ConnectionFailed(IoError)` (refused, broken, or `TimedOut`),
+`ConnectionClosed(text)` (by the server or by `close`), `TlsFailed(TlsError)`,
+`ProtocolFailed(RespError)`, `ServerError(code, text)` for an error reply, its code the first word
+(`ERR`, `WRONGTYPE`, `WRONGPASS`, `EXECABORT`), and `UnexpectedReply(expected, got)` for a reply of
+another kind than the method reads. **A broken connection is made again by the next command, never
+by the one it broke under**: that command answers its failure, since it may or may not have run, and
+nothing is sent twice. A server that refuses the credentials while reconnecting is answered at once.
+An error reply, or one of the wrong kind, leaves the connection as it is.
+
+| Typed commands | Answer |
+| --- | --- |
+| `get`, `getBytes`, `set(k, v)`, `set(k, bytes)`, `set(k, v, ttl)`, `setIfAbsent(k, v, ttl?)`, `mget`, `mset`, `append` | Text, bytes, `unit`, whether it was set; a value that is not UTF-8 is `UnexpectedReply` from `get` and read by `getBytes`. |
+| `incr`, `incrBy`, `decr`, `decrBy`, `incrByFloat` | The new number. |
+| `del`, `exists`, `expire(k, d)`, `ttl(k)`, `persist` | Counts, whether the key was there, and `Expiry`: `NoKey`, `NoExpiry` or `ExpiresIn(d)`. Times are whole milliseconds, a part of one counting as one. |
+| `hset(k, pairs*)`, `hget`, `hmget`, `hgetAll`, `hdel`, `hexists`, `hincrBy`, `hlen` | `hgetAll` is a `Map[string, string]`. |
+| `lpush`, `rpush`, `lpop`, `rpop`, `lrange`, `llen` | `lrange(k, 0, -1)` is the whole list. |
+| `sadd`, `srem`, `smembers`, `sismember`, `scard` | Members in no order. |
+| `zadd(k, (score, member)*)`, `zrange`, `zrangeWithScores`, `zscore`, `zincrBy`, `zrank`, `zrem`, `zcard` | Scores are `real`s, the infinities among them. |
+| `scan(pattern, count)`, `hscan`, `sscan`, `zscan` | An `Iterator` of `Result`s following the cursor page by page; a failure is its last element. A key there throughout comes at least once. |
+| `ping`, `select`, `flushDb`, `dbSize`, `publish`, `watch`, `unwatch` | As the commands answer. |
+
+**`pipeline(p -> …)`** sends every command the callback adds before reading a reply, and answers
+each reply in order as its own `Result`; an outer `Err` is a failure of the connection. It is written
+a batch of at most 64 KiB at a time, the batch's replies read before the next, so a long pipeline
+never fills the connection both ways. **`transaction(t -> …)`** sends `MULTI`, the commands and
+`EXEC` as one pipeline and answers `Some` of each command's reply, `None` where a key `watch`
+watched changed so nothing ran, and `Err(ServerError("EXECABORT", …))` where the server refused a
+command as it was queued. Every reply is read whatever failed, so the connection stays in step.
+
+**`Redis.pool(host, port, options, maxSize = 8, …)`** is an [`avin.threads.Pool`](#concurrency) of
+connections, shared between threads and actors: `pool.use(r -> r.incr("hits"))` lends one for the
+call, and a connection broken while lent is closed rather than lent again. Its other settings
+(`minIdle`, `idleTimeout = 5 min`, `acquireTimeout = 10 s`, `maxLifetime`, `maxWaiting`) are the
+pool's.
+
+**Publish and subscribe** go through a `Subscriber`, a connection of its own:
+`Subscriber.connect(host, port, options)`, then `subscribe(channels*)` and `psubscribe(patterns*)`,
+each answering once the server has confirmed every name, a message that arrives meanwhile kept;
+`unsubscribe` and `punsubscribe`, all of them where none is named. `receive()` waits for the next
+`PubSubMessage(channel, payload, pattern)` (`text` reads its payload), `receive(timeout)` answers
+`None` where none comes in time, and `messages()` is an `Iterator` of them that ends at a failure,
+which `lastFailure` keeps. A broken connection is made again and every channel and pattern
+subscribed again; what was published meanwhile is not received. RESP2's arrays and RESP3's pushes
+are read alike, and a push arriving on a `Redis` connection, not a subscriber, is passed over.
+
+**RESP itself** is public too. A `Value` is one of `SimpleString`, `BlobString` (an
+`ArraySeq[byte]`), `VerbatimString(format, text)`, `SimpleError`, `BlobError`, `Number` (a
+`long`), `Double` (a `real`, `inf`, `-inf` and `nan` among them), `BigNumber` (a `BigInt`),
+`Boolean`, `Null` (RESP2's `$-1` and `*-1` too), `ArrayValue`, `MapValue` (pairs in order),
+`SetValue`, `Push` and `Attributed(attributes, value)`, with `asText`, `asBytes`, `asLong`,
+`asReal`, `asBool`, `asItems`, `asEntries` (a RESP2 flat array too), `isNull`, `isError` and
+`plain` (without attributes). `encode(v)` writes RESP3, `encodeResp2(v)` RESP2,
+`encodeCommand(args)` and `encodeCommandBytes(args)` a command; a simple string or error holding a
+CR or LF traps, as does a verbatim format that is not three bytes. A `RespParser(limits)` reads
+values out of bytes as they arrive: `feed(bytes)`, then `next()` answers `Ok(Some(v))`, `Ok(None)`
+while the value is not whole, or a `RespError` (`Malformed`, `TooLong`, `TooDeep`, `TooMany`, each
+with its offset in the stream), which is final. Streamed strings and aggregates are read whole.
+
+| `RespLimits(…)` | Default | Bounds |
+| --- | --- | --- |
+| `maxBulkBytes` | 536870912 (512 MiB, a Redis string's most) | one blob string, blob error, verbatim string, or a streamed string's chunks together |
+| `maxDepth` | 64 | how deep aggregates nest; a top-level array's items are at depth one |
+| `maxAggregateLength` | 16777216 | the items of an array, set or push, or the pairs of a map or attributes |
+| `maxLineBytes` | 1048576 (1 MiB) | a simple string's or error's line, a number's, a length's |
+
+Each length is checked as its header is read, before the bytes it claims arrive; a limit below one
+traps.
+
+```text run
+import avin.net.redis.{ArrayValue, Number, RespLimits, RespParser, blobOf, encode}
+
+main()
+  val bytes = encode(ArrayValue(Vector(blobOf("views"), Number(42))))
+  println(string.fromUtf8Lossy(bytes).replace("\r\n", "|"))
+  val p = RespParser()
+  p.feed(bytes.slice(0, 9))
+  println(p.next())
+  p.feed(bytes.slice(9, bytes.length))
+  println(p.next().map(v -> v.map(x -> x.asItems.get(1).asLong)))
+  val strict = RespParser(RespLimits(maxDepth = 2))
+  strict.feed("*1\r\n*1\r\n*1\r\n:1\r\n".utf8)
+  println(strict.next().err.map(e -> e.message))
+```
+
+```text output
+*2|$5|views|:42|
+Ok(None)
+Ok(Some(Some(42)))
+Some(RESP aggregates nested deeper than 2 at byte 8)
+```
+
+### Mail messages
+
+`avin.net.mail` writes a mail message as RFC 5322 and MIME (RFC 2045 to 2049) define it, ready for
+[SMTP](#smtp) to send. A `Message` is data: who it is from and to, a subject, a plain-text body, an
+HTML one or both, attachments and further headers; `render()` writes it, or says why it cannot.
+
+```text run
+import avin.net.mail.{Attachment, MailError, Mailbox, Message, decodeHeaderValue}
+
+main() -> Result[unit, MailError]
+  val m = Message(
+    Mailbox("ada@example.com", "Ada Lovelace"),
+    to = [Mailbox("charles@example.com", "Charles Babbage")],
+    bcc = [Mailbox("archive@example.com")],
+    subject = "Notes on the engine — draft",
+    text = Some("The notes are attached.\n"),
+    html = Some("<p>The notes are <b>attached</b>.</p>\n"),
+    attachments = [Attachment("notes.txt", "text/plain; charset=utf-8", "Note G\n".bytes)]
+  )
+  val lines = m.render()?.split("\r\n")
+  for line in lines
+    if line.startsWith("From:") || line.startsWith("To:") || line.startsWith("Subject:") then println(line)
+  println(decodeHeaderValue(lines.find(l -> l.startsWith("Subject:")).getOrElse("").drop(9)))
+  println(s"recipients: ${m.recipients}, Bcc written: ${lines.exists(l -> l.startsWith("Bcc"))}")
+  Ok(())
+```
+
+```text output
+From: Ada Lovelace <ada@example.com>
+To: Charles Babbage <charles@example.com>
+Subject: =?UTF-8?B?Tm90ZXMgb24gdGhlIGVuZ2luZSDigJQgZHJhZnQ=?=
+Notes on the engine — draft
+recipients: [charles@example.com, archive@example.com], Bcc written: false
+```
+
+| Member | Meaning |
+| --- | --- |
+| `Mailbox(address, name = "")` | An address and the name a reader sees, written `Ada Lovelace <ada@example.com>`, or the address alone. |
+| `Attachment(filename, contentType, content: Vector[byte], inline = false, contentId = "")` | A file; an inline one is shown in the body, which refers to it as `cid:<contentId>`. `contentType` is `type/subtype`, parameters allowed. |
+| `Message(from, to = [], cc = [], bcc = [], replyTo = [], subject = "", text = None, html = None, attachments = [], headers = [], date = None, messageId = None, boundary = None)` | A message. `headers` are further `(name, value)` pairs, written after the message's own. `date` is `now()` where none is given, `messageId` (without angle brackets) a random one at the sender's domain, `boundary` (1 to 60 of `A–Z a–z 0–9 '()+_,-./:=?`) a random one. |
+| `m.render() -> Result[string, MailError]` | The message as it goes over the wire, every line ending in CR LF and none longer than 998 characters. |
+| `m.recipients -> Vector[string]` | Every address of `to`, `cc` and `bcc`, in that order, each once: the envelope's recipients. |
+| `m.needsUtf8 -> bool` | Whether an address of the message is beyond ASCII, so the server must take SMTPUTF8. |
+| `decodeHeaderValue(value) -> string` | A header's value as a reader sees it: folding removed and RFC 2047 encoded-words (`B` or `Q`; UTF-8, US-ASCII, ISO-8859-1) decoded, space between two words dropped; a word it cannot decode kept as it is. |
+| `mailDate(t: Instant) -> string` | RFC 5322's date in UTC, `Thu, 01 Jan 1970 00:00:00 +0000`. |
+| `checkedAddress(header, address) -> Result[string, MailError]` | The check every address meets: `local@domain` around the last `@`, a local part of at most 64 bytes, at most 254 in all, no space, control character or `<>()",;\`. An address beyond ASCII is kept for SMTPUTF8. |
+
+**How it writes.** The headers come in the order `Date`, `From`, `Reply-To`, `To`, `Cc`, `Subject`,
+`Message-ID`, `MIME-Version: 1.0`, then the caller's; `Bcc` is never written, its addresses being
+recipients alone. A subject, a display name or a caller's value that is printable ASCII is written
+as itself, folded at its spaces before 78 columns; anything else, and text a reader would take for
+an encoded-word, is written as RFC 2047 encoded-words in UTF-8 and base64, each holding whole
+characters and at most 64 characters long. A name of words is written bare, other plain text as a
+quoted string. The body is `text/plain` or `text/html` in UTF-8, `multipart/alternative` of the two
+where both are given (plain first), inline attachments beside it in `multipart/related` and the
+others after it in `multipart/mixed`; with no body at all it is an empty `text/plain`. Line breaks
+in a body (CR LF, CR or LF) are written CR LF; a body is `7bit` where it is ASCII with lines of at
+most 998, and quoted-printable otherwise. An attachment is base64 in lines of 76, and a filename
+that is not short printable ASCII is an RFC 2231 parameter, `filename*=UTF-8''r%C3%A9sum%C3%A9.pdf`,
+in numbered sections where it is long. Each boundary is `=_`, the base and a number, which neither
+quoted-printable nor base64 can hold.
+
+**Nothing can be smuggled into a header.** A CR or LF in anything that would go into a header (a
+subject, a name, an address, a filename, a content type or ID, a message ID, a caller's header name or
+value) is an `Err`, never written: `MailError` is `LineBreak(header)`, `BadAddress(header, address,
+why)` or `BadHeader(header, why)` (a name that is not a field name or is one of the message's own, a
+value with a word too long for 998 columns, a bad content type, ID or boundary); `message` says it in
+words.
+
+Quoted-printable itself is in [`avin.encoding`](#avinencoding): `toQuotedPrintable(bytes)` and
+`fromQuotedPrintable(text)`.
+
+### SMTP
+
+`avin.net.smtp` hands mail to a server by SMTP (RFC 5321), with STARTTLS (RFC 3207), `AUTH PLAIN` and
+`LOGIN` (RFC 4954), `SIZE`, `8BITMIME` and `SMTPUTF8`. An `SmtpClient` says how to reach the server;
+`send` opens a session, sends one message and quits, and `open` gives a session that sends several.
+
+```text
+import avin.net.mail.{Mailbox, Message}
+import avin.net.smtp.{SmtpClient, SmtpError}
+import avin.process
+
+main() -> Result[unit, SmtpError]
+  val client = SmtpClient("smtp.example.com", user = "ada", password = process.env("SMTP_PASSWORD").getOrElse(""))
+  val m = Message(
+    Mailbox("ada@example.com"),
+    to = [Mailbox("charles@example.com")],
+    subject = "Hello",
+    text = Some("Hi.\n")
+  )
+  client.send(m)
+```
+
+| Member | Meaning |
+| --- | --- |
+| `SmtpClient(host, port = 0, security = StartTls, tls = TlsClient(), user = "", password = "", mechanism = None, authWithoutTls = false, helo = "localhost", connectTimeout = seconds(30), commandTimeout = minutes(5), dataTimeout = minutes(10), maxReplyLine = 1000, maxReplyLines = 100)` | How to reach the server. Port zero is the security's own: 587 for `StartTls`, 465 for `ImplicitTls`, 25 for `Unencrypted`. A negative timeout traps. |
+| `client.open() -> Result[SmtpSession, SmtpError]` | Connects, reads the greeting, says `EHLO`, upgrades by STARTTLS (and says `EHLO` again) or speaks TLS from the start, and authenticates where `user` is given. |
+| `client.send(message) -> Result[unit, SmtpError]` | `open`, `send` and `quit`. |
+| `session.send(message) -> Result[unit, SmtpError]` | Renders the message and sends it from its sender to its `recipients`, Bcc included. |
+| `session.sendData(from, recipients, data: Array[byte])` | Sends a message already written; an empty `from` is the null sender `<>`. |
+| `session.reset()`, `session.quit()`, `session.close()` | `RSET`; `QUIT` and then the connection closed whatever the answer; the connection closed without a word. |
+| `session.extensions`, `session.offers(keyword)`, `session.sizeLimit`, `session.encrypted` | What `EHLO` answered (keywords upper case), whether one is offered, `SIZE`'s limit, whether TLS is on. |
+
+**Secure by default.** `StartTls` sends nothing but `EHLO` before upgrading, and a server not
+offering STARTTLS is `Unsupported("STARTTLS")`, never a reason to go on in the clear; bytes the server
+sends after its `220` to STARTTLS are a `Protocol` error, since they would be read as if they came
+over TLS. The certificate is checked for `host` as every [`TlsStream`](#tls) checks it, against the
+machine's authorities and the client's `tls`. Only `Unencrypted`, asked for by name, sends without
+TLS, and a password is never sent without it unless `authWithoutTls` is `true` (`NotSecure`
+otherwise). The mechanism is the one asked for, or `PLAIN` where offered and else `LOGIN`.
+
+**What it sends.** `MAIL FROM` carries `SIZE=` where the server offers SIZE, `BODY=8BITMIME` for data
+beyond ASCII and `SMTPUTF8` for an address beyond it; a message larger than the server's SIZE is
+`TooLarge` before anything is sent, and one needing an extension the server lacks is `Unsupported`.
+Every address is checked as `checkedAddress` checks it, so a CR, LF or `>` can never add a command.
+The data is dot-stuffed (a `.` doubled at the start of a line) and every line break in it, a lone CR
+or LF too, is sent CR LF, so nothing in a message can end its data early; a line longer than 998
+bytes is `Invalid`. One recipient refused refuses the message: the transaction is reset with `RSET`
+and the session can send the next.
+
+**Every wait is bounded, and so is every reply.** Connecting (the lookup with it) must be done within
+`connectTimeout`, and each wait of a TLS handshake too; each reply must have come whole within
+`commandTimeout` of its command, so a server sending a byte at a time cannot hold a session; the
+message's data is sent with each wait within `dataTimeout`, and its reply must come within it.
+Zero takes a limit away. A reply line longer than `maxReplyLine` bytes or a reply of more than
+`maxReplyLines` lines is a `Protocol` error, so a hostile server cannot make the client hold what it
+sends.
+
+`SmtpError` says what went wrong: `Transport(IoError)`, the connection failed, broke, closed or timed
+out (`TimedOut`); `Tls(TlsError)`; `Rejected(command, reply)`, the server refused, with its
+`Reply(code, lines)`, `reply.enhanced` its RFC 3463 status (`5.1.1`) where it gives one;
+`Protocol(text)`; `Unsupported(text)`; `NotSecure`; `TooLarge(size, limit)`; `BadMessage(MailError)`;
+`Invalid(text)`. `e.code` is a refusal's code, `e.transient` is true for a 4xx refusal and for a
+failed connection (beneath TLS too), which may succeed later, and `e.permanent` for everything else, a 5xx above
+all. After a failure of the connection or the protocol, and after a `421`, the session is closed and
+every operation answers an error. A password is never part of an error.
+
+## `avin.sqlite`
+
+SQLite databases ([settled](/spec/decisions/#settled)). `sqlite.open(path, options)` opens a file,
+or `":memory:"` for a private database in memory, and answers a `Connection`; every failure is a
+`SqliteError`.
+
+```text run
+import avin.sqlite
+import avin.sqlite.{FromRow, SqliteError}
+
+data Note(id: long, body: string, stars: Option[long]) derives FromRow
+
+main() -> Result[unit, SqliteError]
+  val db = sqlite.open(":memory:")?
+  db.execute("create table notes (id integer primary key, body text not null unique, stars int)")?
+  db.execute("insert into notes (body, stars) values (?, ?)", "first", 3)?
+  val unrated: Option[long] = None
+  val added = db.execute(
+    "insert into notes (body, stars) values (:body, :stars)",
+    {"body": "second", "stars": unrated}
+  )?
+  println(s"added row ${added.lastInsertRowid}")
+  db.execute("insert into notes (body) values (?)", "first") match
+    Err(e) -> println(s"refused: ${e.isUniqueViolation}, ${e.message}")
+    Ok(_) -> println("a duplicate went in")
+  val kept = db.transaction(tx ->
+    tx.execute("insert into notes (body) values ('third')")?
+    tx.queryValue[long]("select count(*) from notes")
+  )?
+  println(s"$kept notes after the transaction")
+  for note in db.queryAs[Note]("select id, body, stars from notes order by id")?
+    println(note)
+  Ok(())
+```
+
+```text output
+added row 2
+refused: true, UNIQUE constraint failed: notes.body
+3 notes after the transaction
+Note(1, first, Some(3))
+Note(2, second, None)
+Note(3, third, None)
+```
+
+**Opening.** `OpenOptions` holds `readOnly` (`false`), `create` (`true`: make the file where it is not
+there), `wal` (`true`: a database that is written is put in write-ahead logging, where readers and
+the writer do not wait for one another), `busyTimeout` (5 seconds: how long a statement waits for a
+lock another connection holds before failing with `Busy`), `foreignKeys` (`true`: the schema's
+foreign keys are enforced), `statementCacheSize` (64) and `uri` (`false`: read the path as a `file:`
+URI with its parameters). A negative cache size or busy timeout is a `Misuse`. `close()` closes the
+connection; closing again does nothing, and any other use after it is a `Misuse`.
+
+**Statements.** `execute(sql, params…)` runs one statement and answers `Changes(rows,
+lastInsertRowid)`: the rows it inserted, updated or deleted (0 for one that only reads) and the
+rowid of the last row inserted on the connection; a statement returning rows, `INSERT … RETURNING`
+among them, is run to its end. `query` answers every row, `queryOne` the first or `None`, `queryAs[T]`
+each row as a `T`, `queryValue[T]` the first column of the first row (no row is a `Mismatch`), and
+`each(sql, params, f)` hands each row to `f` as it is read, without holding them all, and answers
+how many there were. `executeScript(sql)` runs every statement of a schema or a migration in order,
+without parameters, stopping at the first that fails. Each of the others runs **exactly one
+statement**: SQL holding none, two (`select 1; drop table t`), or a zero byte is a `Misuse`, so text
+after the first statement is never silently dropped; a trailing `;`, space or comment is allowed.
+
+**Parameters** are given after the SQL, by position, `?` and `?NNN`, one value for each parameter
+the statement has, no more and no fewer (`ParameterRange` otherwise). A map instead gives them by
+name, `{":id": 7}`, the name's `:`, `@` or `$` optional, and every parameter the statement has must
+then be named, and every name be one of them; an unnamed `?` cannot be given by name. A value is any
+`ToSql`: `int`, `long`, `real`, `bool` (stored as 1 and 0), `string`, `Vector[byte]` (a blob),
+`Option` of one (`None` is NULL) and `SqlValue`. A string is bound as UTF-8 of its whole length, so
+text holding a zero byte is stored whole.
+
+**Rows.** A `Row` holds its column `names` and its `values`, each a `SqlValue`: `SqlNull`,
+`SqlInteger(long)`, `SqlReal(real)`, `SqlText(string)` or `SqlBlob(Vector[byte])`, the storage class
+the value has (SQLite keeps the class with the value, not the column). `get[T](index)` and
+`get[T](name)` read one as any `FromSql` type: an `int` from an integer it holds, a `long`, a `real`
+from a real or from an integer a real holds exactly, a `bool` from 0 and 1 only, a `string` from text,
+a `Vector[byte]` from a blob, an `Option` of any of these, `None` for NULL. A value of another class,
+NULL read as a type without one, and a column the row does not have are each a `Mismatch` naming the
+column. Text that is not UTF-8 is a `Mismatch` too; `cast(column as blob)` reads its bytes.
+`derive FromRow` reads a `data` type from a row (`queryAs[T]`, `row.decode[T]()`): each field from
+the column of its name, or the name its `@SqlColumn("name")` gives, a field whose column is absent
+taking its default where it has one.
+
+**Errors.** A `SqliteError` is an `Error` holding `code`, a `SqliteCode` named after SQLite's primary
+result code (`Failed` for `SQLITE_ERROR`, `Busy`, `Locked`, `ReadOnly`, `CantOpen`, `Misuse`,
+`ParameterRange`, `Mismatch`, `NotADatabase` and the rest, `Other(code)` for one it does not name),
+`extendedCode`, SQLite's extended result code, and `message`, SQLite's sentence about the failure,
+taken when it happened. A broken constraint is `Constraint(kind)`, the kind telling `Unique`,
+`PrimaryKey`, `NotNull`, `Check`, `ForeignKey`, `DataType` (a `STRICT` table's column) and the rest
+apart; `isConstraint`, `isUniqueViolation` and `isBusy` ask the common questions.
+
+**Transactions.** `transaction(f)` begins a transaction, runs `f` with the connection, and commits
+where `f` answers `Ok` and rolls back where it answers `Err` or the thread running it is cancelled,
+answering what `f` answered. `transaction(mode, f)` begins it `Deferred` (the default), `Immediate`
+(the write lock at once, so a writing transaction never fails part way for want of it) or
+`Exclusive`. A transaction inside another, or `savepoint(f)` anywhere, is a savepoint: its rollback
+undoes its own work and keeps the outer transaction's, and the outer one's rollback undoes everything.
+Where SQLite has rolled a transaction back by itself (a full disk), a body answering `Ok` is an
+`Abort`, since nothing was committed. `inTransaction` sees the program's own `BEGIN` too.
+
+**Prepared statements.** Each statement `execute` and the queries run is prepared once and kept, by
+its text, in the connection's cache, up to `statementCacheSize`, the least recently used finalized
+first; one in use (inside `each`) is not taken, and the same text inside runs a statement of its own.
+`prepare(sql)` makes a `Statement` of the program's own, with the same `execute`, `query`,
+`queryOne`, `queryAs`, `queryValue` and `each`, its `sql`, `parameterCount`, `columnNames` and
+`isReadOnly`, kept until `close()`. A statement nothing holds is finalized when the collector frees
+it; one whose connection is in a call on another thread at that moment is finalized at that
+connection's next call, so a collection never waits for SQLite. `openStatements` counts what is not
+yet finalized.
+
+**Threads.** A connection belongs to one owner at a time, as a [handle](/spec/sysl-bindings/#handles)
+does: it moves with what is handed to another thread, and its previous owner's next use traps. Threads
+that each use a database open a connection each, or share a `threads.Pool[Connection, SqliteError]`,
+which lends one to one thread at a time. A call that waits for SQLite (a lock another connection holds,
+the disk) is a [blocking call](/spec/sysl-bindings/#calls-that-wait): the lightweight thread waiting
+leaves its worker to the others, and a collection does not wait for it.
+
+SQLite is the machine's own, 3.37 or newer (macOS ships it; `libsqlite3-dev` on Debian and Ubuntu,
+`sqlite-devel` on Fedora), reached through the library's Sysl package `sqlite` in
+`library/sysl/sqlite`, which pkg-config finds it for; a program's shims depend on it only where a
+binding the program compiles reaches it, so a program that never imports `avin.sqlite` never links
+SQLite. `sqlite.version()` answers the version the program runs with.
 
 ## Concurrency
 

@@ -1,0 +1,47 @@
+// expect: exit 0
+// env: AVIN_GC_STRESS=0
+// Many small requests on one kept-alive connection leave the HTTP server's memory flat: after a
+// warm-up, forty thousand more requests, each carrying a 2 KB header, grow the memory the program
+// holds by a bounded amount, where keeping each request would hold more than 80 MB. Every request is
+// answered, in order. So many requests under a collection at each allocation would take minutes, so
+// this program runs with the collector as it ordinarily is; `http_serve_slow_reader.avin` pipelines
+// requests under the stressed one.
+import avin.io.IoError
+import avin.net.TcpStream
+import avin.net.http
+import avin.net.http.{Response, ServerRequest}
+import avin.process.{pid, residentBytes}
+import avin.time
+
+ok[T](r: Result[T, IoError]) -> T = r match
+  Ok(v) -> v
+  Err(e) -> fail(e.message)
+
+residentMegabytes() -> long = residentBytes(pid()).getOrElse(0) / 1000000
+
+echo(r: ServerRequest) -> Response = Response.text(200, r.target)
+
+main()
+  val server = ok(http.serve("127.0.0.1", 0, echo, date = false))
+  val c = ok(TcpStream.connect("127.0.0.1", server.port()))
+  ok(c.setTimeout(time.seconds(10)))
+  val padding = "p".repeat(2000)
+  var before: long = 0
+  var inOrder = true
+  for i in 0 ..< 50000
+    if i == 10000 then before = residentMegabytes()
+    val target = s"/$i"
+    ok(c.writeText(s"GET $target HTTP/1.1\r\nHost: t\r\nX-Pad: $padding\r\n\r\n"))
+    var line = ok(c.readLine()).getOrElse("")
+    if line != "HTTP/1.1 200 OK" then inOrder = false
+    var length = 0
+    while !line.isEmpty
+      line = ok(c.readLine()).getOrElse("")
+      if line.toLower.startsWith("content-length:") then length = line.slice(15, line.byteLength).trim.toInt()
+    val body = Buffer[byte]()
+    while body.length < length do body.addAll(ok(c.read(length - body.length)))
+    if string.fromUtf8Lossy(body.toArray()) != target then inOrder = false
+  val grown = residentMegabytes() - before
+  println(s"answered in order: $inOrder, grown within 32 MB: ${grown < 32}")
+  _ = c.close()
+  server.shutdown()

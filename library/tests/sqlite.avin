@@ -1,0 +1,590 @@
+// `avin.sqlite`: every parameter and column type both ways, NULL, Unicode, zero bytes and a large
+// blob; positional and named parameters and their mistakes; rows read as types and by derivation;
+// `execute`'s changes; SQL errors and each constraint; transactions, savepoints and their nesting;
+// statements of the program's own and the statement cache; the open options; and connections on
+// several threads waiting on one another's locks.
+import avin.sqlite
+
+import avin.sqlite.{
+  Changes, Connection, FromRow, OpenOptions, Row, SqlBlob, SqlColumn, SqlInteger, SqlNull, SqlReal, SqlText, SqlValue,
+  SqliteError, ToSql
+}
+
+import avin.fs
+import avin.threads.{Pool, spawn, sleep}
+import avin.time.{millis, monotonic, seconds}
+
+// A fresh database in memory.
+private memory() -> Connection = sqlite.open(":memory:") match
+  Ok(c) -> c
+  Err(e) -> fail(s"open: ${e.message}")
+
+// The value `r` holds, or the test stopped with its error.
+private ok[T](r: Result[T, SqliteError]) -> T = r match
+  Ok(v) -> v
+  Err(e) -> fail(s"unexpected error: ${e.message}")
+
+// The error `r` holds, or the test stopped.
+private err[T](r: Result[T, SqliteError]) -> SqliteError = r match
+  Ok(_) -> fail("expected an error")
+  Err(e) -> e
+
+// An error of a transaction body's own.
+private gaveUp(message: string) -> SqliteError = SqliteError(sqlite.Misuse, 21, message)
+
+// `v` bound as a parameter and selected straight back, with the storage class SQLite gave it.
+private echo(db: Connection, v: ToSql) -> (string, SqlValue)
+  val row = ok(db.queryOne("select typeof(?1), ?1", v)).get
+  (ok(row.get[string](0)), row.values(1))
+
+@test("each parameter type is stored as its storage class and comes back as it went in")
+everyTypeRoundTrips()
+  val db = memory()
+  assertEq(echo(db, SqlNull), ("null", SqlNull))
+  assertEq(echo(db, 7), ("integer", SqlInteger(7)))
+  assertEq(echo(db, int.MinValue), ("integer", SqlInteger(long(int.MinValue))))
+  assertEq(echo(db, long.MaxValue), ("integer", SqlInteger(long.MaxValue)))
+  assertEq(echo(db, long.MinValue), ("integer", SqlInteger(long.MinValue)))
+  assertEq(echo(db, 2.5), ("real", SqlReal(2.5)))
+  assertEq(echo(db, -0.0), ("real", SqlReal(-0.0)))
+  assertEq(echo(db, 1.0e308), ("real", SqlReal(1.0e308)))
+  assertEq(echo(db, true), ("integer", SqlInteger(1)))
+  assertEq(echo(db, false), ("integer", SqlInteger(0)))
+  assertEq(echo(db, "text"), ("text", SqlText("text")))
+  assertEq(echo(db, ""), ("text", SqlText("")))
+  assertEq(echo(db, Vector[byte]()), ("blob", SqlBlob(Vector[byte]())))
+  assertEq(echo(db, Vector(byte(0), byte(255))), ("blob", SqlBlob(Vector(byte(0), byte(255)))))
+  assertEq(echo(db, Some(3)), ("integer", SqlInteger(3)))
+  assertEq(echo(db, None: Option[int]), ("null", SqlNull))
+  assertEq(echo(db, SqlText("as is")), ("text", SqlText("as is")))
+
+@test("text is stored as UTF-8 whatever it holds: every plane, combining marks, and zero bytes")
+unicodeAndZeroBytes()
+  val db = memory()
+  for s in ["héllo", "日本語", "😀 🇳🇿", "é", "a\u0000b", "\u0000", "tab\tnew\nline"]
+    assertEq(echo(db, s), ("text", SqlText(s)))
+  assertEq(ok(db.queryValue[long]("select length(cast(? as blob))", "a\u0000b")), 3)
+  ok(db.execute("create table t (s text)"))
+  ok(db.execute("insert into t values (?)", "ünï\u0000cödé"))
+  assertEq(ok(db.queryValue[string]("select s from t")), "ünï\u0000cödé")
+  // A table and column of any name.
+  ok(db.execute("create table \"日本\" (\"名前\" text)"))
+  ok(db.execute("insert into \"日本\" values ('x')"))
+  assertEq(ok(db.queryOne("select \"名前\" from \"日本\"")).get.names, ["名前"])
+
+@test("a blob keeps every byte value, a zero byte among them, and a 10 MB blob comes back whole")
+blobsRoundTrip()
+  val db = memory()
+  val every = Vector.tabulate(256, i -> byte(i))
+  assertEq(echo(db, every), ("blob", SqlBlob(every)))
+  ok(db.execute("create table b (data blob)"))
+  val big = Vector.tabulate(10 * 1024 * 1024, i -> byte(i % 251))
+  ok(db.execute("insert into b values (?)", big))
+  assertEq(ok(db.queryValue[long]("select length(data) from b")), 10485760)
+  val back = ok(db.queryValue[Vector[byte]]("select data from b"))
+  assertEq(back.length, big.length)
+  assert(back == big)
+
+@test("NULL reads as None, and into a type without NULL is an error naming the column")
+nullReads()
+  val db = memory()
+  val row = ok(db.queryOne("select null as n, 1 as one")).get
+  assertEq(ok(row.get[Option[long]]("n")), None)
+  assertEq(ok(row.get[Option[long]]("one")), Some(1))
+  assertEq(ok(row.get[SqlValue](0)), SqlNull)
+  val e = err(row.get[long]("n"))
+  assertEq(e.code, sqlite.Mismatch)
+  assert(e.message.contains("`n`") && e.message.contains("NULL"), e.message)
+
+@test("a value read as another type is an error, and each type reads only its own")
+typedReads()
+  val db = memory()
+  val row = ok(db.queryOne("select 1, 2.5, 'x', x'00', 5000000000, 2, 9007199254740993")).get
+  assertEq(ok(row.get[bool](0)), true)
+  assertEq(ok(row.get[int](0)), 1)
+  assertEq(ok(row.get[real](0)), 1.0)
+  assertEq(ok(row.get[real](1)), 2.5)
+  assertEq(ok(row.get[string](2)), "x")
+  assertEq(ok(row.get[Vector[byte]](3)), Vector(byte(0)))
+  assertEq(ok(row.get[long](4)), 5000000000)
+  assert(err(row.get[int](4)).message.contains("integer"))
+  assert(err(row.get[bool](5)).message.contains("integer"))
+  assert(row.get[real](6).isErr, "an integer no real holds exactly")
+  assert(err(row.get[long](1)).message.contains("real"))
+  assert(err(row.get[string](0)).message.contains("integer"))
+  assert(err(row.get[long](2)).message.contains("text"))
+  assert(err(row.get[string](3)).message.contains("blob"))
+  assert(err(row.get[long](7)).message.contains("7 columns"))
+  assert(err(row.get[long](-1)).message.contains("#-1"))
+  assert(err(row.get[long]("nope")).message.contains("no such column"))
+
+@test("text that is not UTF-8 is a Mismatch, and its bytes are read as a blob")
+invalidUtf8()
+  val db = memory()
+  ok(db.execute("create table t (s text)"))
+  ok(db.execute("insert into t values (cast(x'ff' as text))"))
+  assertEq(err(db.query("select s from t")).code, sqlite.Mismatch)
+  assertEq(ok(db.queryValue[Vector[byte]]("select cast(s as blob) from t")), Vector(byte(255)))
+
+private data Person(
+    id: long,
+    name: string,
+    @SqlColumn("born_on") born: Option[long],
+    title: string = "none"
+) derives FromRow
+
+@test("a row reads as a derived type, by column name, with renames, defaults and NULL")
+derivedRows()
+  val db = memory()
+  ok(db.executeScript("""
+    create table people (id integer primary key, name text, born_on integer);
+    insert into people (name, born_on) values ('Ada', 1815), ('Alan', null);
+  """))
+  assertEq(
+    ok(db.queryAs[Person]("select * from people order by id")),
+    [Person(1, "Ada", Some(1815)), Person(2, "Alan", None)]
+  )
+  assertEq(
+    ok(db.queryAs[Person]("select name, 'Dr' as title, id, born_on from people where id = ?", 1)),
+    [Person(1, "Ada", Some(1815), "Dr")]
+  )
+  val missing = err(db.queryAs[Person]("select id from people"))
+  assert(missing.message.contains("`name`"), missing.message)
+  val wrong = err(db.queryAs[Person]("select 'one' as id, 'x' as name, null as born_on"))
+  assert(wrong.message.contains("`id`"), wrong.message)
+  assertEq(
+    ok(ok(db.queryOne("select 3 as id, 'C' as name, 4 as born_on")).get.decode[Person]()),
+    Person(3, "C", Some(4))
+  )
+
+@test("positional parameters must be given one value each, no more and no fewer")
+positionalCounts()
+  val db = memory()
+  assertEq(ok(db.queryValue[long]("select ? + ?", 1, 2)), 3)
+  assertEq(ok(db.queryValue[long]("select ?2 - ?1", 1, 5)), 4)
+  assertEq(ok(db.queryValue[long]("select 7")), 7)
+  val few = err(db.query("select ?, ?", 1))
+  assertEq(few.code, sqlite.ParameterRange)
+  assert(few.message.contains("2 parameters") && few.message.contains("given 1"), few.message)
+  assert(err(db.query("select ?", 1, 2)).message.contains("1 parameter and"))
+  assert(err(db.query("select 1", 1)).message.contains("0 parameters"))
+  // A named parameter may be given by position too.
+  assertEq(ok(db.queryValue[string]("select :a || :b", "x", "y")), "xy")
+
+@test("named parameters are found with or without their prefix, and every one must be given")
+namedParameters()
+  val db = memory()
+  assertEq(ok(db.queryValue[long]("select :a * :b", {":a": 6, ":b": 7})), 42)
+  assertEq(ok(db.queryValue[long]("select :a * :b", {"a": 6, "b": 7})), 42)
+  assertEq(ok(db.queryValue[string]("select @x || $y", {"x": "p", "$y": "q"})), "pq")
+  assertEq(ok(db.queryValue[long]("select :a + :a", {"a": 4})), 8)
+  val unknown = err(db.query("select :a", {"a": 1, "b": 2}))
+  assertEq(unknown.code, sqlite.ParameterRange)
+  assert(unknown.message.contains("`b`"), unknown.message)
+  val missing = err(db.query("select :a, :b", {"a": 1}))
+  assert(missing.message.contains("`:b`"), missing.message)
+  assert(err(db.query("select ?", {"a": 1})).message.contains("`a`"))
+  assert(err(db.query("select :a, ?", {"a": 1})).message.contains("parameter 2 has no name"))
+  assertEq(ok(db.queryValue[long]("select 5", Map.empty[string, ToSql]())), 5)
+  val nothing: Option[long] = None
+  assertEq(ok(db.queryValue[Option[long]]("select :n", {"n": nothing})), None)
+
+@test("execute answers the rows changed and the last rowid; a statement that reads changes none")
+executeChanges()
+  val db = memory()
+  assertEq(ok(db.execute("create table t (id integer primary key, v int)")), Changes(0, 0))
+  assertEq(ok(db.execute("insert into t (v) values (1), (2), (3)")), Changes(3, 3))
+  assertEq(ok(db.execute("insert into t (id, v) values (10, 4)")).lastInsertRowid, 10)
+  assertEq(ok(db.execute("update t set v = v + 1 where v > 1")).rows, 3)
+  assertEq(ok(db.execute("update t set v = 0 where v > 100")).rows, 0)
+  assertEq(ok(db.execute("select * from t")).rows, 0)
+  assertEq(ok(db.execute("delete from t where id = ?", 10)), Changes(1, 10))
+  assertEq(db.changes, 1)
+  assertEq(db.totalChanges, 8)
+  assertEq(db.lastInsertRowid, 10)
+  // A statement returning rows is run to its end by `execute`, and its rows read by `query`.
+  assertEq(ok(db.execute("insert into t (v) values (7), (8) returning id")).rows, 2)
+  assertEq(ok(db.query("insert into t (v) values (9) returning id, v")).map(r -> ok(r.get[long]("v"))), [9])
+  assertEq(ok(db.queryOne("select * from t where id = -1")), None)
+  assert(err(db.queryValue[long]("select v from t where id = -1")).message.contains("no rows"))
+
+@test("each hands every row to the function as it is read, and answers how many")
+eachRow()
+  val db = memory()
+  ok(db.execute("create table t (v int)"))
+  for i in 0 ..< 100
+    ok(db.execute("insert into t values (?)", i))
+  var sum: long = 0
+  assertEq(ok(db.each("select v from t where v >= ?", [50], r -> sum += ok(r.get[long](0)))), 50)
+  assertEq(sum, 3725)
+  assertEq(ok(db.each("select v from t where v < 0", [], r -> fail("no rows"))), 0)
+  // A statement in use by `each` is not taken from under it: the same text inside runs another.
+  var inner: long = 0
+  ok(
+    db.each("select v from t where v < ?", [3], r -> inner += ok(db.queryValue[long]("select v from t where v < ?", 3)))
+  )
+  assertEq(inner, 0)
+
+@test("SQL holding no statement, two, or a zero byte is refused; a trailing semicolon or comment is not")
+statementText()
+  val db = memory()
+  assertEq(err(db.query("")).code, sqlite.Misuse)
+  assert(err(db.query("  -- nothing")).message.contains("no statement"))
+  val two = err(db.execute("select 1; select 2"))
+  assertEq(two.code, sqlite.Misuse)
+  assert(two.message.contains("more than one statement"), two.message)
+  assert(err(db.execute("select 1; garbage")).message.contains("more than one statement"))
+  assert(err(db.query("select 1\u0000; drop table x")).message.contains("zero byte"))
+  assert(err(db.executeScript("select 1;\u0000")).message.contains("zero byte"))
+  assertEq(ok(db.queryValue[long]("select 1;")), 1)
+  assertEq(ok(db.queryValue[long]("select 1; -- done\n  ")), 1)
+  assertEq(ok(db.queryValue[long]("select 1 /* c */ ;  ")), 1)
+
+@test("a script runs every statement in order and stops at the first that fails")
+sqliteScripts()
+  val db = memory()
+  ok(db.executeScript("create table a (x); insert into a values (1); insert into a values (2);"))
+  assertEq(ok(db.queryValue[long]("select count(*) from a")), 2)
+  val e = err(db.executeScript("insert into a values (3); insert into missing values (4); insert into a values (5)"))
+  assert(e.message.contains("missing"), e.message)
+  assertEq(ok(db.queryValue[long]("select count(*) from a")), 3)
+  ok(db.executeScript(""))
+
+@test("SQL errors carry SQLite's code and sentence")
+sqlErrors()
+  val db = memory()
+  val syntax = err(db.execute("selec 1"))
+  assertEq(syntax.code, sqlite.Failed)
+  assertEq(syntax.extendedCode, 1)
+  assert(syntax.message.contains("syntax error"), syntax.message)
+  assert(err(db.query("select * from nowhere")).message.contains("no such table: nowhere"))
+  assert(err(db.query("select nope from (select 1)")).message.contains("no such column"))
+  assertEq(syntax.constraint, None)
+  assert(!syntax.isConstraint && !syntax.isBusy && !syntax.isUniqueViolation)
+  assertEq(s"$syntax", syntax.message)
+
+@test("each constraint a schema declares is told apart by its kind")
+constraints()
+  val db = memory()
+  ok(db.executeScript("""
+    create table parent (id integer primary key, code text unique);
+    create table child (
+      id integer primary key,
+      parent integer references parent (id),
+      n int not null,
+      c int check (c > 0)
+    );
+    create table strict_t (x integer) strict;
+    create table keyed (a, b, primary key (a, b));
+    insert into parent values (1, 'a');
+  """))
+  val unique = err(db.execute("insert into parent values (2, 'a')"))
+  assertEq(unique.code, sqlite.Constraint(sqlite.Unique))
+  assert(unique.isUniqueViolation && unique.isConstraint)
+  assertEq(unique.extendedCode, 2067)
+  assertEq(err(db.execute("insert into parent values (1, 'b')")).constraint, Some(sqlite.PrimaryKey))
+  assertEq(err(db.execute("insert into keyed values (1, 1), (1, 1)")).constraint, Some(sqlite.PrimaryKey))
+  assertEq(err(db.execute("insert into child (parent, n, c) values (1, null, 1)")).constraint, Some(sqlite.NotNull))
+  assertEq(err(db.execute("insert into child (parent, n, c) values (1, 1, 0)")).constraint, Some(sqlite.Check))
+  assertEq(err(db.execute("insert into child (parent, n, c) values (9, 1, 1)")).constraint, Some(sqlite.ForeignKey))
+  assertEq(err(db.execute("insert into strict_t values ('x')")).constraint, Some(sqlite.DataType))
+  // A rowid that is not an integer is a datatype mismatch, not a constraint.
+  val rowid = err(db.execute("insert into parent (id) values ('one')"))
+  assertEq(rowid.code, sqlite.Mismatch)
+  assertEq(rowid.constraint, None)
+  ok(db.execute("insert into child (parent, n, c) values (1, 1, 1)"))
+  assertEq(err(db.execute("delete from parent")).constraint, Some(sqlite.ForeignKey))
+  // A failed statement changes nothing.
+  assertEq(ok(db.queryValue[long]("select count(*) from parent")), 1)
+
+@test("a transaction commits when its body answers Ok and rolls back when it answers Err")
+transactions()
+  val db = memory()
+  ok(db.execute("create table t (v int)"))
+  assertEq(ok(db.transaction(tx ->
+    assert(tx.inTransaction)
+    tx.execute("insert into t values (1)")?
+    tx.execute("insert into t values (2)")?
+    Ok("done")
+  )), "done")
+  assert(!db.inTransaction)
+  assertEq(ok(db.queryValue[long]("select count(*) from t")), 2)
+  val failed = err(db.transaction(tx ->
+    tx.execute("insert into t values (3)")?
+    tx.execute("insert into nowhere values (4)")?
+    Ok(())
+  ))
+  assert(failed.message.contains("nowhere"))
+  assert(!db.inTransaction)
+  assertEq(ok(db.queryValue[long]("select count(*) from t")), 2)
+  // An Err of the body's own rolls back too, and is answered as it was.
+  val own = gaveUp("the body gave up")
+  assertEq(err(db.transaction(tx ->
+    tx.execute("insert into t values (5)")?
+    Err(own)
+  )), own)
+  assertEq(ok(db.queryValue[long]("select count(*) from t")), 2)
+  // Each mode begins a transaction that works the same.
+  for mode in [sqlite.Deferred, sqlite.Immediate, sqlite.Exclusive]
+    ok(db.transaction(mode, tx -> tx.execute("insert into t values (6)")))
+  assertEq(ok(db.queryValue[long]("select count(*) from t where v = 6")), 3)
+
+@test("a transaction inside another is a savepoint: its rollback keeps the outer one's work")
+nestedTransactions()
+  val db = memory()
+  ok(db.execute("create table t (v int)"))
+  ok(db.transaction(outer ->
+    outer.execute("insert into t values (1)")?
+    val inner = outer.transaction(tx ->
+      tx.execute("insert into t values (2)")?
+      Err(gaveUp("inner fails"))
+    )
+    assert(inner.isErr)
+    assert(outer.inTransaction)
+    outer.transaction(tx -> tx.execute("insert into t values (3)"))?
+    outer.transaction(a -> a.transaction(b -> b.transaction(c -> c.execute("insert into t values (4)"))))?
+    Ok(())
+  ))
+  assertEq(ok(db.query("select v from t order by v")).map(r -> ok(r.get[long](0))), [1, 3, 4])
+  // The outer one's rollback undoes the inner ones it released.
+  assert(db.transaction(outer ->
+    outer.transaction(tx -> tx.execute("insert into t values (5)"))?
+    Err(gaveUp("outer fails"))
+  ).isErr)
+  assertEq(ok(db.queryValue[long]("select count(*) from t")), 3)
+  // A savepoint outside a transaction begins one.
+  assertEq(ok(db.savepoint(tx ->
+    assert(tx.inTransaction)
+    tx.execute("insert into t values (6)")
+  )).rows, 1)
+  assert(db.savepoint(tx ->
+    tx.execute("insert into t values (7)")?
+    Err(gaveUp("no"))
+  ).isErr)
+  assertEq(ok(db.queryValue[long]("select count(*) from t")), 4)
+  assert(!db.inTransaction)
+
+@test("a program's own BEGIN is seen by inTransaction, and a transaction inside it is a savepoint")
+ownBegin()
+  val db = memory()
+  ok(db.execute("create table t (v int)"))
+  ok(db.execute("begin"))
+  assert(db.inTransaction)
+  assert(db.transaction(tx ->
+    tx.execute("insert into t values (1)")?
+    Err(gaveUp("no"))
+  ).isErr)
+  ok(db.execute("insert into t values (2)"))
+  ok(db.execute("commit"))
+  assertEq(ok(db.queryValue[long]("select v from t")), 2)
+
+@test("a statement of the program's own runs many times with new parameters, and closes")
+ownStatements()
+  val db = memory()
+  ok(db.execute("create table t (id integer primary key, v text)"))
+  val insert = ok(db.prepare("insert into t (v) values (:v)"))
+  assertEq(insert.parameterCount, 1)
+  assert(!insert.isReadOnly)
+  for v in ["a", "b", "c"]
+    ok(insert.execute(v))
+  assertEq(ok(insert.execute({"v": "d"})).lastInsertRowid, 4)
+  val select = ok(db.prepare("select id, v from t where id > ? order by id"))
+  assert(select.isReadOnly)
+  assertEq(select.columnNames, ["id", "v"])
+  assertEq(select.sql, "select id, v from t where id > ? order by id")
+  assertEq(ok(select.query(2)).length, 2)
+  assertEq(ok(select.queryValue[long](3)), 4)
+  assertEq(ok(ok(select.queryOne(3)).get.get[string]("v")), "d")
+  assertEq(ok(select.queryOne(9)), None)
+  assertEq(ok(select.each([0], r -> ())), 4)
+  var again = ""
+  ok(select.each([0], r -> again = err(select.query(0)).message))
+  assert(again.contains("already running"), again)
+  assertEq(ok(select.query(0)).length, 4)
+  insert.close()
+  insert.close()
+  assert(insert.isClosed)
+  assert(err(insert.execute("e")).message.contains("statement is closed"))
+  assert(err(db.prepare("select 1; select 2")).message.contains("more than one"))
+
+@test("the statement cache keeps statements by their text, up to its size, and reuses them")
+statementCache()
+  val db = ok(sqlite.open(":memory:", OpenOptions(statementCacheSize = 2)))
+  for i in 0 ..< 10
+    ok(db.queryValue[long]("select ?", i))
+  assertEq(db.cachedStatements, 1)
+  assertEq(db.openStatements, 1)
+  ok(db.queryValue[long]("select 2"))
+  ok(db.queryValue[long]("select 3"))
+  assertEq(db.cachedStatements, 2)
+  assertEq(db.openStatements, 2)
+  // A statement that failed is given back and runs again.
+  assert(db.queryValue[long]("select ?", 1, 2).isErr)
+  assertEq(ok(db.queryValue[long]("select ?", 5)), 5)
+  val none = ok(sqlite.open(":memory:", OpenOptions(statementCacheSize = 0)))
+  for i in 0 ..< 10
+    ok(none.queryValue[long]("select ?", i))
+  assertEq(none.cachedStatements, 0)
+  assertEq(none.openStatements, 0)
+  assertEq(err(sqlite.open(":memory:", OpenOptions(statementCacheSize = -1))).code, sqlite.Misuse)
+
+@test("a closed connection refuses every use, and closing it again does nothing")
+closedConnection()
+  val db = memory()
+  ok(db.execute("create table t (v int)"))
+  val s = ok(db.prepare("select v from t"))
+  db.close()
+  db.close()
+  assert(db.isClosed && !db.inTransaction)
+  assertEq(db.openStatements, 0)
+  for e in [
+    err(db.execute("select 1")),
+    err(db.query("select 1")),
+    err(db.executeScript("select 1")),
+    err(db.prepare("select 1")),
+    err(db.transaction(tx -> Ok(()))),
+    err(s.query())
+  ]
+    assertEq(e.code, sqlite.Misuse)
+    assert(e.message.contains("closed"), e.message)
+
+@test("the open options: read-only, create, WAL, foreign keys and the busy timeout")
+openOptions()
+  val dir = fs.tempDir("avin-sqlite").ok.get
+  defer _ = dir.close()
+  val path = dir.path + "/a.db"
+  assertEq(err(sqlite.open(path, OpenOptions(readOnly = true))).code, sqlite.CantOpen)
+  assertEq(err(sqlite.open(path, OpenOptions(create = false))).code, sqlite.CantOpen)
+  val db = ok(sqlite.open(path))
+  assertEq(ok(db.queryValue[string]("pragma journal_mode")), "wal")
+  assertEq(ok(db.queryValue[long]("pragma foreign_keys")), 1)
+  assertEq(ok(db.queryValue[long]("pragma busy_timeout")), 5000)
+  ok(db.execute("create table t (v int)"))
+  db.close()
+  val reader = ok(sqlite.open(path, OpenOptions(readOnly = true)))
+  assertEq(ok(reader.queryValue[long]("select count(*) from t")), 0)
+  val refused = err(reader.execute("insert into t values (1)"))
+  assertEq(refused.code, sqlite.ReadOnly)
+  reader.close()
+  val plain = ok(
+    sqlite.open(dir.path + "/b.db", OpenOptions(wal = false, foreignKeys = false, busyTimeout = millis(250)))
+  )
+  assertEq(ok(plain.queryValue[string]("pragma journal_mode")), "delete")
+  assertEq(ok(plain.queryValue[long]("pragma foreign_keys")), 0)
+  assertEq(ok(plain.queryValue[long]("pragma busy_timeout")), 250)
+  plain.close()
+  assertEq(err(sqlite.open(path, OpenOptions(busyTimeout = millis(-1)))).code, sqlite.Misuse)
+  val shared = ok(sqlite.open("file:" + path + "?mode=ro", OpenOptions(uri = true)))
+  assertEq(err(shared.execute("insert into t values (1)")).code, sqlite.ReadOnly)
+  shared.close()
+  assertEq(err(sqlite.open(dir.path + "/missing/x.db")).code, sqlite.CantOpen)
+  fs.writeText(dir.path + "/junk.db", "this is not a database, but it is long enough to have a header").ok.get
+  assertEq(
+    err(ok(sqlite.open(dir.path + "/junk.db", OpenOptions(wal = false))).query("select * from sqlite_master")).code,
+    sqlite.NotADatabase
+  )
+  assert(sqlite.version().startsWith("3."))
+
+@test("SQLite's JSON functions, RETURNING and strict tables are there")
+features()
+  val db = memory()
+  assertEq(ok(db.queryValue[string]("select json_extract(?, '$.a[1]')", "{\"a\": [1, \"two\"]}")), "two")
+  assertEq(ok(db.queryValue[long]("select json_array_length(json(?))", "[1,2,3]")), 3)
+  ok(db.execute("create table t (id integer primary key, v text) strict"))
+  assertEq(ok(db.queryValue[long]("insert into t (v) values ('x') returning id")), 1)
+
+@test("a writer holding the database makes another wait out its busy timeout, then fail with Busy")
+busyTimeout()
+  val dir = fs.tempDir("avin-sqlite").ok.get
+  defer _ = dir.close()
+  val path = dir.path + "/busy.db"
+  val holder = ok(sqlite.open(path))
+  ok(holder.execute("create table t (v int)"))
+  ok(holder.execute("begin immediate"))
+  val impatient = ok(sqlite.open(path, OpenOptions(busyTimeout = millis(0))))
+  val busy = err(impatient.execute("insert into t values (1)"))
+  assertEq(busy.code, sqlite.Busy)
+  assert(busy.isBusy)
+  val patient = ok(sqlite.open(path, OpenOptions(busyTimeout = millis(200))))
+  val started = monotonic()
+  assert(err(patient.execute("insert into t values (1)")).isBusy)
+  assert(monotonic() - started >= millis(150))
+  // A writer that waits long enough gets in once the holder commits, on another thread.
+  val waiter = spawn(() ->
+    val c = ok(sqlite.open(path, OpenOptions(busyTimeout = seconds(10))))
+    val r = c.execute("insert into t values (2)").map(ch -> ch.rows)
+    c.close()
+    r
+  )
+  sleep(millis(100))
+  ok(holder.execute("insert into t values (1)"))
+  ok(holder.execute("commit"))
+  assertEq(waiter.join(), Ok(1))
+  assertEq(ok(holder.queryValue[long]("select count(*) from t")), 2)
+
+@test("writers on several threads, each with its own connection, all get their rows in")
+sqliteConcurrentWriters()
+  val dir = fs.tempDir("avin-sqlite").ok.get
+  defer _ = dir.close()
+  val path = dir.path + "/many.db"
+  val setup = ok(sqlite.open(path))
+  ok(setup.execute("create table t (writer int, n int)"))
+  val writers = Vector.tabulate(4, w -> spawn(() ->
+    val c = ok(sqlite.open(path, OpenOptions(busyTimeout = seconds(30))))
+    for n in 0 ..< 25
+      ok(c.transaction(sqlite.Immediate, tx -> tx.execute("insert into t values (?, ?)", w, n)))
+    c.close()
+    w
+  ))
+  assertEq(writers.map(t -> t.join()), [0, 1, 2, 3])
+  assertEq(ok(setup.queryValue[long]("select count(*) from t")), 100)
+  assertEq(ok(setup.queryValue[long]("select count(distinct writer) from t")), 4)
+
+@test("a pool of connections lends each to one thread at a time")
+pooledConnections()
+  val dir = fs.tempDir("avin-sqlite").ok.get
+  defer _ = dir.close()
+  val path = dir.path + "/pool.db"
+  val setup = ok(sqlite.open(path))
+  ok(setup.execute("create table t (v int)"))
+  val pool = Pool[Connection, SqliteError](
+    () -> sqlite.open(path, OpenOptions(busyTimeout = seconds(30))),
+    2,
+    destroy = Some(c -> c.close())
+  )
+  val users = Vector.tabulate(
+    6,
+    i -> spawn(() -> pool.use(c -> c.execute("insert into t values (?)", i).map(ch -> ch.rows)))
+  )
+  for u in users
+    assertEq(u.join(), Ok(Ok(1)))
+  pool.close()
+  assertEq(ok(setup.queryValue[long]("select sum(v) from t")), 15)
+
+@test("a thread waiting on a lock leaves its place: other threads run while it waits")
+waitingDoesNotStall()
+  val dir = fs.tempDir("avin-sqlite").ok.get
+  defer _ = dir.close()
+  val path = dir.path + "/stall.db"
+  val holder = ok(sqlite.open(path))
+  ok(holder.execute("create table t (v int)"))
+  ok(holder.execute("begin immediate"))
+  val waiters = Vector.tabulate(8, i -> spawn(() ->
+    val c = ok(sqlite.open(path, OpenOptions(busyTimeout = millis(400))))
+    val r = c.execute("insert into t values (1)").isErr
+    c.close()
+    r
+  ))
+  // With every waiter in its busy wait, a computation on another thread still finishes promptly.
+  val started = monotonic()
+  val sum = spawn(() ->
+    var s: long = 0
+    for i in 0 ..< 1000
+      s += long(i)
+    s
+  ).join()
+  assertEq(sum, 499500)
+  assert(monotonic() - started < millis(300))
+  for w in waiters
+    assert(w.join())
+  ok(holder.execute("rollback"))

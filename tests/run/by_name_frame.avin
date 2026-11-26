@@ -1,0 +1,176 @@
+// expect: exit 0
+// A delayed argument written at a call lives in the caller's frame for as long as the call runs,
+// and allocates nothing. One the callee keeps past the call, by capturing its parameter in a closure,
+// is copied to the heap first, so it still evaluates after the call has returned, its frame long
+// overwritten. Run under a collection at every allocation, what a delayed argument captures must
+// survive every collection the callee makes before it reads the parameter.
+
+import avin.log.Logger
+
+@sysl("avin.rt.allocated_bytes")
+allocatedBytes() -> long
+
+data Box
+  Box(label: string, size: int)
+
+twice(value: -> int) -> int = value + value
+
+never(value: -> int) -> int = 0
+
+many(n: int, value: -> int) -> int
+  var total = 0
+  for _ in 0 ..< n
+    total += value
+  total
+
+quiet(on: bool, message: -> string) -> int = if on then message.byteLength else 0
+
+// Allocates before each read, so a collection runs while the delayed argument is still to be read.
+churned(value: -> string) -> string
+  var junk = ""
+  for i in 0 ..< 50
+    junk = junk + s"$i"
+  val first = value
+  for i in 0 ..< 50
+    junk = junk + s"$i"
+  first + "|" + value + "|" + s"${junk.byteLength}"
+
+untilLimit(limit: int, step: -> unit, current: -> int) -> int
+  var steps = 0
+  while current < limit
+    step
+    steps += 1
+  steps
+
+forwarded(value: -> int) -> int = twice(value)
+
+forwardedTwice(value: -> int) -> int = forwarded(value) + forwarded(value)
+
+// A delayed argument capturing a by-name parameter.
+nested(value: -> int) -> int = twice(value + 1)
+
+// The parameter kept past the call, by a lambda and by a local function made a value.
+later(value: -> int) -> () -> int = () -> value * 10
+
+laterLocal(value: -> string) -> () -> string
+  shown() -> string = "<" + value + ">"
+  shown
+
+laterNested(value: -> int) -> () -> int = later(value + 1)
+
+kept(value: -> int) -> Vector[() -> int] = [() -> value, () -> value + 100]
+
+// Recursion, each frame passing a delayed argument of its own, and one passing its parameter on.
+depth(n: int, value: -> int) -> int = if n == 0 then value else 1 + depth(n - 1, value + n)
+
+down(n: int, value: -> int) -> int = if n == 0 then value else 1 + down(n - 1, value)
+
+pair[T](value: -> T) -> (T, T) = (value, value)
+
+trait Sink
+  put(line: -> string) -> int
+
+class Quiet(val base: int): Sink
+  override put(line: -> string) -> int = base
+
+class Loud(val base: int): Sink
+  override put(line: -> string) -> int = base + line.byteLength
+
+sent(s: Sink, n: int) -> int = s.put(s"line $n")
+
+// Calls passed delayed arguments that capture, `n` times over.
+calls(n: int, k: int, word: string, loud: Loud, logger: Logger) -> int
+  var sum = 0
+  for i in 0 ..< n
+    sum += quiet(false, s"message $i $word")
+    sum += twice(i + k)
+    sum += forwarded(i * 2)
+    sum += loud.put(word)
+    logger.debug(s"request $i $word", [("i", i), ("word", word)])
+  sum
+
+// Overwrites the stack where an earlier call's frame was.
+clobber(n: int) -> int = if n == 0 then 0 else n + clobber(n - 1)
+
+main() -> int
+  var count = 0
+  next() -> int
+    count += 1
+    count
+  println(s"never ${never(next())} after $count")
+  count = 0
+  println(s"twice ${twice(next())} after $count")
+  count = 0
+  println(s"many ${many(5, next())} after $count")
+  count = 0
+  println(s"many none ${many(0, next())} after $count")
+
+  val k = 7
+  val word = "abc"
+  val box = Box("b", 3)
+  println(twice(k * 2))
+  println(twice(word.byteLength + box.size))
+  println(churned(word + s"$k"))
+  println(churned(s"${box.label}${box.size}"))
+
+  // A captured `var` is shared: each read sees what the other delayed argument changed.
+  var n = 0
+  println(s"steps ${untilLimit(5, n += 1, n)} n $n")
+
+  println(forwarded(k + 1))
+  count = 0
+  println(s"forwardedTwice ${forwardedTwice(next())} after $count")
+  println(nested(k))
+
+  count = 0
+  val f = later(next() + k)
+  println(s"later made, after $count")
+  println(clobber(50))
+  println(s"${f()} ${f()} after $count")
+  val g = laterLocal(word + "!")
+  println(clobber(50))
+  println(g())
+  val h = laterNested(k)
+  println(clobber(50))
+  println(h())
+  val fs = kept(k * 3)
+  println(clobber(50))
+  val first = fs(0)
+  val second = fs(1)
+  println(s"${first()} ${second()}")
+
+  println(depth(20, k))
+  println(down(30, k * 2))
+
+  val ints = pair(k + 1)
+  println(s"${ints.0} ${ints.1}")
+  val words = pair(word + "?")
+  println(words.0 + words.1)
+  val boxes = pair(Box(word, k))
+  println(s"${boxes.0.label} ${boxes.1.size}")
+
+  println(sent(Quiet(1), 2) + sent(Loud(1), 3))
+
+  val doubled: (-> int) -> int = v -> v + v
+  println(doubled(k + 2))
+  val delayedLater: (-> int) -> () -> int = v -> () -> v + 1
+  val d = delayedLater(k * 4)
+  println(clobber(50))
+  println(d())
+
+  // A delayed argument passed and never read, or read, allocates nothing for its closure.
+  val loud = Loud(0)
+  val logger = Logger()
+  // The first round makes what the library makes once.
+  println(s"sum ${calls(1, k, word, loud, logger)}")
+  val before = allocatedBytes()
+  val sum = calls(1000, k, word, loud, logger)
+  val allocated = allocatedBytes() - before
+  println(s"sum $sum")
+  println(s"delayed arguments allocate $allocated bytes")
+  // One kept past the call is copied to the heap.
+  val heapBefore = allocatedBytes()
+  val keptOne = later(k + 5)
+  println(s"one kept allocates ${allocatedBytes() - heapBefore > 0}")
+  println(keptOne())
+  0

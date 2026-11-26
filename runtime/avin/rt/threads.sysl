@@ -148,34 +148,46 @@ context_set(ctx: *Context, request: *u8)
  * thread a foreign callback attached is. */
 on_main_thread() -> bool = current_context == &main_context || on_main_scheduler()
 
-// Taken by the first thread that stops the program and never given back, so a thread that traps while
-// another is already stopping it waits for the end instead of reporting a second time.
+// Raised by the first thread that stops the program and never lowered, so a thread that traps while
+// another is already stopping it waits for the end instead of reporting a second time. Asking whether
+// it is raised changes nothing, so no thread's question can make another lose its claim.
+private var stop_begun: Atomic[u32] = Atomic(0)
+
+// What a thread that is not stopping the program waits on until the process ends: the first such
+// thread takes it and then waits for itself, and every other waits for that one.
 private var stopping: SleepLock = SleepLock.new()
+
+/** Claims `begun` for the calling thread, answering whether it is the first to. */
+claims_first(begun: *Atomic[u32]) -> bool = begun.cas(0, 1) == 0
+
+/** Whether some thread has claimed `begun`; asking takes nothing, so it never makes a claim fail. */
+claimed(begun: *Atomic[u32]) -> bool = begun.load() != 0
+
+/** Claims the stopping of the program, answering whether this thread is the first to. */
+private claim_stop() -> bool = claims_first(&stop_begun)
+
+/** Waits until the process ends. */
+private wait_forever() -> never
+    loop
+        stopping.lock()
 
 /** Begins stopping the program from `ctx`'s thread. The first thread to call it returns, and goes on
  * to flush and report; any other is marked safe and waits until the process ends. */
 begin_stop(ctx: *Context)
-    if in_exit_hook(ctx) || stopping.try_lock() then return
+    if in_exit_hook(ctx) || claim_stop() then return
     enter_safe(ctx)
-    loop
-        stopping.lock()
+    wait_forever()
 
 /** Whether a thread has begun stopping the program. */
-stopping_now() -> bool
-    if stopping.try_lock()
-        stopping.unlock()
-        return false
-    true
+stopping_now() -> bool = claimed(&stop_begun)
 
 /** Waits, safe for the collector, until the program another thread is stopping has ended. */
 wait_for_end(ctx: *Context) -> never
     enter_safe(ctx)
-    loop
-        stopping.lock()
+    wait_forever()
 
 /** Begins stopping the program from a thread with no context, as `begin_stop` does: the first
  * thread to stop it returns, and any other waits until the process ends. */
 begin_stop_foreign()
-    if stopping.try_lock() then return
-    loop
-        stopping.lock()
+    if claim_stop() then return
+    wait_forever()

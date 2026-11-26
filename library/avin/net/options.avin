@@ -1,0 +1,123 @@
+module avin.net
+
+// The options of a TCP socket: how a connection sends small writes, whether it probes a peer that
+// has gone quiet, how much the system buffers for it, and how a listener shares its port and queues
+// the connections it has not yet accepted. A connection takes its options from `TcpStream.connect` or
+// from its listener, and changes them through its own methods afterwards; each method reads its
+// option back from the system, so what it answers is what the socket has, not what was asked.
+
+import avin.time.{Duration, seconds}
+
+// When an idle connection is probed (`SO_KEEPALIVE`), so one whose peer vanished without a word, a
+// machine switched off or a cable pulled, fails rather than being held for ever: the first probe goes
+// after `idle` with nothing received, the next every `interval` after it, and `count` probes with no
+// answer end the connection, its next read or write failing. The system keeps each duration in whole
+// seconds, a part of one counting as one. A duration of zero or less, or a `count` less than one,
+// traps where the options are used; a value past the platform's own limit is its `Err`.
+data KeepAlive(idle: Duration = seconds(60), interval: Duration = seconds(10), count: int = 6)
+
+// The options of one TCP connection. `noDelay` sends each write at once (`TCP_NODELAY`) rather than
+// holding a small one back to join the next, which is what a request and its answer want; `keepAlive`
+// probes the connection while it is idle, `None` never; `sendBuffer` and `receiveBuffer` ask the
+// system for buffers of that many bytes, zero leaving the system's own. The system may give a buffer
+// of another size than asked, which the connection's `sendBuffer()` and `receiveBuffer()` say. A
+// negative buffer size traps where the options are used.
+data TcpOptions(
+    noDelay: bool = false,
+    keepAlive: Option[KeepAlive] = None,
+    sendBuffer: int = 0,
+    receiveBuffer: int = 0
+)
+
+// The options of a TCP listener. `backlog` is how many connections the system queues for it before
+// they are accepted, the platform lowering a larger number to its own limit; `reuseAddress` lets it
+// take a port a listener stopped a moment ago still holds (`SO_REUSEADDR`), so a server restarts at
+// once; `reusePort` lets several listeners, in this program or others, bind the same address and
+// port (`SO_REUSEPORT`), each of them setting it, and the system share the connections among them.
+// Each connection it accepts is given `connections`, and `connections`' buffer sizes are set on the
+// listener too, before it listens, so they hold from a connection's first byte. A `backlog` less
+// than one traps.
+data ListenOptions(
+    backlog: int = 128,
+    reuseAddress: bool = true,
+    reusePort: bool = false,
+    connections: TcpOptions = TcpOptions()
+)
+
+// Stops the program where `k` is not one a socket can be given.
+private checkKeepAlive(k: KeepAlive)
+  if k.idle.micros <= 0 then fail(s"a keep-alive idle time of ${k.idle}: it is more than zero")
+  if k.interval.micros <= 0 then fail(s"a keep-alive interval of ${k.interval}: it is more than zero")
+  if k.count < 1 then fail(s"a keep-alive of ${k.count} probes: it sends at least one")
+
+// Stops the program where a buffer of `bytes` is asked for.
+private checkBuffer(which: string, bytes: int)
+  if bytes < 0 then fail(s"a $which buffer of $bytes bytes: it is at least zero")
+
+// Stops the program where `o` holds a value no socket can be given.
+private checkTcpOptions(o: TcpOptions)
+  o.keepAlive match
+    Some(k) -> checkKeepAlive(k)
+    None -> ()
+  checkBuffer("send", o.sendBuffer)
+  checkBuffer("receive", o.receiveBuffer)
+
+// Stops the program where `o` holds a value no listener can be given.
+private checkListenOptions(o: ListenOptions)
+  if o.backlog < 1 then fail(s"a backlog of ${o.backlog} connections: it is at least one")
+  checkTcpOptions(o.connections)
+
+// Whether `o` asks for nothing a new connection does not already have, so nothing need be set.
+private isPlain(o: TcpOptions) -> bool =
+  !o.noDelay && o.keepAlive.isEmpty && o.sendBuffer == 0 && o.receiveBuffer == 0
+
+// A duration as the whole seconds a socket keeps, a part of one counting as one.
+private secondsOf(d: Duration) -> int
+  val whole = d.micros / 1000000
+  val s = if d.micros % 1000000 > 0 then whole + 1 else whole
+  if s > long(int.MaxValue) then int.MaxValue else int(s)
+
+// Probes `s` while idle as `k` says, or stops probing it for `None`.
+private keepAliveOn(s: Socket, k: Option[KeepAlive]) -> Result[unit, SyslError] = k match
+  None -> s.setKeepalive(false)
+  Some(asked) ->
+    s.setKeepalive(true)?
+    s.setKeepaliveIdle(secondsOf(asked.idle))?
+    s.setKeepaliveInterval(secondsOf(asked.interval))?
+    s.setKeepaliveCount(asked.count)
+
+// How `s` is probed while idle, `None` where it is not.
+private keepAliveOf(s: Socket) -> Result[Option[KeepAlive], SyslError]
+  if !s.keepalive()? then return Ok(None)
+  val idle = s.keepaliveIdle()?
+  val interval = s.keepaliveInterval()?
+  Ok(Some(KeepAlive(seconds(long(idle)), seconds(long(interval)), s.keepaliveCount()?)))
+
+// Gives `s` the options `o`, already checked: each of `noDelay` and `keepAlive` as it says, and each
+// buffer size that is not zero.
+private configured(s: Socket, o: TcpOptions) -> Result[unit, SyslError]
+  if o.sendBuffer > 0 then s.setSendBuffer(o.sendBuffer)?
+  if o.receiveBuffer > 0 then s.setRecvBuffer(o.receiveBuffer)?
+  s.setNoDelay(o.noDelay)?
+  keepAliveOn(s, o.keepAlive)
+
+// `s` given the options `o`, already checked, or the error that gave where it closes `s`.
+private optioned(s: Socket, o: TcpOptions) -> Result[Socket, SyslError]
+  if isPlain(o) then return Ok(s)
+  configured(s, o) match
+    Ok(_) -> Ok(s)
+    Err(e) ->
+      s.close()
+      Err(e)
+
+// Gives the listening socket `s` the options of `o`, already checked, that must be set before it
+// binds `to`, binds it and listens, without blocking.
+private listening(s: ListenSocket, to: Address, o: ListenOptions) -> Result[unit, SyslError]
+  s.reuseAddress(o.reuseAddress)?
+  // Set only where asked for, so a platform without it fails only the listeners that need it.
+  if o.reusePort then s.setReusePort(true)?
+  if o.connections.sendBuffer > 0 then s.setSendBuffer(o.connections.sendBuffer)?
+  if o.connections.receiveBuffer > 0 then s.setRecvBuffer(o.connections.receiveBuffer)?
+  s.bind(to)?
+  s.listen(o.backlog)?
+  nonBlocking(s)

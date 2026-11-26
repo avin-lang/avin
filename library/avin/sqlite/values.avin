@@ -1,0 +1,195 @@
+module avin.sqlite
+
+// ---- Values ----
+
+// A value SQLite holds: one of its five storage classes. The class belongs to the value, not to the
+// column, so two rows of one column may hold values of different classes.
+@sysl("avin.sqlite.Value")
+data SqlValue
+  SqlNull
+  SqlInteger(value: long)
+  SqlReal(value: real)
+  SqlText(value: string)
+  SqlBlob(value: Vector[byte])
+
+// The storage class's name, as SQL's `typeof` writes it.
+private kindOf(v: SqlValue) -> string = v match
+  SqlNull -> "null"
+  SqlInteger(_) -> "integer"
+  SqlReal(_) -> "real"
+  SqlText(_) -> "text"
+  SqlBlob(_) -> "blob"
+
+// ---- Reading values as the program's types ----
+
+// A type a column's value can be read as. `fromSql` answers `None` where the value is not one of the
+// type's: NULL for any type but an `Option`, or a value of another class.
+trait FromSql
+  static fromSql(v: SqlValue) -> Option[Self]
+
+impl FromSql for SqlValue
+  static fromSql(v: SqlValue) -> Option[SqlValue] = Some(v)
+
+// SQLite has no boolean: `true` is stored as 1 and `false` as 0, and only those two read as one.
+impl FromSql for bool
+  static fromSql(v: SqlValue) -> Option[bool] = v match
+    SqlInteger(0) -> Some(false)
+    SqlInteger(1) -> Some(true)
+    _ -> None
+
+impl FromSql for int
+  static fromSql(v: SqlValue) -> Option[int] = v match
+    SqlInteger(n) -> if long(int.MinValue) <= n <= long(int.MaxValue) then Some(int(n)) else None
+    _ -> None
+
+impl FromSql for long
+  static fromSql(v: SqlValue) -> Option[long] = v match
+    SqlInteger(n) -> Some(n)
+    _ -> None
+
+// A real reads as itself, and an integer as the real of the same value where a real holds it
+// exactly: a `REAL` column stores a whole number given to it as an integer.
+impl FromSql for real
+  static fromSql(v: SqlValue) -> Option[real] = v match
+    SqlReal(x) -> Some(x)
+    SqlInteger(n) -> if -9007199254740992 <= n <= 9007199254740992 then Some(real(n)) else None
+    _ -> None
+
+impl FromSql for string
+  static fromSql(v: SqlValue) -> Option[string] = v match
+    SqlText(s) -> Some(s)
+    _ -> None
+
+impl FromSql for Vector[byte]
+  static fromSql(v: SqlValue) -> Option[Vector[byte]] = v match
+    SqlBlob(b) -> Some(b)
+    _ -> None
+
+// NULL reads as `None`, and any other value as `Some` of it read as `T`.
+impl[T: FromSql] FromSql for Option[T]
+  static fromSql(v: SqlValue) -> Option[Option[T]] = v match
+    SqlNull -> Some(None)
+    _ -> T.fromSql(v).map(x -> Some(x))
+
+// ---- Making parameters of the program's values ----
+
+// A value that can be a statement's parameter. A parameter is `Sendable`, so a statement's
+// parameters can be handed to a pooled connection's thread.
+trait ToSql: Sendable
+  toSql -> SqlValue
+
+impl ToSql for SqlValue
+  toSql -> SqlValue = self
+
+// `true` is 1 and `false` 0, as SQLite stores them.
+impl ToSql for bool
+  toSql -> SqlValue = SqlInteger(if self then 1 else 0)
+
+impl ToSql for int
+  toSql -> SqlValue = SqlInteger(long(self))
+
+impl ToSql for long
+  toSql -> SqlValue = SqlInteger(self)
+
+impl ToSql for real
+  toSql -> SqlValue = SqlReal(self)
+
+impl ToSql for string
+  toSql -> SqlValue = SqlText(self)
+
+impl ToSql for Vector[byte]
+  toSql -> SqlValue = SqlBlob(self)
+
+// `None` is NULL; `Some(v)` is `v`.
+impl[T: ToSql] ToSql for Option[T]
+  toSql -> SqlValue = self match
+    Some(v) -> v.toSql
+    None -> SqlNull
+
+// ---- Rows ----
+
+// A row of a result: the names of its columns and their values. A row is plain data, so it can be
+// handed to another thread, or given back from a pooled connection's body.
+data Row(columns: Vector[string], values: Vector[SqlValue])
+
+impl Row
+  // The number of columns.
+  length -> int = values.length
+
+  // The names of the columns, in order.
+  names -> Vector[string] = columns
+
+  // The index of the first column named `name`, or `None`.
+  indexOf(name: string) -> Option[int]
+    var i = 0
+    while i < columns.length
+      if columns(i) == name then return Some(i)
+      i += 1
+    None
+
+  // The value of the column at `index`, counting from 0, read as `T`.
+  get[T: FromSql](index: int) -> Result[T, SqliteError]
+    if index < 0 || index >= values.length then return Err(
+      badColumn(s"#$index", s"the row has ${values.length} columns")
+    )
+    readAs[T](columns(index), values(index))
+
+  // The value of the column named `name`, read as `T`; where several columns have the name, the
+  // first.
+  get[T: FromSql](name: string) -> Result[T, SqliteError] = indexOf(name) match
+    Some(i) -> readAs[T](columns(i), values(i))
+    None -> Err(badColumn(name, "the result has no such column"))
+
+  // The row as a `T`, each of its fields read from the column of its name.
+  decode[T: FromRow]() -> Result[T, SqliteError] = T.fromRow(self)
+
+// `v`, the value of `column`, read as `T`.
+private readAs[T: FromSql](column: string, v: SqlValue) -> Result[T, SqliteError] = T.fromSql(v) match
+  Some(t) -> Ok(t)
+  None ->
+    if v == SqlNull then Err(badColumn(column, "it is NULL; read it as an Option"))
+    else Err(badColumn(column, s"it holds ${kindOf(v)}, which is not the type asked for"))
+
+// A type a row can be read as. `derive FromRow` reads each field from the column named after it, or
+// the name its `@SqlColumn` gives; a field whose column is absent takes its default where it has one.
+trait FromRow
+  static fromRow(row: Row) -> Result[Self, SqliteError]
+
+// The column a field is read from, where it is not the field's own name:
+// `@SqlColumn("created_at") created: long`.
+data SqlColumn(name: string)
+
+impl Annotation for SqlColumn
+
+derive FromRow for T
+  static fromRow(row: Row) -> Result[T, SqliteError] = T.build(RowReader(row))
+
+// Supplies a derived type's fields from a row: each field whose column the row has, in the field's
+// order.
+private class RowReader(val row: Row)
+  var cursor = 0
+
+private columnOf(f: FieldShape) -> string = f.annotation[SqlColumn]() match
+  Some(c) -> c.name
+  None -> f.name
+
+impl ShapeBuilder[SqliteError] for RowReader
+  variant(t: TypeShape) -> Result[int, SqliteError] =
+    if t.variantCount == 1 then Ok(0) else Err(
+      badColumn(t.name, "a type of several variants cannot be read from a row")
+    )
+
+  next(v: VariantShape) -> Result[Option[int], SqliteError]
+    while cursor < v.fieldCount
+      val f = v.fields(cursor)
+      cursor += 1
+      if row.indexOf(columnOf(f)).isDefined then return Ok(Some(f.index))
+    Ok(None)
+
+  duplicate(f: FieldShape) -> SqliteError = badColumn(columnOf(f), "the column is read twice")
+
+impl RowReader
+  field[F: FromSql](f: FieldShape) -> Result[F, SqliteError] = row.get[F](columnOf(f))
+
+  missing[F: FromSql](f: FieldShape) -> Result[F, SqliteError] =
+    Err(badColumn(columnOf(f), "the result has no such column"))

@@ -1,0 +1,589 @@
+// `avin.resilience`, on time of the tests' own: a clock that reads what the test set and a pause that
+// moves it on, so nothing sleeps. The retry policy's backoff, capped, constant and from zero; its
+// jitter, full, part and none, drawn from a given source; retrying until `Ok`, until the last attempt,
+// past errors `retryable` accepts and not others, within `maxElapsed` and the calling code's deadline;
+// a policy shared by many threads. The circuit breaker through every state and every change, its
+// trial calls, errors that are not failures, outcomes from a state it has left, calls cancelled, the
+// listener, `reset` and `trip`, and many threads at once. The general rate limiter, keyed and not,
+// waiting for a token and refusing to wait past a deadline.
+import avin.resilience
+
+import avin.resilience.{
+  BreakerOpen, BreakerState, CallFailed, CircuitBreaker, Clock, Pause, RateLimiter, RetryPolicy, Uniform, retry
+}
+
+import avin.threads.{Atomic, Mutex, scope, sleep, withDeadline}
+import avin.time.{Duration, hours, micros, millis, now, seconds}
+
+// Time of a test's own: `clock` reads it, and `pause` moves it on by the wait and records the wait.
+private class FakeTime(): Sendable
+  private val at = Atomic(long(0))
+  private val waited = Mutex[Vector[Duration]]([])
+  clock -> Clock = () -> Duration(at.load())
+  pause -> Pause = d ->
+    _ = at.add(d.micros)
+    _ = waited.update(w -> w :+ d)
+  advance(d: Duration) = _ = at.add(d.micros)
+  waits -> Vector[Duration] = waited.get()
+  millisWaited -> Vector[long] = waits.map(d -> d.micros / 1000)
+
+// Draws `values` in turn, from the first again after the last, counting the draws.
+private class Draws(values: Vector[real]): Sendable
+  private val next = Atomic(0)
+  draw -> Uniform = () ->
+    val i = next.add(1) - 1
+    values(i % values.length)
+  count -> int = next.load()
+
+// The error the tests' work fails with: `transient` says whether waiting may help.
+private data Fault(code: int, transient: bool = true)
+
+// Work failing with `Fault(1)`, `Fault(2)`, … for its first `failures` calls, then answering the
+// number of the call, counting its calls.
+private class Flaky(failures: int)
+  val calls = Atomic(0)
+  run() -> Result[int, Fault]
+    val n = calls.add(1)
+    if n <= failures then Err(Fault(n)) else Ok(n)
+
+// A policy with no jitter on time `t`, its waits exactly the backoff.
+private exact(t: FakeTime, attempts: int = 5, maxElapsed: Option[Duration] = None) -> RetryPolicy =
+  RetryPolicy(attempts, millis(100), seconds(1), 2.0, 0.0, maxElapsed, t.clock, t.pause)
+
+@test("a policy's defaults: three attempts, 100ms doubling to at most 10s, full jitter, no elapsed bound")
+policyDefaults()
+  val p = RetryPolicy()
+  assertEq(p.maxAttempts, 3)
+  assertEq(p.initialDelay, millis(100))
+  assertEq(p.maxDelay, seconds(10))
+  assertEq(p.multiplier, 2.0)
+  assertEq(p.jitter, 1.0)
+  assertEq(p.maxElapsed, None)
+
+@test("the backoff grows by the multiplier from the initial delay and stops at the maximum")
+backoffGrows()
+  val p = RetryPolicy(10, millis(100), seconds(1), 2.0)
+  assertEq((1 .. 6).map(n -> p.backoff(n).micros / 1000).toVector, [100, 200, 400, 800, 1000, 1000])
+  assertEq(p.backoff(int.MaxValue), seconds(1))
+  val triple = RetryPolicy(initialDelay = micros(1), maxDelay = hours(1), multiplier = 3.0)
+  assertEq((1 .. 5).map(n -> triple.backoff(n).micros).toVector, [1, 3, 9, 27, 81])
+  assertEq(
+    RetryPolicy(initialDelay = millis(10), maxDelay = millis(25), multiplier = 1.5).backoff(3),
+    millis(22) + micros(500)
+  )
+
+@test("a multiplier of one keeps the delay; an initial delay of zero, or one equal to the maximum, stays put")
+backoffConstant()
+  val flat = RetryPolicy(initialDelay = millis(250), multiplier = 1.0)
+  for n in [1, 2, 17, int.MaxValue]
+    assertEq(flat.backoff(n), millis(250))
+  val zero = RetryPolicy(initialDelay = micros(0), maxDelay = micros(0))
+  for n in [1, 2, int.MaxValue]
+    assertEq(zero.backoff(n), micros(0))
+  val zeroUp = RetryPolicy(initialDelay = micros(0))
+  assertEq(zeroUp.backoff(40), micros(0))
+  val pinned = RetryPolicy(initialDelay = seconds(2), maxDelay = seconds(2), multiplier = 7.0)
+  for n in [1, 2, 3, int.MaxValue]
+    assertEq(pinned.backoff(n), seconds(2))
+  val huge = RetryPolicy(initialDelay = micros(long.MaxValue), maxDelay = micros(long.MaxValue))
+  assertEq(huge.backoff(5), micros(long.MaxValue))
+
+@test("full jitter takes the draw's share of the backoff off, from none of it to nearly all")
+fullJitter()
+  val d = Draws([0.0, 0.25, 0.5, 0.75, 0.999999])
+  val p = RetryPolicy(initialDelay = millis(400), multiplier = 1.0, random = d.draw)
+  assertEq((1 .. 5).map(n -> p.delay(n).micros).toVector, [400000, 300000, 200000, 100000, 1])
+  assertEq(d.count, 5)
+
+@test("part jitter takes off at most its part; no jitter draws nothing and waits the backoff")
+partJitter()
+  val d = Draws([0.0, 0.5, 0.999999])
+  val half = RetryPolicy(initialDelay = millis(400), multiplier = 1.0, jitter = 0.5, random = d.draw)
+  assertEq((1 .. 3).map(n -> half.delay(n).micros).toVector, [400000, 300000, 200001])
+  val none = Draws([0.5])
+  val exactly = RetryPolicy(initialDelay = millis(400), jitter = 0.0, random = none.draw)
+  assertEq(exactly.delay(1), millis(400))
+  assertEq(exactly.delay(2), millis(800))
+  assertEq(none.count, 0)
+
+@test("a wait stays from zero to the backoff, even with a draw out of range, and a zero backoff draws nothing")
+jitterBounds()
+  val wild = Draws([-1.0, 2.0, 1.0])
+  val p = RetryPolicy(initialDelay = millis(10), multiplier = 1.0, random = wild.draw)
+  assertEq([p.delay(1), p.delay(1), p.delay(1)], [millis(10), micros(0), micros(0)])
+  val d = Draws([0.5])
+  val zero = RetryPolicy(initialDelay = micros(0), random = d.draw)
+  assertEq(zero.delay(1), micros(0))
+  assertEq(d.count, 0)
+
+@test("work answering Ok the first time runs once, with no wait")
+firstTimeOk()
+  val t = FakeTime()
+  val work = Flaky(0)
+  assertEq(retry(exact(t), () -> work.run()), Ok(1))
+  assertEq(work.calls.load(), 1)
+  assertEq(t.waits, [])
+
+@test("work failing for a while is run again after each backoff until it answers Ok")
+untilOk()
+  val t = FakeTime()
+  val work = Flaky(3)
+  assertEq(retry(exact(t), () -> work.run()), Ok(4))
+  assertEq(t.millisWaited, [100, 200, 400])
+
+@test("work failing every time is run maxAttempts times, and the last error is the answer")
+lastAttempt()
+  for attempts in [1, 2, 5]
+    val t = FakeTime()
+    val work = Flaky(100)
+    assertEq(retry(exact(t, attempts), () -> work.run()), Err(Fault(attempts)))
+    assertEq(work.calls.load(), attempts)
+    assertEq(t.waits.length, attempts - 1)
+  val t = FakeTime()
+  val just = Flaky(4)
+  assertEq(retry(exact(t, 5), () -> just.run()), Ok(5))
+
+@test("only an error retryable accepts is retried: another is the answer at once")
+retryablePredicate()
+  val t = FakeTime()
+  var calls = 0
+  val r = retry(exact(t), (f: Fault) -> f.transient, () ->
+    calls += 1
+    if calls < 3 then Err(Fault(calls)) else Err(Fault(calls, transient = false)))
+  assertEq(r, Err(Fault(3, false)))
+  assertEq(calls, 3)
+  assertEq(t.millisWaited, [100, 200])
+  val never = FakeTime()
+  val work = Flaky(5)
+  assertEq(retry(exact(never), (_: Fault) -> false, () -> work.run()), Err(Fault(1)))
+  assertEq(never.waits, [])
+
+@test("retry(policy, …) and policy.run(…) are the same loop")
+runIsRetry()
+  val a = FakeTime()
+  val b = FakeTime()
+  val wa = Flaky(2)
+  val wb = Flaky(2)
+  assertEq(retry(exact(a), () -> wa.run()), exact(b).run(() -> wb.run()))
+  assertEq(a.waits, b.waits)
+  val c = FakeTime()
+  val wc = Flaky(9)
+  assertEq(exact(c).run((f: Fault) -> f.code < 2, () -> wc.run()), Err(Fault(2)))
+
+@test("a retry whose wait would end past maxElapsed is not made, one ending at it is")
+maxElapsedBound()
+  val t = FakeTime()
+  val work = Flaky(10)
+  assertEq(retry(exact(t, 10, Some(millis(350))), () -> work.run()), Err(Fault(3)))
+  assertEq(t.millisWaited, [100, 200])
+  val edge = FakeTime()
+  val w2 = Flaky(10)
+  assertEq(retry(exact(edge, 10, Some(millis(700))), () -> w2.run()), Err(Fault(4)))
+  assertEq(edge.millisWaited, [100, 200, 400])
+  val none = FakeTime()
+  val w3 = Flaky(10)
+  assertEq(retry(exact(none, 10, Some(micros(0))), () -> w3.run()), Err(Fault(1)))
+
+@test("maxElapsed counts the time the work itself takes, from the first attempt's start")
+maxElapsedCountsWork()
+  val t = FakeTime()
+  val p = exact(t, 10, Some(seconds(1)))
+  var calls = 0
+  val r = retry(p, () ->
+    calls += 1
+    t.advance(millis(300))
+    Err(Fault(calls)))
+  // 300ms of work, 100 waited, 300 more, 200 waited: 900ms. The next wait, 400, would end at 1.6s.
+  assertEq(r, Err(Fault(3)))
+  assertEq(t.millisWaited, [100, 200])
+
+@test("under a deadline a retry is made while its wait ends before it, and not once it would not")
+deadlineAware()
+  val t = FakeTime()
+  val work = Flaky(3)
+  val far = withDeadline(now() + hours(1), _ -> retry(exact(t), () -> work.run()))
+  assertEq(far, Ok(Ok(4)))
+  val near = FakeTime()
+  val stuck = Flaky(10)
+  val slow = RetryPolicy(5, hours(2), hours(2), 1.0, 0.0, None, near.clock, near.pause)
+  val r = withDeadline(now() + hours(1), _ -> retry(slow, () -> stuck.run()))
+  assertEq(r, Ok(Err(Fault(1))))
+  assertEq(near.waits, [])
+  assertEq(stuck.calls.load(), 1)
+
+@test("the deadline cuts the backoff short at the first wait that would reach it")
+deadlineMidway()
+  val t = FakeTime()
+  val work = Flaky(10)
+  val p = RetryPolicy(10, minutesOf(10), hours(10), 2.0, 0.0, None, t.clock, t.pause)
+  // The deadline runs on the real clock, which the test's pauses do not move, so each wait is
+  // measured against the 75 minutes: 10, 20 and 40 are made, and 80 is not.
+  val r = withDeadline(now() + minutesOf(75), _ -> retry(p, () -> work.run()))
+  assertEq(r, Ok(Err(Fault(4))))
+  assertEq(t.millisWaited, [600000, 1200000, 2400000])
+
+private minutesOf(n: long) -> Duration = seconds(n * 60)
+
+@test("the real pause and the shared draw: zero delays retry at once")
+realDefaults()
+  val work = Flaky(4)
+  assertEq(retry(RetryPolicy(maxAttempts = 5, initialDelay = micros(0)), () -> work.run()), Ok(5))
+  val jittered = RetryPolicy(initialDelay = millis(8))
+  for _ in 0 ..< 200
+    val d = jittered.delay(1)
+    assert(micros(0) <= d <= millis(8))
+
+@test("results of any type: unit, a string error, nested results, many attempts allocating")
+retryGenerics()
+  val t = FakeTime()
+  var n = 0
+  assertEq(retry(exact(t), () ->
+    n += 1
+    if n < 2 then Err("busy") else Ok(())), Ok(()))
+  val nested: Result[Result[int, string], string] = retry(exact(FakeTime()), () -> Ok(Err("inner")))
+  assertEq(nested, Ok(Err("inner")))
+  val many = RetryPolicy(500, micros(0), micros(0), 1.0, 0.0, None, t.clock, t.pause)
+  var seen = Vector.empty[string]()
+  val r = retry(many, () ->
+    seen = seen :+ s"attempt ${seen.length}"
+    if seen.length < 400 then Err(seen.last) else Ok(seen.length))
+  assertEq(r, Ok(400))
+  assertEq(seen(399), "attempt 399")
+
+@test("one policy shared by many threads retries each one's work on its own")
+sharedPolicy()
+  val t = FakeTime()
+  val p = RetryPolicy(4, millis(1), millis(1), 1.0, 0.0, None, t.clock, t.pause)
+  val total = Atomic(0)
+  scope(s ->
+    for i in 0 ..< 16
+      s.spawn(() ->
+        val work = Flaky(i % 4)
+        retry(p, () -> work.run()) match
+          Ok(k) -> _ = total.add(k)
+          Err(_) -> ()))
+  assertEq(total.load(), 4 * (1 + 2 + 3 + 4))
+  assertEq(t.waits.length, 4 * (0 + 1 + 2 + 3))
+
+// A breaker on time `t`, recording every change of state into `changes`.
+private class Watched(t: FakeTime, threshold: int = 3, openFor: Duration = seconds(10), trials: int = 1)
+  val changes = Mutex[Vector[string]]([])
+  val breaker: CircuitBreaker = CircuitBreaker(threshold, openFor, trials, t.clock, recorder(changes))
+  seen -> Vector[string] = changes.get()
+
+private recorder(changes: Mutex[Vector[string]]) -> resilience.BreakerListener = (a, b) ->
+  _ = changes.update(v -> v :+ s"$a>$b")
+
+private ok(b: CircuitBreaker) -> string = shown(b.call(() -> Ok[string, Fault]("fine")))
+private failing(b: CircuitBreaker, code: int = 1) -> string = shown(b.call(() -> Err[string, Fault](Fault(code))))
+
+private shown[E](r: Result[string, resilience.BreakerError[E]]) -> string = r match
+  Ok(v) -> v
+  Err(BreakerOpen(wait)) -> s"open $wait"
+  Err(CallFailed(_)) -> "failed"
+
+@test("a breaker's defaults: five failures, open for 30s, one trial call, closed to begin with")
+breakerDefaults()
+  val b = CircuitBreaker()
+  assertEq([b.failureThreshold, b.trialCalls], [5, 1])
+  assertEq(b.openFor, seconds(30))
+  assertEq(b.state, BreakerState.Closed)
+  assertEq(b.failures, 0)
+
+@test("closed, every call is made; failures in a row are counted and a success clears them")
+closedCounts()
+  val t = FakeTime()
+  val w = Watched(t)
+  val b = w.breaker
+  assertEq([ok(b), failing(b), failing(b)], ["fine", "failed", "failed"])
+  assertEq(b.failures, 2)
+  assertEq(ok(b), "fine")
+  assertEq(b.failures, 0)
+  assertEq([failing(b), failing(b), ok(b), failing(b), failing(b)], ["failed", "failed", "fine", "failed", "failed"])
+  assertEq(b.state, BreakerState.Closed)
+  assertEq(w.seen, [])
+
+@test("the threshold's failure in a row opens it; open, no call is made and the wait left is told")
+opens()
+  val t = FakeTime()
+  val w = Watched(t)
+  val b = w.breaker
+  for _ in 0 ..< 3 do _ = failing(b)
+  assertEq(b.state, BreakerState.Open)
+  assertEq(b.failures, 0)
+  var made = 0
+  val r = b.call(() ->
+    made += 1
+    Ok[int, Fault](1))
+  assertEq(r, Err(BreakerOpen(seconds(10))))
+  assertEq(made, 0)
+  t.advance(millis(9999))
+  assertEq(ok(b), "open 1ms")
+  assertEq(b.state, BreakerState.Open)
+  assertEq(w.seen, ["Closed>Open"])
+
+@test("a threshold of one opens at the first failure")
+thresholdOne()
+  val t = FakeTime()
+  val w = Watched(t, threshold = 1)
+  assertEq(failing(w.breaker), "failed")
+  assertEq(w.breaker.state, BreakerState.Open)
+
+@test("once openFor has passed it is half open, and a trial call that succeeds closes it")
+halfOpenCloses()
+  val t = FakeTime()
+  val w = Watched(t, threshold = 1)
+  val b = w.breaker
+  _ = failing(b)
+  t.advance(seconds(10))
+  assertEq(b.state, BreakerState.HalfOpen)
+  assertEq(ok(b), "fine")
+  assertEq(b.state, BreakerState.Closed)
+  assertEq(w.seen, ["Closed>Open", "Open>HalfOpen", "HalfOpen>Closed"])
+  assertEq(failing(b), "failed")
+  assertEq(b.state, BreakerState.Open)
+
+@test("a call arriving after openFor is let through as the trial, with no look at the state first")
+trialWithoutLook()
+  val t = FakeTime()
+  val w = Watched(t, threshold = 1)
+  _ = failing(w.breaker)
+  t.advance(seconds(11))
+  assertEq(ok(w.breaker), "fine")
+  assertEq(w.seen, ["Closed>Open", "Open>HalfOpen", "HalfOpen>Closed"])
+
+@test("a trial call that fails opens it again, for openFor from the failure")
+halfOpenReopens()
+  val t = FakeTime()
+  val w = Watched(t, threshold = 2)
+  val b = w.breaker
+  _ = failing(b)
+  _ = failing(b)
+  t.advance(seconds(10))
+  val r = b.call(() ->
+    t.advance(seconds(4))
+    Err[string, Fault](Fault(7)))
+  assertEq(r, Err(CallFailed(Fault(7))))
+  assertEq(b.state, BreakerState.Open)
+  assertEq(ok(b), "open 10s")
+  t.advance(seconds(10))
+  assertEq(b.state, BreakerState.HalfOpen)
+  assertEq(w.seen, ["Closed>Open", "Open>HalfOpen", "HalfOpen>Open", "Open>HalfOpen"])
+
+@test("half open, trialCalls calls are let through at once and the next is refused with no wait to tell")
+trialPlaces()
+  val t = FakeTime()
+  val w = Watched(t, threshold = 1, trials = 2)
+  val b = w.breaker
+  _ = failing(b)
+  t.advance(seconds(10))
+  var inner = ""
+  var innermost = ""
+  val r = b.call(() ->
+    inner = shown(b.call(() ->
+      innermost = ok(b)
+      Ok[string, Fault]("second")))
+    Ok[string, Fault]("first"))
+  assertEq([shown(r), inner, innermost], ["first", "second", "open 0s"])
+  assertEq(b.state, BreakerState.Closed)
+  assertEq(w.seen, ["Closed>Open", "Open>HalfOpen", "HalfOpen>Closed"])
+
+@test("half open with several trial calls, it closes only once that many have succeeded")
+trialsToClose()
+  val t = FakeTime()
+  val w = Watched(t, threshold = 1, trials = 3)
+  val b = w.breaker
+  _ = failing(b)
+  t.advance(seconds(10))
+  assertEq([ok(b), ok(b)], ["fine", "fine"])
+  assertEq(b.state, BreakerState.HalfOpen)
+  assertEq(ok(b), "fine")
+  assertEq(b.state, BreakerState.Closed)
+  _ = failing(b)
+  t.advance(seconds(10))
+  assertEq([ok(b), ok(b), failing(b)], ["fine", "fine", "failed"])
+  assertEq(b.state, BreakerState.Open)
+
+@test("an error isFailure does not accept counts as a success, and is still the call's error")
+notAFailure()
+  val t = FakeTime()
+  val w = Watched(t, threshold = 2)
+  val b = w.breaker
+  val notFound = (f: Fault) -> f.code != 404
+  _ = failing(b)
+  assertEq(b.call(notFound, () -> Err[string, Fault](Fault(404))), Err(CallFailed(Fault(404))))
+  assertEq(b.failures, 0)
+  _ = failing(b)
+  assertEq(b.call(notFound, () -> Err[string, Fault](Fault(500))), Err(CallFailed(Fault(500))))
+  assertEq(b.state, BreakerState.Open)
+  t.advance(seconds(10))
+  assertEq(b.call(notFound, () -> Err[string, Fault](Fault(404))), Err(CallFailed(Fault(404))))
+  assertEq(b.state, BreakerState.Closed)
+
+@test("an outcome from a state the breaker has left counts neither way")
+staleOutcome()
+  val t = FakeTime()
+  val w = Watched(t, threshold = 1)
+  val b = w.breaker
+  // A call begun closed succeeds after the breaker was tripped: it stays open.
+  assertEq(b.call(() ->
+    b.trip()
+    Ok[string, Fault]("late")), Ok("late"))
+  assertEq(b.state, BreakerState.Open)
+  // A call begun closed fails after a reset: the new closed state counts nothing.
+  b.reset()
+  val r = b.call(() ->
+    b.reset()
+    Err[string, Fault](Fault(1)))
+  assertEq(r, Err(CallFailed(Fault(1))))
+  assertEq(b.state, BreakerState.Closed)
+  assertEq(b.failures, 0)
+  // A trial call failing after the breaker was reset leaves it closed.
+  _ = failing(b)
+  t.advance(seconds(10))
+  _ = b.call(() ->
+    b.reset()
+    Err[string, Fault](Fault(2)))
+  assertEq(b.state, BreakerState.Closed)
+  assertEq(b.failures, 0)
+
+@test("a trial call cancelled by a deadline frees its place, and counts neither way")
+cancelledTrial()
+  val t = FakeTime()
+  val w = Watched(t, threshold = 1)
+  val b = w.breaker
+  _ = failing(b)
+  t.advance(seconds(10))
+  val r = withDeadline(now() + millis(20), _ -> b.call(() ->
+    sleep(hours(1))
+    Ok[string, Fault]("never")))
+  assert(r.isErr)
+  assertEq(b.state, BreakerState.HalfOpen)
+  assertEq(ok(b), "fine")
+  assertEq(b.state, BreakerState.Closed)
+
+@test("reset closes and trip opens from any state, the listener told of each change and of nothing else")
+resetAndTrip()
+  val t = FakeTime()
+  val w = Watched(t)
+  val b = w.breaker
+  b.trip()
+  assertEq(ok(b), "open 10s")
+  t.advance(seconds(3))
+  b.trip()
+  assertEq(ok(b), "open 10s")
+  b.reset()
+  assertEq(ok(b), "fine")
+  b.reset()
+  _ = failing(b)
+  b.reset()
+  assertEq(b.failures, 0)
+  b.trip()
+  t.advance(seconds(10))
+  assertEq(b.state, BreakerState.HalfOpen)
+  b.trip()
+  assertEq(w.seen, ["Closed>Open", "Open>Closed", "Closed>Open", "Open>HalfOpen", "HalfOpen>Open"])
+
+@test("an openFor of zero half opens it at once")
+openForZero()
+  val t = FakeTime()
+  val w = Watched(t, threshold = 1, openFor = micros(0))
+  _ = failing(w.breaker)
+  assertEq(w.breaker.state, BreakerState.HalfOpen)
+  assertEq(ok(w.breaker), "fine")
+  assertEq(w.seen, ["Closed>Open", "Open>HalfOpen", "HalfOpen>Closed"])
+
+@test("a breaker's errors name themselves, a failed call's with its error as the cause")
+breakerErrors()
+  val open: resilience.BreakerError[Fault] = BreakerOpen(seconds(3))
+  val failed: resilience.BreakerError[Fault] = CallFailed(Fault(5))
+  assertEq(s"$open", "the circuit breaker is open")
+  assertEq(s"$failed", "the call failed: Fault(5, true)")
+  assertEq(
+    [s"${BreakerState.Closed}", s"${BreakerState.Open}", s"${BreakerState.HalfOpen}"],
+    ["Closed", "Open", "HalfOpen"]
+  )
+  val down: resilience.BreakerError[Down] = CallFailed(Down("db"))
+  val shut: resilience.BreakerError[Down] = BreakerOpen(seconds(1))
+  assertEq([down.message, shut.message], ["the call failed", "the circuit breaker is open"])
+  assertEq(down.cause.map(c -> c.message), Some("db is down"))
+  assert(shut.cause.isEmpty)
+  assertEq(s"$down", "the call failed: db is down")
+
+// An error with a message of its own, for a breaker's error to name as its cause.
+private data Down(host: string)
+
+impl Error for Down
+  message -> string = s"$host is down"
+
+@test("many threads at once: every success made, the threshold's failures opening it exactly once")
+breakerThreads()
+  val t = FakeTime()
+  val w = Watched(t, threshold = 50)
+  val b = w.breaker
+  val made = Atomic(0)
+  scope(s ->
+    for _ in 0 ..< 8
+      s.spawn(() ->
+        for _ in 0 ..< 100
+          if ok(b) == "fine" then _ = made.add(1)
+        ()))
+  assertEq(made.load(), 800)
+  scope(s ->
+    for _ in 0 ..< 8
+      s.spawn(() ->
+        for _ in 0 ..< 20 do _ = failing(b)
+        ()))
+  assertEq(b.state, BreakerState.Open)
+  assertEq(w.seen, ["Closed>Open"])
+
+@test("the general limiter: a burst at once, then a token each interval, keys apart and `\"\"` alone")
+limiterAdmits()
+  val t = FakeTime()
+  val l = RateLimiter(2, seconds(1), burst = 3, clock = t.clock, pause = t.pause)
+  assertEq([l.admit("a"), l.admit("a"), l.admit("a")], [Ok(()), Ok(()), Ok(())])
+  assertEq(l.admit("a"), Err(millis(500)))
+  assertEq(l.admit("b"), Ok(()))
+  assertEq(l.admit(), Ok(()))
+  assertEq(l.admit(""), Ok(()))
+  assertEq(l.size, 3)
+  t.advance(millis(500))
+  assertEq([l.admit("a"), l.admit("a")], [Ok(()), Err(millis(500))])
+  assertEq([l.rate, l.burst, l.maxKeys], [2, 3, 10000])
+
+@test("acquire waits for the next token with the pause, and takes it")
+limiterAcquireWaits()
+  val t = FakeTime()
+  val l = RateLimiter(1, seconds(2), clock = t.clock, pause = t.pause)
+  assert(l.acquire("k"))
+  assert(l.acquire("k"))
+  assert(l.acquire("k"))
+  assertEq(t.millisWaited, [2000, 2000])
+  assert(l.acquire())
+  assertEq(t.waits.length, 2)
+
+@test("under a deadline acquire answers false at once where the token would come no sooner")
+limiterAcquireDeadline()
+  val t = FakeTime()
+  val l = RateLimiter(1, hours(2), clock = t.clock, pause = t.pause)
+  assert(l.acquire())
+  assertEq(withDeadline(now() + hours(1), _ -> l.acquire()), Ok(false))
+  assertEq(t.waits, [])
+  val soon = RateLimiter(1, seconds(1), clock = t.clock, pause = t.pause)
+  assert(soon.acquire())
+  assertEq(withDeadline(now() + hours(1), _ -> soon.acquire()), Ok(true))
+  assertEq(t.millisWaited, [1000])
+
+@test("the general limiter holds at most maxKeys buckets, forgetting the full ones first")
+limiterKeys()
+  val t = FakeTime()
+  val l = RateLimiter(1, seconds(1), burst = 2, maxKeys = 2, clock = t.clock)
+  _ = l.admit("a")
+  _ = l.admit("b")
+  assertEq(l.size, 2)
+  t.advance(seconds(5))
+  _ = l.admit("c")
+  assertEq(l.size, 1)
+  _ = l.admit("d")
+  _ = l.admit("e")
+  assertEq(l.size, 2)

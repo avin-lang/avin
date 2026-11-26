@@ -1,0 +1,77 @@
+// expect: exit 0
+// A URL whose host is written beyond ASCII reaches the server by its ASCII form: the client looks up,
+// connects to, sends as `Host:` and, over TLS, names and verifies the certificate against the name
+// `idna.toAscii` gives. `ｌｏｃａｌｈｏｓｔ` in fullwidth letters is `localhost`, which the test
+// certificate names. A redirect to such a URL is followed the same way. Then names are processed in
+// a loop, with the collector running, and checked each time.
+import avin.fs
+import avin.io.IoError
+import avin.net.Url
+import avin.net.http
+import avin.net.http.{HttpError, Request, Response, ServerRequest}
+import avin.net.idna
+import avin.net.tls.{TlsClient, TlsServer}
+
+ok[T](r: Result[T, IoError]) -> T = r match
+  Ok(v) -> v
+  Err(e) -> fail(s"unexpected error: ${e.message}")
+
+fetched[T](r: Result[T, HttpError]) -> T = r match
+  Ok(v) -> v
+  Err(e) -> fail(s"unexpected error: ${e.message}")
+
+// A test certificate or key, from the repository root or from `compiler/`.
+fixture(name: string) -> string
+  val here = "tests/fixtures/tls/" + name
+  ok(fs.readText(if fs.exists(here) then here else "../" + here))
+
+val Fullwidth: string = "\u{ff4c}\u{ff4f}\u{ff43}\u{ff41}\u{ff4c}\u{ff48}\u{ff4f}\u{ff53}\u{ff54}"
+
+handle(r: ServerRequest) -> Response = Response.text(200, s"Host: ${r.header("Host").getOrElse("none")}")
+
+main()
+  val server = ok(http.serve("127.0.0.1", 0, handle))
+  val port = server.port().toString()
+  val shown = (text: string) -> text.replace(port, "PORT")
+  val url = s"http://$Fullwidth:$port/hello"
+  println(shown(s"${Url(url)}"))
+  println(shown(Url(url).unicodeText))
+  println(shown(fetched(http.send(Request("GET", url))).text))
+
+  // A redirect to a host beyond ASCII.
+  val redirecting = ok(http.serve("127.0.0.1", 0, r -> Response.empty(302).withHeader("Location", url)))
+  println(shown(fetched(http.send(Request("GET", s"http://127.0.0.1:${redirecting.port()}/"))).text))
+
+  // Over TLS: the certificate for `localhost` is verified against the ASCII name.
+  val identity = TlsServer.of(fixture("localhost.pem"), fixture("localhost.key")) match
+    Ok(s) -> s
+    Err(e) -> fail(e.message)
+  val secure = ok(http.serve("127.0.0.1", 0, handle, tls = Some(identity)))
+  val securePort = secure.port().toString()
+  val trusting = TlsClient().trust(fixture("ca.pem"))
+  val answer = fetched(http.send(Request("GET", s"https://$Fullwidth:$securePort/").withTls(trusting)))
+  println(answer.text.replace(securePort, "PORT"))
+
+  // A host that is not a valid name is refused before any connection.
+  println(Url.parse(s"http://a\u{fffd}b:$port/").isErr)
+
+  // Names processed again and again while the collector runs.
+  val names = [
+    "B\u{fc}cher.example",
+    "\u{65e5}\u{672c}.\u{440}\u{444}",
+    "fa\u{df}.de",
+    "\u{5d0}\u{5d1}.example",
+    "a\u{ad}b.c"
+  ]
+  var agreed = 0
+  for k in 0 ..< 3000
+    val name = names(k % names.length)
+    val ascii = idna.toAscii(name).getOrElse("!")
+    val back = idna.toUnicode(ascii).getOrElse("?")
+    val again = idna.toAscii(back).getOrElse("?")
+    val parsed = Url(s"http://$name:$k/p").host.getOrElse("-")
+    if again == ascii && parsed == ascii && ascii.chars.forall(c -> int(c) < 0x80) then agreed += 1
+  println(s"$agreed of 3000 names agreed")
+  server.stop()
+  redirecting.stop()
+  secure.stop()

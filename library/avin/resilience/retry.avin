@@ -1,0 +1,115 @@
+module avin.resilience
+
+// Running work again when it fails for a reason that may pass: a dropped connection, a server busy
+// for a moment. Each retry waits longer than the one before, by exponential backoff, and the wait is
+// spread at random, so that many callers that failed together do not all come back together. Retrying
+// stops at the policy's last attempt, at an error that is not worth retrying, and before a wait that
+// would end past the deadline the calling code runs under.
+
+import avin.math.pow
+import avin.threads.{Context, sleep}
+import avin.time.{Duration, micros, millis, monotonic, seconds}
+
+// How work is retried. At most `maxAttempts` attempts are made, the first included. The wait before
+// retry `n` (the first retry is `1`) is the backoff `initialDelay × multiplierⁿ⁻¹`, at most `maxDelay`,
+// less a random part of it: `jitter` says how much may be taken off, `1.0` (the default) any of it, so
+// a wait falls anywhere from zero to the backoff, `0.5` up to half, and `0.0` none, every wait the
+// backoff exactly. Where `maxElapsed` is given, a retry whose wait would end more than that long after
+// the first attempt began is not made.
+//
+// A `maxAttempts` below one, a negative `initialDelay`, a `maxDelay` shorter than `initialDelay`, a
+// `multiplier` below one or not finite, a `jitter` outside zero to one and a negative `maxElapsed`
+// trap. The time is read from `clock`, a wait is made with `pause`, and the random part is drawn from
+// `random`, all three given only to drive a policy on time of one's own, as a test does.
+//
+//     val policy = RetryPolicy(maxAttempts = 5, initialDelay = millis(50))
+//     val reply = retry(policy, e -> e.isTransient, () -> fetch(url))
+class RetryPolicy(
+    val maxAttempts: int = 3,
+    val initialDelay: Duration = millis(100),
+    val maxDelay: Duration = seconds(10),
+    val multiplier: real = 2.0,
+    val jitter: real = 1.0,
+    val maxElapsed: Option[Duration] = None,
+    private val clock: Clock = monotonic,
+    private val pause: Pause = sleep,
+    private val random: Uniform = uniform
+): Sendable
+  if maxAttempts < 1 then fail(s"a retry policy of $maxAttempts attempts: it makes at least one")
+  if initialDelay.isNegative then fail(s"a retry policy's initial delay of $initialDelay: it is not negative")
+  if maxDelay < initialDelay then fail(
+    s"a retry policy's maximum delay of $maxDelay: it is at least the initial delay, $initialDelay"
+  )
+  if !(multiplier.isFinite && multiplier >= 1.0) then fail(
+    s"a retry policy's multiplier of $multiplier: it is a finite number at least one"
+  )
+  if !(0.0 <= jitter <= 1.0) then fail(s"a retry policy's jitter of $jitter: it is from zero to one")
+  maxElapsed match
+    Some(m) -> if m.isNegative then fail(s"a retry policy's maximum elapsed time of $m: it is not negative")
+    None -> ()
+
+  // The backoff before retry `n`, the first retry being `1`, before any of it is taken off at random:
+  // `initialDelay × multiplierⁿ⁻¹`, at most `maxDelay`. An `n` below one traps.
+  backoff(n: int) -> Duration
+    if n < 1 then fail(s"retry $n: retries are counted from one")
+    val cap = real(maxDelay.micros)
+    val grown = real(initialDelay.micros) * pow(multiplier, real(n - 1))
+    if grown >= cap then maxDelay else micros(long(grown))
+
+  // The wait before retry `n`: its backoff, less the part of it `jitter` lets a draw take off.
+  delay(n: int) -> Duration
+    val b = backoff(n).micros
+    if jitter == 0.0 || b == 0 then return micros(b)
+    val off = long(real(b) * jitter * random())
+    micros(if off <= 0 then b elif off >= b then 0 else b - off)
+
+  // Runs `body`, and again after each `Err` until it answers `Ok` or the policy stops, and answers its
+  // last result. See `retry`.
+  run[T, E](body: () -> Result[T, E]) -> Result[T, E] = run(_ -> true, body)
+
+  // Runs `body`, and again after each `Err` that `retryable` accepts, until the policy stops, and
+  // answers its last result. See `retry`.
+  run[T, E](retryable: (E) -> bool, body: () -> Result[T, E]) -> Result[T, E]
+    val start = clock()
+    var result = body()
+    var n = 1
+    while n < maxAttempts && worthRetrying(result, retryable)
+      val wait = delay(n)
+      if !inTime(start, wait) then return result
+      pause(wait)
+      n += 1
+      result = body()
+    result
+
+  // Whether a wait of `wait` from now ends within `maxElapsed` of `start` and before the deadline the
+  // calling code runs under, which a retry needs time left after.
+  private inTime(start: Duration, wait: Duration) -> bool
+    val withinElapsed = maxElapsed match
+      Some(m) -> clock() - start + wait <= m
+      None -> true
+    withinElapsed && Context.current().remaining().forall(left -> wait < left)
+
+// Whether `result` failed with an error `retryable` accepts.
+private worthRetrying[T, E](result: Result[T, E], retryable: (E) -> bool) -> bool = result match
+  Ok(_) -> false
+  Err(e) -> retryable(e)
+
+// Runs `body` under `policy`: again after each `Err`, waiting the policy's delay before each retry,
+// until it answers `Ok`, the policy's last attempt is made, or the next wait would end past the
+// policy's `maxElapsed` or the deadline the calling code runs under (`withDeadline`). It answers the
+// last result `body` gave. The first attempt is always made; a retry is made only where some time
+// would be left for it before the deadline. A cancellation, the deadline passing among them, ends a
+// wait as it ends any other.
+//
+//     retry(RetryPolicy(maxAttempts = 4), () -> connect(address))
+retry[T, E](policy: RetryPolicy, body: () -> Result[T, E]) -> Result[T, E] = policy.run(body)
+
+// `retry` that retries only an `Err` that `retryable` accepts, answering any other at once: an
+// error that will not pass by waiting, a refused password or a malformed request, is not retried.
+//
+//     retry(policy, e -> e.status >= 500, () -> client.get(url))
+retry[T, E](
+    policy: RetryPolicy,
+    retryable: (E) -> bool,
+    body: () -> Result[T, E]
+) -> Result[T, E] = policy.run(retryable, body)

@@ -1,0 +1,247 @@
+// expect: exit 0
+// A `Client` going by a proxy written here: an `http` URL asked of the proxy with the whole URL as
+// its target and the proxy's credentials, percent-encoded in the proxy URL, sent as
+// `Proxy-Authorization`; an `https` URL through a `CONNECT` tunnel, the TLS handshake made with the
+// server through it, the proxy seeing no request inside it; connections through the proxy kept and
+// used again, apart from those made directly to a host `noProxy` names; a proxy wanting credentials
+// it was not given or refusing those it was, `407` as the answer for `http` and `ProxyRefused` for
+// `https`; a proxy that never answers the `CONNECT` within the connect timeout, one sending bytes after
+// opening the tunnel, one that is not there, and proxy URLs the client cannot use.
+import avin.encoding.toBase64
+import avin.fs
+import avin.io.{IoError, TimedOut}
+import avin.net.{StreamReader, StreamWriter, TcpServer, TcpStream}
+import avin.net.http
+import avin.net.http.{Client, HttpError, Io, Proxy, ProxyRefused, Request, Response, ServerRequest}
+import avin.net.tls.{TlsClient, TlsServer}
+import avin.threads.{Mutex, spawn}
+import avin.time.millis
+
+ok[T](r: Result[T, IoError]) -> T = r match
+  Ok(v) -> v
+  Err(e) -> fail(e.message)
+
+// A test certificate or key, from the repository root or from `compiler/`.
+fixture(name: string) -> string
+  val here = "tests/fixtures/tls/" + name
+  ok(fs.readText(if fs.exists(here) then here else "../" + here))
+
+identity() -> TlsServer = TlsServer.of(fixture("localhost.pem"), fixture("localhost.key")) match
+  Ok(s) -> s
+  Err(e) -> fail(e.message)
+
+trusting() -> TlsClient = TlsClient().trust(fixture("ca.pem"))
+
+// A request's head and body as a proxy reads them: its request line, its headers, its body; `None`
+// where the connection ends first.
+readRequest(s: TcpStream) -> Option[(string, Vector[(string, string)], Array[byte])]
+  val line = s.readLine() match
+    Ok(Some(l)) -> l
+    _ -> return None
+  val headers = Buffer[(string, string)]()
+  var length = 0
+  while true
+    val h = s.readLine() match
+      Ok(Some(l)) -> l
+      _ -> return None
+    if h.isEmpty then break
+    val colon = h.indexOf(':')
+    val name = h.slice(0, colon)
+    val value = h.slice(colon + 1, h.byteLength).trim
+    if name.equalsIgnoreCase("Content-Length") then length = value.toInt()
+    headers.addOne((name, value))
+  val body = Buffer[byte]()
+  while body.length < length
+    val part = s.read(length - body.length) match
+      Ok(p) -> p
+      Err(_) -> return None
+    if part.length == 0 then return None
+    for b in part
+      body.addOne(b)
+  Some((line, headers.toVector, body.toArray()))
+
+headerOf(headers: Vector[(string, string)], name: string) -> Option[string]
+  for (n, v) in headers
+    if n.equalsIgnoreCase(name) then return Some(v)
+  None
+
+// Whether a header belongs to one hop, the proxy's, and is not passed on.
+isHop(name: string) -> bool =
+  ["Proxy-Authorization", "Proxy-Connection", "Connection", "Content-Length", "Transfer-Encoding", "Host"].exists(n ->
+    n.equalsIgnoreCase(name)
+  )
+
+// What a proxy does with each request on a connection: `wanted`, where it is given, is the
+// `Proxy-Authorization` it asks for, answering any other `407`; each request is written to `log`.
+proxyServe(s: TcpStream, wanted: Option[string], log: Mutex[Vector[string]])
+  while true
+    val (line, headers, body) = readRequest(s) match
+      Some(r) -> r
+      None -> return
+    val auth = headerOf(headers, "Proxy-Authorization")
+    val host = headerOf(headers, "Host").getOrElse("-")
+    _ = log.update(v -> v :+ s"$line | auth ${auth.getOrElse("-")} | host $host")
+    val connect = line.startsWith("CONNECT ")
+    if wanted.isDefined && auth != wanted
+      _ = s.writeText(
+        "HTTP/1.1 407 Proxy Authentication Required\r\nProxy-Authenticate: Basic realm=\"test\"\r\nContent-Length: 0\r\n\r\n"
+      )
+      if connect then return
+      continue
+    val target = line.split(' ')(1)
+    if connect
+      val colon = target.lastIndexOf(':')
+      val far = TcpStream.connect(target.slice(0, colon), target.slice(colon + 1, target.byteLength).toInt()) match
+        Ok(t) -> t
+        Err(_) ->
+          _ = s.writeText("HTTP/1.1 502 Bad Gateway\r\nContent-Length: 0\r\n\r\n")
+          return
+      _ = s.writeText("HTTP/1.1 200 Connection Established\r\n\r\n")
+      relay(s, far)
+      return
+    forward(s, line.split(' ')(0), target, headers, body)
+
+// The request forwarded to the URL `target` names, its redirects not followed, and the answer
+// written back on `s`.
+forward(s: TcpStream, method: string, target: string, headers: Vector[(string, string)], body: Array[byte])
+  val passed = Buffer[(string, string)]()
+  for (n, v) in headers
+    if !isHop(n) then passed.addOne((n, v))
+  Client(maxRedirects = 0, keepAlive = false).send(Request(method, target, passed.toVector, body)) match
+    Ok(r) ->
+      var out = s"HTTP/1.1 ${r.status} ${r.reason}\r\n"
+      for (n, v) in r.headers
+        if !isHop(n) then out += s"$n: $v\r\n"
+      out += s"Content-Length: ${r.body.length}\r\n\r\n"
+      _ = s.writeText(out)
+      _ = s.write(r.body)
+    Err(e) ->
+      val text = e.message
+      _ = s.writeText(s"HTTP/1.1 502 Bad Gateway\r\nContent-Length: ${text.byteLength}\r\n\r\n$text")
+
+// Bytes copied both ways between `a` and `b` until either end closes.
+relay(a: TcpStream, b: TcpStream)
+  val (ar, aw) = a.split()
+  val (br, bw) = b.split()
+  val up = spawn(() -> pump(ar, bw))
+  pump(br, aw)
+  up.join()
+
+pump(r: StreamReader, w: StreamWriter)
+  while true
+    val part = r.read(16384) match
+      Ok(p) -> p
+      Err(_) -> break
+    if part.length == 0 || w.write(part).isErr then break
+  _ = r.close()
+  _ = w.close()
+
+// A proxy on its own port, wanting `wanted`, logging to `log`.
+proxyOn(wanted: Option[string], log: Mutex[Vector[string]]) -> TcpServer =
+  ok(TcpServer.start("127.0.0.1", 0, (s, _) -> proxyServe(s, wanted, log), maxConnections = 16))
+
+// The log's lines since the last call, the ports in them written as names, and the log emptied.
+drained(log: Mutex[Vector[string]], names: Vector[(int, string)]) -> string
+  val lines = log.with(v -> v)
+  _ = log.update(_ -> Vector.empty[string]())
+  if lines.isEmpty then return "  (the proxy saw nothing)"
+  var text = lines.mkString("\n  ")
+  for (port, name) in names
+    text = text.replace(port.toString(), name)
+  "  " + text
+
+describe(r: Result[Response, HttpError]) -> string = r match
+  Ok(res) -> if res.text.isEmpty then s"${res.status}" else s"${res.status} ${res.text}"
+  Err(ProxyRefused(status, reason)) -> s"refused: $status $reason"
+  Err(Io(IoError(TimedOut, _, _))) -> "timed out"
+  Err(e) -> s"error: ${e.message}"
+
+// What a request asked, as the server saw it.
+handle(r: ServerRequest) -> Response =
+  Response.text(200, s"${r.method} ${r.target} [${r.text}] auth ${r.header("Proxy-Authorization").getOrElse("-")}")
+
+main()
+  val plain = ok(http.serve("127.0.0.1", 0, handle))
+  val direct = ok(http.serve("127.0.0.1", 0, handle))
+  val secure = ok(http.serve("127.0.0.1", 0, handle, tls = Some(identity())))
+  val log = Mutex(Vector.empty[string]())
+  val open = proxyOn(None, log)
+  val credentials = "Basic " + toBase64("us@r:pa:ss é")
+  val guarded = proxyOn(Some(credentials), log)
+  val names = [
+    (plain.port(), "PLAIN"),
+    (direct.port(), "DIRECT"),
+    (secure.port(), "SECURE"),
+    (open.port(), "OPEN"),
+    (guarded.port(), "GUARDED")
+  ]
+  val show = (label: string, r: Result[Response, HttpError]) ->
+    var text = describe(r)
+    for (port, name) in names
+      text = text.replace(port.toString(), name)
+    println(s"$label: $text")
+    println(drained(log, names))
+
+  // Plain `http` by the proxy: the whole URL as the target, the connection kept for the next request
+  // and for another origin's apart; a host `noProxy` names reached directly.
+  val viaOpen = Client(proxy = Proxy.to(s"http://127.0.0.1:${open.port()}", s"localhost:${direct.port()}"))
+  show("http by proxy", viaOpen.get(s"http://127.0.0.1:${plain.port()}/a?q=1"))
+  show("again", viaOpen.get(s"http://127.0.0.1:${plain.port()}/b"))
+  println(s"connections: ${viaOpen.stats().opened} opened, ${viaOpen.stats().reused} reused")
+  show("another origin", viaOpen.get(s"http://localhost:${plain.port()}/c"))
+  show("no proxy", viaOpen.get(s"http://localhost:${direct.port()}/d"))
+  println(s"connections: ${viaOpen.stats().opened} opened")
+  show("a POST", viaOpen.send(Request("POST", s"http://127.0.0.1:${plain.port()}/post").withBody("data")))
+
+  // `https` through a tunnel: the proxy sees only the `CONNECT`, and the tunnel is kept.
+  show("https by tunnel", viaOpen.send(Request("GET", s"https://localhost:${secure.port()}/s").withTls(trusting())))
+  show("again", viaOpen.send(Request("GET", s"https://localhost:${secure.port()}/t").withTls(trusting())))
+  println(s"connections: ${viaOpen.stats().opened} opened")
+  viaOpen.close()
+
+  // A proxy wanting credentials: given in the proxy URL, percent-encoded, sent on every `http`
+  // request and on the `CONNECT`; missing or wrong, `407` for `http` and refused for `https`.
+  val user = Client(proxy = Proxy.to(s"us%40r:pa:ss%20%C3%A9@127.0.0.1:${guarded.port()}"))
+  show("credentials, http", user.get(s"http://127.0.0.1:${plain.port()}/x"))
+  show("credentials, https", user.send(Request("GET", s"https://localhost:${secure.port()}/y").withTls(trusting())))
+  show(
+    "the request's own",
+    user.send(Request("GET", s"http://127.0.0.1:${plain.port()}/own").withHeader("Proxy-Authorization", "Basic b3du"))
+  )
+  user.close()
+  val anonymous = Client(proxy = Proxy.to(s"http://127.0.0.1:${guarded.port()}"))
+  show("none, http", anonymous.get(s"http://127.0.0.1:${plain.port()}/x"))
+  show("none, https", anonymous.send(Request("GET", s"https://localhost:${secure.port()}/y").withTls(trusting())))
+  val wrong = Client(proxy = Proxy.to(s"http://us%40r:nope@127.0.0.1:${guarded.port()}"))
+  show("wrong, https", wrong.send(Request("GET", s"https://localhost:${secure.port()}/y").withTls(trusting())))
+  show("the module's, directly", http.send(Request("GET", s"http://127.0.0.1:${plain.port()}/module")))
+
+  // A proxy that never answers the `CONNECT`, one sending bytes after its `200`, and one not there.
+  val silent = ok(TcpServer.start("127.0.0.1", 0, (s, _) -> _ = s.readAll()))
+  val hasty = ok(TcpServer.start("127.0.0.1", 0, (s, _) ->
+    _ = s.readLine()
+    _ = s.writeText("HTTP/1.1 200 OK\r\n\r\nearly")
+    _ = s.readAll()))
+  val gone = ok(TcpServer.start("127.0.0.1", 0, (_, _) -> ()))
+  val gonePort = gone.port()
+  gone.stop()
+  gone.join()
+  val tunnelled = (proxyPort: int) ->
+    Client(proxy = Proxy.to(s"127.0.0.1:$proxyPort")).send(
+      Request("GET", s"https://localhost:${secure.port()}/z").withTls(trusting()).withConnectTimeout(millis(300))
+    )
+  println(s"silent: ${describe(tunnelled(silent.port()))}")
+  println(s"hasty: ${describe(tunnelled(hasty.port()))}")
+  println(s"gone: ${tunnelled(gonePort).isErr}")
+
+  // Proxy URLs the client cannot use fail the request rather than send it directly.
+  for p in ["https://127.0.0.1:1", "socks5://127.0.0.1:1", "http://[::1", "http://:8080", "http://%zz@127.0.0.1:1"]
+    println(s"$p: ${describe(Client(proxy = Proxy.to(p)).get(s"http://127.0.0.1:${plain.port()}/"))}")
+  println(drained(log, names))
+  silent.stop()
+  hasty.stop()
+  open.stop()
+  guarded.stop()
+  plain.stop()
+  direct.stop()
+  secure.stop()

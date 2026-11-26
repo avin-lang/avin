@@ -1,0 +1,125 @@
+module avin.crypto
+
+// Authenticated encryption with associated data: AES-GCM with a 128- or 256-bit key (NIST SP
+// 800-38D) and ChaCha20-Poly1305 (RFC 8439), through OpenSSL's libcrypto. Sealing encrypts a message
+// and authenticates it together with associated data (a header, a record's id) that travels in the
+// clear; opening gives the message back only if neither was changed.
+//
+//     val key = Aes256Gcm.generateKey()
+//     val sealed = key.seal("attack at dawn", "msg-1".bytes)
+//     println(key.open(sealed, "msg-1".bytes).map(b -> string.fromUtf8Lossy(b.toArray())))
+//
+// `seal` draws a fresh 12-byte nonce from `SecureRandom` for every message and puts it in front of the
+// ciphertext, so the sealed form is the nonce, the ciphertext (as long as the message) and the 16-byte
+// tag, 28 bytes more than the message. A random nonce is safe for 2^32 messages under one key; past
+// that, change the key. `sealWithNonce` takes the nonce from the caller for a protocol that fixes it
+// (TLS, a counter): **a nonce must never be used twice with one key**, which reveals both messages and
+// lets anyone forge new ones.
+
+import avin.random.SecureRandom
+
+// An authenticated cipher.
+@sysl("avincrypto.Cipher")
+data Aead
+  // AES with a 16-byte key in Galois/Counter Mode.
+  Aes128Gcm
+  // AES with a 32-byte key in Galois/Counter Mode.
+  Aes256Gcm
+  // ChaCha20 with a 32-byte key and the Poly1305 authenticator, fast where AES has no hardware.
+  ChaCha20Poly1305
+
+impl Aead
+  // The length of the key in bytes: 16 for `Aes128Gcm`, 32 for the others.
+  keyLength -> int = self match
+    Aes128Gcm -> 16
+    _ -> 32
+
+  // The length of a nonce in bytes, 12.
+  nonceLength -> int = 12
+
+  // The length of the authentication tag in bytes, 16.
+  tagLength -> int = 16
+
+  // The key whose bytes are `bytes`, which must be `keyLength` long (`InvalidKey` otherwise).
+  key(bytes: Vector[byte]) -> Result[AeadKey, CryptoError]
+    if bytes.length != keyLength then
+      return Err(InvalidKey(s"a $self key is $keyLength bytes, and these are ${bytes.length}"))
+    Ok(AeadKey(AeadParts(self, bytes)))
+
+  // A new key from the operating system's randomness.
+  generateKey() -> AeadKey = AeadKey(AeadParts(self, SecureRandom.nextBytes(keyLength).toVector))
+
+impl Display for Aead
+  display(out: Writer, spec: FormatSpec) = out.writeField(self match
+    Aes128Gcm -> "AES-128-GCM"
+    Aes256Gcm -> "AES-256-GCM"
+    ChaCha20Poly1305 -> "ChaCha20-Poly1305", spec)
+
+private data AeadParts(aead: Aead, bytes: Vector[byte])
+
+// A key for one authenticated cipher. Its text shows the cipher and nothing of the key; `toBytes` is
+// the only way out of it.
+opaque type AeadKey = AeadParts
+
+@sysl("avincrypto.seal")
+private rawSeal(
+    cipher: Aead,
+    key: Vector[byte],
+    nonce: Vector[byte],
+    aad: Vector[byte],
+    plaintext: Vector[byte]
+) -> Result[Vector[byte], Refusal]
+
+@sysl("avincrypto.open")
+private rawOpen(
+    cipher: Aead,
+    key: Vector[byte],
+    nonce: Vector[byte],
+    aad: Vector[byte],
+    sealed: Vector[byte]
+) -> Result[Vector[byte], Refusal]
+
+impl AeadKey
+  // The cipher the key is for.
+  aead -> Aead = repr.aead
+
+  // The key's bytes, the secret itself.
+  toBytes() -> Vector[byte] = repr.bytes
+
+  // `plaintext` sealed under a fresh random nonce, authenticating `aad` with it: the nonce, the
+  // ciphertext and the tag.
+  seal(plaintext: Vector[byte], aad: Vector[byte] = Vector()) -> Vector[byte]
+    val nonce = SecureRandom.nextBytes(12).toVector
+    nonce ++ sealWithNonce(nonce, plaintext, aad)
+
+  // The UTF-8 bytes of `plaintext` sealed under a fresh random nonce.
+  seal(plaintext: string, aad: Vector[byte] = Vector()) -> Vector[byte] = seal(plaintext.bytes, aad)
+
+  // What `seal` made, opened: the message, if it and `aad` are as they were sealed under this key,
+  // and `Unauthentic` otherwise, never a part of the message.
+  open(sealed: Vector[byte], aad: Vector[byte] = Vector()) -> Result[Vector[byte], CryptoError]
+    if sealed.length < 28 then return Err(Unauthentic)
+    openWithNonce(sealed.slice(0, 12), sealed.slice(12, sealed.length), aad)
+
+  // `plaintext` sealed under `nonce`, which must be 12 bytes (it traps otherwise) and must never have
+  // sealed anything under this key before: the ciphertext and the 16-byte tag.
+  sealWithNonce(nonce: Vector[byte], plaintext: Vector[byte], aad: Vector[byte] = Vector()) -> Vector[byte]
+    if nonce.length != 12 then fail(s"AeadKey.sealWithNonce: a nonce is 12 bytes, and this one is ${nonce.length}")
+    rawSeal(repr.aead, repr.bytes, nonce, aad, plaintext) match
+      Ok(sealed) -> sealed
+      Err(r) -> fail(s"AeadKey.sealWithNonce: ${errorOf(r).message}")
+
+  // A ciphertext and its tag opened under `nonce`, which must be 12 bytes (it traps otherwise):
+  // `Unauthentic` unless they and `aad` are as they were sealed under this key and nonce.
+  openWithNonce(
+      nonce: Vector[byte],
+      sealed: Vector[byte],
+      aad: Vector[byte] = Vector()
+  ) -> Result[Vector[byte], CryptoError]
+    if nonce.length != 12 then fail(s"AeadKey.openWithNonce: a nonce is 12 bytes, and this one is ${nonce.length}")
+    rawOpen(repr.aead, repr.bytes, nonce, aad, sealed) match
+      Ok(plaintext) -> Ok(plaintext)
+      Err(r) -> Err(errorOf(r))
+
+impl Display for AeadKey
+  display(out: Writer, spec: FormatSpec) = out.writeField(s"AeadKey(${repr.aead})", spec)

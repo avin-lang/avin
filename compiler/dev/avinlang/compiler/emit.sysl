@@ -663,6 +663,17 @@ private emit_function_text(out: *StrBuilder, intrinsics: *Buf[string], program: 
                 else
                     out.push(s"  %s$s = alloca ${llvm_type(f.slots[s])}\n")
                     if plan.slot_zeroed[s] then out.push(s"  store ptr null, ptr %s$s\n")
+            // Each object the function makes in its own frame has its storage here, at the entry, so
+            // one made in a loop reuses it on every pass rather than growing the stack; its header
+            // is a constant object's, the descriptor and a zero word, and never changes.
+            for sb in f.blocks
+                for si in sb.insts
+                    if si is StackObject(dest, d)
+                        val shape = s"{ ptr, i64, [${program.descriptors[d].size} x i8] }"
+                        out.push(s"  %so$dest = alloca $shape, align 16\n")
+                        out.push(s"  store ptr ${desc_symbol(program, d)}, ptr %so$dest, align 16\n")
+                        out.push(s"  %so$dest.word = getelementptr inbounds $shape, ptr %so$dest, i32 0, i32 1\n")
+                        out.push(s"  store i64 0, ptr %so$dest.word, align 8\n")
             for i in 0..<f.signature.params.len()
                 if value_roots[i] is Some(k) then out.push(s"  store ptr %v$i, ptr %root$k\n")
             if scope > 0 then emit_variables(out, intrinsics, program, f, plan, meta, scope, program.debug[index])
@@ -764,9 +775,19 @@ private tail_call_at(program: MirProgram, f: MirFunction, block: MirBlock) -> Op
     for a in args
         a match
             SlotAddress(_) -> return None
-            Value(id) -> if f.value_types[id] is MPtr && id >= f.signature.params.len() then return None
+            Value(id) ->
+                if f.value_types[id] is MPtr && id >= f.signature.params.len() then return None
+                if made_on_stack(f, id) then return None
             _ -> ()
     Some(c)
+
+/** Whether value `id` of `f` is an object `f` makes in its own frame. */
+private made_on_stack(f: MirFunction, id: usize) -> bool
+    for block in f.blocks
+        for inst in block.insts
+            if inst is StackObject(dest, _)
+                if dest == id then return true
+    false
 
 private same_words(a: Buf[MirType], b: Buf[MirType]) -> bool
     if a.len() != b.len() then return false
@@ -1066,6 +1087,8 @@ inst_operands(inst: Inst) -> Buf[Operand]
             out.push(address)
             out.push(value)
         Alloc(_, _) -> ()
+        StackObject(_, _) -> ()
+        Keep(values) -> for v in values do out.push(v)
         Publish -> ()
         AtomicLoad(_, address) -> out.push(address)
         AtomicStore(address, value) ->
@@ -1393,6 +1416,8 @@ inst_dest(inst: Inst) -> Option[usize] = inst match
     Load(dest, _) -> Some(dest)
     Store(_, _) -> None
     Alloc(dest, _) -> Some(dest)
+    StackObject(dest, _) -> Some(dest)
+    Keep(_) -> None
     Publish -> None
     AtomicLoad(dest, _) -> Some(dest)
     AtomicStore(_, _) -> None
@@ -1639,6 +1664,8 @@ private emit_inst(out: *StrBuilder,intrinsics: *Buf[string], program: MirProgram
         Alloc(dest, descriptor) ->
             need(intrinsics, "declare ptr @avin_rt_alloc(ptr, ptr)")
             out.push(s"  %v$dest = call ptr @avin_rt_alloc(ptr %ctx, ptr ${desc_symbol(program, descriptor)})\n")
+        StackObject(dest, _) -> out.push(s"  %v$dest = getelementptr inbounds i8, ptr %so$dest, i64 $KindBack\n")
+        Keep(_) -> ()
         Offset(dest, base, bytes) ->
             out.push(s"  %v$dest = getelementptr inbounds i8, ptr " + operand(program, f, base) + s", i64 $bytes\n")
         Index(dest, base, index) ->

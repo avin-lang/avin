@@ -1,0 +1,245 @@
+// expect: exit 0
+// `avin.net.smtp` against scripted servers in the same program, each printing what passed between
+// them: a whole conversation in the clear (a greeting of two lines, EHLO's extensions, MAIL FROM
+// with SIZE and BODY, three recipients from to, cc and bcc, DATA dot-stuffed with its lone line
+// breaks made CR LF, QUIT); STARTTLS with AUTH PLAIN over it; implicit TLS with AUTH LOGIN; a server
+// asking for PLAIN's response after an empty prompt; HELO where EHLO is refused; two messages in one
+// session; SMTPUTF8 and 8BITMIME where they are needed; and the null sender.
+import avin.fs
+import avin.io.IoError
+import avin.net.{ByteStream, TcpListener, TcpStream}
+import avin.net.mail.{Mailbox, Message}
+import avin.net.smtp.{ImplicitTls, Login, SmtpClient, SmtpError, SmtpSession, StartTls, Unencrypted}
+import avin.net.tls.{TlsClient, TlsError, TlsServer, TlsStream}
+import avin.threads.{Thread, spawn}
+import avin.time.{epochSeconds, seconds}
+
+ok[T](r: Result[T, IoError]) -> T = r match
+  Ok(v) -> v
+  Err(e) -> fail(s"unexpected error: ${e.message}")
+
+tls[T](r: Result[T, TlsError]) -> T = r match
+  Ok(v) -> v
+  Err(e) -> fail(s"unexpected error: ${e.message}")
+
+smtp[T](r: Result[T, SmtpError]) -> T = r match
+  Ok(v) -> v
+  Err(e) -> fail(s"unexpected SMTP error: ${e.message}")
+
+// A test certificate or key, from the repository root or from `compiler/`.
+fixture(name: string) -> string
+  val here = "tests/fixtures/tls/" + name
+  ok(fs.readText(if fs.exists(here) then here else "../" + here))
+
+// The server's end of a connection, logging what each side says: `C:` for the client's lines and
+// `S:` for the server's.
+class Peer(private val tcp: TcpStream)
+  private var conn: ByteStream = tcp
+  val log = Buffer[string]()
+
+  // The client's next line.
+  hear() -> string
+    val line = ok(conn.readLine()).getOrElse("(closed)")
+    log += "C: " + line
+    line
+
+  // Lines until the client closes, each logged.
+  hearRest()
+    while true
+      ok(conn.readLine()) match
+        Some(line) -> log += "C: " + line
+        None -> return
+
+  // The client's data, up to and with the line `.`, its line breaks shown: `⏎` for CR LF and `\n`
+  // or `\r` for a lone one, which must never come.
+  hearData()
+    val got = Buffer[byte]()
+    while !string.fromUtf8Lossy(got.toArray()).endsWith("\r\n.\r\n")
+      val part = ok(conn.read(4096))
+      if part.length == 0 then return
+      for b in part do got += b
+    val text = string.fromUtf8Lossy(got.toArray())
+    for line in text.replace("\r\n", "⏎\u{1}").replace("\n", "\\n").replace("\r", "\\r").split('\u{1}')
+      if line.nonEmpty then log += "D: " + line
+
+  // Says `text`, its lines joined with CR LF.
+  say(text: string)
+    for line in text.split('\n') do log += "S: " + line
+    ok(conn.writeText(text.replace("\n", "\r\n") + "\r\n"))
+
+  // TLS as the server from here on.
+  secure()
+    conn = tls(TlsStream.server(tcp, tls(TlsServer.of(fixture("localhost.pem"), fixture("localhost.key")))))
+    log += "-- TLS"
+
+  close() = ok(conn.close())
+
+// A listener's port and the thread serving its one connection by `script`, which answers the log.
+serving(script: @sendable (Peer) -> unit) -> (int, Thread[Vector[string]])
+  val listener = ok(TcpListener.bind("127.0.0.1", 0))
+  val port = listener.port()
+  val server = spawn(() ->
+    val tcp = ok(listener.accept())
+    _ = listener.close()
+    ok(tcp.setTimeout(seconds(20)))
+    val p = Peer(tcp)
+    script(p)
+    _ = p.close()
+    p.log.toVector)
+  (port, server)
+
+// The server's log, printed once it has ended.
+printLog(server: Thread[Vector[string]])
+  for line in server.join() do println(line)
+
+trusting() -> TlsClient = TlsClient().trust(fixture("ca.pem"))
+
+// The standard exchange after the greeting and EHLO: a transaction for each message, then QUIT.
+transactions(p: Peer, count: int)
+  for _ in 0 ..< count
+    p.hear()
+    p.say("250 2.1.0 sender ok")
+    var line = p.hear()
+    while line.startsWith("RCPT")
+      p.say("250 2.1.5 recipient ok")
+      line = p.hear()
+    p.say("354 go ahead")
+    p.hearData()
+    p.say("250 2.0.0 queued as 42")
+  p.hear()
+  p.say("221 bye")
+
+message(subject: string, text: string) -> Message = Message(
+  Mailbox("ada@example.com", "Ada"),
+  to = [Mailbox("bob@example.com")],
+  cc = [Mailbox("carol@example.com")],
+  bcc = [Mailbox("dave@example.com")],
+  subject = subject,
+  text = Some(text),
+  date = Some(epochSeconds(0)),
+  messageId = Some("m@example.com")
+)
+
+main()
+  // A whole conversation in the clear.
+  val (p1, s1) = serving(p ->
+    p.say("220-fake.example ESMTP\n220 ready")
+    p.hear()
+    p.say("250-fake.example greets localhost\n250-PIPELINING\n250-SIZE 100000\n250-8BITMIME\n250 HELP")
+    transactions(p, 1))
+  val c1 = SmtpClient("127.0.0.1", p1, security = Unencrypted, helo = "client.example")
+  val session = smtp(c1.open())
+  println(s"extensions: ${session.extensions}")
+  println(
+    s"SIZE: ${session.sizeLimit}, 8BITMIME: ${session.offers("8bitmime")}, STARTTLS: ${session.offers("STARTTLS")}"
+  )
+  println(s"encrypted: ${session.encrypted}")
+  smtp(session.send(message("Dots", ".leading dot\n..two\nlone LF\rlone CR\r\n.\nend")))
+  smtp(session.quit())
+  println(s"quit again: ${session.quit().isOk}")
+  printLog(s1)
+
+  // STARTTLS, then EHLO again over TLS and AUTH PLAIN.
+  val (p2, s2) = serving(p ->
+    p.say("220 fake ESMTP")
+    p.hear()
+    p.say("250-fake\n250-STARTTLS\n250 AUTH PLAIN")
+    p.hear()
+    p.say("220 2.0.0 ready to start TLS")
+    p.secure()
+    p.hear()
+    p.say("250-fake\n250-AUTH LOGIN PLAIN\n250 SIZE")
+    p.hear()
+    p.say("235 2.7.0 authenticated")
+    transactions(p, 1))
+  val c2 = SmtpClient("localhost", p2, tls = trusting(), user = "ada", password = "s3cret")
+  println(
+    s"port by default: ${SmtpClient("x").portUsed} ${SmtpClient("x", security = ImplicitTls).portUsed} ${SmtpClient("x", security = Unencrypted).portUsed}"
+  )
+  smtp(c2.send(message("Over TLS", "Secure.\n")))
+  printLog(s2)
+
+  // Implicit TLS, and AUTH LOGIN asked for by name.
+  val (p3, s3) = serving(p ->
+    p.secure()
+    p.say("220 fake ESMTP")
+    p.hear()
+    p.say("250-fake\n250 AUTH PLAIN LOGIN")
+    p.hear()
+    p.say("334 VXNlcm5hbWU6")
+    p.hear()
+    p.say("334 UGFzc3dvcmQ6")
+    p.hear()
+    p.say("235 ok")
+    p.hear()
+    p.say("221 bye"))
+  val c3 = SmtpClient(
+    "localhost",
+    p3,
+    security = ImplicitTls,
+    tls = trusting(),
+    user = "ada",
+    password = "pässword",
+    mechanism = Some(Login)
+  )
+  val tlsSession = smtp(c3.open())
+  println(s"implicit TLS encrypted: ${tlsSession.encrypted}")
+  smtp(tlsSession.quit())
+  printLog(s3)
+
+  // A server that takes no initial response asks for it with an empty prompt; credentials allowed
+  // in the clear where asked.
+  val (p4, s4) = serving(p ->
+    p.say("220 fake")
+    p.hear()
+    p.say("250-fake\n250 AUTH PLAIN")
+    p.hear()
+    p.say("334 ")
+    p.hear()
+    p.say("235 ok")
+    p.hearRest())
+  val c4 = SmtpClient("127.0.0.1", p4, security = Unencrypted, user = "u", password = "p", authWithoutTls = true)
+  val clear = smtp(c4.open())
+  clear.close()
+  clear.close()
+  printLog(s4)
+
+  // HELO where EHLO is refused, on a connection that stays unencrypted; two messages in one session.
+  val (p5, s5) = serving(p ->
+    p.say("220 old")
+    p.hear()
+    p.say("502 5.5.1 EHLO not understood")
+    p.hear()
+    p.say("250 old")
+    transactions(p, 2))
+  val old = smtp(SmtpClient("127.0.0.1", p5, security = Unencrypted).open())
+  println(s"after HELO: ${old.extensions}")
+  smtp(old.send(message("One", "1\n")))
+  smtp(old.send(message("Two", "2\n")))
+  smtp(old.quit())
+  printLog(s5)
+
+  // SMTPUTF8 for an address beyond ASCII, BODY=8BITMIME for data beyond it, and the null sender.
+  val (p6, s6) = serving(p ->
+    p.say("220 fake")
+    p.hear()
+    p.say("250-fake\n250-SMTPUTF8\n250 8BITMIME")
+    transactions(p, 4))
+  val modern = smtp(SmtpClient("127.0.0.1", p6, security = Unencrypted).open())
+  smtp(
+    modern.send(
+      Message(
+        Mailbox("ü@example.com"),
+        to = [Mailbox("bob@example.com")],
+        text = Some("x"),
+        date = Some(epochSeconds(0)),
+        messageId = Some("u@x")
+      )
+    )
+  )
+  smtp(modern.sendData("ada@example.com", ["bob@example.com"], "Subject: raw\r\n\r\nGrüße\r\n".utf8))
+  smtp(modern.sendData("", ["bob@example.com"], "Subject: bounce\r\n\r\nreturned".utf8))
+  // Lone line breaks around a `.` cannot end the data early: each is sent CR LF and the `.` doubled.
+  smtp(modern.sendData("ada@example.com", ["bob@example.com"], "Subject: lone\n\nx\ry\n.\r.\n..z\r\n.\r\n".utf8))
+  smtp(modern.quit())
+  printLog(s6)

@@ -12,8 +12,9 @@ module avin.log
 
 import avin.fs
 import avin.io.IoError
-import avin.threads.Mutex
-import avin.time.{Instant, now}
+import avin.signal
+import avin.threads.{Atomic, Mutex, Thread, spawn}
+import avin.time.{Duration, Instant, millis, monotonic, now, seconds}
 
 // How much a record matters, least first. A logger writes the records at its level and above.
 data Level derives Ord
@@ -77,9 +78,38 @@ type Field = (string, Any)
 // Where a logger's lines go. `write` is called once for each line, which ends with `\n`, so a sink
 // that hands each call to one write keeps lines whole. `colours` says whether the sink is a terminal
 // that takes colour, which a text logger asked for colour then paints its levels for.
-class Sink(private val put: @sendable (string) -> unit, val colours: bool = false): Sendable
+class Sink(
+    private val put: @sendable (string) -> unit,
+    val colours: bool = false,
+    private val again: @sendable () -> unit = () -> ()
+): Sendable
   // Writes `line`, a whole line with its `\n`.
   write(line: string) = put(line)
+
+  // Makes the sink look at where it writes afresh: a file sink opens its file again, making it where
+  // a log rotator has moved it away. A sink with nothing to open does nothing.
+  reopen() = again()
+
+// Watches `sig` (`Hangup`, the daemon's conventional "read your settings again", unless given
+// another) on a thread of its own and `reopen`s `sink` each time it arrives, which is what a log
+// rotator asks for after it has moved the log away. Answers the `Reopener` to stop it by, or the
+// `IoError` of a signal that cannot be watched. While it runs the signal no longer ends the program.
+reopenOnSignal(sink: Sink, sig: int = signal.Hangup) -> Result[Reopener, IoError]
+  val watch = signal.watch(sig)?
+  val stopped = Atomic(false)
+  val thread = spawn(() ->
+    while !stopped.load()
+      if watch.wait(millis(50)) then sink.reopen()
+    ())
+  Ok(Reopener(stopped, thread))
+
+// A thread reopening a sink on a signal, made by `reopenOnSignal`.
+class Reopener(private val stopped: Atomic[bool], private val thread: Thread[unit]): Sendable
+  // Stops watching, waiting for the thread to end; the signal does what it did before again once
+  // no watch of it is left. Stopping again does nothing.
+  stop()
+    stopped.store(true)
+    thread.join()
 
 // Standard error, each line in one write. It takes colour where standard error is a terminal, `NO_COLOR`
 // is not set and `TERM` is not `dumb`.
@@ -90,17 +120,50 @@ stderrSink() -> Sink = Sink(line -> StandardError.write(line), colourOnStderr())
 stdoutSink() -> Sink = Sink(line -> StandardOutput.write(line), colourOnStdout())
 
 // The file `file`, created if it is not there and appended to if it is; an `Err` where it cannot be
-// opened to append to. Each line is appended under a lock the sink's users share, the file opened for
-// it and closed again, so the line is in the file, whole, when the record's call returns, and a file
-// moved away by a log rotator is made again by the next line. A line that cannot be written is
-// dropped: logging never stops the program it reports on.
-fileSink(file: string) -> Result[Sink, IoError]
-  fs.appendText(file, "")?
-  val lock = Mutex(0)
-  Ok(Sink(line -> lock.with(_ -> appendLine(file, line))))
+// opened to append to. The sink keeps the file open, behind a lock its users share, and each line is
+// one write, handed to the platform before the record's call returns, so it is in the file, whole.
+// At most once every `recheck` the sink looks at what `file` names now, and where a log rotator has
+// moved the file away or put another in its place it opens `file` again, making it where it is gone;
+// a `recheck` of zero or less looks before every line. A line that cannot be written is dropped:
+// logging never stops the program it reports on. The sink's `reopen` opens `file` again at once,
+// without waiting for the next look, as a signal from a log rotator asks.
+fileSink(file: string, recheck: Duration = seconds(1)) -> Result[Sink, IoError]
+  val target = Mutex(appending(file)?)
+  Ok(Sink(line -> target.with(a -> a.put(line, recheck)), again = () -> target.with(a -> a.reopen())))
 
-private appendLine(file: string, line: string)
-  _ = fs.appendText(file, line)
+// The file a file sink writes, what `file` named when it was opened, and when the sink last looked.
+private class Appending(
+    private val file: string,
+    private var open: fs.File,
+    private var named: (long, long),
+    private var looked: long
+)
+  // Writes `line`, opening the file again first where the time has come to look and the name no
+  // longer leads to the open file.
+  put(line: string, recheck: Duration)
+    val at = monotonic().micros
+    if at - looked >= recheck.micros
+      looked = at
+      if identity(file) != Some(named) then reopen()
+    if open.writeText(line).isOk then _ = open.flush()
+
+  // Opens `file` again, keeping the file open now where it cannot be.
+  reopen()
+    appending(file) match
+      Ok(fresh) ->
+        _ = open.close()
+        open = fresh.open
+        named = fresh.named
+        looked = fresh.looked
+      Err(_) -> ()
+
+// `file` opened to append to, with what it names now.
+private appending(file: string) -> Result[Appending, IoError]
+  val open = fs.append(file)?
+  Ok(Appending(file, open, identity(file).getOrElse((long(-1), long(-1))), monotonic().micros))
+
+// The device and inode `file` names now, or `None` where it names nothing.
+private identity(file: string) -> Option[(long, long)] = fs.metadata(file).ok.map(m -> (m.device, m.inode))
 
 // Any `Writer`, behind its mutex: each line is written whole while the mutex is held.
 writerSink[W: Writer](target: Mutex[W]) -> Sink = Sink(line -> target.with(w -> w.write(line)))

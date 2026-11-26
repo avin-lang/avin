@@ -4,6 +4,7 @@
 import avin.encoding.{DecodeError, BadCharacter, BadPadding, Truncated, UnusedBits}
 import avin.encoding.{toHex, fromHex, toBase64, fromBase64, toBase64Url, fromBase64Url}
 import avin.encoding.{toBase32, toBase32Unpadded, toBase32Lower, fromBase32}
+import avin.encoding.{toQuotedPrintable, fromQuotedPrintable}
 import avin.random.SecureRandom
 
 // `Mixed` and `allBytes` are the library tests' own, from crypto.avin.
@@ -349,3 +350,95 @@ base32UnusedBits()
     assertEq(fromBase32(s"AAAA${d}===").isOk, v % 2 == 0)
     if v % 4 != 0 then assertEq(fromBase32(s"A${d}"), Err(UnusedBits(1)))
     if v % 8 != 0 then assertEq(fromBase32(s"AAAAAA${d}"), Err(UnusedBits(6)))
+
+// The longest line of `text`, its lines split at CR LF.
+longestQpLine(text: string) -> int
+  var longest = 0
+  for line in text.split("\r\n")
+    if line.byteLength > longest then longest = line.byteLength
+  longest
+
+@test("quoted-printable keeps printable ASCII and CR LF, and escapes =, bytes beyond ASCII, lone CR and LF")
+quotedPrintableEscapes()
+  assertEq(toQuotedPrintable(""), "")
+  assertEq(toQuotedPrintable("hello, world!"), "hello, world!")
+  assertEq(toQuotedPrintable("a=b"), "a=3Db")
+  assertEq(toQuotedPrintable("café"), "caf=C3=A9")
+  assertEq(toQuotedPrintable("\u{1f600}"), "=F0=9F=98=80")
+  assertEq(toQuotedPrintable("one\r\ntwo\r\n"), "one\r\ntwo\r\n")
+  assertEq(toQuotedPrintable("a\nb"), "a=0Ab")
+  assertEq(toQuotedPrintable("a\rb"), "a=0Db")
+  assertEq(toQuotedPrintable("\u{0}\u{7f}~ !"), "=00=7F~ !")
+  assertEq(toQuotedPrintable(Vector[byte](byte(255), byte(0), byte(61))), "=FF=00=3D")
+
+@test("quoted-printable escapes a space or tab only at the end of a line")
+quotedPrintableTrailingSpace()
+  assertEq(toQuotedPrintable("a b\tc"), "a b\tc")
+  assertEq(toQuotedPrintable("end \r\nnext"), "end=20\r\nnext")
+  assertEq(toQuotedPrintable("tab\t\r\n"), "tab=09\r\n")
+  assertEq(toQuotedPrintable("last "), "last=20")
+  assertEq(toQuotedPrintable("  "), " =20")
+  assertEq(toQuotedPrintable(" \r\n "), "=20\r\n=20")
+
+@test("quoted-printable breaks a line longer than 76 with a soft break, never inside an escape")
+quotedPrintableSoftBreaks()
+  val a = "a"
+  assertEq(toQuotedPrintable(a.repeat(76)), a.repeat(76))
+  assertEq(toQuotedPrintable(a.repeat(77)), a.repeat(75) + "=\r\n" + a.repeat(2))
+  assertEq(toQuotedPrintable(a.repeat(100)), a.repeat(75) + "=\r\n" + a.repeat(25))
+  assertEq(toQuotedPrintable(a.repeat(74) + "é"), a.repeat(74) + "=\r\n=C3=A9")
+  assertEq(toQuotedPrintable(a.repeat(73) + "="), a.repeat(73) + "=3D")
+  assertEq(toQuotedPrintable(a.repeat(74) + "="), a.repeat(74) + "=\r\n=3D")
+  assertEq(toQuotedPrintable(a.repeat(75) + " "), a.repeat(75) + "=\r\n=20")
+  assertEq(
+    toQuotedPrintable(a.repeat(80) + "\r\n" + a.repeat(3)),
+    a.repeat(75) + "=\r\n" + a.repeat(5) + "\r\n" + a.repeat(3)
+  )
+  val escapes = toQuotedPrintable("é".repeat(500))
+  assert(longestQpLine(escapes) <= 76)
+  assertEq(escapes.split("\r\n").size, 40)
+
+@test("quoted-printable decodes escapes in either case, soft breaks, and drops spaces at a line's end")
+quotedPrintableDecodes()
+  assertEq(fromQuotedPrintable("").map(text), Ok(""))
+  assertEq(fromQuotedPrintable("a=3Db").map(text), Ok("a=b"))
+  assertEq(fromQuotedPrintable("a=3db").map(text), Ok("a=b"))
+  assertEq(fromQuotedPrintable("caf=C3=A9").map(text), Ok("café"))
+  assertEq(fromQuotedPrintable("caf=c3=a9").map(text), Ok("café"))
+  assertEq(fromQuotedPrintable("ab=\r\ncd").map(text), Ok("abcd"))
+  assertEq(fromQuotedPrintable("ab=\ncd").map(text), Ok("abcd"))
+  assertEq(fromQuotedPrintable("ab= \t\r\ncd").map(text), Ok("abcd"))
+  assertEq(fromQuotedPrintable("ab=").map(text), Ok("ab"))
+  assertEq(fromQuotedPrintable("ab=  ").map(text), Ok("ab"))
+  assertEq(fromQuotedPrintable("ab  \r\ncd").map(text), Ok("ab\r\ncd"))
+  assertEq(fromQuotedPrintable("ab \t\ncd").map(text), Ok("ab\ncd"))
+  assertEq(fromQuotedPrintable("ab  ").map(text), Ok("ab"))
+  assertEq(fromQuotedPrintable("a  b").map(text), Ok("a  b"))
+  assertEq(fromQuotedPrintable("é").map(text), Ok("é"))
+
+@test("quoted-printable refuses an = with no two digits or soft break after it, at the =")
+quotedPrintableRefusals()
+  assertEq(fromQuotedPrintable("a=G1"), Err(BadCharacter(1)))
+  assertEq(fromQuotedPrintable("a=1G"), Err(BadCharacter(1)))
+  assertEq(fromQuotedPrintable("=4G"), Err(BadCharacter(0)))
+  assertEq(fromQuotedPrintable("a=G"), Err(BadCharacter(1)))
+  assertEq(fromQuotedPrintable("a= b"), Err(BadCharacter(1)))
+  assertEq(fromQuotedPrintable("a==41"), Err(BadCharacter(1)))
+  assertEq(fromQuotedPrintable("a=4"), Err(Truncated(3)))
+  assertEq(fromQuotedPrintable("ok=41=4"), Err(Truncated(7)))
+
+@test("quoted-printable round-trips every byte value, Unicode, line breaks and random bytes")
+quotedPrintableRoundTrips()
+  val all = allBytes()
+  val encoded = toQuotedPrintable(all)
+  assert(longestQpLine(encoded) <= 76)
+  assert(encoded.forall(c -> int(c) < 128))
+  assertEq(fromQuotedPrintable(encoded), Ok(all))
+  assertEq(fromQuotedPrintable(toQuotedPrintable(Mixed)).map(text), Ok(Mixed))
+  for sample in ["", " ", "\r\n", "\r", "\n", "a \r\n b \r\n", "=", "==\r\n=", "x".repeat(300), "é".repeat(77)]
+    assertEq(fromQuotedPrintable(toQuotedPrintable(sample)).map(text), Ok(sample))
+  for n in [1, 2, 75, 76, 77, 1000]
+    val bytes = SecureRandom.nextBytes(n).toVector
+    val qp = toQuotedPrintable(bytes)
+    assert(longestQpLine(qp) <= 76)
+    assertEq(fromQuotedPrintable(qp), Ok(bytes))

@@ -1,0 +1,127 @@
+// expect: exit 0
+// A file mapped read-only: its length, each byte by an `int` and a `long` offset, slices copied out,
+// the whole file as an array, Unicode bytes, an empty file, a mapping that outlives its file being
+// closed, removed and renamed over, the bytes as they were when mapped, `File.map` handing what was
+// written over first, and every failure as an `Err` naming the path.
+import avin.fs
+import avin.fs.MappedBytes
+import avin.io.IoError
+
+impl[T] Result[T, IoError]
+  get() -> T = self match
+    Ok(v) -> v
+    Err(e) -> fail(s"unexpected $e")
+
+bytesOf(text: string) -> Array[byte] = Array.tabulate(text.byteLength, i -> text.byteAt(i))
+
+show(b: Array[byte]) -> string = "[" + b.mkString(" ") + "]"
+
+text(b: Array[byte]) -> string = string.fromUtf8Lossy(b)
+
+var root = ""
+
+say(line: Any)
+  println(if root == "" then s"$line" else s"$line".replace(root, "DIR"))
+
+err[T](r: Result[T, IoError]) -> string = r match
+  Ok(_) -> "Ok"
+  Err(e) -> s"Err($e)"
+
+main()
+  val dir = fs.createTempDir("avin-mapped-read").get()
+  root = dir
+  val path = dir + "/a"
+  _ = fs.writeText(path, "0123456789").get()
+  val m = fs.mapFile(path).get()
+  say(m.length)
+  say(m.isEmpty)
+  // The first, a middle and the last byte, by an int and by a long.
+  say(s"${m(0)} ${m(5)} ${m(9)}")
+  val last: long = 9
+  say(m(last))
+  // Slices: the whole, one byte, empty at the start, the middle and the end.
+  say(text(m.slice(0, 10)))
+  say(text(m.slice(3, 4)))
+  say(show(m.slice(0, 0)))
+  say(show(m.slice(5, 5)))
+  say(show(m.slice(10, 10)))
+  val from: long = 2
+  val until: long = 7
+  say(text(m.slice(from, until)))
+  say(text(m.toArray()))
+  // A slice is a copy: changing it leaves the mapping as it was.
+  val copy = m.slice(0, 3)
+  copy(0) = byte(88)
+  say(s"${copy(0)} ${m(0)}")
+
+  // Unicode: each byte of every code point's UTF-8 form, in order.
+  val greeting = "héllo, 世界 🌍"
+  _ = fs.writeText(dir + "/u", greeting).get()
+  val u = fs.mapFile(dir + "/u").get()
+  say(u.length == long(greeting.byteLength))
+  say(u.toArray().toVector == bytesOf(greeting).toVector)
+  say(text(u.toArray()))
+  _ = u.close()
+
+  // An empty file maps to no bytes.
+  _ = fs.writeText(dir + "/empty", "").get()
+  val e = fs.mapFile(dir + "/empty").get()
+  say(s"${e.length} ${e.isEmpty}")
+  say(show(e.toArray()))
+  say(show(e.slice(0, 0)))
+  _ = e.close()
+
+  // One byte.
+  _ = fs.writeText(dir + "/one", "x").get()
+  val one = fs.mapFile(dir + "/one").get()
+  say(s"${one.length} ${one(0)}")
+  _ = one.close()
+
+  // The mapping keeps the bytes the file had when it was mapped, when the file is renamed over and
+  // when it is removed.
+  _ = fs.writeText(dir + "/b", "renamed").get()
+  _ = fs.rename(dir + "/b", path).get()
+  say(text(m.toArray()))
+  _ = fs.remove(path).get()
+  say(text(m.toArray()))
+  say(m.length)
+  _ = m.close()
+  // Closing twice is fine.
+  say(err(m.close()))
+
+  // File.map hands over what was written through the file first, and the mapping outlives the file.
+  val f = fs.createUpdate(dir + "/c").get()
+  _ = f.write(bytesOf("written, not flushed")).get()
+  val fm = f.map().get()
+  _ = f.close()
+  say(text(fm.toArray()))
+  _ = fm.close()
+  // A file open only to read maps too.
+  val r = fs.open(dir + "/c").get()
+  val rm = r.map().get()
+  say(rm.length)
+  _ = rm.close()
+  // Mapping a closed file is an Err.
+  say(err(r.close()))
+  say(err(r.map()))
+  // A missing file, a directory, and a writable map of a missing file.
+  say(err(fs.mapFile(dir + "/missing")))
+  say(err(fs.mapFile(dir)))
+  say(err(fs.mapFileMutable(dir + "/missing")))
+  say(err(fs.mapFileMutable(dir)))
+  // A writable map needs a file open for reading and writing.
+  val ro = fs.open(dir + "/c").get()
+  say(err(ro.mapMutable()))
+  _ = ro.close()
+  val wo = fs.create(dir + "/d").get()
+  say(err(wo.mapMutable()))
+  _ = wo.close()
+  val ap = fs.append(dir + "/d").get()
+  say(err(ap.mapMutable()))
+  _ = ap.close()
+  // A file the program cannot write maps read-only but not writable.
+  _ = fs.setPermissions(dir + "/c", 0o444).get()
+  say(err(fs.mapFile(dir + "/c").flatMap(x -> x.close())))
+  say(err(fs.mapFileMutable(dir + "/c")))
+  _ = fs.setPermissions(dir + "/c", 0o644).get()
+  _ = fs.removeDirAll(dir).get()

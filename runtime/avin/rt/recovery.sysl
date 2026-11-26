@@ -59,6 +59,7 @@ guarded(ctx: *Context, run: *u8, name: *u8, outcome: *u8, runner: *u8) -> bool
     ctx.recovery = back.previous
     val elements: **u8 = ptr_cast(array_elements(back.outcome))
     elements[0] = back.reason
+    ctx.trap_reason = null
     true
 
 /** Stops the program from an actor whose failure was escalated past every parent: the trap was
@@ -80,13 +81,30 @@ leave_doubt(ctx: *Context)
 /** How a trap's report begins on the thread of `ctx`: naming the actor whose code it runs, if any. */
 trap_prefix(ctx: *Context) -> string = if ctx.recovery == null && in_exit_hook(ctx) then "avin: trap in an exit hook: " elif ctx.recovery == null then "avin: trap: " else "avin: trap in " + text_string(ctx.recovery.name) + ": "
 
+/** Whether a trap on the thread of `ctx` now fails only the actor whose code the thread runs. */
+private containable(ctx: *Context) -> bool = ctx.recovery != null && ctx.doubt <= ctx.recovery.doubt
+
+/** The frames a trap on the thread of `ctx` leaves it: those of the actor's turn where `contain` will
+ * return the thread there, none where the trap stops the program (`trap.sysl`). */
+surviving_frames(ctx: *Context) -> *Frame = if containable(ctx) then ctx.recovery.top else null
+
+/** Begins a trap on the thread of `ctx` for `reason`, an Avin string that may have been made while
+ * the program ran: the frames of the code that trapped are dropped, and the context keeps the reason
+ * alive in their place. The thread never goes back to that code, and its frames are consistent only
+ * at a collection point, which a trap is not: a slot not yet stored to may hold whatever the stack
+ * held before, and a collection that read it, while the trap is reported or the exit hooks run, would
+ * follow a stale address. Called before anything that may wait. */
+leave_trapped_code(ctx: *Context, reason: *u8)
+    ctx.trap_reason = reason
+    ctx.top = surviving_frames(ctx)
+
 /** Fails the actor whose code traps on the thread of `ctx` for `reason`, an Avin string, at `place`
  * (null where there is none), where its failure can be contained: the trap is reported naming the
  * actor and the thread returns to the actor's turn. Elsewhere, outside any actor or where the trap
  * leaves shared state in doubt, this returns, and the caller stops the program. */
 contain(ctx: *Context, reason: *u8, place: *TrapSite)
     val r = ctx.recovery
-    if r == null || ctx.doubt > r.doubt then return
+    if !containable(ctx) then return
     if stopping_now() && !in_exit_hook(ctx) then wait_for_end(ctx)
     flush_safely(ctx)
     report_contained(ctx, reason, place)

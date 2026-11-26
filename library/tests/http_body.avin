@@ -1,0 +1,338 @@
+// `avin.net.http`'s streamed request bodies away from a connection: a `BodyReader` over a buffered
+// request's body and its limit, routes that take their body as a stream and the router that says
+// which, and `MultipartReader` beyond what `http_forms` checks it agrees with `Multipart.parse` on:
+// passing over unread bodies, reading before and after the parts, a failing source, its sticky
+// faults, its limits counted as it reads, and a delimiter's padding.
+import avin.io.{IoError, Other, Reader, TimedOut}
+
+import avin.net.http.{
+  BadMultipart, BodyReader, BodyUnreadable, FormError, FormTooLarge, Multipart, MultipartLimits, MultipartReader,
+  NoBoundary, NotAForm, Part, PartHead, PartHeadersTooLarge, Response, Route, Router, ServerRequest, TooManyParts
+}
+
+// The UTF-8 bytes of `text`.
+utf8Of(text: string) -> Array[byte] = Array.tabulate(text.byteLength, i -> text.byteAt(i))
+
+textOf(b: Array[byte]) -> string = string.fromUtf8Lossy(b)
+
+// A request posting `body` of the type `contentType`.
+postedText(contentType: string, body: string) -> ServerRequest =
+  ServerRequest("POST", "/", [("Content-Type", contentType)], utf8Of(body))
+
+// Every piece `reader` answers, `size` at a time, up to its end or its failure.
+piecesOf(reader: BodyReader, size: int) -> Vector[string]
+  val out = Buffer[string]()
+  loop
+    reader.read(size) match
+      Ok(got) ->
+        if got.length == 0 then break
+        out.addOne(textOf(got))
+      Err(e) ->
+        out.addOne(s"error: ${e.message}")
+        break
+  out.toVector
+
+// A source handing out `bytes` at most `size` at a time, then failing with `failure` where it has one
+// instead of ending, and counting how many times it was read.
+class Trickle(
+    private val bytes: Array[byte],
+    private val size: int,
+    private val failure: Option[IoError] = None
+): Reader
+  private var at = 0
+  var reads = 0
+
+  override read(max: int) -> Result[Array[byte], IoError]
+    reads += 1
+    if at == bytes.length
+      failure match
+        Some(e) -> return Err(e)
+        None -> ()
+    val n = if size < max then size else max
+    val end = if bytes.length - at > n then at + n else bytes.length
+    val out = bytes.slice(at, end)
+    at = end
+    Ok(out)
+
+partsOf(body: string, size: int = 65536, limits: MultipartLimits = MultipartLimits()) -> MultipartReader =
+  MultipartReader.over(Trickle(utf8Of(body), size), "multipart/form-data; boundary=XyZ", limits).getOrElse(
+    fail("not a multipart type")
+  )
+
+// A part's head written out: name, filename, type and headers.
+shownHead(h: PartHead) -> string = s"${h.name}|${h.filename.getOrElse("-")}|${h.contentType}|${h.headers}"
+
+shownError(e: FormError) -> string = e match
+  BodyUnreadable(io) -> s"BodyUnreadable(${io.message})"
+  other -> other.message
+
+val twoParts = "--XyZ\r\nContent-Disposition: form-data; name=a\r\n\r\nfirst body\r\n--XyZ\r\nContent-Disposition: form-data; name=f; filename=\"x.txt\"\r\nContent-Type: text/markdown\r\n\r\nsecond\r\n--XyZ--\r\nepilogue"
+
+@test("a buffered request's body reader reads its body in pieces of at most the size asked, then ends")
+bufferedReader()
+  val r = postedText("text/plain", "0123456789")
+  assertEq(r.bodyStreamed, false)
+  assertEq(piecesOf(r.bodyReader(), 3), ["012", "345", "678", "9"])
+  assertEq(piecesOf(r.bodyReader(), 10), ["0123456789"])
+  assertEq(piecesOf(r.bodyReader(), 1000), ["0123456789"])
+  assertEq(r.bodyReader().length, Some(long(10)))
+  assertEq(r.bodyReader().readAll().map(textOf), Ok("0123456789"))
+  // Each reader of a buffered body reads it from its start.
+  val one = r.bodyReader()
+  assertEq(one.read(4).map(textOf), Ok("0123"))
+  assertEq(r.bodyReader().read(4).map(textOf), Ok("0123"))
+  assertEq(one.read(4).map(textOf), Ok("4567"))
+  val empty = ServerRequest("POST", "/")
+  assertEq(piecesOf(empty.bodyReader(), 5), Vector.empty[string]())
+  assertEq(empty.bodyReader().length, Some(long(0)))
+  assertEq(empty.bodyReader(0).readAll().map(b -> b.length), Ok(0))
+  assertEq(piecesOf(postedText("text/plain", "café ✓").bodyReader(), 64), ["café ✓"])
+
+@test("a body reader's limit takes a body at it and refuses one a byte over it, every read alike")
+bufferedLimit()
+  val r = postedText("text/plain", "0123456789")
+  assertEq(piecesOf(r.bodyReader(10), 4), ["0123", "4567", "89"])
+  val over = r.bodyReader(9)
+  assertEq(piecesOf(over, 4), ["error: cannot read the request body: it is longer than its limit of 9 bytes"])
+  assertEq(over.read(4).isErr, true)
+  assertEq(r.bodyReader(0).readAll().isErr, true)
+  assertEq(ServerRequest("POST", "/").bodyReader(0).readAll().isOk, true)
+  assertEq(r.bodyReader(long.MaxValue).readAll().map(b -> b.length), Ok(10))
+
+@test("a request's copies keep its body reader's source: params, route, headers and values")
+copiesKeepTheBody()
+  val r = postedText("text/plain", "abc")
+  val copies = [
+    r.withParams([("id", "1")]),
+    r.routed("/x", Vector.empty[(string, string)]()),
+    r.withHeaderReplaced("X-A", "1"),
+    r.withValue(42)
+  ]
+  for c in copies
+    assertEq(c.bodyReader().readAll().map(textOf), Ok("abc"))
+    assertEq(c.bodyStreamed, false)
+
+// A handler answering 200.
+answerOk(r: ServerRequest) -> Response = Response.text(200, "ok")
+
+@test("a route takes its body as a stream once made streaming, kept through wrap, under and group")
+streamingRoutes()
+  assertEq(Route.post("/a", answerOk).streamsBody, false)
+  assertEq(Route.post("/a", answerOk).streaming().streamsBody, true)
+  assertEq(Route.post("/a", answerOk).streaming().wrap(inner -> inner).streamsBody, true)
+  assertEq(Route.post("/a", answerOk).streaming().under("/p").streamsBody, true)
+  assertEq(Route.post("/a", answerOk).streaming().under("/p").pattern, "/p/a")
+  assertEq(
+    Route.group("/g", [Route.put("/b", answerOk).streaming(), Route.put("/c", answerOk)]).map(r -> r.streamsBody),
+    [true, false]
+  )
+  assertEq(Route("PATCH", "/d", answerOk, true).streamsBody, true)
+
+@test("a router says a request streams its body where the route it would choose does, a GET one for HEAD")
+routerStreamsBody()
+  val router = Router(
+    [
+      Route.post("/up/:id", answerOk).streaming(),
+      Route.post("/up/fixed", answerOk),
+      Route.get("/feed", answerOk).streaming(),
+      Route.put("/plain", answerOk),
+      Route("HEAD", "/both", answerOk),
+      Route.get("/both", answerOk).streaming()
+    ]
+  )
+  assertEq(router.streamsBody(ServerRequest("POST", "/up/7")), true)
+  // The first route that matches decides, as it would answer.
+  assertEq(router.streamsBody(ServerRequest("POST", "/up/fixed")), true)
+  assertEq(router.streamsBody(ServerRequest("PUT", "/plain")), false)
+  assertEq(router.streamsBody(ServerRequest("GET", "/feed")), true)
+  assertEq(router.streamsBody(ServerRequest("HEAD", "/feed")), true)
+  assertEq(router.streamsBody(ServerRequest("HEAD", "/both")), false)
+  assertEq(router.streamsBody(ServerRequest("GET", "/missing")), false)
+  assertEq(router.streamsBody(ServerRequest("DELETE", "/up/7")), false)
+  assertEq(router.streamsBody(ServerRequest("POST", "/up/caf%C3%A9")), true)
+  assertEq(Router(Vector.empty[Route]()).streamsBody(ServerRequest("POST", "/")), false)
+
+@test("next passes over a part's unread body, read answers empty before the first part and after each")
+multipartNextAndRead()
+  val m = partsOf(twoParts)
+  assertEq(m.read(10).map(textOf), Ok(""))
+  val a = m.next().map(o -> o.map(shownHead))
+  assertEq(a, Ok(Some("a|-|text/plain|[(Content-Disposition, form-data; name=a)]")))
+  assertEq(m.read(3).map(textOf), Ok("fir"))
+  val f = m.next()
+  assertEq(
+    f.map(o -> o.map(h -> (h.name, h.filename, h.isFile, h.header("content-type")))),
+    Ok(Some(("f", Some("x.txt"), true, Some("text/markdown"))))
+  )
+  assertEq(m.readAll().map(textOf), Ok("second"))
+  assertEq(m.read(3).map(textOf), Ok(""))
+  assertEq(m.next().map(o -> o.isDefined), Ok(false))
+  assertEq(m.next().map(o -> o.isDefined), Ok(false))
+  assertEq(m.read(3).map(textOf), Ok(""))
+  // Every part passed over unread.
+  val skipping = partsOf(twoParts, 1)
+  assertEq(skipping.next().map(o -> o.map(h -> h.name)), Ok(Some("a")))
+  assertEq(skipping.next().map(o -> o.map(h -> h.name)), Ok(Some("f")))
+  assertEq(skipping.next().map(o -> o.isDefined), Ok(false))
+  // A body of no parts.
+  assertEq(partsOf("--XyZ--").next().map(o -> o.isDefined), Ok(false))
+
+@test("the epilogue past the closing delimiter is not read, so it is not counted against maxBytes")
+multipartEpilogueUnread()
+  val source = Trickle(utf8Of(twoParts), 1)
+  val m = MultipartReader.over(source, "multipart/form-data; boundary=XyZ").getOrElse(fail("no reader"))
+  loop
+    if m.next().map(o -> o.isEmpty).getOrElse(true) then break
+  assertEq(source.reads < twoParts.byteLength, true)
+  val size = twoParts.byteLength - "\r\nepilogue".byteLength
+  val limited = partsOf(twoParts, 1, MultipartLimits(maxBytes = size))
+  assertEq(limited.next().isOk && limited.next().isOk && limited.next().isOk, true)
+  assertEq(
+    Multipart.parse(utf8Of(twoParts), "multipart/form-data; boundary=XyZ", MultipartLimits(maxBytes = size)).isErr,
+    true
+  )
+
+@test("a source that fails is BodyUnreadable, and every read after a fault fails the same way")
+multipartFaults()
+  val fails = IoError(TimedOut, "read", "the request body")
+  val cut = "--XyZ\r\nContent-Disposition: form-data; name=a\r\n\r\nhalf of a body"
+  val m = MultipartReader.over(
+    Trickle(utf8Of(cut), 3, Some(fails)),
+    "multipart/form-data; boundary=XyZ"
+  ).getOrElse(fail("no reader"))
+  assertEq(m.next().isOk, true)
+  val first = m.readAll()
+  assertEq(first.mapErr(shownError), Err("BodyUnreadable(cannot read the request body: timed out)"))
+  assertEq(m.read(1).mapErr(shownError), Err("BodyUnreadable(cannot read the request body: timed out)"))
+  assertEq(
+    m.next().mapErr(shownError).map(o -> o.isDefined),
+    Err("BodyUnreadable(cannot read the request body: timed out)")
+  )
+  assertEq(BodyUnreadable(fails).toResponse().status, 400)
+  assertEq(
+    BodyUnreadable(fails).message,
+    "the multipart body could not be read: cannot read the request body: timed out"
+  )
+  // A malformed part's fault is sticky too.
+  val bad = partsOf("--XyZ\r\nno colon\r\n\r\n1\r\n--XyZ--")
+  assertEq(bad.next().mapErr(shownError).isErr, true)
+  assertEq(
+    bad.next().mapErr(shownError).map(o -> o.isDefined),
+    Err("the multipart body is malformed: a part's header line `no colon` is not a header")
+  )
+
+@test("parts are counted as each begins, bytes as they are read, and a head's bytes as it grows")
+multipartStreamingLimits()
+  val three = "--XyZ\r\nContent-Disposition: form-data; name=a\r\n\r\n1\r\n".repeat(3) + "--XyZ--"
+  val m = partsOf(three, 7, MultipartLimits(maxParts = 2))
+  assertEq(m.next().isOk && m.next().isOk, true)
+  assertEq(
+    m.next().mapErr(shownError).map(o -> o.isDefined),
+    Err("the multipart body has more parts than its limit of 2")
+  )
+  // A head that never ends is refused once it passes the limit, before the source ends.
+  val endless = Trickle(utf8Of("--XyZ\r\nContent-Disposition: form-data; name=a" + "x".repeat(100000)), 10)
+  val h = MultipartReader.over(
+    endless,
+    "multipart/form-data; boundary=XyZ",
+    MultipartLimits(maxHeaderBytes = 100)
+  ).getOrElse(fail("no reader"))
+  assertEq(
+    h.next().mapErr(shownError).map(o -> o.isDefined),
+    Err("a part's headers are longer than their limit of 100 bytes")
+  )
+  assertEq(endless.reads < 20, true)
+  // A body that never closes is refused once it passes `maxBytes`, as it is read.
+  val big = Trickle(utf8Of("--XyZ\r\nContent-Disposition: form-data; name=a\r\n\r\n" + "y".repeat(100000)), 1000)
+  val b = MultipartReader.over(
+    big,
+    "multipart/form-data; boundary=XyZ",
+    MultipartLimits(maxBytes = 5000)
+  ).getOrElse(fail("no reader"))
+  assertEq(b.next().isOk, true)
+  assertEq(
+    b.readAll().mapErr(shownError).map(x -> x.length),
+    Err("the multipart body is longer than its limit of 5000 bytes")
+  )
+  assertEq(big.reads <= 6, true)
+
+@test("a delimiter's line may carry 1024 spaces and tabs after its boundary, and no more")
+multipartPadding()
+  val padded = (
+      n: int
+  ) -> s"--XyZ${" \t".repeat(n / 2)}${" ".repeat(n % 2)}\r\nContent-Disposition: form-data; name=a\r\n\r\n1\r\n--XyZ--"
+  for n in [0, 1, 1023, 1024]
+    val m = partsOf(padded(n), 5)
+    assertEq(m.next().map(o -> o.map(h -> h.name)), Ok(Some("a")))
+    assertEq(Multipart.parse(utf8Of(padded(n)), "multipart/form-data; boundary=XyZ").isOk, true)
+  assertEq(
+    partsOf(padded(1025), 5).next().mapErr(shownError).map(o -> o.isDefined),
+    Err("the multipart body is malformed: a delimiter's line does not end")
+  )
+
+@test("over and multipartReader check the type and boundary as parse does")
+multipartReaderTypes()
+  val src = () -> Trickle(utf8Of(twoParts), 9)
+  assertEq(MultipartReader.over(src(), "multipart/form-data").isErr, true)
+  assertEq(
+    MultipartReader.over(src(), "multipart/mixed; boundary=XyZ").map(_ -> 0).mapErr(shownError),
+    Err("the body is `multipart/mixed; boundary=XyZ`, not `multipart/form-data`")
+  )
+  assertEq(
+    MultipartReader.over(src(), "multipart/form-data; boundary=\"b \"").map(_ -> 0).mapErr(shownError),
+    Err("the multipart body has no valid boundary")
+  )
+  assertEq(MultipartReader.over(src(), "Multipart/Form-Data; charset=x; BOUNDARY=\"XyZ\"").isOk, true)
+  assertEq(
+    ServerRequest("POST", "/").multipartReader().map(_ -> 0).mapErr(shownError),
+    Err("the body has no content type, not `multipart/form-data`")
+  )
+  val r = postedText("multipart/form-data; boundary=XyZ", twoParts)
+  val m = r.multipartReader().getOrElse(fail("no reader"))
+  assertEq(m.next().map(o -> o.map(h -> h.name)), Ok(Some("a")))
+  assertEq(m.readAll().map(textOf), Ok("first body"))
+  // Through the request, `maxBytes` is the body reader's limit too.
+  val small = r.multipartReader(MultipartLimits(maxBytes = 10)).getOrElse(fail("no reader"))
+  assertEq(
+    small.next().mapErr(shownError).map(o -> o.isDefined),
+    Err("BodyUnreadable(cannot read the request body: it is longer than its limit of 10 bytes)")
+  )
+  // A part's head of bytes that are not UTF-8, and a quoted boundary, as `parse` reads them.
+  val notUtf8 = Array(
+    utf8Of("--XyZ\r\nContent-Disposition: form-data; name=\"").toVector,
+    Vector(byte(0xff)),
+    utf8Of("\"\r\n\r\n1\r\n--XyZ--").toVector
+  ).flatMap(v -> v)
+  val u = MultipartReader.over(Trickle(notUtf8, 2), "multipart/form-data; boundary=XyZ").getOrElse(fail("no reader"))
+  assertEq(
+    u.next().mapErr(shownError).map(o -> o.isDefined),
+    Err("the multipart body is malformed: a part's headers are not UTF-8")
+  )
+  val quoted = "--a b:c\r\nContent-Disposition: form-data; name=x\r\n\r\n1\r\n--a b:c--"
+  val q = MultipartReader.over(
+    Trickle(utf8Of(quoted), 1),
+    "multipart/form-data; BOUNDARY=\"a b:c\""
+  ).getOrElse(fail("no reader"))
+  assertEq(q.next().map(o -> o.map(h -> h.name)), Ok(Some("x")))
+  assertEq(q.readAll().map(textOf), Ok("1"))
+
+@test("a large file part read in pieces comes back byte for byte, every byte value included")
+multipartLargeFile()
+  val file = Array.tabulate(200003, i -> byte((i * 7) % 256))
+  val form = Multipart([Part.field("t", "ü"), Part.file("f", "a.bin", "application/octet-stream", file)])
+  for size in [1, 4096, 65536, 1000000]
+    val m = MultipartReader.over(
+      Trickle(form.encoded("bnd"), size),
+      form.contentType("bnd")
+    ).getOrElse(fail("no reader"))
+    assertEq(m.next().map(o -> o.map(h -> h.name)), Ok(Some("t")))
+    assertEq(m.readAll().map(textOf), Ok("ü"))
+    assertEq(m.next().map(o -> o.map(h -> h.filename)), Ok(Some(Some("a.bin"))))
+    val got = Buffer[byte]()
+    loop
+      val piece = m.read(777).getOrElse(fail("a read failed"))
+      if piece.length == 0 then break
+      assertEq(piece.length <= 777, true)
+      got.addAll(piece)
+    assertEq(got.toArray().toVector == file.toVector, true)
+    assertEq(m.next().map(o -> o.isDefined), Ok(false))
