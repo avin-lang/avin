@@ -378,6 +378,7 @@ data IoError
   NotOpen
   NotPermitted
   InvalidUtf8(offset: long)
+  NoAttribute
   Other(code: int)
 
 @sysl("sysl.fs.read_text")
