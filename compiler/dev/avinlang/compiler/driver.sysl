@@ -289,8 +289,12 @@ compile_program(tc: Toolchain, files: Buf[ProgramFile], testing: bool, sysl: Buf
 
 /** `compile_program` reading and writing the instance cache, with `caching`, or neither; with
  * `debug`, into a program with debug information (`debug_info.sysl`). */
+//
+// Each phase lets go of what no later phase reads, so its memory is free for the next: the parsed
+// units once the shims are built, and once the text is written, the MIR but for what the cache
+// stores of it, and the cache's text entries.
 private compile_with(tc: Toolchain, files: Buf[ProgramFile], testing: bool, sysl: Buf[SyslPackage], c: Buf[CLibrary], caching: bool, debug: bool) -> Compilation
-    val lowered = lower_units(tc, files, testing, c, caching, debug) match
+    var lowered = lower_units(tc, files, testing, c, caching, debug) match
         Ok(l) -> l
         Err(diagnostics) -> return Compilation(diagnostics, None, None, buf(), buf())
     var archive: Option[string] = None
@@ -307,9 +311,12 @@ private compile_with(tc: Toolchain, files: Buf[ProgramFile], testing: bool, sysl
         ensure_shims(tc, lowered.program.bindings, lowered.program.handles, lowered.units, reached) match
             Ok(a) -> archive = Some(a)
             Err(diagnostics) -> return Compilation(diagnostics, None, None, buf(), buf())
+    lowered.units = buf()
     began = phase_done("shims", began, s"bindings=${lowered.program.bindings.len()} handles=${lowered.program.handles.len()}")
     val emitted = emit_llvm_cached(lowered.program, lowered.store.texts, caching)
     val ll = emitted.text
+    retire_mir(&lowered.program)
+    lowered.store.texts = map()
     began = phase_done("emit", began, s"bytes=${ll.len} reused=${emitted.reused}")
     if caching
         val written = store_entries(lowered, emitted)
@@ -321,11 +328,36 @@ private compile_with(tc: Toolchain, files: Buf[ProgramFile], testing: bool, sysl
 private store_entries(lowered: Lowered, emitted: Emitted) -> StoreWritten
     var store = lowered.store
     val mir = lowered.program
-    for i in 0..<mir.functions.len()
+    for i in 0..<mir.stored.len()
         if mir.stored[i] != "" then keep_entry(&store, lowered.modules[i], CacheEntry(LoweredEntry, mir.key_inputs.own[i], mir.stored[i]))
     for i in 0..<emitted.keys.len()
         keep_entry(&store, lowered.modules[i], CacheEntry(TextEntry, emitted.keys[i], emitted.payloads[i]))
     write_instance_store(store)
+
+/** Lets go of all of `program` but what the instance cache stores of it, once its text is written:
+ * each function's lowered entry and own key stay, by the function's index, and its code, the program's
+ * tables and the rest of what its keys were made from are let go of, so a build's last phase does not
+ * hold the whole program as well as its text. */
+retire_mir(program: *MirProgram)
+    program.functions = buf()
+    program.strings = buf()
+    program.descriptors = buf()
+    program.records = buf()
+    program.closures = buf()
+    program.constants = buf()
+    program.traps = buf()
+    program.globals = buf()
+    program.bindings = buf()
+    program.handles = buf()
+    program.tests = buf()
+    program.c_handles = buf()
+    program.c_trampolines = buf()
+    program.global_names = buf()
+    program.string_names = buf()
+    program.key_inputs = KeyInputs(buf(), buf(), buf(), buf(), buf(), buf(), "", program.key_inputs.own, program.key_inputs.bodies)
+    program.keys = buf()
+    program.reused = buf()
+    program.debug = buf()
 
 /** What a build with the instance cache made of a program: its MIR, with each function's keys and
  * whether its code came from the cache, its LLVM text, and how many functions' text the cache gave. */
@@ -737,9 +769,11 @@ private lower_units(tc: Toolchain, files: Buf[ProgramFile], testing: bool, c: Bu
         c_link.push(o)
     for flag in c_unit.link
         c_link.push(flag)
-    val store = if caching then read_instance_store(incremental_directory()) else instance_store_at("")
+    var store = if caching then read_instance_store(incremental_directory()) else instance_store_at("")
     if caching then began = phase_done("cache", began, s"files=${store.files} damaged=${store.damaged} lowered=${store.lowered.len()} texts=${store.texts.len()}")
     var mir = lower_program_cached(program, store.lowered, caching, debug)
+    // Lowering is the last reader of the cache's lowered entries.
+    store.lowered = map()
     var reused = 0usize
     for r in mir.reused
         if r then reused += 1
