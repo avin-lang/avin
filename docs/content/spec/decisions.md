@@ -12136,8 +12136,9 @@ Settled on the user's delegation 2026-11-11 (built on branch `json-derive`): **J
   - **`Url` converts a registered name holding a character beyond ASCII (as written or in
     percent-escapes) or a label beginning `xn--`, in every scheme**, with `idna.toAscii`'s
     defaults, after decoding its escapes; the result must hold only RFC 3986's unescaped name
-    characters (so `℀`, mapped to `a/c`, is `BadHost`). An ASCII name without such a label is
-    kept as written, escapes and all, as before, and an address in brackets is never converted.
+    characters (so `℀`, mapped to `a/c`, is `BadHost`). An ASCII name's escapes are decoded too
+    (the entry "A URL host's percent-escapes are decoded" below), and an address in brackets is
+    never converted.
     `parse`, `resolve` and `withHost` all hold the ASCII form, so `Url("http://bücher.example/")`
     equals `Url("http://xn--bcher-kva.example/")` and the HTTP and WebSocket clients look up,
     connect to, send `Host:` with, and over TLS name (SNI) and verify the ASCII form with no change
@@ -15057,6 +15058,15 @@ Settled on the user's delegation 2026-11-11 (built on branch `json-derive`): **J
   parameter, a digits, period or counter a code cannot use, a missing secret, an empty account, a
   secret that is not base32). A `+` is not read as a space. Alternatives weighed: leaving the issuer
   only in the label (apps differ); reading `+` as a space (not what the URI format says).
+- **A URL host's percent-escapes are decoded.** Decided by the user 2026-11-26. A registered name
+  is percent-decoded first, then taken through IDNA where it holds a character beyond ASCII or an
+  `xn--` label, otherwise lower-cased, and the result must hold only unreserved characters and
+  sub-delimiters: `Url("http://ex%41mple.com/").host` is `Some("example.com")`, `%31%32%37.0.0.1`
+  is `127.0.0.1`, `a%2Db.com` is `a-b.com`, and an escape for a space, `/`, NUL or `%` is
+  `BadHost`. An address in brackets is unchanged. This is the order of the WHATWG URL standard;
+  the name that reaches DNS, `Host:`, SNI and certificate verification is the decoded one.
+  Alternative weighed and dropped: keeping an ASCII name's escapes as written (the earlier rule),
+  which sent the undecoded name to DNS and let two spellings of one host compare unequal.
 
 ## Proposed
 

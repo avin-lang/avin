@@ -4994,23 +4994,26 @@ traps on text that is not, with the error's message and the text, as `Regex(p)` 
 A `Url` is a `data` type of its components: `scheme`, `userInfo`, `host`, `port` (an `Option[int]`),
 `path`, `query` and `fragment`, each optional one an `Option`. **An empty component is not an absent
 one**: `http://h?` has the query `Some("")` and `http://h` has `None`; `file:///etc` has the host
-`Some("")` and `mailto:a@b.c`, which has no authority, `None`. Components are kept as they were
+`Some("")` and `mailto:a@b.c`, which has no authority, `None`. Components other than the host are kept as they were
 written, percent-escapes and all, and `Url.decode` turns one into text. A host is a name, an IPv4
-address, or an address in brackets, kept with them: an IPv6 address, with an optional zone written
+address, or an address in brackets, kept as written: an IPv6 address, with an optional zone written
 `%25` and its name (`[fe80::1%25eth0]`), or an address of a later form (`[v7.x]`). A component may
 hold characters beyond ASCII other than controls and spaces, kept as they are, except the host.
 
-**A host name beyond ASCII is held in the ASCII form DNS carries**, as the WHATWG URL standard holds
-it: a name holding a character beyond ASCII, written as it is or in percent-escapes, or a label
-beginning `xn--` in any case, is taken through [`idna.toAscii`](#internationalized-domain-names)
-with its defaults, so `Url("http://Bücher.example/")` has the host `xn--bcher-kva.example` and
+**A host name is percent-decoded first, and held in the ASCII form DNS carries**, in the order the
+WHATWG URL standard gives: its escapes are decoded, so `Url("http://ex%41mple.com/")` has the host
+`example.com` and `%31%32%37.0.0.1` is `127.0.0.1`; a name then holding a character beyond ASCII,
+written as it is or in escapes, or a label beginning `xn--` in any case, is taken through
+[`idna.toAscii`](#internationalized-domain-names) with its defaults, and any other name is put in
+lower case. An escape that is not well formed is `BadPercent`, and one decoding to a character a
+name may not hold (`%20`, `%2F`, `%00`, `%25`) is `BadHost`. So `Url("http://Bücher.example/")` has the host `xn--bcher-kva.example` and
 equals `Url("http://xn--bcher-kva.example/")`. A name that is not a valid one, or whose ASCII form
 holds a character a name may not (`℀` is mapped to `a/c`), is `BadHost`. `parse`, `resolve` and
 `withHost` all hold the ASCII form, so the HTTP and WebSocket clients look the name up, connect to
 it, send it as `Host:` and, over TLS, send it as the server name and verify the certificate against
-it. An ASCII name with no `xn--` label is kept as written, escapes and all.
+it. An ASCII name with no escape and no `xn--` label is kept as written, in lower case.
 
-The scheme and host are held in lower case (a zone's name and a host's percent-escapes as written),
+The scheme and host are held in lower case (an address's zone name as written),
 and a port that is the scheme's default is held as `None`, so URLs differing only in those are
 equal, and a `Url` displays as the text it was read from with exactly those differences:
 `Url("HTTP://Example.COM:80/A")` displays as `http://example.com/A`.
