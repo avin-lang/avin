@@ -1,0 +1,97 @@
+// expect: exit 0
+// Closing a TLS connection whose peer has already reset it answers `Ok`, as a TCP connection's close
+// does, and closing again does nothing. The peer resets by closing with the victim's bytes unread.
+// It holds at the client and at the server end, for the whole connection and for each half of a split
+// one, in either order of the halves. A close that fails for any other reason still answers the
+// failure: here a send that times out because the peer reads nothing.
+import avin.fs
+import avin.io.{IoError, TimedOut}
+import avin.net.{TcpListener, TcpStream}
+import avin.net.tls.{TlsClient, TlsError, TlsServer, TlsStream}
+import avin.threads.{sleep, spawn}
+import avin.time.millis
+
+ok[T](r: Result[T, IoError]) -> T = r match
+  Ok(v) -> v
+  Err(e) -> fail(e.message)
+
+tls[T](r: Result[T, TlsError]) -> T = r match
+  Ok(v) -> v
+  Err(e) -> fail(e.message)
+
+// A test certificate or key, from the repository root or from `compiler/`.
+fixture(name: string) -> string
+  val here = "tests/fixtures/tls/" + name
+  ok(fs.readText(if fs.exists(here) then here else "../" + here))
+
+// A client and a server end of one TLS connection.
+pair(l: TcpListener, port: int, server: TlsServer) -> (TlsStream, TlsStream)
+  val accepting = spawn(() -> tls(TlsStream.server(ok(l.accept()), server)))
+  val c = tls(TlsStream.connect("localhost", port, TlsClient().trust(fixture("ca.pem"))))
+  (c, accepting.join())
+
+// Has `sender` write to `resetter`, which never reads it, and close, so its socket closes with that
+// unread and resets the connection; waits for the reset to arrive.
+reset(sender: TlsStream, resetter: TlsStream)
+  ok(sender.write(Array.fill(12, byte(5))))
+  sleep(millis(200))
+  _ = resetter.close()
+  sleep(millis(300))
+
+say(name: string, r: Result[unit, IoError]) = println(name, r.isOk)
+
+whole(name: string, victim: TlsStream, other: TlsStream)
+  reset(victim, other)
+  say(name + " close", victim.close())
+  say(name + " close again", victim.close())
+
+halves(name: string, victim: TlsStream, other: TlsStream, writerFirst: bool)
+  reset(victim, other)
+  val (r, w) = victim.split()
+  if writerFirst
+    say(name + " writer", w.close())
+    say(name + " reader", r.close())
+  else
+    say(name + " reader", r.close())
+    say(name + " writer", w.close())
+  say(name + " writer again", w.close())
+  say(name + " reader again", r.close())
+
+// A send that waits for room until its limit runs out leaves the close notice unsent, which a close
+// answers as the failure it is.
+unsent(c: TlsStream, s: TlsStream) -> string
+  ok(c.setTimeout(millis(100)))
+  val block = Array.fill(65536, byte(7))
+  var timedOut = false
+  var sent = 0
+  while !timedOut && sent < 134217728
+    c.writeSome(block) match
+      Ok(n) -> sent += n
+      Err(IoError(TimedOut, _, _)) -> timedOut = true
+      Err(e) -> fail(e.message)
+  val answer = c.close() match
+    Ok(_) -> "ok"
+    Err(IoError(TimedOut, _, _)) -> "timed out"
+    Err(e) -> "other: " + e.message
+  _ = s.close()
+  s"filled $timedOut close $answer"
+
+main()
+  val l = ok(TcpListener.bind("127.0.0.1", 0))
+  val port = l.port()
+  val server = tls(TlsServer.of(fixture("localhost.pem"), fixture("localhost.key")))
+  val (c1, s1) = pair(l, port, server)
+  whole("client", c1, s1)
+  val (c2, s2) = pair(l, port, server)
+  whole("server", s2, c2)
+  val (c3, s3) = pair(l, port, server)
+  halves("client split writer first", c3, s3, true)
+  val (c4, s4) = pair(l, port, server)
+  halves("client split reader first", c4, s4, false)
+  val (c5, s5) = pair(l, port, server)
+  halves("server split writer first", s5, c5, true)
+  val (c6, s6) = pair(l, port, server)
+  halves("server split reader first", s6, c6, false)
+  val (c7, s7) = pair(l, port, server)
+  println(unsent(c7, s7))
+  _ = l.close()
