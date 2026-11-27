@@ -7,6 +7,7 @@ module avin.net.http
 // `requestTimeout` and the limit it gives. A body the server cannot take, malformed, over the limit or
 // too slow, fails the read and is answered by the server, as a buffered one is.
 
+import avin.compress.{CompressError, Decoder, Format}
 import avin.io.{IoError, Other, Reader, TimedOut}
 import avin.net.ByteStream
 
@@ -35,7 +36,8 @@ val streamedBodyLimit: long = 104857600
 class BodyReader(
     private val source: Option[BodySource],
     private val held: Array[byte],
-    private val maxBytes: long
+    private val maxBytes: long,
+    private val decoding: Option[BodyDecoding] = None
 ): Reader
   if maxBytes < 0 then fail(s"a body limit of $maxBytes bytes: it is at least zero")
   private var at = 0
@@ -43,6 +45,12 @@ class BodyReader(
   // Up to `max` bytes of the body, `max` being at least one, or an empty array at its end.
   override read(max: int) -> Result[Array[byte], IoError]
     if max < 1 then fail(s"a read of $max bytes: it is at least one")
+    decoding match
+      Some(d) -> d.read(max, source, held, maxBytes)
+      None -> raw(max)
+
+  // Up to `max` bytes of the body as it arrives, within the limit.
+  private raw(max: int) -> Result[Array[byte], IoError]
     source match
       Some(s) -> s.read(max, maxBytes)
       None ->
@@ -53,8 +61,8 @@ class BodyReader(
         Ok(out)
 
   // The body's length where its headers give it: its `Content-Length`, zero where it has no body, and
-  // `None` for a chunked one, whose length is known only at its end.
-  length -> Option[long] = source match
+  // `None` for a chunked one, whose length is known only at its end, and for a decoded one.
+  length -> Option[long] = if decoding.isDefined then None else source match
     Some(s) -> s.framing match
       NoBody -> Some(0)
       Announced(n) -> Some(n)
@@ -69,6 +77,34 @@ class BodyReader(
       if got.length == 0 then return Ok(out.toArray())
       out.addAll(got)
     Ok(out.toArray())
+
+// The decompression of a request's body, which every reader of the request shares: made at the
+// first read, within that read's limit.
+private class BodyDecoding(val format: Format)
+  private var decoder: Option[Decoder] = None
+
+  // Up to `max` bytes of the decompressed body. A streamed body that fails to decompress is recorded
+  // on its source, so the server answers it: `413` past the limit, `400` for any other failure.
+  read(max: int, source: Option[BodySource], held: Array[byte], maxBytes: long) -> Result[Array[byte], IoError]
+    val d = decoder match
+      Some(made) -> made
+      None ->
+        val made = Decoder(BodyReader(source, held, compressedLimit(maxBytes)), format, maxBytes)
+        decoder = Some(made)
+        made
+    val got = d.read(max)
+    if got.isErr && source is Some(s) && s.refusal.isEmpty
+      d.failure match
+        Some(CompressError.TooLarge(_)) -> s.refusal = Some(Answer(413))
+        Some(_) -> s.refusal = Some(Answer(400))
+        None -> ()
+    got
+
+// The most compressed bytes read for a body of at most `limit` decompressed ones: the limit, a
+// sixty-fourth of it for the framing of data that does not compress, and 64 KiB for a gzip header's
+// optional fields.
+private compressedLimit(limit: long) -> long =
+  if limit > (long.MaxValue - 65536) / 2 then long.MaxValue else limit + limit / 64 + 65536
 
 // The failure of a body longer than `limit`.
 private tooLong(limit: long) -> IoError =

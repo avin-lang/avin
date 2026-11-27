@@ -4360,14 +4360,47 @@ spelling is better, as each entry says.
   blocking calls only (every such call a hand-off between threads).
 - Settled on the user's delegation 2026-11-06 (branch `lwt-scheduler`): **every lock and condition parks: `Mutex`, `Condition` and
   `Once` as well as channels, futures, promises and joins.** The runtime's one lock and one
-  condition, which all of them are built on, keep a queue of waiters; a lock let go goes straight to
-  its oldest waiter. The brief planned `Mutex` and `Condition` for the next step, keeping them
+  condition, which all of them are built on, keep a queue of waiters; a lock let go went straight to
+  its oldest waiter, until the barging lock settled by the user on 2026-11-26 (next entry) replaced
+  that. The brief planned `Mutex` and `Condition` for the next step, keeping them
   blocking until then. *Why*: channels, futures' cells and the pools are built on the very lock and
   condition `Mutex` uses, so keeping `Mutex` blocking meant a second, temporary implementation of
   both; and a `Mutex` whose holder parks can then never hold every worker. *Alternatives*: a parking
   lock and condition beside the blocking ones, used by channels and futures only, until the next
   step (two implementations, one to remove). Review with the user: it moves part of the next step
   into this one.
+- Settled by the user 2026-11-26 (branch `mutex-contention`), choosing it over keeping strict order:
+  **the runtime's lock barges, with a starvation bound, rather than handing itself to its oldest
+  waiter.** A thread takes a free lock with one compare-and-set and lets go of one nobody is parked
+  on with another. A thread finding it busy spins for up to 10 µs, then parks; with threads parked,
+  only one thread at a time spins (the one holding the lock's "awake" mark). Letting go with threads
+  parked and none awake leaves the lock free and wakes the oldest, which competes with threads
+  arriving meanwhile and, losing, parks again at the front; while a thread is awake for the lock,
+  letting it go wakes nobody. A first waiter that has waited over 1 ms since it first found the lock
+  busy is handed the lock, held, at most once a millisecond per lock, so no thread is overtaken for
+  ever and a lock whose waiters are all old does not turn back into a relay. The spec's "the mutex
+  goes to the thread that has waited longest" (`threads.md`, end of § Synchronization) became the
+  bound. `Pool` keeps its strict order through its own queue of tickets; `Semaphore` already
+  promised no order; `RwLock`, `Barrier`, `Once`, channels and futures keep their own rules over the
+  lock and condition. *Why*: handing a contended lock to a parked waiter makes every release wait for
+  a thread to be scheduled, a lock convoy every lock in the library inherited. Measured at -O2 on the
+  development machine (`tests/bench/mutex_contention.avin`, lock-and-let-go pairs a second, 1 / 2 /
+  4 / 8 / 16 threads), body of one addition: before 52.4M / 0.36M / 0.41M / 0.29M / 0.26M, after
+  56.6M / 12.4M / 5.2M / 5.7M / 5.3M; body of 200 arithmetic steps: before 1.52M / 0.28M / 0.27M /
+  0.27M / 0.26M, after 1.56M / 1.31M / 1.32M / 1.33M / 1.31M. The long body now keeps 84% of its
+  one-thread rate at 16 threads, and the short body 9 to 10%, up from 0.5%. The short body is bounded
+  by moving the lock's word between processors: additions to one `Atomic` from the same threads
+  reach 239M / 34M / 30M / 26M / 26M, and a lock costs at least two such steps and the guarded
+  value's own line. *Alternatives*: keeping strict order and making the hand-over cheaper (a fast
+  path and a spin before parking: the order kept, but every contended release still waits for one
+  processor-to-processor hand-over and a parked thread's scheduling); both kinds of lock, a barging
+  default and a fair one on request (more surface for a need only `Pool` has, which its own queue
+  meets); a bound per waiter alone, without the once-a-millisecond limit (measured: with 16 threads
+  all waiters grew old and the lock handed itself over at nearly every release, 0.95M a second); no
+  "awake" mark, a spin of 64 hints and a wake at every contended release (measured: 0.44M a second at
+  16 threads and the long body down to 0.18M, every release waking a thread that then lost); every
+  busy thread spinning, not only the one holding the mark (measured: about 15% slower at 8 and 16
+  threads with the short body).
 - Settled on the user's delegation 2026-11-06 (branch `lwt-scheduler`): **a context waits as the one waiter it holds**, since a thread
   waits on one thing at a time; a timed wait of a lightweight thread is a timer the monitor fires,
   added by the worker after the thread has switched away and taken off by the thread when it runs
@@ -11052,8 +11085,8 @@ Settled on the user's delegation 2026-11-11 (built on branch `json-derive`): **J
     a streamed request's body (branch `http-request-stream`). Alternatives weighed: one
     `BodyReader` for both ends (their framing, limits and connection hand-back differ, and the
     server's answers a refusal the client's has no use for);
-    renaming the server's (its `ServerRequest.bodyReader()` reads naturally with it). Review with
-    the user: the name.
+    renaming the server's (its `ServerRequest.bodyReader()` reads naturally with it). Confirmed by
+    the user 2026-11-26 (shipped in 0.0.39): the name `ResponseBodyReader`.
 - Settled on the user's delegation 2026-11-24 (branch `http-hardening`): **`http.serve` is
   hardened against a hostile client** ([servers](/spec/system-library/#http-server), its
   Hardening table), every limit with a default, after a review that played each attack against a
@@ -11089,9 +11122,9 @@ Settled on the user's delegation 2026-11-11 (built on branch `json-derive`): **J
     accepting and answering `503` (which costs a thread and a write per refused client, under
     exactly the flood it guards against); a connection's requests are read one at a time with
     8 KiB read ahead, so pipelining has one request in flight and `writeTimeout` closes a client
-    that never reads. Review with the user: whether `writeTimeout`, which bounds each wait and not
-    a whole response, should gain a whole-response bound or a minimum rate, since a client reading
-    a byte every few seconds holds a connection for as long as a large response lasts.
+    that never reads. Confirmed by the user 2026-11-26 (shipped in 0.0.39): `writeTimeout` bounds each
+    wait and not a whole response. A whole-response bound or a minimum rate was weighed, since a
+    client reading a byte every few seconds holds a connection for as long as a large response lasts.
 
 - Settled on the user's delegation 2026-11-24 (branch `http-client-extras`): **the HTTP client's
   cookie jar, proxies and `Authorization` helpers** ([client](/spec/system-library/#client)).
@@ -11112,8 +11145,8 @@ Settled on the user's delegation 2026-11-11 (built on branch `json-derive`): **J
     then gets a host-only cookie), and an IP address is a domain only to itself. A suffix of two
     labels or more (`co.uk`, `github.io`) is not caught, so a host under one may set a cookie for
     its siblings. Bundling the list (some 10,000 rules, changing monthly) was weighed and left out:
-    it would date with every release, and a client usually talks to a few known services. Review
-    with the user: whether to bundle it, or take one from a file.
+    it would date with every release, and a client usually talks to a few known services. Confirmed
+    by the user 2026-11-26 (shipped in 0.0.39): no public-suffix list is bundled.
   - **`HttpOnly` and `SameSite` are stored, not enforced**: they guard a page's scripts and its
     cross-site requests, and a client has neither, so every matching cookie is sent. Ports are not
     told apart, as RFC 6265 says.
@@ -11126,8 +11159,9 @@ Settled on the user's delegation 2026-11-11 (built on branch `json-derive`): **J
     it is what many command-line tools do, but in a server it lets the environment redirect every
     outgoing request, and under CGI a request's `Proxy` header becomes `HTTP_PROXY` ("httpoxy"), so
     `fromEnvironment` also skips `HTTP_PROXY` where `REQUEST_METHOD` is set. Lower case wins over
-    upper case, then `ALL_PROXY`, as tools on the machine read them. Review with the user: whether
-    the default should be the environment.
+    upper case, then `ALL_PROXY`, as tools on the machine read them. Confirmed by the user
+    2026-11-26 (shipped in 0.0.39): the default is no proxy; the environment is read only by
+    `Proxy.fromEnvironment()`.
   - **`http` by the proxy with an absolute target; `https` through `CONNECT`**, the TLS handshake
     with the server inside the tunnel, so the proxy sees nothing of the exchange. Only `http://`
     proxies: a proxy URL of `https://` (TLS to the proxy) or `socks5://` fails the request with
@@ -11730,8 +11764,8 @@ Settled on the user's delegation 2026-11-11 (built on branch `json-derive`): **J
     package can move there unchanged, which needs only the binding targets renamed); `@c` bindings in
     the library (the library's manifest has no `c-libraries`, and out-parameters such as `EVP_PKEY **`
     want Sysl's pointers anyway); Ed25519 from `sysl:monocypher` and the rest from OpenSSL (two
-    libraries for one module). Review with the user: whether the package should become a
-    `sysl:openssl` release.
+    libraries for one module). Confirmed by the user 2026-11-26 (shipped in 0.0.39): the package stays
+    as built; moving it into a `sysl:openssl` release is not decided here.
   - **A key is a value, held as its DER and parsed again at each use** (`opaque type PrivateKey =
     KeyParts`, the kind and the PKCS#8 or SubjectPublicKeyInfo bytes). A key read at startup is then
     used by every thread at once, needs no `close`, and has no finalizer. The price is one DER parse
@@ -11929,8 +11963,9 @@ Settled on the user's delegation 2026-11-11 (built on branch `json-derive`): **J
     `avin: trap: bus error: …` and stops the program. Avin cannot make the access succeed or fail softly, since it is an
     ordinary load or store. Alternatives: a registry of mapped ranges consulted by the handler (more
     exact, but a lock-free table for a message that already names the one cause Avin code has); a
-    check of the file's size before each access (a system call per byte). Review with the user:
-    whether a program should be able to recover from a cut-short mapping (it cannot, today).
+    check of the file's size before each access (a system call per byte). Confirmed by the user
+    2026-11-26 (shipped in 0.0.39): a program cannot recover from a cut-short mapping; the trap
+    stops the program.
   - **Left out:** `advise` (Sysl has it on `Mapped` only), a mapping of part of a file, and growing
     a mapping; a program `setLength`s the file and maps it again.
 - Settled on the user's delegation 2026-11-24 (branch `actor-segv`): **a trap drops the frames of
@@ -11961,8 +11996,8 @@ Settled on the user's delegation 2026-11-11 (built on branch `json-derive`): **J
     nothing of SQLite's (its Sysl package joins a program only where a binding reaches it, as
     OpenSSL's does). Alternatives: the package `dev.avinlang.sqlite` in its own repository (the JSON
     and `pg` precedent; a dependency to add for what a server takes as given, and a repository and
-    release of its own). **Review with the user**: the JSON decision of 2026-11-13 moved a module out
-    of the library, and this one goes the other way.
+    release of its own). Confirmed by the user 2026-11-26 (shipped in 0.0.39): `avin.sqlite` is in
+    the standard library, though the JSON decision of 2026-11-13 moved a module out of it.
   - **The machine's SQLite, through a Sysl package of the library's own** (`library/sysl/sqlite`,
     named by its directory in `library/library.hocon`; `pkg-config sqlite3` finds it). macOS ships
     3.43 or newer in its SDK and every Linux distribution packages it, so nothing is compiled; 3.37 is
@@ -11975,8 +12010,9 @@ Settled on the user's delegation 2026-11-11 (built on branch `json-derive`): **J
     only a package's manifest has `sources`, not the library's, and it adds 9 MB of C and a long
     compile to every first build); Avin C bindings straight to `libsqlite3` (the library's manifest
     has no `c-libraries`, and a library entry would have to be reached per module rather than linked
-    into every program; `SQLITE_TRANSIENT` needs C glue either way). **Review with the user**:
-    vendoring for a pinned SQLite, which would also need `sources` for the library's manifest.
+    into every program; `SQLITE_TRANSIENT` needs C glue either way). Confirmed by the user
+    2026-11-26 (shipped in 0.0.39): the machine's SQLite through a Sysl package, not a vendored
+    SQLite (which would also need `sources` for the library's manifest).
   - **A connection belongs to one owner at a time, and a call that waits is `blocking`.** The
     connection and its statements are Sysl handles, so the owner check every handle has keeps two
     threads off one connection; threads use a connection each or a `threads.Pool` of them. `open`,
@@ -11998,9 +12034,9 @@ Settled on the user's delegation 2026-11-11 (built on branch `json-derive`): **J
     read-only connection and `:memory:` are left as they are), `foreignKeys` on (SQLite's own default
     is off only for compatibility), `busyTimeout` 5 seconds (SQLite's is 0, failing at the first
     lock), a statement cache of 64. Alternatives: SQLite's own defaults throughout (a server's
-    concurrent writers then fail with `Busy` at once and its foreign keys go unchecked). **Review with
-    the user**: WAL by default leaves `-wal` and `-shm` files beside the database and does not suit a
-    database on a network file system.
+    concurrent writers then fail with `Busy` at once and its foreign keys go unchecked). Confirmed by
+    the user 2026-11-26 (shipped in 0.0.39): WAL is on by default, though it leaves `-wal` and
+    `-shm` files beside the database and does not suit a database on a network file system.
   - **One statement per call.** `execute` and the queries refuse SQL holding a second statement, or
     a zero byte, as a `Misuse`, rather than run the first and drop the rest as `sqlite3_prepare`
     does; `executeScript` runs several, without parameters. Alternatives: SQLite's behaviour (a
@@ -12134,8 +12170,87 @@ Settled on the user's delegation 2026-11-11 (built on branch `json-derive`): **J
   2026-11-25: **the name `Missable`**, after the core's capability names (`Enumerable`, `Sendable`,
   `Buildable`), a bound reading "may be missing"; `Missing` was weighed and refused, since
   `avin.net.http`'s `ParamError` has a variant `Missing` and `T: Missing` reads as a fact about `T`.
-
-## Proposed
+- Settled on the user's delegation 2026-11-24 (branch `compression`): **compression, and HTTP's
+  content codings** ([system library](/spec/system-library/#avincompress), and *Compression* under
+  [HTTP server](/spec/system-library/#http-server)).
+  - **The codec is the system's zlib, reached through a Sysl package the library carries**,
+    `library/sysl/zcodec` (module `avin.zcodec`), named in `library/library.hocon` by its path, so
+    only a program whose bindings reach it builds it and links `-lz`. Its C shim allocates the
+    `z_stream` and makes `deflateInit2`/`inflateInit2` (macros) callable; each step hands zlib two
+    slices and reports what it took and wrote. *Why*: zlib is on every machine Avin runs on (macOS
+    carries it; Debian's `zlib1g-dev`), has the streaming API this needs whole: a bounded output
+    per step, which is what makes the decompression limit exact; a sync flush, which a streamed
+    response needs to send each write at once; gzip, zlib and raw framings and multi-member reset.
+    *Alternatives*: `sysl:miniz` (vendored, nothing to install), which its `Decoder` appends a
+    chunk's whole output into a `Buf` (a few hundred bytes can stand for megabytes before the limit
+    is seen), its `Deflater` writes into one fixed slice and offers no sync flush, and it has no gzip
+    encoder: closing those would be changes to that package first; `@c` bindings to zlib from
+    `avin.compress` itself (the library has no `c-libraries`, and adding them to `library.hocon`
+    is a compiler change for one module). Review with the user: a Linux machine building a program
+    that uses `avin.net.http` now needs zlib's headers, beside OpenSSL's.
+  - **`avin.compress`'s surface**: `Format` (`Gzip`, `Zlib`, `RawDeflate`), `compress`/`decompress`
+    and `gzip`/`gunzip` on whole arrays, `Encoder` (a `ByteWriter` and `Close`, with `flush`,
+    `writeFlushed` and `finish`) and `Decoder` (a `Reader`), levels 0 to 9 with zlib's default 6,
+    `CompressError` (`Corrupt(text)`, `Truncated`, `TooLarge(limit)`). *Alternatives*: an
+    auto-detecting format for decoding (zlib can; left out, since every caller here knows its
+    format); levels as an enum (the numbers are what every tool and reader of zlib knows).
+  - **Every decompression has a limit, 100 MiB unless given** (`defaultMaxBytes`), and `TooLarge`
+    is answered before any byte past it: the codec is never given more room than the limit leaves
+    plus one byte. *Alternatives*: no default limit (unbounded by default, the decompression-bomb
+    hole); a ratio limit (a legitimate highly compressible body fails it, a bomb under it still
+    costs the ratio times its size). Review with the user: the 100 MiB default, shared with the
+    streamed request body's.
+  - **Members and trailing bytes**: a gzip stream of several members decompresses joined, as the
+    `gzip` tool and RFC 1952 read it; anything else after a stream's end (junk, zero padding, a
+    second zlib stream) is `Corrupt`. *Alternatives*: ignoring trailing bytes (hides a truncated or
+    spliced body).
+  - **`BodyWriter.through(writer)` is how a middleware wraps a streamed body**: a writer of the same
+    body, keeping its server's stopping, whose writes go to `writer`. *Why*: `StreamedBody.write`
+    takes a `BodyWriter`, a final class, so a transform needs a `BodyWriter` that does not write to
+    the connection; one method gives every middleware that, with no new type and no change to
+    `StreamedBody`. *Alternatives*: a `BodyWriter` trait (every stream's writer type changes, for one
+    use); a transform hook on `StreamedBody` (a second way to say the same thing).
+  - **A compressed stream sends each write at once**, by a zlib sync flush after it, as an
+    uncompressed stream does. *Why*: server-sent events and progress streams must arrive as they are
+    written. The cost is a few bytes per write and a little ratio. *Alternatives*: compressing with
+    no flush until the end (events held back); a flush every N bytes (latency a handler cannot see).
+  - **Negotiation**: q-values to the RFC 9110 grammar (malformed entries dropped), `*` for any coding
+    not named and for identity unless named, a coding used where its q-value is above zero and no
+    lower than identity's, gzip winning a tie; no `Accept-Encoding` means the response as it is.
+    *Alternatives*: compressing for a request with no header (RFC 9110 allows any coding then;
+    clients that send none rarely decode).
+  - **A request refusing identity and accepting neither coding is answered `406`, before the
+    handler**. *Why*: it is all that honours the header, and deciding before the handler wastes no
+    work. *Alternatives*: ignoring the refusal (RFC 9110 allows it; the header would then mean
+    nothing). Review with the user: some servers ignore it.
+  - **What is left alone**: `HEAD`, `101`, `204`, `206`, `304`, a `Content-Range`, a
+    `Content-Encoding` already set, `Cache-Control: no-transform`, already-compressed types (a
+    `compressible` predicate, default `compressibleType`), and bodies under `minBytes` (1024); a
+    request refusing identity overrides the last two. `Vary: Accept-Encoding` goes on exactly the
+    responses whose form depends on the header. A buffered body compressing larger is sent as it
+    was. A strong `ETag` is made weak, as the common servers do. *Alternatives*: an allow-list of
+    compressible types (misses every type a program invents); `HEAD` compressed like `GET` (the
+    server would have to compress a body it never sends, to report its length).
+  - **Request bodies are decompressed by the same middleware** (`decodesRequests = true`), a
+    buffered body whole within `maxDecodedBytes` (1 MiB, `serve`'s own `maxBodyBytes` default: the
+    middleware cannot see the server's), answering `400` or `413` itself; a streamed one through
+    `ServerRequest.withBodyDecoded(format)`, its reader's limit counting decompressed bytes and the
+    compressed bytes bounded by the limit plus a sixty-fourth and 64 KiB, a failure answered by the
+    server as an unreadable body is; any other coding `415` with `Accept-Encoding`. *Alternatives*:
+    a separate request middleware (one more thing to compose for the common case); decoding in
+    `serve` (the server would choose codings for every program).
+  - **The client asks for gzip and decompresses by default**, within `Request.decoding` (100 MiB),
+    stripping `Content-Encoding` and `Content-Length`; `withoutDecoding()` opts out, and a request
+    sending its own `Accept-Encoding` gets the body raw. A decompression failure is the new
+    `HttpError.Decoding`. In the pooled `Client` the decompression wraps the response's body reader,
+    so `stream` reads decompressed bytes as they arrive; `maxResponseBytes` counts decompressed bytes;
+    a redirect's body is drained as it came, never decompressed; a connection is kept only where the
+    compressed body was read to its end; and an empty body (`HEAD`, `204`, `304`, a length of zero)
+    is left with its headers. *Alternatives*: off by default (most callers want the bytes, and a
+    server that compresses unasked still works either way); `Malformed` for a failure (a body past a
+    limit is not malformed). Review with the user: `HttpError` gained a case.
+  - **brotli and zstd are follow-ups** (`sysl:brotli`, `sysl:zstd` exist), as further `Format`s and
+    codings in the same negotiation.
 
 - Settled on the user's delegation 2026-11-24 (branch `fs-content-type`): **`avin.fs` has
   `probeContentType(file) -> Result[Option[string], IoError]`, `contentTypeOfName(name) -> Option[string]`,
@@ -12165,8 +12280,8 @@ Settled on the user's delegation 2026-11-11 (built on branch `json-derive`): **J
   - **A new `ErrorKind`, `HostNotFound`** ("no address found for the name"), for a name with no
     address, `TcpStream.connect`'s and `bind`'s resolving included. Alternatives: `NotFound`, whose
     sentence speaks of files and would print `cannot look up x: no such file or directory`; or
-    `Other("no address found")`, which a program can only tell apart by its text. Review with the
-    user: a new case of a shared error type, as `NoTerminal` was.
+    `Other("no address found")`, which a program can only tell apart by its text. Confirmed by the
+    user 2026-11-26 (shipped in 0.0.39): a new case of a shared error type, as `NoTerminal` was.
   - **Names refused before the resolver sees them**: empty (which the system's resolver answers
     with the loopback), longer than `HostNameMost` = 254 bytes (the DNS's 253 and a trailing dot),
     or holding white space, a control character or a zero byte (which would cut the name short in
@@ -14070,8 +14185,9 @@ Settled on the user's delegation 2026-11-11 (built on branch `json-derive`): **J
   the gauge exact when the connection's failure is reported. Alternatives: hooks as callbacks on
   `serve` (a general hook API is a larger design, and the counting it would serve is this one);
   counting refusals in `http_server_requests_total` with an empty method (a refused request has no
-  trustworthy method, and its exact code says which limit was hit). Review with the user: whether a
-  process-wide default registry is wanted after all, and OpenMetrics negotiation.
+  trustworthy method, and its exact code says which limit was hit). Confirmed by the user
+  2026-11-26 (shipped in 0.0.39): no process-wide default registry, and the 0.0.4 text without
+  OpenMetrics negotiation, as built.
 - Settled on the user's delegation 2026-11-15 (built on branch `api-observe`): **rate limiting.**
   `RateLimiter(rate, per, burst, key, maxKeys, clock, errors)` is a token bucket per key, computed as
   each bucket's next-token time in integer microseconds (the generic cell rate algorithm, exactly a
@@ -14384,34 +14500,6 @@ Settled on the user's delegation 2026-11-11 (built on branch `json-derive`): **J
   inference as it was); a nominal meet of unrelated arguments, the greatest common subclass
   (none can be named in general, and an intersection type is not a type Avin writes); keeping the
   result-level message (it names a trait the program never mentioned).
-
-## Open
-
-- Whether constructor traits may carry parameters that are not holes (an error type fixed per
-  trait, `MonadError[A, E]`), and whether composed constructors (`Option[List[_]]`) are wanted; both
-  are left out of the higher-kinded design and need no change to it to add later.
-
-- Exporting a whole module as a member of another (`export a.b`), which needs modules as members.
-
-- Tooling for exports: completion after `m.` and in an import group listing a module's exports
-  beside its declarations, and the IntelliJ plugin's resolution following an export to the
-  declaration (go-to-definition, find usages, renaming through an export).
-
-- What a comprehension over a `Map` yields when its values are not pairs (it needs `Iterable`'s own
-  transformations).
-
-- Packages, where Sysl's choice does not transfer ([packages](/spec/packages/)):
-  - Whether a build should re-hash `vendor/` on every run, catching a hand edit to a committed
-    vendored package, or trust the hash recorded beside each package as it trusts the cache's.
-
-- Lightweight threads, the open parts of the settled design above (cancellation is under
-  [Proposed](#proposed)): none is left open. Stack size and growth are settled above (branch
-  `lwt-stacks`), and keeping user-interface work on the main thread is settled above as threads
-  pinned to the main thread (branch `main-lwt`). The allocation chunk belongs to the carrier (proposed above), so
-  thousands of parked lightweight threads hold no chunk each. The collector needs nothing new: its roots are what the
-  runtime's callback marks, so a parked lightweight thread's context keeps its exact shadow stack
-  and is walked as an attached thread's is, and switching stacks happens only at the runtime's own
-  safepoints, so no collection sees one half done.
 
 - Settled on the user's delegation 2026-11-06 (branch `check-stops-early`): **`avin check` stops after type checking**. Checking a
   program no longer lowers it, builds the shims of its Sysl bindings or builds its C unit: the
@@ -14808,10 +14896,11 @@ Settled on the user's delegation 2026-11-11 (built on branch `json-derive`): **J
   template language in its own files with a compiler (a large item, likely a package); a JavaScript
   lexer to escape inside the author's quotes (more code, more ways to misjudge); allowing unquoted
   attribute holes with `escapeAttribute` (an empty value swallows the next attribute); escaping rather
-  than refusing `Html` in a script (it is trusted as markup, not as code). Review with the user: a
-  compile-time hook for interpolators (checking a template's parts as it compiles, as `f"…"` is), which
-  would move every template mistake from first render to compile time; and private constructors, which
-  would let `Html` be made only through a named trusting function.
+  than refusing `Html` in a script (it is trusted as markup, not as code). Confirmed by the user
+  2026-11-26 (shipped in 0.0.39): the gaps stay as built. There is no compile-time hook for
+  interpolators (checking a template's parts as it compiles, as `f"…"` is, which would move every
+  template mistake from first render to compile time), and no private constructors, which would let
+  `Html` be made only through a named trusting function.
 - Settled on the user's delegation 2026-11-24 (branch `crypto-password`): **password hashing is
   `avin.crypto.password`, over the Argon2 reference implementation and Openwall's crypt_blowfish,
   vendored as C sources in a Sysl package the standard library carries** (`library/sysl/password`,
@@ -14830,9 +14919,9 @@ Settled on the user's delegation 2026-11-11 (built on branch `json-derive`): **J
   0.4.1, which binds Argon2id too (the audit row saying "Argon2i only" is out of date) and is audited,
   but computes lanes one after another and is not the source the item named; libsodium or libargon2
   installed through a package manager (a dependency to install everywhere); a library manifest that
-  carries `c-libraries` (a compiler feature for something a Sysl package already does). Review with
-  the user: whether the standard library should grow `c-libraries` of its own, which would make the
-  Sysl package unnecessary.
+  carries `c-libraries` (a compiler feature for something a Sysl package already does). Confirmed by
+  the user 2026-11-26 (shipped in 0.0.39): the vendored C stays, and the standard library takes no
+  `c-libraries` of its own.
 - Settled on the user's delegation 2026-11-24 (branch `crypto-password`): **the password API.**
   `hashPassword(password, params = Argon2Params(), secret = [])` returns a PHC string;
   `verifyPassword(password, encoded, secret = [], limits = PasswordLimits()) -> Result[bool,
@@ -14858,3 +14947,67 @@ Settled on the user's delegation 2026-11-11 (built on branch `json-derive`): **J
   bcrypt ignores it. *Alternatives weighed*: `verifyPassword -> bool` (hides malformed rows);
   `needsRehash` only on weaker costs; a `Result` from `hashPassword` (its parameters are the server's
   own, so a bad one is a programming error and traps, as `pbkdf2HmacSha256`'s do).
+- Settled on the user's delegation 2026-11-24 (branch `totp`): **one-time passwords live in
+  `avin.crypto` (file `otp.avin`), not a new module**, so the module lists of the reject tests do not
+  change and a program importing `avin.crypto` finds them beside `hmacSha1`. (1) Functions, not a
+  stateful object: `hotp(secret, counter, digits = 6, algorithm = OtpSha1)`, `totp(secret, at = now(),
+  digits, algorithm, period = 30, t0 = 0)`, `totpStep`, `verifyHotp`, `verifyTotp`. The clock is the
+  `at` argument, defaulting to `now()`; a test passes an `Instant`, so no clock type is needed.
+  Alternatives weighed: a `Totp` class holding the settings and a clock function (state to keep in step
+  with an account row, and a closure the caller must make `@sendable`). (2) The program's own settings
+  (empty secret, digits outside 6 to 8, a period under 1, a negative window or counter, a generated
+  secret under 16 bytes, a time before `t0`) trap; text that arrives from outside (a secret, a URI)
+  answers `Result`, and a code someone typed answers `None`. Digits stop at 8 because the truncated
+  value has 31 bits. (3) `verifyTotp` and `verifyHotp` return the matched step or counter, not a bool.
+  Every step in the window is computed and compared with `constantTimeEquals` whatever the first
+  answer, and the greatest match is answered, so the answer does not depend on where the match lies.
+  Replay: the caller stores the step and passes it back as `lastStep`; only steps after it are
+  accepted, so an accepted code, and any older one, is refused. A caller that does not pass it accepts a
+  code for as long as it stays in the window; the docs say so. Alternatives weighed: a bool (cannot
+  refuse reuse); a mutable verifier (hides the account state). (4) Algorithm names are `OtpSha1`,
+  `OtpSha256`, `OtpSha512`, since `Sha1` and the others are the streaming digest classes in the same
+  module. (5) Secrets are base32 text, upper case and unpadded when written, and either case, padded or
+  not, with spaces and hyphens left in, when read. (6) `OtpUri` holds the kind (`TimeBased(period)` or
+  `CounterBased(counter)`), secret, issuer, account, algorithm and digits; `uri` writes
+  `otpauth://totp/Issuer:account?secret=&issuer=&algorithm=&digits=&period=` with issuer and account
+  percent-escaped (`Url.encode`, so a colon inside either is `%3A` and only the label's own colon
+  divides it) and `parseOtpUri` reads it back, either type. It is lenient where apps are (case of the
+  scheme, type, algorithm and secret; missing `algorithm`, `digits`, `period` default to SHA1, 6, 30;
+  unknown parameters ignored; the `issuer` parameter beats the label's; `Issuer%3Aaccount` with that
+  `issuer` parameter is split) and strict where a wrong value would give wrong codes (a duplicate
+  parameter, a digits, period or counter a code cannot use, a missing secret, an empty account, a
+  secret that is not base32). A `+` is not read as a space. Alternatives weighed: leaving the issuer
+  only in the label (apps differ); reading `+` as a space (not what the URI format says).
+
+## Proposed
+
+Nothing is waiting for a decision: every choice above was settled on the user's delegation or by the
+user, and the entries still marked "Review with the user" name a point to talk through.
+
+## Open
+
+- Whether constructor traits may carry parameters that are not holes (an error type fixed per
+  trait, `MonadError[A, E]`), and whether composed constructors (`Option[List[_]]`) are wanted; both
+  are left out of the higher-kinded design and need no change to it to add later.
+
+- Exporting a whole module as a member of another (`export a.b`), which needs modules as members.
+
+- Tooling for exports: completion after `m.` and in an import group listing a module's exports
+  beside its declarations, and the IntelliJ plugin's resolution following an export to the
+  declaration (go-to-definition, find usages, renaming through an export).
+
+- What a comprehension over a `Map` yields when its values are not pairs (it needs `Iterable`'s own
+  transformations).
+
+- Packages, where Sysl's choice does not transfer ([packages](/spec/packages/)):
+  - Whether a build should re-hash `vendor/` on every run, catching a hand edit to a committed
+    vendored package, or trust the hash recorded beside each package as it trusts the cache's.
+
+- Lightweight threads, the open parts of the settled design above (cancellation is under
+  [Proposed](#proposed)): none is left open. Stack size and growth are settled above (branch
+  `lwt-stacks`), and keeping user-interface work on the main thread is settled above as threads
+  pinned to the main thread (branch `main-lwt`). The allocation chunk belongs to the carrier (proposed above), so
+  thousands of parked lightweight threads hold no chunk each. The collector needs nothing new: its roots are what the
+  runtime's callback marks, so a parked lightweight thread's context keeps its exact shadow stack
+  and is walked as an attached thread's is, and switching stacks happens only at the runtime's own
+  safepoints, so no collection sees one half done.

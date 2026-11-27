@@ -1,0 +1,354 @@
+// `avin.net.http`'s `Compression` away from a connection: the `Accept-Encoding` negotiation, q-values
+// and all; the responses left as they are and why; the headers a compressed response is given; the
+// request bodies it decompresses and the ones it refuses; and a buffered request's body read through
+// `withBodyDecoded`. Streamed responses and streamed request bodies, which need a connection, are in
+// tests/run/http_compression.avin.
+import avin.compress.{Gzip, RawDeflate, Zlib, compress, decompress, gzip}
+import avin.net.http.{Compression, Cors, Response, ServerRequest, compressibleType}
+import avin.fs
+import avin.threads.Atomic
+
+// The UTF-8 bytes of `text`.
+bytesOfText(text: string) -> Array[byte] = text.utf8
+
+// `bytes` read as UTF-8.
+textOfBytes(bytes: Array[byte]) -> string = string.fromUtf8Lossy(bytes)
+
+// `unwrap` is compress.avin's: the files of library/tests are one module.
+
+// A body worth compressing: 2,400 bytes of text.
+val big: string = "hello world ".repeat(200)
+
+// A request for `/` sending `headers`.
+asking(headers: Vector[(string, string)], method: string = "GET") -> ServerRequest = ServerRequest(method, "/", headers)
+
+// What `response` says about its coding: the `Content-Encoding`, or `none`, then its `Vary`, or
+// `-`, and whether its body decompresses to `big`.
+summary(response: Response) -> string
+  val coding = response.header("Content-Encoding").getOrElse("none")
+  val vary = response.header("Vary").getOrElse("-")
+  val body = coding match
+    "gzip" -> decompress(response.body, Gzip).map(textOfBytes).getOrElse("<corrupt>")
+    "deflate" -> decompress(response.body, Zlib).map(textOfBytes).getOrElse("<corrupt>")
+    _ -> response.text
+  s"${response.status} $coding $vary ${body == big}"
+
+// The summary of the response `Compression()` makes of `answer` for a request sending
+// `Accept-Encoding: accept` (none where `accept` is `None`).
+negotiated(
+    accept: Option[string],
+    answer: @sendable () -> Response = () -> Response.text(200, big),
+    method: string = "GET"
+) -> string
+  val headers = accept match
+    Some(a) -> [("Accept-Encoding", a)]
+    None -> Vector.empty[(string, string)]()
+  summary(Compression().middleware(_ -> answer())(asking(headers, method)))
+
+@test("Accept-Encoding is read with its q-values, `*`, `identity` and case, gzip winning a tie")
+negotiation()
+  val table: Vector[(Option[string], string)] = [
+    (None, "200 none Accept-Encoding true"),
+    (Some(""), "200 none Accept-Encoding true"),
+    (Some("gzip"), "200 gzip Accept-Encoding true"),
+    (Some("x-gzip"), "200 gzip Accept-Encoding true"),
+    (Some("GZIP"), "200 gzip Accept-Encoding true"),
+    (Some("deflate"), "200 deflate Accept-Encoding true"),
+    (Some("gzip, deflate"), "200 gzip Accept-Encoding true"),
+    (Some("deflate, gzip"), "200 gzip Accept-Encoding true"),
+    (Some("deflate, gzip;q=0.5"), "200 deflate Accept-Encoding true"),
+    (Some("gzip;q=0"), "200 none Accept-Encoding true"),
+    (Some("gzip;q=0.0, deflate;q=0.001"), "200 none Accept-Encoding true"),
+    (Some("gzip;q=0.0, deflate;q=0.001, identity;q=0"), "200 deflate Accept-Encoding true"),
+    (Some("*"), "200 gzip Accept-Encoding true"),
+    (Some("*;q=0.1"), "200 gzip Accept-Encoding true"),
+    (Some("br"), "200 none Accept-Encoding true"),
+    (Some("br, *;q=0.2"), "200 gzip Accept-Encoding true"),
+    (Some("gzip;q=0.5, identity;q=0.8"), "200 none Accept-Encoding true"),
+    (Some("gzip;q=0.8, identity;q=0.8"), "200 gzip Accept-Encoding true"),
+    (Some("identity"), "200 none Accept-Encoding true"),
+    (Some("identity;q=0, gzip"), "200 gzip Accept-Encoding true"),
+    (Some("*;q=0, deflate"), "200 deflate Accept-Encoding true"),
+    (Some(" gzip ; q=1 "), "200 gzip Accept-Encoding true"),
+    (Some("gzip; Q=1.000"), "200 gzip Accept-Encoding true"),
+    (Some("gzip;q=0.999"), "200 none Accept-Encoding true"),
+    (Some("gzip;q=0.999, identity;q=0.998"), "200 gzip Accept-Encoding true"),
+    // Malformed q-values drop their entry.
+    (Some("gzip;q=1.5"), "200 none Accept-Encoding true"),
+    (Some("gzip;q=0.0001"), "200 none Accept-Encoding true"),
+    (Some("gzip;q=2"), "200 none Accept-Encoding true"),
+    (Some("gzip;q=-1"), "200 none Accept-Encoding true"),
+    (Some("gzip;q=."), "200 none Accept-Encoding true"),
+    (Some("gzip;q="), "200 none Accept-Encoding true"),
+    (Some("gzip;q=1.001"), "200 none Accept-Encoding true"),
+    (Some(",,gzip,,"), "200 gzip Accept-Encoding true"),
+    (Some("gzip;level=1"), "200 gzip Accept-Encoding true")
+  ]
+  for (accept, expected) in table
+    assertEq(s"$accept: ${negotiated(accept)}", s"$accept: $expected")
+
+@test("a request that refuses identity and accepts no coding the server has is answered 406 before the handler")
+unacceptable()
+  for accept in [
+    "identity;q=0",
+    "*;q=0",
+    "br, identity;q=0",
+    "gzip;q=0, deflate;q=0, identity;q=0",
+    "*;q=0, identity;q=0"
+  ]
+    val called = Atomic(false)
+    val h = Compression().middleware(_ ->
+      called.store(true)
+      Response.text(200, big))
+    val r = h(asking([("Accept-Encoding", accept)]))
+    assertEq(s"$accept: ${r.status} ${r.header("Vary")} ${called.load()}", s"$accept: 406 Some(Accept-Encoding) false")
+  // `*;q=0` with identity named is not a refusal of identity.
+  assertEq(negotiated(Some("*;q=0, identity")), "200 none Accept-Encoding true")
+
+@test("HEAD, 204, 206, 304, Content-Range, a Content-Encoding of its own and no-transform are left as they are")
+untouched()
+  assertEq(negotiated(Some("gzip"), method = "HEAD"), "200 none - true")
+  assertEq(negotiated(Some("gzip"), () -> Response.empty(204)), "204 none - false")
+  assertEq(negotiated(Some("gzip"), () -> Response.text(304, big)), "304 none - true")
+  assertEq(negotiated(Some("gzip"), () -> Response.text(206, big)), "206 none - true")
+  assertEq(
+    negotiated(Some("gzip"), () -> Response.text(200, big).withHeader("Content-Range", "bytes 0-9/100")),
+    "200 none - true"
+  )
+  val packed = gzip(bytesOfText(big))
+  val passed = Compression().middleware(_ ->
+    Response.bytes(200, gzip(bytesOfText(big)), "text/plain").withHeader("Content-Encoding", "gzip"))(asking([("Accept-Encoding", "gzip")]))
+  assertEq(passed.body.length, packed.length)
+  assertEq(passed.header("Vary"), None)
+  assertEq(
+    negotiated(Some("gzip"), () -> Response.text(200, big).withHeader("Cache-Control", "public, No-Transform")),
+    "200 none - true"
+  )
+  assertEq(
+    negotiated(Some("gzip"), () -> Response.text(200, big).withHeader("Cache-Control", "no-cache")),
+    "200 gzip Accept-Encoding true"
+  )
+
+@test("bodies under minBytes and already-compressed types are left alone, unless identity is refused")
+smallAndIncompressible()
+  assertEq(negotiated(Some("gzip"), () -> Response.text(200, "short")), "200 none - false")
+  val exact = Compression(minBytes = 2400).middleware(_ -> Response.text(200, big))(
+    asking([("Accept-Encoding", "gzip")])
+  )
+  assertEq(summary(exact), "200 gzip Accept-Encoding true")
+  val under = Compression(minBytes = 2401).middleware(_ -> Response.text(200, big))(
+    asking([("Accept-Encoding", "gzip")])
+  )
+  assertEq(summary(under), "200 none - true")
+  assertEq(negotiated(Some("gzip"), () -> Response.bytes(200, bytesOfText(big), "image/png")), "200 none - true")
+  assertEq(negotiated(Some("gzip"), () -> Response.bytes(200, bytesOfText(big), "IMAGE/JPEG; q=1")), "200 none - true")
+  assertEq(
+    negotiated(Some("gzip"), () -> Response.bytes(200, bytesOfText(big), "image/svg+xml")),
+    "200 gzip Accept-Encoding true"
+  )
+  assertEq(negotiated(Some("gzip"), () -> Response.bytes(200, bytesOfText(big), "video/mp4")), "200 none - true")
+  assertEq(negotiated(Some("gzip"), () -> Response.bytes(200, bytesOfText(big), "application/zip")), "200 none - true")
+  assertEq(
+    negotiated(Some("gzip"), () -> Response.bytes(200, bytesOfText(big), "application/json")),
+    "200 gzip Accept-Encoding true"
+  )
+  // Refusing identity compresses whatever the size or type.
+  assertEq(
+    negotiated(Some("gzip, identity;q=0"), () -> Response.bytes(200, bytesOfText(big), "image/png")),
+    "200 gzip Accept-Encoding true"
+  )
+  val tiny = Compression().middleware(_ -> Response.text(200, "x"))(asking([("Accept-Encoding", "gzip, identity;q=0")]))
+  assertEq(tiny.header("Content-Encoding"), Some("gzip"))
+  assertEq(textOfBytes(decompress(tiny.body, Gzip).unwrap()), "x")
+  // A body that compressing does not shrink is sent as it was, still varying.
+  val sent = Compression().middleware(_ ->
+    Response.bytes(200, fs.readBytes("tests/fixtures/compress/random.bin").getOrElse(Array.empty[byte]()), "text/plain"))(asking([("Accept-Encoding", "gzip")]))
+  assertEq(sent.header("Content-Encoding"), None)
+  assertEq(sent.header("Vary"), Some("Accept-Encoding"))
+  assertEq(sent.body.length, 65536)
+  // A custom predicate decides the types.
+  val onlyText = Compression(compressible = t -> t.startsWith("text/"))
+  assertEq(
+    summary(onlyText.middleware(_ -> Response.json(200, big))(asking([("Accept-Encoding", "gzip")]))),
+    "200 none - true"
+  )
+
+@test("the default types: compressed formats, media and opaque bytes are not worth compressing; text and the rest are")
+defaultTypes()
+  for t in [
+    "image/png",
+    "image/jpeg",
+    "image/webp",
+    "image/avif",
+    "video/webm",
+    "audio/ogg",
+    "font/woff2",
+    "font/woff",
+    "application/zip",
+    "application/gzip",
+    "application/zstd",
+    "application/pdf",
+    "application/octet-stream"
+  ]
+    assertEq(s"$t ${compressibleType(t)}", s"$t false")
+  for t in [
+    "",
+    "text/html",
+    "text/css",
+    "application/json",
+    "application/javascript",
+    "image/svg+xml",
+    "image/bmp",
+    "font/ttf",
+    "application/wasm",
+    "text/event-stream"
+  ]
+    assertEq(s"$t ${compressibleType(t)}", s"$t true")
+
+@test("a compressed response drops Content-Length, weakens a strong ETag, keeps a weak one, and merges Vary")
+headers()
+  val r = Compression().middleware(_ ->
+    Response.text(200, big)
+      .withHeader("Content-Length", "2400")
+      .withHeader("ETag", "\"v1\"")
+      .withHeader("Vary", "Origin"))(asking([("Accept-Encoding", "gzip")]))
+  assertEq(r.header("Content-Length"), None)
+  assertEq(r.header("ETag"), Some("W/\"v1\""))
+  assertEq(r.headers.filter(h -> h.0 == "Vary"), [("Vary", "Origin, Accept-Encoding")])
+  assertEq(r.header("Content-Encoding"), Some("gzip"))
+  assertEq(r.header("Content-Type"), Some("text/plain; charset=utf-8"))
+  val weak = Compression().middleware(
+    _ -> Response.text(200, big).withHeader("ETag", "W/\"v2\"")
+  )(asking([("Accept-Encoding", "gzip")]))
+  assertEq(weak.header("ETag"), Some("W/\"v2\""))
+  val already = Compression().middleware(
+    _ -> Response.text(200, big).withHeader("Vary", "accept-encoding")
+  )(asking([("Accept-Encoding", "gzip")]))
+  assertEq(already.headers.filter(h -> h.0 == "Vary"), [("Vary", "accept-encoding")])
+  val star = Compression().middleware(
+    _ -> Response.text(200, big).withHeader("Vary", "*")
+  )(asking([("Accept-Encoding", "gzip")]))
+  assertEq(star.headers.filter(h -> h.0 == "Vary"), [("Vary", "*")])
+  // An uncompressed answer to the same request keeps its ETag strong.
+  val plain = Compression().middleware(
+    _ -> Response.text(200, big).withHeader("ETag", "\"v1\"")
+  )(asking(Vector.empty[(string, string)]()))
+  assertEq(plain.header("ETag"), Some("\"v1\""))
+
+@test("each level compresses, 0 storing; with CORS outside, the response carries both headers")
+levelsAndCors()
+  for level in 0 ..< 10
+    val r = Compression(level = level).middleware(_ -> Response.text(200, big))(
+      asking([("Accept-Encoding", "deflate")])
+    )
+    if level == 0
+      assertEq(r.header("Content-Encoding"), None)
+    else
+      assertEq(s"$level ${summary(r)}", s"$level 200 deflate Accept-Encoding true")
+  val both = Cors(origins = ["https://a.example"]).middleware(Compression().middleware(_ -> Response.text(200, big)))
+  val r = both(asking([("Accept-Encoding", "gzip"), ("Origin", "https://a.example")]))
+  assertEq(r.headers.filter(h -> h.0 == "Vary"), [("Vary", "Accept-Encoding, Origin")])
+  assertEq(r.header("Content-Encoding"), Some("gzip"))
+
+// What the handler behind `Compression(...)` sees of a request sending `body` with `headers`: its
+// body as text, its Content-Encoding and Content-Length; or the status the middleware answered.
+received(headers: Vector[(string, string)], body: Array[byte], c: Compression = Compression()) -> string
+  val h = c.middleware(
+    r -> Response.text(200, s"${r.text}|${r.header("Content-Encoding")}|${r.header("Content-Length")}")
+  )
+  val answer = h(ServerRequest("POST", "/", headers, body))
+  if answer.status == 200 then answer.text else s"${answer.status} ${answer.header("Accept-Encoding")}"
+
+@test("request bodies in gzip, x-gzip and deflate are decompressed; identity is dropped; others are 415")
+requestDecoding()
+  val packed = gzip(bytesOfText("posted text"))
+  assertEq(
+    received([("Content-Encoding", "gzip"), ("Content-Length", s"${packed.length}")], packed),
+    "posted text|None|Some(11)"
+  )
+  assertEq(received([("Content-Encoding", "x-gzip")], packed), "posted text|None|Some(11)")
+  assertEq(received([("Content-Encoding", " GZip ")], packed), "posted text|None|Some(11)")
+  assertEq(
+    received([("Content-Encoding", "deflate")], compress(bytesOfText("posted text"), Zlib)),
+    "posted text|None|Some(11)"
+  )
+  assertEq(received([("Content-Encoding", "identity")], bytesOfText("as is")), "as is|None|None")
+  assertEq(received([("Content-Encoding", "identity, gzip")], packed), "posted text|None|Some(11)")
+  assertEq(received(Vector.empty[(string, string)](), bytesOfText("as is")), "as is|None|None")
+  assertEq(received([("Content-Encoding", "br")], bytesOfText("x")), "415 Some(gzip, deflate)")
+  assertEq(received([("Content-Encoding", "gzip, gzip")], gzip(packed)), "415 Some(gzip, deflate)")
+  assertEq(
+    received([("Content-Encoding", "gzip"), ("Content-Encoding", "gzip")], gzip(packed)),
+    "415 Some(gzip, deflate)"
+  )
+  assertEq(received([("Content-Encoding", "compress")], bytesOfText("x")), "415 Some(gzip, deflate)")
+  // An empty body is passed on empty.
+  assertEq(received([("Content-Encoding", "gzip")], Array.empty[byte]()), "|None|None")
+  // Unicode survives.
+  assertEq(received([("Content-Encoding", "gzip")], gzip(bytesOfText("ℵ₀ café 🎉"))), "ℵ₀ café 🎉|None|Some(17)")
+  // With decodesRequests off, the handler sees the body as it came.
+  val raw = received([("Content-Encoding", "gzip")], packed, Compression(decodesRequests = false))
+  assertEq(raw.endsWith("|Some(gzip)|None"), true)
+
+@test("a corrupt or truncated request body is 400, one past maxDecodedBytes 413, and the handler is not called")
+requestRefusals()
+  val packed = gzip(bytesOfText(big))
+  assertEq(received([("Content-Encoding", "gzip")], packed.slice(0, packed.length - 4)), "400 None")
+  assertEq(received([("Content-Encoding", "gzip")], bytesOfText("not gzip at all")), "400 None")
+  assertEq(received([("Content-Encoding", "deflate")], packed), "400 None")
+  val bomb = gzip(Array.fill(5000000, byte(0)), 9)
+  assertEq(received([("Content-Encoding", "gzip")], bomb), "413 None")
+  assertEq(received([("Content-Encoding", "gzip")], packed, Compression(maxDecodedBytes = 2399)), "413 None")
+  assertEq(
+    received([("Content-Encoding", "gzip")], packed, Compression(maxDecodedBytes = 2400)).startsWith("hello world"),
+    true
+  )
+  val called = Atomic(false)
+  val h = Compression().middleware(_ ->
+    called.store(true)
+    Response.text(200, "reached"))
+  assertEq(h(ServerRequest("POST", "/", [("Content-Encoding", "gzip")], bomb)).status, 413)
+  assertEq(called.load(), false)
+
+@test("a buffered body read through withBodyDecoded decompresses within the reader's limit, counted decompressed")
+bodyDecoded()
+  val packed = gzip(bytesOfText(big))
+  val r = ServerRequest("POST", "/", Vector.empty[(string, string)](), packed).withBodyDecoded(Gzip)
+  assertEq(textOfBytes(r.bodyReader().readAll().unwrap()), big)
+  assertEq(r.bodyReader().length, None)
+  assertEq(r.body.length, packed.length)
+  // The limit counts decompressed bytes: exactly the length passes, one less fails.
+  val exact = ServerRequest("POST", "/", Vector.empty[(string, string)](), packed).withBodyDecoded(Gzip)
+  assertEq(exact.bodyReader(2400).readAll().map(b -> b.length), Ok(2400))
+  val short = ServerRequest("POST", "/", Vector.empty[(string, string)](), packed).withBodyDecoded(Gzip)
+  assertEq(
+    short.bodyReader(2399).readAll().mapErr(e -> e.message),
+    Err("cannot decompress: the decompressed data is longer than its limit of 2399 bytes")
+  )
+  // Raw deflate and zlib, read a byte at a time.
+  val z = ServerRequest(
+    "POST",
+    "/",
+    Vector.empty[(string, string)](),
+    compress(bytesOfText("zlib body"), Zlib)
+  ).withBodyDecoded(Zlib)
+  val reader = z.bodyReader()
+  val out = Buffer[byte]()
+  loop
+    val got = reader.read(1).unwrap()
+    if got.length == 0 then break
+    assertEq(got.length, 1)
+    out.addAll(got)
+  assertEq(textOfBytes(out.toArray()), "zlib body")
+  val rawDeflate = ServerRequest(
+    "POST",
+    "/",
+    Vector.empty[(string, string)](),
+    compress(bytesOfText("raw"), RawDeflate)
+  ).withBodyDecoded(RawDeflate)
+  assertEq(textOfBytes(rawDeflate.bodyReader().readAll().unwrap()), "raw")
+  // withBody replaces the body and drops the decoding; withoutHeader drops every header of a name.
+  val replaced = r.withBody(bytesOfText("new")).withoutHeader("X-A")
+  assertEq(textOfBytes(replaced.bodyReader().readAll().unwrap()), "new")
+  val headed = ServerRequest("GET", "/", [("X-A", "1"), ("x-a", "2"), ("X-B", "3")]).withoutHeader("X-A")
+  assertEq(headed.headers, [("X-B", "3")])

@@ -1,0 +1,369 @@
+module avin.crypto
+
+// One-time passwords: HOTP (RFC 4226) and TOTP (RFC 6238), the six-digit codes an authenticator app
+// shows, over HMAC-SHA-1, HMAC-SHA-256 or HMAC-SHA-512, and the `otpauth://` URI that hands a secret
+// to such an app.
+//
+//     val secret = generateOtpSecret()
+//     val code = totp(secret)
+//     assertEq(verifyTotp(secret, code), Some(totpStep(now())))
+//
+// A code is checked with `verifyTotp`, which allows the steps either side of the present one (a
+// clock a little off, a code typed as the step ends) and answers the step it matched, not a bool.
+// The caller keeps that step for the account and passes it back as `lastStep`: a code is then
+// accepted only for a step after the last one used, so a code seen once, over a shoulder or on a
+// network, is no good a second time. `verifyHotp` does the same with the counter. The clock is an
+// argument, `at`, which is the present moment unless a test gives one.
+
+import avin.encoding.{fromBase32, toBase32Unpadded}
+import avin.net.Url
+import avin.random.SecureRandom
+import avin.time.{Instant, now}
+
+// The hash a code is made with. SHA-1 is what every authenticator app understands; HMAC does not
+// weaken with it as a plain hash does, but SHA-256 and SHA-512 are there for an app that reads them.
+data OtpAlgorithm
+  OtpSha1
+  OtpSha256
+  OtpSha512
+
+impl OtpAlgorithm
+  // The name an `otpauth://` URI gives it: `SHA1`, `SHA256` or `SHA512`.
+  name -> string = self match
+    OtpSha1 -> "SHA1"
+    OtpSha256 -> "SHA256"
+    OtpSha512 -> "SHA512"
+
+impl Display for OtpAlgorithm
+  display(out: Writer, spec: FormatSpec) = out.writeField(name, spec)
+
+// The two kinds of one-time password and what each needs besides the secret.
+data OtpKind
+  // A code that changes every `period` seconds (30 in an authenticator app).
+  TimeBased(period: int)
+  // A code for the `counter`th use, which both sides count.
+  CounterBased(counter: long)
+
+// The things an `otpauth://` URI says: what the code is for (`issuer` and `account`), the `secret`
+// and how a code is made from it. `digits` is 6, 7 or 8.
+data OtpUri(
+    kind: OtpKind,
+    secret: Vector[byte],
+    issuer: Option[string],
+    account: string,
+    algorithm: OtpAlgorithm,
+    digits: int,
+)
+
+// Why text is not an `otpauth://` URI, or not a secret.
+data OtpError
+  // The text is not a usable `otpauth://` URI; `reason` says what is wrong with it.
+  BadUri(reason: string)
+  // The secret is not base32, or is empty.
+  BadSecret(reason: string)
+
+impl Error for OtpError
+  // A sentence saying what is wrong.
+  message -> string = self match
+    BadUri(reason) -> s"not an otpauth URI: $reason"
+    BadSecret(reason) -> s"not a usable secret: $reason"
+
+// The secrets a program makes are this long unless asked otherwise: 160 bits, the length RFC 4226
+// recommends.
+val OtpSecretBytes: int = 20
+
+// The shortest secret `generateOtpSecret` makes: 128 bits, the least RFC 4226 allows.
+val OtpMinimumGeneratedBytes: int = 16
+
+private val Seconds30: int = 30
+
+// Traps unless `digits` is 6, 7 or 8.
+private checkDigits(digits: int)
+  if !(6 <= digits <= 8) then fail(s"one-time password: digits must be 6, 7 or 8, was ${digits}")
+
+// Traps for a secret with no bytes.
+private checkSecret(secret: Vector[byte])
+  if secret.isEmpty then fail("one-time password: the secret must not be empty")
+
+// Traps unless `period` is positive.
+private checkPeriod(period: int)
+  if period <= 0 then fail(s"one-time password: the period must be positive, was ${period}")
+
+// The eight bytes of `counter`, the most significant first.
+private counterBytes(counter: long) -> Vector[byte] =
+  Vector.tabulate(8, i -> byte(int((counter >> long(8 * (7 - i))) & 255)))
+
+private macOf(algorithm: OtpAlgorithm, secret: Vector[byte], message: Vector[byte]) -> Vector[byte] = algorithm match
+  OtpSha1 -> hmacSha1(secret, message)
+  OtpSha256 -> hmacSha256(secret, message)
+  OtpSha512 -> hmacSha512(secret, message)
+
+private powerOfTen(digits: int) -> int =
+  Iterator.iterate(1, n -> n * 10).drop(digits).next()
+
+// The code for `counter`: RFC 4226's dynamic truncation of the MAC to `digits` decimal digits,
+// padded with zeros on the left.
+private codeAt(
+    algorithm: OtpAlgorithm,
+    secret: Vector[byte],
+    counter: long,
+    digits: int,
+) -> string
+  val mac = macOf(algorithm, secret, counterBytes(counter))
+  val offset = int(mac(mac.length - 1)) & 15
+  val binary =
+    ((int(mac(offset)) & 127) << 24) | (
+      (int(mac(offset + 1)) & 255) << 16
+    ) | ((int(mac(offset + 2)) & 255) << 8) | (int(mac(offset + 3)) & 255)
+  (binary % powerOfTen(digits)).toString().padStart(digits, '0')
+
+// The HOTP code of `secret` for `counter`, `digits` digits long (6, 7 or 8). An empty secret, a
+// negative counter or other `digits` traps: these are the program's own settings.
+hotp(secret: Vector[byte], counter: long, digits: int = 6, algorithm: OtpAlgorithm = OtpSha1) -> string
+  checkSecret(secret)
+  checkDigits(digits)
+  if counter < 0 then fail(s"hotp: the counter must not be negative, was ${counter}")
+  codeAt(algorithm, secret, counter, digits)
+
+// The step the TOTP clock is in at `at`: the whole `period`s since `t0`, which is a time in seconds
+// since the epoch (0 unless asked). A time before `t0` is in a negative step, for which there is no
+// code. A period that is not positive traps.
+totpStep(at: Instant = now(), period: int = Seconds30, t0: long = 0) -> long
+  checkPeriod(period)
+  val elapsed = at.epochSeconds - t0
+  val whole = long(period)
+  if elapsed % whole < 0 then elapsed / whole - 1 else elapsed / whole
+
+// The TOTP code of `secret` at `at` (now unless given): the HOTP code for the step `at` is in. A
+// time before `t0` traps, as do the settings `hotp` and `totpStep` refuse.
+totp(
+    secret: Vector[byte],
+    at: Instant = now(),
+    digits: int = 6,
+    algorithm: OtpAlgorithm = OtpSha1,
+    period: int = Seconds30,
+    t0: long = 0,
+) -> string
+  val step = totpStep(at, period, t0)
+  if step < 0 then fail("totp: the time is before the start time t0")
+  hotp(secret, step, digits, algorithm)
+
+// Whether the text `code` is the code `expected`, in constant time: every digit is read and the
+// answer is decided at the end.
+private sameCode(expected: string, code: string) -> bool = constantTimeEquals(expected, code)
+
+// The counter, from `counter` to `counter + lookAhead`, whose HOTP code is `code`, or `None`. A
+// counter that matched should be stored as the next one, `matched + 1`, so that it is not accepted
+// again; `lookAhead` lets a counter that ran ahead of the server (a button pressed away from it) be
+// found. Every counter in the range is computed and compared whatever the first answer, so the time
+// taken does not say where a match lies. Where several match, the greatest is answered.
+verifyHotp(
+    secret: Vector[byte],
+    code: string,
+    counter: long,
+    lookAhead: int = 0,
+    digits: int = 6,
+    algorithm: OtpAlgorithm = OtpSha1,
+) -> Option[long]
+  checkSecret(secret)
+  checkDigits(digits)
+  if counter < 0 then fail(s"verifyHotp: the counter must not be negative, was ${counter}")
+  if lookAhead < 0 then fail(s"verifyHotp: lookAhead must not be negative, was ${lookAhead}")
+  var matched: long = -1
+  for i in 0 .. lookAhead
+    val candidate = counter + long(i)
+    if sameCode(codeAt(algorithm, secret, candidate, digits), code) then matched = candidate
+  if matched < 0 then None else Some(matched)
+
+// The step, within `window` steps either side of the one `at` is in (now unless given), whose TOTP
+// code is `code`, or `None`: the code is wrong, is for a step outside the window, is not `digits`
+// digits, or its step is not after `lastStep`. A window of 0 accepts the present step alone; the
+// default of 1 also accepts the step before and the one after.
+//
+// The answer is the step to keep as the account's `lastStep`. With it passed back, a code that has
+// been accepted is never accepted again, nor is any older one. Without it a code can be used as
+// often as it stays in the window. Every step of the window is computed and compared whatever the
+// first answer, so the time taken does not say where a match lies. Where several steps match, the
+// greatest is answered.
+verifyTotp(
+    secret: Vector[byte],
+    code: string,
+    at: Instant = now(),
+    window: int = 1,
+    digits: int = 6,
+    algorithm: OtpAlgorithm = OtpSha1,
+    period: int = Seconds30,
+    t0: long = 0,
+    lastStep: Option[long] = None,
+) -> Option[long]
+  checkSecret(secret)
+  checkDigits(digits)
+  if window < 0 then fail(s"verifyTotp: the window must not be negative, was ${window}")
+  val present = totpStep(at, period, t0)
+  val floor: long = lastStep.getOrElse(-1)
+  var matched: long = -1
+  for i in -window .. window
+    val candidate = present + long(i)
+    if candidate >= 0 && candidate > floor
+      if sameCode(codeAt(algorithm, secret, candidate, digits), code) then matched = candidate
+  if matched < 0 then None else Some(matched)
+
+// A new secret of `length` random bytes from the system's source of randomness, 20 unless asked. A
+// length under 16 bytes (128 bits) traps.
+generateOtpSecret(length: int = OtpSecretBytes) -> Vector[byte]
+  if length < OtpMinimumGeneratedBytes then
+    fail(s"generateOtpSecret: the secret must be at least ${OtpMinimumGeneratedBytes} bytes, was ${length}")
+  SecureRandom.nextBytes(length).toVector
+
+// The secret as an authenticator app reads it: base32, upper case, with no padding.
+otpSecretText(secret: Vector[byte]) -> string = toBase32Unpadded(secret)
+
+// The secret a person or an app wrote as base32: either case, with or without padding, and with the
+// spaces and hyphens apps group it by left in. A character that is not base32, or no secret at all,
+// is an error.
+otpSecretFromText(text: string) -> Result[Vector[byte], OtpError]
+  val bare = text.filter(c -> c != ' ' && c != '-')
+  if bare.isEmpty then return Err(BadSecret("the secret is empty"))
+  fromBase32(bare) match
+    Ok(bytes) -> Ok(bytes)
+    Err(error) -> Err(BadSecret(error.message))
+
+impl OtpUri
+  // The URI: `otpauth://totp/Issuer:account?secret=…&issuer=…&algorithm=…&digits=…&period=…`, or
+  // `hotp` with `counter=…`. The issuer and account are percent-escaped, so any text is safe in
+  // them; the issuer is written in the label and again as a parameter, as apps expect. Traps for an
+  // empty secret or account, and for digits, a period or a counter outside the ones a code uses.
+  uri -> string
+    checkSecret(secret)
+    checkDigits(digits)
+    if account.isEmpty then fail("otpauth URI: the account must not be empty")
+    val label = issuer match
+      Some(name) -> Url.encode(name) + ":" + Url.encode(account)
+      None -> Url.encode(account)
+    val issuerPart = issuer match
+      Some(name) -> "&issuer=" + Url.encode(name)
+      None -> ""
+    val head = s"otpauth://${kindName}/${label}?secret=${otpSecretText(secret)}${issuerPart}"
+    val tail = s"&algorithm=${algorithm.name}&digits=${digits}"
+    kind match
+      TimeBased(period) ->
+        checkPeriod(period)
+        s"${head}${tail}&period=${period}"
+      CounterBased(counter) ->
+        if counter < 0 then fail(s"otpauth URI: the counter must not be negative, was ${counter}")
+        s"${head}${tail}&counter=${counter}"
+
+  private kindName -> string = kind match
+    TimeBased(_) -> "totp"
+    CounterBased(_) -> "hotp"
+
+impl Display for OtpUri
+  display(out: Writer, spec: FormatSpec) = out.writeField(uri, spec)
+
+private val UriScheme: string = "otpauth://"
+
+// Whether `text` is one or more decimal digits and nothing else.
+private allDigits(text: string) -> bool = !text.isEmpty && text.forall(c -> '0' <= c <= '9')
+
+// The value of the parameter `name`, `None` if it is absent; the query is `key=value` pairs joined
+// by `&`, each decoded. A parameter given twice is an error, since there is no saying which is meant.
+private parameter(pairs: Vector[(string, string)], name: string) -> Result[Option[string], OtpError]
+  val values = pairs.filter(pair -> pair.0 == name).map(pair -> pair.1)
+  if values.length > 1 then Err(BadUri(s"the parameter `${name}` is given more than once"))
+  else Ok(values.headOption)
+
+private decodeText(text: string, what: string) -> Result[string, OtpError] = Url.decode(text) match
+  Ok(decoded) -> Ok(decoded)
+  Err(_) -> Err(BadUri(s"${what} is not valid percent-encoded UTF-8"))
+
+private queryPairs(query: string) -> Result[Vector[(string, string)], OtpError]
+  val pairs = Buffer[(string, string)]()
+  for piece in query.split('&')
+    if !piece.isEmpty
+      val eq = piece.indexOf('=')
+      val rawName = if eq < 0 then piece else piece.slice(0, eq)
+      val rawValue = if eq < 0 then "" else piece.slice(eq + 1, piece.byteLength)
+      val name = decodeText(rawName, "a parameter name")?
+      val value = decodeText(rawValue, s"the parameter `${name}`")?
+      pairs.addOne((name, value))
+  Ok(pairs.toVector)
+
+private algorithmOf(text: Option[string]) -> Result[OtpAlgorithm, OtpError] = text match
+  None -> Ok(OtpSha1)
+  Some(name) -> name.toUpper match
+    "SHA1" -> Ok(OtpSha1)
+    "SHA256" -> Ok(OtpSha256)
+    "SHA512" -> Ok(OtpSha512)
+    _ -> Err(BadUri(s"the algorithm `${name}` is not SHA1, SHA256 or SHA512"))
+
+private digitsOf(text: Option[string]) -> Result[int, OtpError] = text match
+  None -> Ok(6)
+  Some(t) ->
+    if allDigits(t) && t.toIntOption().exists(n -> 6 <= n <= 8) then Ok(t.toInt())
+    else Err(BadUri(s"the digits `${t}` are not 6, 7 or 8"))
+
+private periodOf(text: Option[string]) -> Result[int, OtpError] = text match
+  None -> Ok(Seconds30)
+  Some(t) ->
+    if allDigits(t) && t.toIntOption().exists(n -> n > 0) then Ok(t.toInt())
+    else Err(BadUri(s"the period `${t}` is not a positive number of seconds"))
+
+private counterOf(text: Option[string]) -> Result[long, OtpError] = text match
+  None -> Err(BadUri("an hotp URI needs a counter"))
+  Some(t) ->
+    if allDigits(t) && t.toLongOption().isDefined then Ok(t.toLong())
+    else Err(BadUri(s"the counter `${t}` is not a non-negative number"))
+
+// The label's two halves: the issuer before the first colon and the account after it, with any
+// spaces after the colon dropped; or the whole label as the account when it has no colon. Only a
+// colon written as `:` divides the label, since `%3A` is how a colon inside the issuer or the
+// account is written.
+private labelParts(raw: string) -> Result[(Option[string], string), OtpError]
+  val colon = raw.indexOf(':')
+  if colon < 0 then
+    val account = decodeText(raw, "the label")?
+    Ok((None, account))
+  else
+    val issuer = decodeText(raw.slice(0, colon), "the issuer")?
+    val account = decodeText(raw.slice(colon + 1, raw.byteLength), "the account")?
+    Ok((Some(issuer), account.dropWhile(c -> c == ' ')))
+
+// The URI `text` read: `otpauth://totp/…` or `otpauth://hotp/…`, a label of `Issuer:account` or
+// `account`, and the parameters `secret` (required, base32), `issuer`, `algorithm` (SHA1 unless
+// given), `digits` (6), and `period` (30) for `totp` or `counter` (required) for `hotp`. A
+// parameter the app does not know is ignored; one given twice, or one with a value a code cannot
+// use, is an error. The `issuer` parameter, where it is given, is the issuer rather than the
+// label's; a label written `Issuer%3Aaccount` whose `issuer` parameter is that issuer is read as
+// that issuer and account. A `+` stays a `+`: only `%XX` is an escape.
+parseOtpUri(text: string) -> Result[OtpUri, OtpError]
+  if !text.toLower.startsWith(UriScheme) then return Err(BadUri("it does not begin with otpauth://"))
+  val rest = text.slice(UriScheme.byteLength, text.byteLength)
+  val slash = rest.indexOf('/')
+  if slash < 0 then return Err(BadUri("it has no type and label"))
+  val typeName = rest.slice(0, slash).toLower
+  if typeName != "totp" && typeName != "hotp" then
+    return Err(BadUri(s"the type `${typeName}` is not totp or hotp"))
+  val afterType = rest.slice(slash + 1, rest.byteLength)
+  val question = afterType.indexOf('?')
+  if question < 0 then return Err(BadUri("it has no parameters, so no secret"))
+  val labelParsed = labelParts(afterType.slice(0, question))?
+  val pairs = queryPairs(afterType.slice(question + 1, afterType.byteLength))?
+  val secretText = parameter(pairs, "secret")? match
+    Some(t) -> t
+    None -> return Err(BadUri("the parameter `secret` is missing"))
+  val secret = otpSecretFromText(secretText)?
+  val issuerParam = parameter(pairs, "issuer")?
+  val labelIssuer = labelParsed.0
+  val labelAccount = labelParsed.1
+  val issuer = if issuerParam.isDefined then issuerParam else labelIssuer
+  val account = (labelIssuer, issuerParam) match
+    (None, Some(name)) if labelAccount.startsWith(name + ":") ->
+      labelAccount.slice(name.byteLength + 1, labelAccount.byteLength).dropWhile(c -> c == ' ')
+    _ -> labelAccount
+  if account.isEmpty then return Err(BadUri("the account is empty"))
+  val algorithm = algorithmOf(parameter(pairs, "algorithm")?)?
+  val digits = digitsOf(parameter(pairs, "digits")?)?
+  val kind =
+    if typeName == "totp" then TimeBased(periodOf(parameter(pairs, "period")?)?)
+    else CounterBased(counterOf(parameter(pairs, "counter")?)?)
+  Ok(OtpUri(kind, secret, issuer, account, algorithm, digits))

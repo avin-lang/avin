@@ -1,0 +1,83 @@
+// expect: exit 0
+// `avin.compress` streams under the collector: encoders and decoders made by the hundred, written and
+// read in pieces of one byte to 64 KiB, flushed, finished, and left unfinished for the collector to
+// give their codec back; whole arrays round-tripped in every format; and a bomb held to its limit.
+import avin.compress.{Decoder, Encoder, Format, Gzip, RawDeflate, TooLarge, Zlib, compress, decompress}
+import avin.io.{ByteWriter, IoError, Reader}
+
+class Sink(): ByteWriter
+  val held = Buffer[byte]()
+  override write(bytes: Array[byte]) -> Result[unit, IoError]
+    held.addAll(bytes)
+    Ok(())
+
+class Pieces(private val bytes: Array[byte], private val size: int): Reader
+  private var at = 0
+  override read(max: int) -> Result[Array[byte], IoError]
+    val step = if max < size then max else size
+    val end = if bytes.length - at > step then at + step else bytes.length
+    val out = bytes.slice(at, end)
+    at = end
+    Ok(out)
+
+same(a: Array[byte], b: Array[byte]) -> bool
+  if a.length != b.length then return false
+  for i in 0 ..< a.length
+    if a(i) != b(i) then return false
+  true
+
+text(n: int) -> Array[byte]
+  val line = "streams of text, café 🎉, compressed in pieces\n".utf8
+  Array.tabulate(n, i -> line(i % line.length))
+
+encoded(data: Array[byte], format: Format, size: int, level: int) -> Array[byte]
+  val sink = Sink()
+  val e = Encoder(sink, format, level)
+  var at = 0
+  var n = 0
+  while at < data.length
+    val end = if data.length - at > size then at + size else data.length
+    _ = e.write(data.slice(at, end))
+    n += 1
+    if n % 5 == 0 then _ = e.flush()
+    at = end
+  _ = e.finish()
+  sink.held.toArray()
+
+decoded(packed: Array[byte], format: Format, size: int) -> Result[Array[byte], IoError]
+  val d = Decoder(Pieces(packed, size), format)
+  val out = Buffer[byte]()
+  loop
+    val got = d.read(size)?
+    if got.length == 0 then return Ok(out.toArray())
+    out.addAll(got)
+  Ok(out.toArray())
+
+main()
+  val data = text(20000)
+  for format in [Gzip, Zlib, RawDeflate]
+    var good = 0
+    for size in [1, 3, 64, 1000, 4096, 65536]
+      for level in [0, 1, 6, 9]
+        val packed = encoded(data, format, size, level)
+        if decoded(packed, format, size).map(back -> same(back, data)).getOrElse(false) then good += 1
+    println(s"$format: $good of 24 streams round-trip")
+  // Codecs never finished nor read to their end are given back by the collector.
+  for i in 0 ..< 300
+    val e = Encoder(Sink(), Gzip)
+    _ = e.write(text(100 + i))
+    val d = Decoder(Pieces(compress(text(5000)), 50))
+    _ = d.read(10)
+  println("abandoned codecs collected")
+  for format in [Gzip, Zlib, RawDeflate]
+    var good = 0
+    for n in [0, 1, 2, 100, 65535, 65536, 65537, 300000]
+      val d = text(n)
+      if decompress(compress(d, format), format).map(back -> same(back, d)).getOrElse(false) then good += 1
+    println(s"$format whole: $good of 8")
+  val bomb = compress(Array.fill(3000000, byte(0)), Gzip, 9)
+  val held = decompress(bomb, Gzip, 1000000)
+  val said = held match
+    Err(TooLarge(n)) -> s"TooLarge($n)"
+    _ -> "not held"
+  println(s"bomb: $said")

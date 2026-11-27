@@ -1,0 +1,54 @@
+// The throughput of one contended `Mutex`: 1, 2, 4, 8 and 16 threads share a fixed number of
+// lock-and-let-go pairs between them, first with a body of one addition, then with a body of a few
+// hundred steps of arithmetic. Each line is the pairs a second all the threads made together; the
+// first lines, additions to one `Atomic`, are the ceiling the short body can approach. Run it
+// built with -O2, with as many processors free as the most threads it starts:
+//
+//     avin run tests/bench/mutex_contention.avin -O2
+import avin.threads.{Atomic, Mutex, scope}
+import avin.time.monotonic
+
+work(v: int, rounds: int) -> int
+  var x = v
+  for i in 0 ..< rounds do x = (x * 31 + i) % 1000003
+  x
+
+// The pairs a second `threads` threads make, each taking the mutex `perThread` times with a body of
+// `rounds` steps, or one addition where `rounds` is zero.
+run(threads: int, perThread: int, rounds: int) -> long
+  val m = Mutex(0)
+  val start = monotonic().micros
+  scope(s ->
+    for _ in 0 ..< threads
+      s.spawn(() ->
+        for _ in 0 ..< perThread
+          _ = m.update(v -> if rounds == 0 then v + 1 else work(v, rounds))))
+  val took = monotonic().micros - start
+  if rounds == 0 && m.get() != threads * perThread then println("lost updates")
+  if took <= 0 then 0 else long(threads) * long(perThread) * 1000000 / took
+
+// The additions a second `threads` threads make to one `Atomic`, `perThread` each: the most a second
+// that threads taking turns at one word of memory can do on this machine, which a contended lock,
+// moving the same word from processor to processor, cannot pass.
+atomicAdds(threads: int, perThread: int) -> long
+  val a = Atomic(0)
+  val start = monotonic().micros
+  scope(s ->
+    for _ in 0 ..< threads
+      s.spawn(() ->
+        for _ in 0 ..< perThread
+          _ = a.add(1)))
+  val took = monotonic().micros - start
+  if a.load() != threads * perThread then println("lost additions")
+  if took <= 0 then 0 else long(threads) * long(perThread) * 1000000 / took
+
+main() -> int
+  for threads in [1, 2, 4, 8, 16]
+    val rate = atomicAdds(threads, 4000000 / threads)
+    println(s"atomic additions, $threads threads: $rate a second")
+  for rounds in [0, 200]
+    val pairs = if rounds == 0 then 4000000 else 200000
+    for threads in [1, 2, 4, 8, 16]
+      val rate = run(threads, pairs / threads, rounds)
+      println(s"body of $rounds steps, $threads threads: $rate pairs a second")
+  0

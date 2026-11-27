@@ -2313,6 +2313,48 @@ forge new ones. `seal` draws each nonce from `SecureRandom` and puts it in front
 its nonces (a record counter), which then answers for never repeating one. A key's text is its
 cipher, `AeadKey(AES-256-GCM)`, and nothing of the key.
 
+### One-time passwords
+
+HOTP (RFC 4226) and TOTP (RFC 6238), the codes an authenticator app shows, and the `otpauth://` URI
+that gives an app its secret. Every vector of RFC 4226 Appendix D and RFC 6238 Appendix B is a test.
+
+```text
+import avin.crypto.{generateOtpSecret, otpSecretText, totp, totpStep, verifyTotp, OtpUri, TimeBased, OtpSha1}
+import avin.time.epochSeconds
+
+main()
+  val secret = generateOtpSecret()
+  val at = epochSeconds(1700000000)
+  val code = totp(secret, at)
+  assertEq(code.charCount, 6)
+  val step = verifyTotp(secret, code, at)
+  assertEq(step, Some(totpStep(at)))
+  assertEq(verifyTotp(secret, code, at, 1, 6, OtpSha1, 30, 0, step), None)
+  val uri = OtpUri(TimeBased(30), secret, Some("Example"), "alice@example.com", OtpSha1, 6)
+  println(uri.uri)
+  println(otpSecretText(secret))
+```
+
+| Function | Meaning |
+| --- | --- |
+| `hotp(secret, counter, digits = 6, algorithm = OtpSha1) -> string` | The code for `counter`, zero-padded to 6, 7 or 8 digits. |
+| `totp(secret, at = now(), digits = 6, algorithm = OtpSha1, period = 30, t0 = 0) -> string` | The code for the step `at` is in. |
+| `totpStep(at = now(), period = 30, t0 = 0) -> long` | Whole periods since `t0` (seconds since the epoch), rounded down. |
+| `verifyTotp(secret, code, at = now(), window = 1, digits, algorithm, period, t0, lastStep = None) -> Option[long]` | The step, within `window` steps either side of the present one, whose code is `code`; `None` for a wrong code, a wrong length or a step not after `lastStep`. |
+| `verifyHotp(secret, code, counter, lookAhead = 0, digits, algorithm) -> Option[long]` | The counter from `counter` to `counter + lookAhead` whose code is `code`. |
+| `generateOtpSecret(length = 20) -> Vector[byte]` | Random bytes from `SecureRandom`; under 16 traps. |
+| `otpSecretText(secret)`, `otpSecretFromText(text)` | Base32, upper case without padding; and back, either case, with spaces and hyphens ignored (`Err(BadSecret)` for anything else). |
+| `OtpUri(kind, secret, issuer, account, algorithm, digits).uri` | `otpauth://totp/Issuer:account?secret=...&issuer=...&algorithm=SHA1&digits=6&period=30` (`hotp` with `counter=`), the issuer and account percent-escaped. |
+| `parseOtpUri(text) -> Result[OtpUri, OtpError]` | Reads either type back; `Err(BadUri)` for a duplicate parameter, a bad digits, period or counter, a missing secret or an empty account. |
+
+The comparison of a code with the expected one is in constant time, and every step of the window is
+computed whatever the first answer. **Refusing a reused code is the caller's part**: `verifyTotp`
+answers the step it matched, the caller stores it for the account, and passes it back as `lastStep`;
+only a later step is then accepted. Without it a code works for as long as it stays in the window
+(about 90 seconds at the default). `verifyHotp` answers the counter; store `matched + 1` as the next.
+A program's own wrong settings (an empty secret, digits outside 6 to 8, a period under 1, a negative
+window, a time before `t0`) trap.
+
 ## `avin.crypto.password`
 
 Password hashing for a server: Argon2id (RFC 9106) in the PHC string format, which every Argon2
@@ -2812,6 +2854,100 @@ left out, and a `None` anywhere else, as an array's element, is an error. The bu
 decoders are `bool`, `int` (an integer that fits), `long`, `real` (from a float or an integer),
 `string`, `Toml`, `Zoned`, `Instant` (written in UTC), `DateTime`, `Date`, `Time`, `Option`, `Vector`,
 `List`, and `HashMap` and `TreeMap` keyed by a `TomlMapKey`: `string`, `int` or `long`.
+
+## `avin.compress`
+
+Deflate compression in its three framings: **gzip** (RFC 1952), what the `gzip` tool writes and
+HTTP's `gzip` content coding; **the zlib wrapper** (RFC 1950), HTTP's `deflate`; and **raw deflate**
+(RFC 1951), for a container that frames and checks the data itself. The codec is the system's zlib,
+which macOS carries and a Linux machine installs as its zlib development package (Debian's
+`zlib1g-dev`); only a program that reaches `avin.compress`, or `avin.net.http`, builds against it.
+
+```text run
+import avin.compress.{Decoder, Encoder, Zlib, compress, decompress, gunzip, gzip}
+import avin.io.{ByteWriter, IoError, Reader}
+
+// The bytes written to it, kept.
+class Kept(): ByteWriter
+  val bytes = Buffer[byte]()
+  override write(more: Array[byte]) -> Result[unit, IoError]
+    bytes.addAll(more)
+    Ok(())
+
+// An array read once.
+class Once(private val bytes: Array[byte]): Reader
+  private var done = false
+  override read(max: int) -> Result[Array[byte], IoError]
+    if done then return Ok(Array.empty[byte]())
+    done = true
+    Ok(bytes)
+
+main()
+  val text = "to be or not to be, ".repeat(50)
+  val packed = gzip(text.utf8)
+  println(s"${text.byteLength} bytes as ${packed.length < 100} under 100")
+  println(gunzip(packed).map(b -> string.fromUtf8Lossy(b) == text))
+  println(gunzip(packed, maxBytes = 10).mapErr(e -> e.message))
+  println(gunzip(packed.slice(0, 20)).mapErr(e -> e.message))
+
+  // A stream: written in pieces, flushed, finished; read back a piece at a time.
+  val out = Kept()
+  val encoder = Encoder(out, Zlib, level = 9)
+  _ = encoder.write("first ".utf8)
+  _ = encoder.flush()
+  _ = encoder.write("second".utf8)
+  _ = encoder.finish()
+  val decoder = Decoder(Once(out.bytes.toArray()), Zlib)
+  println(decoder.read(3).map(b -> string.fromUtf8Lossy(b)))
+  println(decompress(compress("raw".utf8, Zlib), Zlib).map(b -> b.length))
+```
+
+```text output
+1000 bytes as true under 100
+Ok(true)
+Err(the decompressed data is longer than its limit of 10 bytes)
+Err(the compressed data ends before its stream does)
+Ok(fir)
+Ok(3)
+```
+
+| Function or type | Meaning |
+| --- | --- |
+| `compress(bytes, format = Gzip, level = 6) -> Array[byte]` | `bytes` compressed into `format`, a `Format`: `Gzip`, `Zlib` or `RawDeflate`. |
+| `decompress(bytes, format = Gzip, maxBytes = 100 MiB) -> Result[Array[byte], CompressError]` | `bytes` decompressed from `format`, within `maxBytes` of output. |
+| `gzip(bytes, level = 6)`, `gunzip(bytes, maxBytes = 100 MiB)` | The same for gzip. |
+| `Encoder(out, format = Gzip, level = 6)` | A `ByteWriter` and `Close` compressing what is written to it into the `ByteWriter` `out`. |
+| `Decoder(input, format = Gzip, maxBytes = 100 MiB)` | A `Reader` decompressing what it reads from the `Reader` `input`. |
+| `defaultLevel`, `defaultMaxBytes` | 6, zlib's own default, and 104,857,600. |
+
+**A level** runs from 0, stored without compression (and so a little larger than the input), to 9,
+the smallest and slowest; 6 is close to 9's size for a fraction of its time. A level outside 0 to 9
+traps where it is given.
+
+**An `Encoder`** hands on, at each `write`, whatever output the codec has ready, which may be
+nothing: the codec holds input back to compress it better. `flush()` hands on everything written so
+far, ending on a byte boundary, so the reader at the other end can decompress all of it at once, and
+the stream goes on with the same history; `writeFlushed(bytes)` is a write and a flush, their output
+handed on in one write to `out` (one of each 64 KiB where it is more), as a streamed HTTP body sends
+each write as one chunk; `finish()` writes the rest of the stream and its trailer,
+and `close()` finishes it. Neither closes `out`. A write or flush after the finish answers `Err`, and
+a second finish does nothing; a write to `out` that fails is answered by every call after it.
+
+**A `Decoder`** answers, at each `read(max)`, up to `max` bytes of the decompressed data, reading as
+much of `input` as that takes, and an empty array once the stream has ended together with `input`.
+Its `failure` says why a read failed where the stream was at fault; a failing `input` is answered
+as it failed. Every read after a failure fails the same way.
+
+**Decompression is bounded and strict.** Output past `maxBytes` is `TooLarge(limit)`, and no byte
+past the limit is ever answered or held: the codec writes into a buffer no larger than what is left
+of the limit, so a few hundred bytes of hostile input that stand for gigabytes cost no more than the
+limit, and memory no more than one piece. Input that ends before its stream does is `Truncated`; input
+that is not a stream of its format, whose checksum or length does not match, or that has bytes
+after its end, is `Corrupt(text)`, `text` being zlib's account (`incorrect header check`, `incorrect
+data check`). A gzip stream of several members, as `cat a.gz b.gz` makes, decompresses to their
+outputs joined, as the `gzip` tool does; anything after a member that does not begin another, zero
+padding included, is `Corrupt`. A limit below zero traps. `CompressError` is an `Error` whose
+`message` says which of the three it is.
 
 ## `avin.log`
 
@@ -3935,7 +4071,10 @@ request made without a connection. `request.route: Option[string]` is the whole 
 a router chose (`/api/users/:id` under its groups; a `GET` route's for a `HEAD` it answers), `None`
 until one has, so a middleware wrapped around a whole router's `handle` sees `None`.
 `request.withHeaderReplaced(name, value)` is the request with every header of `name`, any case,
-replaced by one, added last, a name that is not a token or a value holding a line break trapping. A
+replaced by one, added last, a name that is not a token or a value holding a line break trapping.
+`request.withoutHeader(name)` is the request without its headers of `name`, any case, and
+`request.withBody(bytes)` the request with `bytes` for its body, held, a streamed request becoming a
+buffered one; both leave the request they were called on as it was. A
 `ByteStream`'s `remoteAddress` is where `remote` comes from: the other end's address for a
 `TcpStream`, accepted or connected, and a `TlsStream`, and `None` for a `UnixStream`.
 
@@ -4040,6 +4179,57 @@ seconds) and the origin and credentials headers; asking for more, or from an ori
 carries none. `*` together with `credentials`, and a negative `maxAge`, trap where the policy is
 made.
 
+**Compression.** `Compression(level = 6, minBytes = 1024, maxDecodedBytes = 1048576,
+decodesRequests = true, compressible = compressibleType)` is a policy whose `middleware` compresses
+responses for the clients that accept it and decompresses the request bodies clients compressed,
+by [`avin.compress`](#avincompress).
+
+```text
+val compression = Compression()
+http.serve("0.0.0.0", 8080, compression.middleware(router.handle), streamsBody = router.streamsBody)
+```
+
+- **Negotiation.** The request's `Accept-Encoding` is read with its q-values: `gzip` (or `x-gzip`)
+  and `deflate` (the zlib format), `*` standing for any coding the header does not name, names and
+  `q` in any case, and an entry whose q-value is malformed (above 1, more than three decimals)
+  dropped. A coding is used where its q-value is above zero and no lower than identity's, which is 1
+  unless the header names `identity`, or `*`, with another; `gzip` wins a tie with `deflate`. A
+  header that refuses identity (`identity;q=0`, or `*;q=0` without `identity`) and accepts neither
+  coding is answered `406`, with `Vary: Accept-Encoding`, before the handler is called. A request
+  with no `Accept-Encoding` is answered as the handler answers it.
+- **What is left alone.** A response to `HEAD`; a `101`, `204`, `206` or `304`; one carrying a
+  `Content-Range`, a `Content-Encoding` of its own or `Cache-Control: no-transform`; one whose media
+  type `compressible` says is not worth compressing; and one with a body under `minBytes` (a streamed
+  one only where its length is given) are sent as the handler answered them, without `Vary`. A
+  request that refuses identity has its response compressed whatever its type and size.
+  `compressibleType(mediaType)` is the default: false for images other than SVG, BMP and icons, for
+  video, audio and fonts other than TrueType and OpenType, for archives and compressed files
+  (`application/zip`, `gzip`, `zstd`, `x-bzip2`, `x-xz`, `x-7z-compressed`, `vnd.rar`, `epub+zip`),
+  PDF and `application/octet-stream`; true for every other type and for none. It is given the type
+  in lower case without its parameters.
+- **What a compressed response carries.** Every other response says `Vary: Accept-Encoding`, merged
+  into any `Vary` it has, once, and left alone where it is `*`. Where a coding was chosen its body is
+  compressed at `level`, `Content-Encoding` names the coding, any `Content-Length` it gave is
+  dropped (the server writes the length of what it sends), and a strong `ETag` is made weak (`"v1"`
+  becomes `W/"v1"`, a weak one staying as it is), the bytes no longer being the ones the tag names. A
+  buffered body that compressing does not make smaller is sent as it was. A streamed body is
+  compressed as the handler writes it, each write sent at once as the compressed bytes of everything
+  written so far (a zlib sync flush, so the client decompresses it on arrival and server-sent events
+  stay events), and goes chunked, or to an HTTP/1.0 client to the connection's end.
+- **Request bodies.** Where `decodesRequests`, a request whose `Content-Encoding` is `gzip`, `x-gzip`
+  or `deflate` reaches the handler decompressed, without its `Content-Encoding`; `identity` is
+  dropped. A buffered body is decompressed whole within `maxDecodedBytes`, its `Content-Length` made
+  the decompressed length; one that is corrupt or ends early is answered `400`, one that decompresses
+  past the limit `413`, and the handler is not called. A streamed body is decompressed as the handler
+  reads it, by `request.withBodyDecoded(format)`: `bodyReader(maxBytes)` reads it decompressed, its
+  limit counting the decompressed bytes and the compressed ones read within that limit, a
+  sixty-fourth of it and 64 KiB more; a body that fails to decompress is answered by the server `400`,
+  or `413` past the limit, as it answers a body it could not read. The readers of one request share
+  its decompression. Any other coding, or more than one, is answered `415` with `Accept-Encoding:
+  gzip, deflate`. An empty body is passed on empty.
+- A level outside 0 to 9, or a `minBytes` or `maxDecodedBytes` below zero, traps where the policy is
+  made. brotli and zstd are not offered.
+
 **Trusted proxies.** `TrustedProxies(trusted = [], maxHops = 32)` is a middleware (`.middleware`)
 that reads where a request came from behind a reverse proxy. `trusted` is a list of CIDR blocks
 (`Cidr` texts: `10.0.0.0/8`, `2001:db8::/32`, or one address); a block that is not one traps where
@@ -4134,6 +4324,20 @@ write after one that failed, so the code writing a stream ends there; a failed w
 connection. A `BodyWriter` is an [`io.ByteWriter`](#bytewriter) by `write(bytes)`, so
 `io.copy(reader, w)` streams a file or any other `Reader` into a body. No body is written for
 `HEAD`, `204` or `304`, and `write` is not run.
+
+**A middleware that transforms a streamed body** answers a new `StreamedBody` whose `write` hands the
+handler's `write` a writer from `BodyWriter.through(writer)`: a `BodyWriter` of the same body, saying
+the server is stopping as the real one does, whose writes go to `writer` as they are rather than to
+the connection. `writer` transforms each write and writes the result to the real `BodyWriter`; once
+the handler's `write` returns, the middleware writes what its transform still holds. `Compression`
+compresses a stream so:
+
+```text
+Some(body) -> StreamedBody(None, out ->
+  val encoder = Encoder(out, Gzip)
+  body.write(out.through(Flushing(encoder)))
+  _ = encoder.finish())
+```
 
 `Response.events(write)` is a stream of server-sent events, `200` of the type `text/event-stream`,
 written through an `EventWriter`: `send(text, event = None, id = None)` sends an event, each line of
@@ -4637,8 +4841,27 @@ reading that as UTF-8, a sequence that is not read as U+FFFD. **A status is an a
 `BadUrl(UrlError)`, `Malformed(text)` for a reply that is not HTTP, `Unsupported(text)` for a scheme
 other than `http` and `https`, `Tls(TlsError)` for TLS that could not be set up (a connection
 that could not be made, broke or timed out being `Io`, for `https` as for `http`),
-`TooLarge(text)` for a reply over the client's limits, and `ProxyRefused(status, reason)` for a
-proxy that would not open a tunnel ([below](#client)). The module's functions speak HTTP/1.1 on a
+`TooLarge(text)` for a reply over the client's limits, `ProxyRefused(status, reason)` for a
+proxy that would not open a tunnel ([below](#client)), and `Decoding(CompressError)` for a
+compressed body that could not be decompressed.
+
+**Compressed responses.** A request asks for a compressed response unless it says otherwise: the
+module's functions and a `Client` send `Accept-Encoding: gzip` and decompress a body the server sent
+as `gzip`, `x-gzip` or `deflate` within the request's `decoding` limit, 100 MiB unless
+`withDecoding(maxBytes)` gives another, so `body`, or the `ResponseBodyReader` `Client.stream` hands
+over, is the decompressed bytes and the response's headers carry no `Content-Encoding` or
+`Content-Length`. It is so through redirects, each response decompressed on its own, and on kept
+connections: a redirect's body is dropped as it came, never decompressed, and a connection is used
+again only where its body, compressed, was read to its end. A body that is corrupt, ends early or
+passes the limit fails the request with `Decoding` (a `ResponseBodyReader`'s `read` with an
+`IoError` saying so), its `TooLarge`, `Truncated` or `Corrupt` saying which; the client's own
+`maxResponseBytes` counts the decompressed bytes. `withoutDecoding()` sends no `Accept-Encoding`
+and takes the body as it comes, and so does a request sending an `Accept-Encoding` of its own: what
+it asked for is its to decompress. A body of a coding the client does not know, and an empty one
+(`HEAD`, `204`, `304`, a length of zero), is left as it came, its headers with it. A limit below zero
+traps.
+
+The module's functions speak HTTP/1.1 on a
 connection of their own for each request, closed after its response, read bodies by
 `Content-Length`, chunked or to the connection's end, and follow up to five redirects as a
 [`Client`](#client) does; the sixth is the answer. They write `Host`, `Content-Length` (for a body,

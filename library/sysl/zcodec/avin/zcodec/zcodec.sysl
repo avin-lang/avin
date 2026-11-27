@@ -1,0 +1,145 @@
+// Deflate compression and decompression for Avin's `avin.compress`, over the system's zlib.
+//
+// A `Stream` compresses or decompresses a step at a time between two slices the caller hands over,
+// and never writes past the end of the output slice: what a step could not fit stays inside zlib for
+// the next one. That is what lets a caller put a hard limit on what a decompression produces, a few
+// hundred bytes of hostile input being able to stand for gigabytes.
+
+module avin.zcodec
+
+import avin.zcodec.c
+import sysl.slices.{as_ptr, as_mut_ptr}
+import sysl.text.from_cstring
+
+// The framing around the deflate data.
+enum Wrapper
+    // Bare deflate (RFC 1951), with no header and no checksum.
+    Raw
+
+    // A two-byte header and an Adler-32 of the data (RFC 1950): what HTTP calls `deflate`.
+    Zlib
+
+    // A gzip header and a CRC-32 and length of the data (RFC 1952).
+    Gzip
+
+    // Decompressing only: zlib or gzip, decided by the stream's first bytes.
+    Detect
+end Wrapper
+
+// How much a compressing step pushes out.
+enum Flush
+    // As much as zlib chooses; it may hold input back to compress it better.
+    Keep
+
+    // Everything taken so far, ending on a byte boundary, so the other end can decompress all of it
+    // now. The stream goes on.
+    Sync
+
+    // Everything, and the stream's end: its last block and its trailer.
+    Finish
+end Flush
+
+// Why a step failed.
+enum Error
+    // The input is not a stream of the expected wrapper, or its checksum or length is wrong. `text`
+    // is zlib's account.
+    Corrupt(text: string)
+
+    // zlib could not allocate its state.
+    NoMemory
+
+    // A setting zlib refused, such as a level outside 0 to 9.
+    Refused(text: string)
+end Error
+
+// How far a step got: input taken and output written by this step, and whether the stream has
+// reached its end (for a decompression, the end of a gzip member, a zlib stream or a raw one).
+struct Step
+    consumed: usize
+    produced: usize
+    ended: bool
+end Step
+
+// One compression or decompression.
+struct Stream
+    private z: *c.ZStream
+    private compress: bool
+
+    // Takes from `src` and writes into `dst`, flushing as `flush` says when compressing (ignored when
+    // decompressing). A step that could not move anything, for want of input or of room, is not an
+    // error: it answers zero for both.
+    step(&self, src: []const u8, dst: []u8, flush: Flush) -> Result[Step, Error]
+        var consumed: usize = 0
+        var produced: usize = 0
+
+        val how = flush match
+            Keep -> c.NO_FLUSH
+            Sync -> c.SYNC_FLUSH
+            Finish -> c.FINISH
+
+        val r = c.step(self.z, mode(self.compress), as_ptr(src), src.len, as_mut_ptr(dst), dst.len,
+                       if self.compress then how else c.NO_FLUSH, &consumed, &produced)
+
+        if r == c.OK || r == c.BUF_ERROR then return Ok(Step(consumed, produced, false))
+        if r == c.STREAM_END then return Ok(Step(consumed, produced, true))
+        if r == c.MEM_ERROR then return Err(NoMemory)
+        if r == c.NEED_DICT then return Err(Corrupt("the stream asks for a preset dictionary"))
+
+        Err(Corrupt(self.message("the data is not a valid compressed stream")))
+    end step
+
+    // Makes the stream ready for another, as a gzip file of several members needs.
+    reset(&self) -> Result[unit, Error]
+        if c.reset(self.z, mode(self.compress)) == c.OK then return Ok(())
+
+        Err(Refused("the stream could not be reset"))
+    end reset
+
+    private message(self, otherwise: string) -> string
+        val text = c.message(self.z)
+
+        if text == null then return otherwise
+
+        from_cstring(text) match
+            Ok(t) -> t
+            Err(_) -> otherwise
+    end message
+end Stream
+
+impl Drop for Stream
+    drop(self) = c.close(self.z, mode(self.compress))
+
+private mode(compress: bool) -> int = if compress then 1 else 0
+
+// zlib's `windowBits` for a wrapper: fifteen for the largest window, negated for raw deflate, plus
+// sixteen for gzip and thirty-two to detect.
+private window_bits(wrapper: Wrapper) -> int = wrapper match
+    Raw -> -15
+    Zlib -> 15
+    Gzip -> 31
+    Detect -> 47
+
+private opened(compress: bool, level: int, wrapper: Wrapper) -> Result[&Stream, Error]
+    var status: int = 0
+
+    val z = c.open(mode(compress), level, window_bits(wrapper), &status)
+
+    if z == null
+        if status == c.MEM_ERROR then return Err(NoMemory)
+
+        return Err(Refused("zlib refused the settings"))
+    end if
+
+    Ok(Stream(z, compress))
+end opened
+
+// A compression at `level`, 0 (stored, no compression) to 9 (smallest), into `wrapper`, which is not
+// `Detect`.
+encoder(level: int, wrapper: Wrapper) -> Result[&Stream, Error]
+    if wrapper == Wrapper.Detect then return Err(Refused("a compression cannot detect its wrapper"))
+
+    opened(true, level, wrapper)
+end encoder
+
+// A decompression of a stream in `wrapper`.
+decoder(wrapper: Wrapper) -> Result[&Stream, Error] = opened(false, 0, wrapper)

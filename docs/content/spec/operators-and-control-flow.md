@@ -567,9 +567,10 @@ answer() -> int
   result
 ```
 
-A binding may take a value apart by a pattern that cannot fail: `val q, r = divmod(17, 5)`, or
-`var (lo, hi) = 0, 10`, in which every name is a `var`. A pattern that could fail, such as a literal
-or a variant of a type with several, belongs in a `match`.
+A binding may take a value apart by a pattern that cannot fail: `val q, r = divmod(17, 5)`,
+`var (lo, hi) = 0, 10`, in which every name is a `var`, or the constructor of a type with one
+variant, `val Line(Point(x, y), tip) = line`. A pattern that could fail, such as a literal or a
+variant of a type with several, belongs in a `match`.
 
 ## Multiple assignment
 
