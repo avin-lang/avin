@@ -11,9 +11,14 @@
 // input while it has a rest to send rather than waiting for room alone; and a server that starts
 // reading only after the client's read has timed out, which shows the read's wait keeps its limit
 // and that the rest it did not send is kept, in order, for the next read to send.
+//
+// Both ends ask for socket buffers of a fixed size. Left to itself the system may grow a loopback
+// connection's buffers while it fills, so a client pouring one-byte records could go on for millions
+// of them before the connection stopped being writable; a size asked for stays put, so every pour
+// fills in a bounded number of records, and one that does not fill fails rather than going on.
 import avin.fs
 import avin.io.{IoError, TimedOut}
-import avin.net.TcpListener
+import avin.net.{ListenOptions, TcpListener, TcpOptions, TcpStream}
 import avin.net.tls.{TlsClient, TlsError, TlsServer, TlsStream}
 import avin.threads.{Channel, spawn}
 import avin.time.{millis, seconds}
@@ -31,18 +36,38 @@ fixture(name: string) -> string
   val here = "tests/fixtures/tls/" + name
   ok(fs.readText(if fs.exists(here) then here else "../" + here))
 
+// The socket buffers each end asks for, which the system keeps rather than growing.
+val Buffers = TcpOptions(sendBuffer = 65536, receiveBuffer = 65536)
+
 // The most the client sends: far more than the buffers between the two ends hold.
 val Most = 8388608
 
-// Writes records of `size` bytes until one leaves the connection not writable or `Most` has gone, and
-// answers how much plaintext went.
+// The most records the client writes: far more than the buffers between the two ends hold, even of
+// one-byte records.
+val MostRecords = 200000
+
+// Writes records of `size` bytes until one leaves the connection not writable, and answers how much
+// plaintext went; a connection still writable after `Most` bytes or `MostRecords` records fails.
 poured(c: TlsStream, size: int) -> int
   val block = Array.fill(size, byte(42))
   var sent = 0
-  while sent < Most
+  var records = 0
+  while true
     sent += ok(c.writeSome(block))
-    if !c.writable() then break
+    records += 1
+    if !c.writable() then return sent
+    if sent >= Most || records >= MostRecords then fail(s"the connection still had room after $records records")
   sent
+
+// A client's connection to `port`, with the fixed buffers.
+connected(port: int) -> TlsStream =
+  tls(
+    TlsStream.client(
+      ok(TcpStream.connect("localhost", port, seconds(20), Buffers)),
+      "localhost",
+      TlsClient().trust(fixture("ca.pem"))
+    )
+  )
 
 // The server's side: sends `first` bytes of its own, waits to hear how much the client sent, reads
 // exactly that much, answers with `done` and how much came, and closes once the client has.
@@ -72,7 +97,7 @@ answer(c: TlsStream, first: int) -> string
 // own.
 round(l: TcpListener, port: int, server: TlsServer, size: int, first: int)
   val accepting = spawn(() -> tls(TlsStream.server(ok(l.accept()), server)))
-  val c = tls(TlsStream.connect("localhost", port, TlsClient().trust(fixture("ca.pem"))))
+  val c = connected(port)
   ok(c.setTimeout(seconds(20)))
   val s = accepting.join()
   val reported = Channel[int](1)
@@ -85,16 +110,17 @@ round(l: TcpListener, port: int, server: TlsServer, size: int, first: int)
   serving.join()
 
 // The client's read times out while the server is not reading, and a read after the server starts
-// reading still sends the whole rest and gets the answer.
-timedOut(l: TcpListener, port: int, server: TlsServer)
+// reading still sends the whole rest and gets the answer; the client's records are of `size` bytes,
+// a one-byte record's rest being only part of its overhead.
+timedOut(l: TcpListener, port: int, server: TlsServer, size: int)
   val accepting = spawn(() -> tls(TlsStream.server(ok(l.accept()), server)))
-  val c = tls(TlsStream.connect("localhost", port, TlsClient().trust(fixture("ca.pem"))))
+  val c = connected(port)
   ok(c.setTimeout(seconds(20)))
   val s = accepting.join()
-  val sent = poured(c, 65536)
+  val sent = poured(c, size)
   ok(c.setTimeout(millis(300)))
   c.read(100) match
-    Err(IoError(TimedOut, _, _)) -> println("the read with a rest to send timed out")
+    Err(IoError(TimedOut, _, _)) -> println("records of", size, "the read with a rest to send timed out")
     Err(e) -> println("the read failed otherwise:", e.message)
     Ok(bytes) -> println("the read answered", bytes.length, "bytes")
   ok(c.setTimeout(seconds(20)))
@@ -106,12 +132,13 @@ timedOut(l: TcpListener, port: int, server: TlsServer)
   serving.join()
 
 main()
-  val l = ok(TcpListener.bind("127.0.0.1", 0))
+  val l = ok(TcpListener.bind("127.0.0.1", 0, ListenOptions(connections = Buffers)))
   val port = l.port()
   val server = tls(TlsServer.of(fixture("localhost.pem"), fixture("localhost.key")))
   for size in [65536, 16384, 10000, 1]
     round(l, port, server, size, 0)
   round(l, port, server, 65536, 4194304)
   round(l, port, server, 10000, 4194304)
-  timedOut(l, port, server)
+  timedOut(l, port, server, 65536)
+  timedOut(l, port, server, 1)
   _ = l.close()

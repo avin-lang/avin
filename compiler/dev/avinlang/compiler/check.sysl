@@ -5300,7 +5300,8 @@ private opaque_defaults(c: *Checker, t: &Type, name: string) -> Buf[usize]
     out
 
 /** `t` as an instance of trait `k`, where it conforms to it at its type arguments; a type parameter
- * does through its bounds. */
+ * does through its bounds, and a built-in, opaque or tuple type through its impls, so the methods
+ * impls add to a trait reach `int` or `string` as they reach a class implementing it. */
 private trait_view(c: *Checker, t: &Type, k: usize) -> Option[&Type]
     val known = zonk(c, t)
     val f = conformances(c)
@@ -5308,7 +5309,30 @@ private trait_view(c: *Checker, t: &Type, k: usize) -> Option[&Type]
         for b in bounds_of(c, known)
             if bound_ancestor(f, b, k) is Some(up) then return Some(up)
         return None
+    if is_builtin_or_opaque(known) || *known is Tuple(_)
+        // Every integer is a member of `Integer`, and of what it requires.
+        if *known is Int(_)
+            if c.core.trait_named("Integer") is Some(integer)
+                if ancestor_type(c.classes, c.data, own_class_type(c.classes[integer], integer), k) is Some(up) then return Some(up)
+        for b in c.builtins
+            if builtin_covers(b.ty, known) && tuple_parts_hold(f, b.owner, b.params, known)
+                if ancestor_type(c.classes, c.data, builtin_trait_at(c, b.ty, b.trait_type, b.owner, b.params.len(), known), k) is Some(up) then return Some(up)
+        return None
     holding_ancestor(f, known, k)
+
+/** The trait `trait_type` a built-in impl for `stated`, with `count` parameters `owner` owns, makes
+ * type `t` an instance of, at the arguments its parameters take in `t`: an impl of `Pair[A, B]` for
+ * `(A, B)` makes an `(int, string)` a `Pair[int, string]`. */
+private builtin_trait_at(c: *Checker, stated: &Type, trait_type: &Type, owner: usize, count: usize, t: &Type) -> &Type
+    if count == 0 then return trait_type
+    var binds: Buf[Option[&Type]] = buf()
+    for _ in 0..<count
+        binds.push(None)
+    if !match_target(c, stated, t, owner, &binds, false) then return trait_type
+    var args: Buf[&Type] = buf()
+    for x in binds
+        args.push(x.unwrap_or(ErrorType))
+    substitute(trait_type, owner, args)
 
 // The methods of `name` a value of type `t` has: `own`, those of its type, then each that an impl
 // adds to a trait `t` conforms to. The type's own method takes precedence over an added one with the
@@ -22713,6 +22737,17 @@ private choose_among(c: *Checker, at: Span, name_span: Span, name: string, signa
             params.push(argument_type(c, bound_signatures[k], views[k], bindings[k], args, j).unwrap())
         compared.push(params)
     if fitting.len() == 0
+        // An argument holding the type of an expression that already failed fits no candidate, and
+        // its error is reported once, where it was found. One set aside while choosing, a tuple
+        // holding a number literal beside the failure, is checked by itself now to report it.
+        var failed = false
+        for j in 0..<args.len()
+            if typed[j] is None && !takes_parameter_type(argument_value(args[j]))
+                val t = check_expr(c, argument_value(args[j]), None)
+                typed[j] = Some(t)
+            if typed[j] is Some(x)
+                if holds_error(zonk(c, x.ty)) then failed = true
+        if failed then return Choice(None, typed)
         // Overloads are chosen while compiling, and a union's member is known only while running.
         var hint = ""
         for t in typed
@@ -22738,11 +22773,20 @@ private choose_among(c: *Checker, at: Span, name_span: Span, name: string, signa
             literal_preferred(c, owners, counts, compared, args) match
                 Some(k) -> Choice(Some(fitting[k]), typed)
                 None ->
-                    // A lambda whose body was already reported fits every candidate alike; the call
-                    // goes on with the first rather than reporting the same error again as ambiguity.
+                    // An argument whose error was already reported, a name that is not defined or a
+                    // lambda whose body failed, fits every candidate alike; the call goes on with the
+                    // first rather than reporting the same error again as ambiguity.
                     for j in 0..<args.len()
                         if typed[j] is Some(x)
-                            if takes_parameter_type(argument_value(args[j])) && yields_error(c, x.ty) then return Choice(Some(fitting[0]), typed)
+                            if yields_error(c, x.ty) || holds_error(zonk(c, x.ty)) then return Choice(Some(fitting[0]), typed)
+                    // A lambda left unchecked that no candidate's parameter lets its body check has a
+                    // body that fails whatever it is given, and reports that where it is called.
+                    for j in 0..<args.len()
+                        if typed[j] is None && takes_parameter_type(argument_value(args[j]))
+                            var taken = false
+                            for k in 0..<bound.len()
+                                if considered[k] && argument_trial(c, bound_signatures[k], bindings[k], args, j, written) then taken = true
+                            if !taken then return Choice(Some(fitting[0]), typed)
                     if never_returns then return Choice(Some(fitting[0]), typed)
                     c.note(unit, name_span, s"this call to `$name` is ambiguous: ${joined_labels(fitting_labels)} each accept it, and none is more specific than the others")
                     Choice(None, typed)
@@ -26400,6 +26444,9 @@ private lower_bound(c: *Checker, i: usize, v: &Type, open: *Buf[usize], covarian
         return unify(c, p, given)
     if *now is Var(_) then return unify(c, p, v)
     if !has_unknowns(now) && conforms(upcast(c, v, now), now) then return true
+    // A bound holding the type of an expression that already failed says nothing new: its error is
+    // reported once, where it was found, and not again as two bounds that do not join.
+    if holds_error(zonk(c, now)) || holds_error(v) then return true
     join(c, now, v) match
         Some(t) ->
             settle(c, i, zonk(c, t))

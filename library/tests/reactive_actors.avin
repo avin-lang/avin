@@ -1,0 +1,149 @@
+// `avin.reactive` across threads and actors: many threads writing through ports while the owner
+// drains, every observation consistent and every writer's last value applied; an actor owning a
+// graph, its messages turned into writes and its effects telling another actor; an actor stopped by
+// its own effect in the middle of a flush, which finishes that flush and tells nothing after; and an
+// actor failing inside an effect, restarted with a fresh graph, the failed flush's later effects never
+// run.
+import avin.actors.{ActorRef, Restart, failure, spawn as spawnActor}
+import avin.reactive.{Atom, Graph, Port}
+import avin.threads.{Atomic, Channel, Thread, spawn}
+import avin.time
+
+@test(
+  "eight threads writing through ports while the owner drains: each observation is consistent and the last values land"
+)
+rxPortsUnderStress()
+  val writers = 8
+  val each = 3000
+  val g = Graph()
+  val atoms = Buffer[Atom[int]]()
+  for i in 0 ..< writers do atoms.append(g.atom(0))
+  val total = g.derived(get ->
+    var t = 0
+    for a in atoms do t += get(a)
+    t)
+  var observations = 0
+  _ = g.effect(get ->
+    val t = get(total)
+    var direct = 0
+    for a in atoms do direct += a.get()
+    assertEq(t, direct)
+    observations += 1)
+  val ports = Buffer[Port[int]]()
+  for a in atoms do ports.append(g.port(a))
+  val finished = Atomic(0)
+  val threads = Buffer[Thread[unit]]()
+  for i in 0 ..< writers
+    val p = ports(i)
+    threads.append(spawn(() ->
+      for v in 1 .. each do assert(p.set(v))
+      _ = finished.add(1)))
+  while finished.load() < writers do _ = g.awaitWrites(time.millis(5))
+  for t in threads do t.join()
+  _ = g.drain()
+  for a in atoms do assertEq(a.get(), each)
+  assertEq(total.get(), writers * each)
+  assert(observations >= 2)
+
+data RxSensorMsg
+  RxReading(v: int)
+
+data RxCollectMsg
+  RxValue(v: int)
+  RxReport(replyTo: ActorRef[Vector[int]])
+
+actor RxCollector receives RxCollectMsg
+  val got = Buffer[int]()
+  receive
+    RxValue(v) -> got.append(v)
+    RxReport(r) -> r.tell(got.toVector)
+
+// Doubles each reading; stops itself, from an effect, once the doubled value reaches `stopAt`. The
+// effect telling the collector runs after the one that stops, in the same flush.
+actor RxSensor(sink: ActorRef[RxCollectMsg], stopAt: int) receives RxSensorMsg
+  val g = Graph()
+  val value = g.atom(0)
+  val doubled = value.map(v -> v * 2)
+  _ = g.effect(get -> if get(doubled) >= stopAt then stop())
+  _ = g.effect(get -> sink.tell(RxValue(get(doubled))))
+  receive
+    RxReading(v) -> value.set(v)
+  stopping
+    g.dispose()
+
+@test(
+  "an actor owns a graph: messages become writes, an effect tells another actor, and stopping mid-flush finishes the flush and tells nothing more"
+)
+rxActorStops()
+  val collector = spawnActor(RxCollector())
+  val sensor = spawnActor(RxSensor(collector, 10))
+  for v in [1, 2, 5, 7, 3] do sensor.tell(RxReading(v))
+  _ = sensor.ended().await()
+  val got = collector.ask(r -> RxReport(r), timeout = time.seconds(10)).await()
+  assertEq(got, Ok([0, 2, 4, 10]))
+
+// Fails, from an effect, on a reading of 13, before the effect that tells runs in that flush. The
+// effect that fails tells -1 from its cleanup, which runs before each run after the first and when
+// it is disposed; `stopping` tells -100 where it runs after a failure.
+actor RxFragile(sink: ActorRef[RxCollectMsg], starts: Channel[int]) receives RxSensorMsg
+  val g = Graph()
+  val value = g.atom(0)
+  val doubled = value.map(v -> v * 2)
+  _ = g.effect(get ->
+    get.onCleanup(() -> sink.tell(RxValue(-1)))
+    if get(doubled) == 26 then fail("a reading of 13"))
+  _ = g.effect(get -> sink.tell(RxValue(get(doubled))))
+  starts.send(1)
+  receive
+    RxReading(v) -> value.set(v)
+  stopping
+    g.dispose()
+    if failure() is Some(_) then sink.tell(RxValue(-100))
+
+@test(
+  "an actor failing inside an effect restarts with a fresh graph: the failed flush's later effects never run, and the effect that trapped is cleaned up in stopping"
+)
+rxActorRestarts()
+  val collector = spawnActor(RxCollector())
+  val starts = Channel[int]()
+  val fragile = spawnActor(RxFragile(collector, starts), onFailure = Restart(3, time.minutes(1)))
+  assertEq(starts.receive(), Some(1))
+  fragile.tell(RxReading(1))
+  fragile.tell(RxReading(13))
+  fragile.tell(RxReading(4))
+  assertEq(starts.receive(), Some(1))
+  var got: Vector[int] = []
+  var tries = 0
+  while got.length < 9 && tries < 1000
+    got = collector.ask(r -> RxReport(r), timeout = time.seconds(10)).await() match
+      Ok(v) -> v
+      Err(_) -> []
+    tries += 1
+  assertEq(got, [0, -1, 2, -1, -1, -100, 0, -1, 8])
+
+// Stops when told, disposing its graph in `stopping`, where `failure()` answers `None`.
+actor RxQuiet(sink: ActorRef[RxCollectMsg]) receives RxSensorMsg
+  val g = Graph()
+  val value = g.atom(0)
+  _ = g.effect(get ->
+    val v = get(value)
+    get.onCleanup(() -> sink.tell(RxValue(-v - 1))))
+  receive
+    RxReading(v) ->
+      value.set(v)
+      if v == 5 then stop()
+  stopping
+    g.dispose()
+    if failure() is None then sink.tell(RxValue(100))
+
+@test(
+  "an actor stopped without a failure disposes its graph in stopping, running each cleanup once, and failure() is None"
+)
+rxActorQuietStop()
+  val collector = spawnActor(RxCollector())
+  val quiet = spawnActor(RxQuiet(collector))
+  quiet.tell(RxReading(5))
+  _ = quiet.ended().await()
+  assertEq(failure(), None)
+  val got = collector.ask(r -> RxReport(r), timeout = time.seconds(10)).await()
+  assertEq(got, Ok([-1, -6, 100]))

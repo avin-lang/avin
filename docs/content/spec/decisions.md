@@ -10479,6 +10479,23 @@ Settled on the user's delegation 2026-11-11 (built on branch `json-derive`): **J
   random pairs checked against the quadratic table for minimality. Review with the user: the names
   `Edit`, `Keep`, `Insert`, `Delete`, `diffLines`, `unifiedDiff` and `changes`, and whether a
   patience diff should join this one as `diffLines`' option.
+- Settled on the user's delegation 2026-11-20 (branch `extension-value`): **the methods an impl adds
+  to a trait reach a built-in, opaque or tuple type implementing it**, as they reach a class or `data`
+  type: with `impl Plain for int` and `impl Plain` adding `loud(k: int)`, `5.loud(1)` is a call and
+  `val f = 5.loud` an `(int) -> string`, extensions of core traits included (`impl Display` adding
+  `framed` gives `2.5.framed` and `7.framed`); every integer is an `Integer`, so what is added to
+  `Integer` and the traits it requires reaches it too. The rule "every value whose type conforms to
+  the trait has them" already said so; the checker saw a built-in type's conformances only for bounds,
+  so both the call and the method value reported "int has no field `loud`". The type's own method of
+  the name and parameter types is still found first (`"ab".repeat(2)` is `string`'s), the
+  extension's visibility is unchanged (an `impl Display` in a module a file does not import is refused
+  there by name), and an added method's value is taken exactly as a type's own: its `using` section
+  filled where it is taken, an overload chosen by the expected function type and ambiguous without
+  one, a method declared with `()` a value only where a function type is expected. Alternative
+  weighed: keeping added methods to user and library types only, which would leave a trait's added
+  methods missing exactly on the types most programs implement it for, with no way to call them but
+  through a generic function. Review with the user: it is a widening; no core impl adds methods to a
+  trait a built-in type implements today, so no existing call changes meaning.
 - **`io.inputs` and `io.inputLines`: the files named, or standard input when none.** Settled on the
   user's delegation 2026-11-19: `io.inputs(paths: Vector[string]) -> Iterator[Result[(string, string),
   IoError]]` yields each input as its name and all its text, and `io.inputLines(paths)` yields the
@@ -12251,6 +12268,68 @@ Settled on the user's delegation 2026-11-11 (built on branch `json-derive`): **J
     limit is not malformed). Review with the user: `HttpError` gained a case.
   - **brotli and zstd are follow-ups** (`sysl:brotli`, `sysl:zstd` exist), as further `Format`s and
     codings in the same negotiation.
+
+- Settled by the user 2026-11-26 (built on branch `frp-research`): **reactive values are a standard
+  library module, [`avin.reactive`](/spec/system-library/#avinreactive)**: a `Graph` of atoms,
+  derived values whose sources are tracked as they are read, and effects.
+  - **The name is `avin.reactive`.** `avin.signal` is the module of the operating system's signals.
+    *Alternatives*: `avin.atoms`, `avin.cells`, `avin.state`.
+  - **Nodes are objects holding their own values**, tracked through an explicit `Get` parameter, with
+    no ambient tracker, since a module-level variable would make the module unreachable from actors.
+    A source refers to a node only while an effect observes it, so a node nobody observes, and a
+    whole graph, is collected with no weak reference. *Alternative*: sendable atom definitions used
+    as keys into a store per owner, which let one module-level atom serve every actor. That needs a
+    weak map, which Avin does not have, so that a store does not keep every key it ever saw, and it
+    needs atoms' initial values to be sendable.
+  - **Glitch-freedom by pushing to find the effects and pulling to compute**, in the order each
+    computation last read its sources, stopping at the first that changed, with `==` as the cutoff.
+    *Alternatives*:
+    - pushing in order of height: it computes values nobody reads and must keep heights under
+      dependencies that switch;
+    - pulling only: it checks every effect on every write;
+    - running effects inside `set`: that gives glitches as soon as an effect writes.
+  - **A write from an effect is queued**: it takes effect at once, its effects run after the writer
+    returns in the same flush, and **a hundred runs of one effect in one flush trap** as a loop.
+    *Alternatives*: refusing writes from effects (safe, but a program needs them, to copy a reloaded
+    configuration into its state for one); no limit (a loop hangs silently); a limit set per graph.
+    A derived computation's write traps.
+  - **Ownership is the compiler's sendability check alone.** A graph's nodes are mutable, so none is
+    sendable. *Alternative*: a run-time check against the owner word handles use, on every
+    operation, as defence in depth. The compile-time rule already excludes every shared access, and
+    a stored owner would mis-fire after a lawful hand-over of ownership.
+  - **A `Port` is latest-wins**: a sendable slot of one value per atom, drained by the owner in one
+    batch. *Alternative*: a queued port delivering every write with `send`'s backpressure, which is a
+    stream and belongs in a `Channel` or a mailbox.
+  - **Equality is `==`**, with no equality per atom for now.
+  - **Asynchronous values are left out**, with the reason given in the chapter. They need a
+    cancellation `Future` lacks: either run the work as a scope's thread and cancel it when
+    superseded, or add cancellation to futures. That choice comes first. The shape that fits is a
+    derived `Loadable[T]`, each computation numbered, its completion delivered through a port tagged
+    with its number, and a result for an older number dropped.
+  - **The live heap is read by a runtime test hook, not a public API**:
+    `avin.rt.live_bytes_after_collection()` collects and answers the live bytes. The lifetime tests
+    (`library/tests/reactive_heap.avin`) bind it, and they are checked against a leak planted on
+    purpose.
+  - **`avin.actors.failure()`** answers, in a `stopping` block and what it calls, the reason of the
+    trap ending or restarting the actor, so `Graph.dispose` cleans up the effect a trap stopped
+    part-way. A trap runs no deferred statement, so nothing else could tell it.
+    *Alternatives*:
+    - a method on `ActorContext` only: a library a `stopping` block calls holds no context;
+    - an `Ending` given to `stopping`: that changes every `stopping` block, and a restart is not an
+      ending;
+    - running deferred statements on a trap: that was refused when `defer` was settled.
+  - **An actor's effects come after its fields**, by the rule for
+    [objects under construction](/spec/declarations/#objects-under-construction). The diagnostic is
+    the class body's, and it is right; the actors chapter shows the order.
+
+- Settled by the user 2026-11-26 (branch `tls-close-reset`): **closing a TLS stream whose peer has
+  already reset the connection answers `Ok`**, as `TcpStream.close` does (a TCP close answers `Ok`
+  always). It covers the whole `TlsStream` and a split connection's writer, at the client and at
+  the server end. Other failures to send the close notice, a timeout for one, are still the
+  `Err`. Why: the notice's failing to go out because the socket is gone tells the caller nothing
+  it can act on, and a peer that closes with session tickets unread resets the connection, so the
+  answer was a race. Weighed: answering the error always, which the TCP close does not, and
+  ignoring every close failure, which would hide a send that timed out.
 
 - Settled on the user's delegation 2026-11-24 (branch `fs-content-type`): **`avin.fs` has
   `probeContentType(file) -> Result[Option[string], IoError]`, `contentTypeOfName(name) -> Option[string]`,

@@ -24,6 +24,11 @@ class Avin < Formula
   # links the machine's OpenSSL, found by pkg-config, and trusts its certificate store.
   depends_on "openssl@3"
 
+  # `avin.compress` links the system zlib. macOS ships one; Linux takes it from here.
+  on_linux do
+    depends_on "zlib"
+  end
+
   # A collection out of Sysl is converted by two generic shim overloads, for a slice and a `Buf`,
   # that a program can reach at the same type argument, which needs Sysl 0.9.0; a handle passed to a
   # `&T` parameter is shared rather than copied, and a socket closes when its last copy goes, from

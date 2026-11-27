@@ -45,6 +45,25 @@ actor Counter(start: int) receives CounterMsg
   is checked where the actor is declared. Since an actor runs on any of an executor's workers,
   nothing its body, its arms or its methods reach may be a module-level `var` or a module-level
   value that is not sendable.
+- **Its fields come first, then what hands out `self`.** The body is a class's body, so
+  [objects under construction](/spec/declarations/#objects-under-construction) holds: until the
+  last field is set, it may not make a lambda that captures `self`. Such a lambda reads a field or a
+  parameter, or calls the actor's own methods or its context's (`stop()`, `watch`, `after`). A body
+  that registers one where it runs later (an effect on a [reactive graph](/spec/system-library/#avinreactive),
+  a timer's handler, a callback) does so in a statement after the last field. Where it keeps the
+  handle it is given, that goes in a `var` assigned there:
+
+  ```text
+  actor Sensor(sink: ActorRef[int]) receives int
+    val g = Graph()
+    val reading = g.atom(0)
+    val alarm = g.effect(get -> if get(reading) > 100 then stop()) // error: a lambda that captures `self` is made before `seen` is initialized
+    val seen = Buffer[int]()
+    _ = g.effect(get -> sink.tell(get(reading))) // every field is set: the body may use `self` freely
+    receive
+      n -> reading.set(n)
+  ```
+
 - **`receive` holds the arms** that handle a message: exactly a `match`'s arms over `M`, with
   patterns, guards and block bodies, and checked for exhaustiveness and for unreachable arms in the same way. A message the
   actor wants to ignore is handled by an arm that does nothing, `_ -> ()`, so ignoring one is always
@@ -431,6 +450,17 @@ doubt, and the runtime can contain it:
   a trap had failed it already, and with no supervision asked, so a block that traps during a
   restart ends the actor instead. Of several `onStopping` functions, those after one that traps do
   not run.
+- **`failure() -> Option[string]`**, in `avin.actors`, tells a `stopping` block, and whatever it
+  calls, why it runs:
+  - `Some` of the trap's reason, as `Failed` holds it, where a failure is ending the actor (under
+    `Stop`, or escalated, in the actor that trapped and in each parent it fails) or restarting it;
+  - `None` where the actor stops without one;
+  - `None` in code that is not running a `stopping` block, an actor's body and arms among it.
+
+  A library that a `stopping` block hands its state to reads it to know that a trap left that state
+  half changed. [`avin.reactive`](/spec/system-library/#avinreactive)'s `Graph.dispose` does this,
+  to clean up an effect the trap stopped part-way. A trap runs no deferred statement, so nothing else
+  could tell it.
 - **Watching.** `watch(ref, message: M)` asks for `message` in this actor's own mailbox when the
   actor `ref` ends, for whatever reason, and `watch(ref, f: Ending -> M)` for `f` of how it ended;
   `unwatch(ref)` stops asking. Watching an actor that has already ended delivers at once. `Ending` is
