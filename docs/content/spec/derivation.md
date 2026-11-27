@@ -247,6 +247,59 @@ whose `walk` and `build` are written for `Order`'s shape.
 - **Static members are derived too.** A template's `static decode` becomes `Order.decode`, called
   through a bound as `A.decode(r)`.
 
+## Absent fields: `Missable`
+
+The core library's `Missable` says what a decoder takes for a field its input leaves out. Every
+module sees it without an import, as it sees the core's other traits.
+
+```text
+trait Missable
+  static whenMissing() -> Option[Self] = None
+```
+
+- **`None` is no value**: a decoder reports the absent field as an error naming it. `Some(v)` is
+  the value the field takes. The core gives the built-in scalars, `string`, `Array`, `Vector`,
+  `List`, `HashMap` and `TreeMap` `None`, and `Option[A]` `Some(None)`, so an absent `Option` field
+  is `None`.
+- **Every format's decoder trait requires it** and declares no `whenMissing` of its own: `trait
+  TomlDecoder: Missable`, and so `CborDecoder`, `MsgpackDecoder` and the JSON package's
+  `JsonDecoder`. A type has one method of a name and parameter types, which serves every trait that
+  declares it ([impl](/spec/declarations/#impl)), so each type has one answer, which every format
+  takes, and any formats can be imported together.
+- **A type deriving a decoder keeps the default**, `None`, through the trait's
+  [static default](/spec/declarations/#static-members), with nothing more written. A type writes
+  its own answer with an impl in its module, and every format's derived decoder takes it:
+
+```text run
+import avin.cbor
+import avin.cbor.{CborDecoder, CborEncoder}
+import avin.toml
+import avin.toml.{TomlDecoder, TomlEncoder}
+
+data Port(number: int) derives TomlEncoder, TomlDecoder, CborEncoder, CborDecoder
+
+impl Missable for Port
+  static whenMissing() -> Option[Port] = Some(Port(80))
+
+data Server(name: string, port: Port, nick: Option[string]) derives TomlDecoder, CborDecoder
+
+data Named(name: string) derives TomlEncoder, CborEncoder
+
+main()
+  val fromToml = toml.decode[Server](toml.encode(Named("web")).ok.get).ok.get
+  println(s"${fromToml.port.number} ${fromToml.nick}")
+  val fromCbor = cbor.decode[Server](cbor.encode(Named("web"))).ok.get
+  println(s"${fromCbor.port.number} ${fromCbor.nick}")
+```
+
+```text output
+80 None
+80 None
+```
+
+- **A field's own default comes first**: the field takes its default where it has one, else its
+  type's `whenMissing`, else the absence is an error.
+
 ## Cost
 
 ```text
@@ -300,9 +353,8 @@ impl JsonError
 trait JsonEncoder
   encode(out: JsonWriter)
 
-trait JsonDecoder
+trait JsonDecoder: Missable // a value for a field absent from the input is the core's answer
   static decode(r: JsonReader) -> Result[Self, JsonError]
-  static whenMissing() -> Option[Self] // a value for a field absent from the input
 
 data JsonKey(name: string) // a field's or variant's name in JSON
 impl Annotation for JsonKey
@@ -324,12 +376,10 @@ impl JsonEncoder for string
 
 impl JsonDecoder for string
   static decode(r: JsonReader) -> Result[string, JsonError] = r.readString()
-  static whenMissing() -> Option[string] = None
 
 impl[A: JsonDecoder] JsonDecoder for Option[A]
   static decode(r: JsonReader) -> Result[Option[A], JsonError] =
     if r.takeNull() then Ok(None) else A.decode(r).map(a -> Some(a))
-  static whenMissing() -> Option[Option[A]] = Some(None)
 
 impl[A: JsonDecoder] JsonDecoder for Vector[A]
   static decode(r: JsonReader) -> Result[Vector[A], JsonError] =
@@ -338,8 +388,10 @@ impl[A: JsonDecoder] JsonDecoder for Vector[A]
     while r.nextElement()?
       items.addOne(A.decode(r).mapErr(e -> e.atIndex(items.length))?)
     Ok(items.toVector)
-  static whenMissing() -> Option[Vector[A]] = None
 ```
+
+The decoders give no `whenMissing`: each type has the core's [`Missable`](#absent-fields-missable)
+answer, `Some(None)` for the `Option` and `None` for the others, which every format shares.
 
 The encoder's derivation. A sum type writes its discriminator first:
 
@@ -373,7 +425,6 @@ the value at that field's type, skipping keys it does not know:
 ```text
 derive JsonDecoder for T
   static decode(r: JsonReader) -> Result[T, JsonError] = T.build(FieldReader(r))
-  static whenMissing() -> Option[T] = None
 
 data FieldReader(r: JsonReader)
 

@@ -1,0 +1,276 @@
+module avin.msgpack
+
+// Encoding and decoding a program's own types. `derives MsgpackEncoder` and `derives MsgpackDecoder`
+// give a data type or a class an encoder and a decoder written for its own fields: a value is a map of
+// its fields by name, and a value of a type of several variants also carries its variant's name under
+// a discriminator key written first.
+
+import avin.io.ByteWriter
+import avin.io.IoError
+import avin.io.Reader
+
+// A value that writes itself as MessagePack. `isMsgpackNone` is whether the value is an `Option`'s
+// `None`, which a field marked `@MsgpackOmitNone` leaves out.
+trait MsgpackEncoder
+  encode(out: MsgpackWriter)
+  isMsgpackNone() -> bool = false
+
+// A value read from MessagePack. The value of a field absent from the input is the core's `Missable`
+// answer for its type, the one every format's decoder shares: `Some(None)` for an `Option`, and
+// otherwise `None`, an absence that is an error.
+trait MsgpackDecoder: Missable
+  static decode(r: MsgpackReader) -> Result[Self, MsgpackError]
+
+// A field's or a variant's name in the map, in place of its name in the program.
+data MsgpackKey(name: string)
+impl Annotation for MsgpackKey
+
+// The discriminator key of a type of several variants, in place of `"type"`.
+data MsgpackTag(key: string)
+impl Annotation for MsgpackTag
+
+// A field never written, and skipped where the input has it: a decoded value takes the field's default.
+object MsgpackOmit: Annotation
+
+// A field left out of the map where its value is `None`, rather than written as nil.
+object MsgpackOmitNone: Annotation
+
+// `value` as MessagePack. With `deterministic`, every map's entries are sorted by their encoded keys
+// and every float is at its shortest exact width.
+encode[A: MsgpackEncoder](value: A, deterministic: bool = false) -> Array[byte]
+  val out = MsgpackWriter.toBytes(false)
+  value.encode(out)
+  if !deterministic then return out.toArray()
+  parse(out.toArray()) match
+    Ok(tree) -> encodeTree(tree, true)
+    Err(e) -> fail(s"the encoder wrote bytes that are not MessagePack: $e")
+
+// `value` written to `sink`, a piece at a time; the first failure to write is the `Err`. The bytes are
+// those `encode(value)` gives, without `deterministic`.
+encodeTo[A: MsgpackEncoder](sink: ByteWriter, value: A) -> Result[unit, IoError]
+  val out = MsgpackWriter.to(sink)
+  value.encode(out)
+  out.finish()
+
+// The value of type `A` that `bytes` hold, with nothing after it, or the first thing wrong with them,
+// its path naming where in the document the value at fault is.
+decode[A: MsgpackDecoder](bytes: Array[byte], options: MsgpackOptions = MsgpackOptions()) -> Result[A, MsgpackError] =
+  decodeAll[A](MsgpackReader.fromBytes(bytes, options))
+
+// The value of type `A` that the document `source` gives, read as it arrives.
+decode[A: MsgpackDecoder](source: Reader, options: MsgpackOptions = MsgpackOptions()) -> Result[A, MsgpackError] =
+  decodeAll[A](MsgpackReader.fromReader(source, options))
+
+// The value of type `A` that the tree `tree` holds, as `decode` reads the bytes it encodes to.
+decode[A: MsgpackDecoder](tree: Msgpack, options: MsgpackOptions = MsgpackOptions()) -> Result[A, MsgpackError] =
+  decodeAll[A](MsgpackReader.fromBytes(encodeTree(tree), options))
+
+// The tree that `encode` writes `value` as.
+toTree[A: MsgpackEncoder](value: A) -> Msgpack = parse(encode(value)) match
+  Ok(tree) -> tree
+  Err(e) -> fail(s"the encoder wrote bytes that are not MessagePack: $e")
+
+private decodeAll[A: MsgpackDecoder](r: MsgpackReader) -> Result[A, MsgpackError]
+  val value = A.decode(r)?
+  r.finish()?
+  Ok(value)
+
+private keyOf(f: FieldShape) -> string = f.annotation[MsgpackKey]().map(k -> k.name).getOrElse(f.name)
+
+private nameOf(v: VariantShape) -> string = v.annotation[MsgpackKey]().map(k -> k.name).getOrElse(v.name)
+
+private tagOf(t: TypeShape) -> string = t.annotation[MsgpackTag]().map(tag -> tag.key).getOrElse("type")
+
+// The built-in types: a `bool`, the integers, a `real` at its shortest width, a string, a byte array as
+// binary data, a `Msgpack` as itself.
+
+impl MsgpackEncoder for bool
+  encode(out: MsgpackWriter) = out.bool(self)
+  isMsgpackNone() -> bool = false
+
+impl MsgpackDecoder for bool
+  static decode(r: MsgpackReader) -> Result[bool, MsgpackError] = r.readBool()
+
+impl MsgpackEncoder for int
+  encode(out: MsgpackWriter) = out.integer(long(self))
+  isMsgpackNone() -> bool = false
+
+impl MsgpackDecoder for int
+  static decode(r: MsgpackReader) -> Result[int, MsgpackError] = r.readInt()
+
+impl MsgpackEncoder for long
+  encode(out: MsgpackWriter) = out.integer(self)
+  isMsgpackNone() -> bool = false
+
+impl MsgpackDecoder for long
+  static decode(r: MsgpackReader) -> Result[long, MsgpackError] = r.readLong()
+
+impl MsgpackEncoder for real
+  encode(out: MsgpackWriter) = out.float(self)
+  isMsgpackNone() -> bool = false
+
+impl MsgpackDecoder for real
+  static decode(r: MsgpackReader) -> Result[real, MsgpackError] = r.readReal()
+
+impl MsgpackEncoder for string
+  encode(out: MsgpackWriter) = out.textString(self)
+  isMsgpackNone() -> bool = false
+
+impl MsgpackDecoder for string
+  static decode(r: MsgpackReader) -> Result[string, MsgpackError] = r.readText()
+
+impl MsgpackEncoder for Array[byte]
+  encode(out: MsgpackWriter) = out.binary(self)
+  isMsgpackNone() -> bool = false
+
+impl MsgpackDecoder for Array[byte]
+  static decode(r: MsgpackReader) -> Result[Array[byte], MsgpackError] = r.readBytes()
+
+impl MsgpackEncoder for Msgpack
+  encode(out: MsgpackWriter) = out.value(self)
+
+impl MsgpackDecoder for Msgpack
+  static decode(r: MsgpackReader) -> Result[Msgpack, MsgpackError] = r.readValue()
+
+impl Missable for Msgpack
+
+// An `Option` is nil when it is `None`, and its value otherwise; a field of an `Option` type absent
+// from the input is `None`.
+impl[A: MsgpackEncoder] MsgpackEncoder for Option[A]
+  encode(out: MsgpackWriter) = self match
+    Some(a) -> a.encode(out)
+    None -> out.nil()
+  override isMsgpackNone() -> bool = self is None
+
+impl[A: MsgpackDecoder] MsgpackDecoder for Option[A]
+  static decode(r: MsgpackReader) -> Result[Option[A], MsgpackError]
+    if r.takeNil()? then Ok(None) else A.decode(r).map(a -> Some(a))
+
+// A vector and a list are arrays, the path of an error in an element naming its index.
+impl[A: MsgpackEncoder] MsgpackEncoder for Vector[A]
+  encode(out: MsgpackWriter)
+    out.beginArray(self.length)
+    for a in self
+      a.encode(out)
+
+impl[A: MsgpackDecoder] MsgpackDecoder for Vector[A]
+  static decode(r: MsgpackReader) -> Result[Vector[A], MsgpackError] = decodeElements[A](r)
+
+private decodeElements[A: MsgpackDecoder](r: MsgpackReader) -> Result[Vector[A], MsgpackError]
+  r.beginArray()?
+  val items = Buffer[A]()
+  while r.nextElement()?
+    items.addOne(A.decode(r).mapErr(e -> e.atIndex(items.length))?)
+  Ok(items.toVector)
+
+impl[A: MsgpackEncoder] MsgpackEncoder for List[A]
+  encode(out: MsgpackWriter)
+    out.beginArray(self.length)
+    for a in self
+      a.encode(out)
+
+impl[A: MsgpackDecoder] MsgpackDecoder for List[A]
+  static decode(r: MsgpackReader) -> Result[List[A], MsgpackError] = decodeElements[A](r).map(items -> items.toList)
+
+// A map, a `HashMap` or a `TreeMap`, is a MessagePack map of its entries in the map's own order, a key
+// of any type the program can encode; a key written twice in the input keeps its last value.
+impl[K: MsgpackEncoder, A: MsgpackEncoder] MsgpackEncoder for HashMap[K, A]
+  encode(out: MsgpackWriter) = encodeEntries(out, self.size, self.iterator())
+
+impl[K: MsgpackDecoder, A: MsgpackDecoder] MsgpackDecoder for HashMap[K, A]
+  static decode(r: MsgpackReader) -> Result[HashMap[K, A], MsgpackError] = decodeEntries(r, HashMap.newBuilder[K, A]())
+
+impl[K: MsgpackEncoder, A: MsgpackEncoder] MsgpackEncoder for TreeMap[K, A]
+  encode(out: MsgpackWriter) = encodeEntries(out, self.size, self.iterator())
+
+impl[K: MsgpackDecoder, A: MsgpackDecoder] MsgpackDecoder for TreeMap[K, A]
+  static decode(r: MsgpackReader) -> Result[TreeMap[K, A], MsgpackError] = decodeEntries(r, TreeMap.newBuilder[K, A]())
+
+private encodeEntries[K: MsgpackEncoder, A: MsgpackEncoder](out: MsgpackWriter, length: int, entries: Iterator[(K, A)])
+  out.beginMap(length)
+  for (k, a) in entries
+    k.encode(out)
+    a.encode(out)
+
+private decodeEntries[K: MsgpackDecoder, A: MsgpackDecoder, M](
+    r: MsgpackReader,
+    entries: Builder[(K, A), M]
+) -> Result[M, MsgpackError]
+  r.beginMap()?
+  var n = 0
+  while r.nextEntry()?
+    val k = K.decode(r).mapErr(e -> e.atIndex(n))?
+    entries.addOne((k, A.decode(r).mapErr(e -> e.atIndex(n))?))
+    n += 1
+  Ok(entries.result())
+
+// The derived encoder: a map of the value's fields, by name, each written by its own type's encoder.
+// A type of several variants writes its variant's name first, under its discriminator key.
+derive MsgpackEncoder for T
+  encode(out: MsgpackWriter)
+    val count = T.walk(self, FieldCounter(T.shape(), 0)).count
+    T.walk(self, FieldWriter(out, T.shape(), count))
+
+private data FieldCounter(shape: TypeShape, count: int)
+
+impl ShapeVisitor for FieldCounter
+  variant(v: VariantShape) -> FieldCounter = FieldCounter(shape, if shape.variantCount > 1 then 1 else 0)
+
+impl FieldCounter
+  field[F: MsgpackEncoder](f: FieldShape, value: F) -> FieldCounter =
+    if f.has(MsgpackOmit) || (
+      value.isMsgpackNone() && f.has(MsgpackOmitNone)
+    ) then self else FieldCounter(shape, count + 1)
+
+private data FieldWriter(out: MsgpackWriter, shape: TypeShape, count: int)
+
+impl ShapeVisitor for FieldWriter
+  variant(v: VariantShape) -> FieldWriter
+    out.beginMap(count)
+    if shape.variantCount > 1
+      out.textString(tagOf(shape))
+      out.textString(nameOf(v))
+    self
+
+impl FieldWriter
+  field[F: MsgpackEncoder](f: FieldShape, value: F) -> FieldWriter
+    if !f.has(MsgpackOmit) && !(value.isMsgpackNone() && f.has(MsgpackOmitNone))
+      out.textString(keyOf(f))
+      value.encode(out)
+    self
+
+// The derived decoder reads as the bytes come: the discriminator first, where the type has several
+// variants, then each key, decoding its value at that field's type. A key no field has is skipped, a
+// key written twice is an error, and a field absent from the input takes its default, or its type's
+// `whenMissing`, or is an error naming it. The deriving type keeps `Missable`'s default, `None`, unless
+// it implements `Missable` itself.
+derive MsgpackDecoder for T
+  static decode(r: MsgpackReader) -> Result[T, MsgpackError] = T.build(FieldReader(r))
+
+private data FieldReader(r: MsgpackReader)
+
+impl ShapeBuilder[MsgpackError] for FieldReader
+  variant(t: TypeShape) -> Result[int, MsgpackError]
+    r.beginMap()?
+    if t.variantCount == 1 then return Ok(0)
+    val tag = tagOf(t)
+    if r.nextKey()? != Some(tag) then return Err(r.error(s"expected \"$tag\" first, naming the variant"))
+    val name = r.readText().mapErr(e -> e.inField(tag))?
+    t.variants.find(v -> nameOf(v) == name) match
+      Some(v) -> Ok(v.index)
+      None -> Err(r.error(s"unknown variant \"$name\"").inField(tag))
+
+  next(v: VariantShape) -> Result[Option[int], MsgpackError]
+    while r.nextKey()? is Some(key)
+      if v.fields.find(f -> !f.has(MsgpackOmit) && keyOf(f) == key) is Some(f) then return Ok(Some(f.index))
+      r.skipValue()?
+    Ok(None)
+
+  duplicate(f: FieldShape) -> MsgpackError = r.error(s"duplicate field \"${keyOf(f)}\"")
+
+impl FieldReader
+  field[F: MsgpackDecoder](f: FieldShape) -> Result[F, MsgpackError] = F.decode(r).mapErr(e -> e.inField(keyOf(f)))
+
+  missing[F: MsgpackDecoder](f: FieldShape) -> Result[F, MsgpackError] = F.whenMissing() match
+    Some(value) -> Ok(value)
+    None -> Err(r.error(s"missing field \"${keyOf(f)}\""))

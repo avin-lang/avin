@@ -1,0 +1,395 @@
+// `avin.cbor`'s derived encoders and decoders on every shape of type, the built-in instances, reading
+// from a `Reader` a byte at a time and writing to a `ByteWriter`, and the errors of a decoder with the
+// path of the value at fault.
+import avin.cbor
+
+import avin.cbor.{
+  Arr, Bool, Bytes, Cbor, CborDecoder, CborEncoder, CborError, CborKey, CborOmit, CborOmitNone, CborOptions, CborReader,
+  CborTag, CborWriter, Dict, Double, Half, Null, Num, Single, Text, Undefined
+}
+
+// `library/tests` is one module: the helpers the MessagePack tests share are in `binary_helpers.avin`,
+// and the types whose names other tests use are prefixed `Cb`.
+
+data Address(street: string, city: string) derives CborEncoder, CborDecoder
+
+data CbPerson(
+    @CborKey("full_name") name: string,
+    age: int,
+    home: Option[Address],
+    @CborOmit visits: int = 0
+) derives CborEncoder, CborDecoder
+
+@CborTag("kind")
+data CbShape derives CborEncoder, CborDecoder
+  @CborKey("circle") CbCircle(radius: real)
+  Rect(width: real, height: real)
+  @CborKey("Empty") CbEmpty
+
+data Node(value: int, children: Vector[Node]) derives CborEncoder, CborDecoder
+
+data Sparse(@CborOmitNone a: Option[int], b: Option[int], c: int) derives CborEncoder, CborDecoder
+
+data Bag(
+    tags: List[string],
+    scores: HashMap[string, int],
+    ordered: TreeMap[int, string],
+    blob: Array[byte],
+    big: long,
+    ratio: real,
+    nested: Option[Option[int]],
+    flag: bool,
+    raw: Cbor
+) derives CborEncoder, CborDecoder
+
+class CbCounter(val n: int, val label: string) derives CborEncoder, CborDecoder
+
+val ada = CbPerson("Ada", 36, Some(Address("1 Main", "Oslo")))
+
+@test("a derived type is a map of its fields by name, and reads back to itself")
+dataRoundTrip()
+  assertEq(hexOf(cbor.encode(Address("a", "b"))), "a2" + "66737472656574" + "6161" + "6463697479" + "6162")
+  assertEq(cbor.decode[Address](cbor.encode(Address("a", "b"))), Ok(Address("a", "b")))
+  assertEq(cbor.decode[CbPerson](cbor.encode(ada)), Ok(ada))
+  assertEq(
+    cbor.toTree(ada),
+    Dict(
+      [
+        (Text("full_name"), Text("Ada")),
+        (Text("age"), Num(36)),
+        (Text("home"), Dict([(Text("street"), Text("1 Main")), (Text("city"), Text("Oslo"))]))
+      ]
+    )
+  )
+  assertEq(cbor.decode[CbPerson](cbor.toTree(ada)), Ok(ada))
+  val noHome = CbPerson("Bo", 0, None)
+  assertEq(cbor.decode[CbPerson](cbor.encode(noHome)), Ok(noHome))
+  assertEq(cbor.toTree(noHome).get("home"), Some(Null))
+  assertEq(cbor.toTree(CbPerson("Bo", 0, None, 5)).get("visits"), None)
+
+@test("a type of several variants carries its variant's name under its discriminator, written first")
+variants()
+  assertEq(cbor.toTree(CbCircle(1.5)), Dict([(Text("kind"), Text("circle")), (Text("radius"), Half(1.5))]))
+  assertEq(cbor.decode[CbShape](cbor.encode(CbCircle(1.5))), Ok(CbCircle(1.5)))
+  assertEq(cbor.decode[CbShape](cbor.encode(Rect(2.0, 3.0))), Ok(Rect(2.0, 3.0)))
+  assertEq(cbor.decode[CbShape](cbor.encode(CbEmpty)), Ok(CbEmpty))
+  assertEq(cbor.toTree(CbEmpty), Dict([(Text("kind"), Text("Empty"))]))
+  assertEq(
+    cbor.decode[CbShape](
+      cbor.encodeTree(Dict([(Text("radius"), Num(1)), (Text("kind"), Text("circle"))]))
+    ).mapErr(e -> e.message),
+    Err("expected \"kind\" first, naming the variant")
+  )
+  assertEq(
+    cbor.decode[CbShape](cbor.encodeTree(Dict([(Text("kind"), Text("blob"))]))).mapErr(e -> e.message),
+    Err("unknown variant \"blob\"")
+  )
+
+@test("recursive and generic shapes, empty and nested, round trip")
+recursiveShapes()
+  val tree = Node(1, [Node(2, []), Node(3, [Node(4, [])])])
+  assertEq(cbor.decode[Node](cbor.encode(tree)), Ok(tree))
+  assertEq(cbor.decode[Vector[Node]](cbor.encode(Vector.empty[Node]())), Ok(Vector.empty[Node]()))
+  assertEq(cbor.decode[List[Vector[int]]](cbor.encode([[1, 2], [], [3]].toList)), Ok([[1, 2], [], [3]].toList))
+  assertEq(cbor.decode[Option[Vector[Option[int]]]](cbor.encode(Some([Some(1), None]))), Ok(Some([Some(1), None])))
+
+@test("every built-in instance round trips, at its boundary values")
+builtIns()
+  assertEq(cbor.decode[bool](cbor.encode(true)), Ok(true))
+  assertEq(cbor.decode[bool](cbor.encode(false)), Ok(false))
+  assertEq(cbor.decode[int](cbor.encode(-2147483647 - 1)), Ok(-2147483647 - 1))
+  assertEq(cbor.decode[int](cbor.encode(2147483647)), Ok(2147483647))
+  assertEq(cbor.decode[long](cbor.encode(long(-9223372036854775807) - 1)), Ok(long(-9223372036854775807) - 1))
+  assertEq(cbor.decode[long](cbor.encode(long(9223372036854775807))), Ok(long(9223372036854775807)))
+  assertEq(cbor.decode[string](cbor.encode("")), Ok(""))
+  assertEq(cbor.decode[string](cbor.encode("é水\u{10151}")), Ok("é水\u{10151}"))
+  assertEq(cbor.decode[Array[byte]](cbor.encode(Array[byte](1, 2, 255))), Ok(Array[byte](1, 2, 255)))
+  assertEq(cbor.decode[Array[byte]](cbor.encode(Array.empty[byte]())), Ok(Array.empty[byte]()))
+  for x in [0.0, 1.0, -1.5, 0.1, 65504.0, 1.0e300, 5.960464477539063e-8, 3.4028234663852886e38, 1.0 / 0.0, -1.0 / 0.0]
+    assertEq(cbor.decode[real](cbor.encode(x)), Ok(x))
+  assertEq(cbor.decode[real](cbor.encode(0.0 / 0.0)).map(x -> x != x), Ok(true))
+  assertEq(hexOf(cbor.encode(1.0)), "f93c00")
+  assertEq(hexOf(cbor.encode(100000.0)), "fa47c35000")
+  assertEq(hexOf(cbor.encode(1.1)), "fb3ff199999999999a")
+  assertEq(cbor.decode[real](hexArray("07")), Ok(7.0))
+  assertEq(cbor.decode[real](hexArray("20")), Ok(-1.0))
+  assertEq(cbor.decode[Cbor](cbor.encode(Arr([Num(1), Null]))), Ok(Arr([Num(1), Null])))
+
+@test("maps of any key type, in any order, and bags of everything")
+bags()
+  val bag = Bag(
+    ["a", "b"],
+    {"x": 1, "y": 2},
+    {3: "c", 1: "a"},
+    Array[byte](9, 8),
+    long(1) << 40,
+    2.5,
+    Some(None),
+    true,
+    Dict([(Num(1), Text("one"))])
+  )
+  assertEq(cbor.decode[Bag](cbor.encode(bag)).map(b -> b.scores.get("y")), Ok(Some(2)))
+  assertEq(cbor.decode[Bag](cbor.encode(bag)).map(b -> b.ordered.get(3)), Ok(Some("c")))
+  assertEq(cbor.decode[Bag](cbor.encode(bag)).map(b -> b.tags), Ok(["a", "b"].toList))
+  assertEq(cbor.decode[Bag](cbor.encode(bag)).map(b -> b.nested), Ok(None))
+  val deep = Bag([], {}, {}, Array[byte](), 0, 0.5, Some(Some(3)), false, Null)
+  assertEq(cbor.decode[Bag](cbor.encode(deep)).map(b -> b.nested), Ok(Some(Some(3))))
+  assertEq(cbor.decode[Bag](cbor.encode(bag)).map(b -> b.raw), Ok(Dict([(Num(1), Text("one"))])))
+  val two: TreeMap[int, string] = {2: "b", 1: "a"}
+  assertEq(cbor.decode[TreeMap[int, string]](cbor.encode(two)).map(m -> m.size), Ok(2))
+  assertEq(hexOf(cbor.encode(two)), "a2" + "016161" + "026162")
+  assertEq(cbor.decode[HashMap[string, int]](hexArray("a0")).map(m -> m.size), Ok(0))
+  assertEq(cbor.decode[HashMap[int, int]](hexArray("a2" + "0102" + "0103")).map(m -> m.get(1)), Ok(Some(3)))
+  assertEq(cbor.decode[CbCounter](cbor.encode(CbCounter(3, "x"))).map(c -> c.label), Ok("x"))
+
+@test("a field of None is null, or left out where marked, and a missing Option field is None")
+noneFields()
+  assertEq(cbor.toTree(Sparse(None, None, 1)), Dict([(Text("b"), Null), (Text("c"), Num(1))]))
+  assertEq(cbor.toTree(Sparse(Some(1), Some(2), 3)).asEntries.map(e -> e.length), Some(3))
+  assertEq(cbor.decode[Sparse](cbor.encodeTree(Dict([(Text("c"), Num(1))]))), Ok(Sparse(None, None, 1)))
+  assertEq(
+    cbor.decode[Sparse](cbor.encodeTree(Dict([(Text("c"), Num(1)), (Text("a"), Null), (Text("b"), Undefined)]))),
+    Ok(Sparse(None, None, 1))
+  )
+  assertEq(cbor.decode[Option[int]](hexArray("f6")), Ok(None))
+  assertEq(cbor.decode[Option[int]](hexArray("f7")), Ok(None))
+  assertEq(cbor.decode[Option[int]](hexArray("05")), Ok(Some(5)))
+  assertEq(hexOf(cbor.encode(Vector[Option[int]](None, Some(1)))), "82f601")
+
+@test("a decoder skips keys it does not know, whatever their values, and refuses a key twice")
+unknownKeys()
+  val extra = Dict(
+    [
+      (Text("zzz"), Arr([Dict([(Text("deep"), Arr([Num(1)]))]), Text("t"), Bytes(hexArray("00"))])),
+      (Text("street"), Text("s")),
+      (Text("qq"), Null),
+      (Text("city"), Text("c"))
+    ]
+  )
+  assertEq(cbor.decode[Address](cbor.encodeTree(extra)), Ok(Address("s", "c")))
+  val twice = Dict([(Text("street"), Text("s")), (Text("city"), Text("c")), (Text("street"), Text("t"))])
+  assertEq(cbor.decode[Address](cbor.encodeTree(twice)).mapErr(e -> e.message), Err("duplicate field \"street\""))
+  assertEq(cbor.decode[Address](hexArray("a0")).mapErr(e -> e.message), Err("missing field \"street\""))
+  assertEq(
+    cbor.decode[Address](hexArray("a1" + "66737472656574" + "6161")).mapErr(e -> e.message),
+    Err("missing field \"city\"")
+  )
+  assertEq(cbor.decode[Address](hexArray("80")).mapErr(e -> e.message), Err("expected a map, found an array"))
+  assertEq(
+    cbor.decode[Address](hexArray("a10100")).mapErr(e -> e.message),
+    Err("expected a text string, found an integer")
+  )
+
+@test("an error names the path to the value at fault, keys and indexes in order")
+errorPaths()
+  val bad = Dict(
+    [
+      (Text("full_name"), Text("Ada")),
+      (Text("age"), Num(1)),
+      (Text("home"), Dict([(Text("street"), Text("s")), (Text("city"), Num(5))]))
+    ]
+  )
+  val e = cbor.decode[CbPerson](cbor.encodeTree(bad)).mapErr(e -> e.pathText())
+  assertEq(e, Err("home.city"))
+  assertEq(
+    cbor.decode[Vector[Address]](
+      cbor.encodeTree(Arr([Dict([(Text("street"), Text("s")), (Text("city"), Text("c"))]), Num(3)]))
+    ).mapErr(e -> e.pathText()),
+    Err("[1]")
+  )
+  assertEq(
+    cbor.decode[Node](
+      cbor.encodeTree(
+        Dict(
+          [
+            (Text("value"), Num(1)),
+            (Text("children"), Arr([Dict([(Text("value"), Text("x")), (Text("children"), Arr([]))])]))
+          ]
+        )
+      )
+    ).mapErr(e -> e.pathText()),
+    Err("children[0].value")
+  )
+  assertEq(
+    cbor.decode[CbPerson](cbor.encodeTree(bad)).mapErr(e -> e.message),
+    Err("expected a text string, found an integer")
+  )
+  assertEq(cbor.decode[int](hexArray("60")).mapErr(e -> e.offset), Err(0))
+  assertEq(cbor.decode[int](hexArray("0000")).isErr, true)
+
+@test("a document is read from a Reader a byte at a time, and the same as from bytes")
+readingFromAReader()
+  val bytes = cbor.encode(ada)
+  for step in [1, 2, 3, 7, 100000]
+    assertEq(cbor.decode[CbPerson](SlowReader(bytes, step)), Ok(ada))
+  assertEq(cbor.parse(SlowReader(hexArray("5f42010243030405ff"), 1)), Ok(Bytes(hexArray("0102030405"))))
+  val big = Array.tabulate(300000, i -> byte(i % 251))
+  assertEq(cbor.parse(SlowReader(cbor.encodeTree(Bytes(big)), 7000)), Ok(Bytes(big)))
+  assertEq(cbor.parse(SlowReader(cbor.encodeTree(Bytes(big)), 65536)), Ok(Bytes(big)))
+  assertEq(cbor.decode[CbPerson](SlowReader(bytes.slice(0, bytes.length - 1), 1)).isErr, true)
+  assertEq(cbor.decode[CbPerson](SlowReader(bytes, 1), CborOptions(maxSize = 10)).isErr, true)
+
+@test("a Reader that fails is an error naming the failure, and a Reader that ends early is an error")
+failingReader()
+  val bytes = cbor.encode(ada)
+  assertEq(
+    cbor.decode[CbPerson](FailingReader(bytes, 5)).mapErr(e -> e.message),
+    Err("the document could not be read: cannot read the source: the connection dropped")
+  )
+  assertEq(cbor.decode[CbPerson](FailingReader(bytes, 0)).isErr, true)
+  assertEq(cbor.parse(FailingReader(hexArray("00"), 0)).isErr, true)
+
+@test("a document is written to a ByteWriter, in pieces for a long one, and a failing sink is the Err")
+writingToASink()
+  val sink = CollectingSink()
+  assertEq(cbor.encodeTo(sink, ada), Ok(()))
+  assertEq(Array.tabulate(sink.got.length, i -> sink.got(i)), cbor.encode(ada))
+  assertEq(sink.writes, 1)
+  val many = CollectingSink()
+  val items = Vector.tabulate(100000, i -> i)
+  assertEq(cbor.encodeTo(many, items), Ok(()))
+  assertEq(many.got.length, cbor.encode(items).length)
+  assertEq(many.writes > 1, true)
+  assertEq(cbor.decode[Vector[int]](Array.tabulate(many.got.length, i -> many.got(i))), Ok(items))
+  assertEq(cbor.encodeTo(BrokenSink(), ada).mapErr(e -> e.message), Err("cannot write the sink: disk full"))
+  assertEq(cbor.encodeTo(BrokenSink(), Vector.tabulate(100000, i -> i)).isErr, true)
+  val empty = CollectingSink()
+  assertEq(cbor.encodeTo(empty, Vector.empty[int]()), Ok(()))
+  assertEq(hexOf(Array.tabulate(empty.got.length, i -> empty.got(i))), "80")
+
+@test("several documents in one stream are read one after another")
+sequences()
+  val bytes = hexArray("01" + "6161" + "83010203" + "f6")
+  val r = CborReader.fromReader(SlowReader(bytes, 2))
+  assertEq(r.hasMore(), Ok(true))
+  assertEq(r.readLong(), Ok(1))
+  assertEq(r.readText(), Ok("a"))
+  assertEq(r.readValue(), Ok(Arr([Num(1), Num(2), Num(3)])))
+  assertEq(r.takeNull(), Ok(true))
+  assertEq(r.hasMore(), Ok(false))
+  assertEq(r.finish(), Ok(()))
+  assertEq(r.offset(), 8)
+  val unfinished = CborReader.fromBytes(hexArray("8101"))
+  assertEq(unfinished.beginArray(), Ok(()))
+  assertEq(unfinished.finish().isErr, true)
+  assertEq(unfinished.depth(), 1)
+  assertEq(unfinished.nextElement(), Ok(true))
+  assertEq(unfinished.readLong(), Ok(1))
+  assertEq(unfinished.nextElement(), Ok(false))
+  assertEq(unfinished.depth(), 0)
+
+@test("strict decoding of a derived type takes the deterministic bytes and refuses the rest")
+strictDecoding()
+  val strict = CborOptions(strict = true)
+  val bytes = cbor.encode(ada, true)
+  assertEq(cbor.decode[CbPerson](bytes, strict), Ok(ada))
+  assertEq(
+    cbor.decode[Address](hexArray("a2" + "6463697479" + "6162" + "66737472656574" + "6161"), strict),
+    Ok(Address("a", "b"))
+  )
+  assertEq(cbor.decode[Address](hexArray("a2" + "66737472656574" + "6161" + "6463697479" + "6162"), strict).isErr, true)
+  assertEq(
+    cbor.decode[Address](hexArray("bf" + "66737472656574" + "6161" + "6463697479" + "6162" + "ff"), strict).isErr,
+    true
+  )
+  assertEq(
+    cbor.decode[Address](hexArray("bf" + "66737472656574" + "6161" + "6463697479" + "6162" + "ff")),
+    Ok(Address("a", "b"))
+  )
+  assertEq(cbor.decode[int](hexArray("1800"), strict).isErr, true)
+  assertEq(cbor.decode[int](hexArray("1800")), Ok(0))
+
+@test("deterministic encoding of a type is stable: fields' maps sorted, every float shortest")
+deterministicDerived()
+  val bag = Bag(["a"], {"b": 1, "a": 2}, {2: "b", 1: "a"}, Array[byte](), 0, 1.0, None, false, Null)
+  val one = cbor.encode(bag, true)
+  val two = cbor.encode(bag, true)
+  assertEq(one, two)
+  assertEq(cbor.decode[Bag](one, CborOptions(strict = true)).map(b -> b.scores.get("a")), Ok(Some(2)))
+  val tree = cbor.parse(one).getOrElse(Null)
+  assertEq(tree.get("scores"), Some(Dict([(Text("a"), Num(2)), (Text("b"), Num(1))])))
+  assertEq(
+    tree.asEntries.map(es -> es.map(e -> e.0)),
+    Some(
+      Vector(
+        Text("big"),
+        Text("raw"),
+        Text("blob"),
+        Text("flag"),
+        Text("tags"),
+        Text("ratio"),
+        Text("nested"),
+        Text("scores"),
+        Text("ordered")
+      )
+    )
+  )
+
+@test("GC stress: many documents built, written, read and dropped")
+gcStress()
+  var total = 0
+  for i in 0 ..< 3000
+    val p = CbPerson(s"name $i", i, if i % 2 == 0 then Some(Address(s"street $i", "c")) else None)
+    val back = cbor.decode[CbPerson](cbor.encode(p))
+    assertEq(back, Ok(p))
+    total += i
+    val tree = Arr(Vector.tabulate(20, k -> Dict([(Text("k"), Text(s"v$k$i"))])))
+    assertEq(cbor.parse(cbor.encodeTree(tree)), Ok(tree))
+  assertEq(total, 4498500)
+
+@test("a reader of a stream refuses a length beyond the stream, and the limits, without reading further")
+hostileStreams()
+  assertEq(
+    cbor.parse(SlowReader(hexArray("5a00ffffff"), 1)).mapErr(e -> e.message),
+    Err("the input ends inside an item")
+  )
+  assertEq(
+    cbor.parse(SlowReader(hexArray("5a00ffffff" + "0000"), 3)).mapErr(e -> e.message),
+    Err("the input ends inside an item")
+  )
+  assertEq(cbor.parse(SlowReader(hexArray("5bffffffffffffffff"), 1)).isErr, true)
+  assertEq(cbor.parse(SlowReader(hexArray("9bffffffffffffffff"), 1)).isErr, true)
+  assertEq(cbor.parse(SlowReader(hexArray("9f"), 1)).isErr, true)
+  assertEq(cbor.parse(SlowReader(Array.fill(1000, byte(0x81)), 7), CborOptions(maxDepth = 10)).isErr, true)
+  assertEq(cbor.parse(SlowReader(hexArray("7f6161"), 1)).isErr, true)
+  assertEq(cbor.parse(SlowReader(hexArray("62c328"), 1)).mapErr(e -> e.message), Err("a text string is not UTF-8"))
+  assertEq(cbor.parse(SlowReader(hexArray("83010203"), 1), CborOptions(maxItems = 2)).isErr, true)
+
+@test("a writer made by hand writes each head, tag, simple value and float width")
+writerByHand()
+  val w = CborWriter.toBytes()
+  w.beginArray(12)
+  w.integer(-1)
+  w.unsigned(-1)
+  w.negative(-1)
+  w.byteString(hexArray("01"))
+  w.textString("a")
+  w.tag(1)
+  w.integer(2)
+  w.simple(16)
+  w.simple(255)
+  w.half(1.0)
+  w.single(1.5)
+  w.double(1.5)
+  assertEq(
+    hexOf(w.toArray()),
+    "8c" + "20"
+      + "1bffffffffffffffff"
+      + "3bffffffffffffffff"
+      + "4101"
+      + "6161"
+      + "c102"
+      + "f0"
+      + "f8ff"
+      + "f93c00"
+      + "fa3fc00000"
+      + "fb3ff8000000000000"
+  )
+  val d = CborWriter.toBytes(true)
+  d.value(Dict([(Text("b"), Double(1.0)), (Text("a"), Single(2.0))]))
+  assertEq(hexOf(d.toArray()), "a2" + "6161" + "f94000" + "6162" + "f93c00")
+  assertEq(d.deterministic, true)
+  assertEq(CborWriter.toBytes().deterministic, false)
+  val s = CborWriter.to(CollectingSink())
+  s.integer(1)
+  assertEq(s.finish(), Ok(()))

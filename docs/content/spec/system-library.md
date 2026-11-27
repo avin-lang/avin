@@ -2470,6 +2470,95 @@ main()
 A `Uuid` implements `FromParam` in [`avin.net.http`](#avinnethttp), so `paramAs[Uuid]` and
 `queryAs[Uuid]` read one from a route or query parameter, an invalid one answering `400`.
 
+## `avin.cbor`
+
+CBOR (RFC 8949), written in Avin: a value tree, a reader and a writer that work a piece at a time
+over an `avin.io.Reader` and an `avin.io.ByteWriter`, and encoders and decoders derived for a
+program's own types, which work as [`derives`](/spec/derivation/) does for any library trait.
+
+```avin
+import avin.cbor
+import avin.cbor.{CborDecoder, CborEncoder, CborOptions}
+
+data Address(street: string, city: string) derives CborEncoder, CborDecoder
+
+data Person(name: string, age: int, home: Option[Address]) derives CborEncoder, CborDecoder
+
+main()
+  val bytes = cbor.encode(Person("Ada", 36, Some(Address("1 Main", "Oslo"))))
+  println(cbor.decode[Person](bytes))
+  // bytes from outside: with the default limits, or tighter ones
+  val limits = CborOptions(maxDepth = 16, maxSize = 4096)
+  println(cbor.decode[Person](bytes, limits).isOk)
+```
+
+| Member | Meaning |
+| --- | --- |
+| `Cbor` | The value tree: `Num(long)`, `BigUnsigned(bits)` and `BigNegative(bits)` for an integer beyond a `long` (the 64-bit argument), `Bytes`, `Text`, `Arr`, `Dict(entries)` (every entry, in order), `Tagged(tag, value)` (an unknown tag is kept), `Simple(n)`, `Bool`, `Null`, `Undefined`, and `Half`, `Single` and `Double` for the three float widths, each keeping the width it was read at. |
+| `parse(bytes \| reader, options) -> Result[Cbor, CborError]` | One document and nothing after it. Indefinite-length strings, arrays and maps are read as their definite values. |
+| `encode(value, deterministic = false) -> Array[byte]` | Any `CborEncoder`: shortest integers and lengths, definite lengths, a `real` at the shortest float width that holds it. |
+| `encodeTo(sink, value) -> Result[unit, IoError]` | The same bytes written to a `ByteWriter` 64 KiB at a time; the first failure of the sink is the `Err`. |
+| `decode[A](bytes \| reader \| tree, options) -> Result[A, CborError]` | Any `CborDecoder`; the error names the path of the value at fault (`home.city`, `items[2]`) and the byte offset. |
+| `toTree(value)`, `encodeTree(tree, deterministic)` | A value as a tree; a tree as bytes. |
+| `Cbor.dateTime(text)`, `Cbor.epoch(seconds)`, `Cbor.epochFraction(seconds)`, `Cbor.integer(BigInt)` | Tags 0 and 1, and an integer as a number or, beyond a `long`, a tag 2 or 3 bignum. `asDateTime`, `asEpoch` and `asInteger` read them back. |
+| `CborReader`, `CborWriter` | The pull reader (`beginArray`, `nextElement`, `beginMap`, `nextKey`, `readText`, `readLong`, `readReal`, `readValue`, `skipValue`, `hasMore`, `finish`) and the push writer (`integer`, `textString`, `byteString`, `beginArray(n)`, `beginMap(n)`, `tag`, `half`, `single`, `double`, `float`, `value`, `finish`) that derived code is written with; several documents may follow one another in one stream. |
+
+A derived type is a map of its fields by name: `@CborKey("name")` renames a field or variant,
+`@CborOmit` leaves a field out, `@CborOmitNone` leaves an `Option` out where it is `None`, and a type of
+several variants writes the variant's name first under `"type"` (`@CborTag("kind")` renames it). An
+`Option` is `null` when `None`; a `null` or `undefined` reads as `None`; a key a type has no field for
+is skipped, a key written twice is an error. `Vector`, `List`, `HashMap` and `TreeMap` (any key type
+that encodes), `Array[byte]` (a byte string), `Cbor` and the integers, `real`, `bool` and `string` have
+instances. An `Option[Option[A]]` written as `Some(None)` reads back `None`, as `null` does not say how
+many options deep it is.
+
+**Limits.** `CborOptions` bounds what a reader accepts: `maxDepth` 128 (arrays, maps and tags nested),
+`maxItems` 1,048,576 (elements or entries in one array or map), `maxBytes` 16 MiB (one string, and the
+chunks of an indefinite one together) and `maxSize` 64 MiB (the whole document). A length that
+promises more than the input holds is an `Err` before anything is allocated for it, and a reader of a
+`Reader` holds only the bytes that have arrived. Text that is not UTF-8 is an `Err` naming its offset;
+in an indefinite-length text string each chunk must be UTF-8 on its own.
+
+**Deterministic encoding (RFC 8949 section 4.2).** `encode(value, deterministic = true)` and
+`encodeTree(tree, true)` write every float at its shortest exact width (a NaN as `f97e00`) and sort
+each map's entries by their encoded keys, so equal values give equal bytes. `CborOptions(strict =
+true)` is the matching reader: it refuses an integer or length not in its shortest form, an
+indefinite length, a float wider than it needs, a NaN other than `f97e00`, and map keys out of order or
+repeated (checked for a tree and for the text keys a derived decoder reads), and the default reading
+accepts all of them.
+
+## `avin.msgpack`
+
+MessagePack, written in Avin, with the same shape as `avin.cbor`: a tree, a pull reader and a push
+writer over `avin.io`, derived encoders and decoders, limits, and strict and deterministic modes.
+
+```avin
+import avin.msgpack
+import avin.msgpack.{Msgpack, MsgpackDecoder, MsgpackEncoder}
+
+data Reading(sensor: string, value: real, at: long) derives MsgpackEncoder, MsgpackDecoder
+
+main()
+  val bytes = msgpack.encode(Reading("t1", 21.5, 1700000000))
+  println(msgpack.decode[Reading](bytes))
+  // the timestamp extension, in the shortest of its three forms
+  val stamp = Msgpack.timestamp(1700000000, 123456789)
+  println(stamp.asTimestamp)
+```
+
+| Member | Meaning |
+| --- | --- |
+| `Msgpack` | `Nil`, `Bool`, `Num(long)`, `BigUint(bits)` (2^63 to 2^64 - 1), `Single`, `Double`, `Str`, `Bin`, `Arr`, `Dict(entries)` and `Ext(kind, data)`. Every format of the specification is read, whatever its size; a tree is written in the shortest format that holds each integer, string, array, map and extension. The byte `0xC1` is never used and is an `Err`. |
+| `parse`, `encode`, `encodeTo`, `decode`, `toTree`, `encodeTree` | As in `avin.cbor`, with `MsgpackEncoder`, `MsgpackDecoder`, `MsgpackOptions` and `MsgpackError`. |
+| `Msgpack.timestamp(seconds, nanos = 0)`, `asTimestamp` | The extension of type -1: 4 bytes where there are no nanoseconds and the seconds fit 32 bits unsigned, 8 where they fit 34 bits, else 12. `asTimestamp` reads any of the three, and is `None` for a length that is not one of them or for a billion nanoseconds or more. |
+| `MsgpackReader`, `MsgpackWriter` | The pull reader and push writer, with `readBytes` for `bin`, `readText` for `str`, `takeNil`, and `integer`, `textString`, `binary`, `ext`, `float` and the rest. |
+
+The limits are those of `avin.cbor` (`MsgpackOptions`: `maxDepth` 128, `maxItems` 1,048,576, `maxBytes`
+16 MiB, `maxSize` 64 MiB), and a length beyond the input is as much an `Err` before any allocation. With
+`strict`, the reader accepts only the shortest format of every integer and length, the shortest float
+width, the one quiet NaN and map keys in the encoded order without repeats. `deterministic` writing
+shortens a float to a single where it is exact and sorts maps by their encoded keys.
+
 ## `avin.diff`
 
 The differences between two sequences, found with Myers' O(ND) algorithm in its linear-space form
@@ -2756,8 +2845,11 @@ perhaps in another order. A date outside the years 0 to 9999, which TOML cannot 
 **The derivations are those of JSON, on a tree**: a value is a table of its fields, by name; a type
 of several variants also carries its variant's name under the key `type`, written first. `@TomlKey(
 "name")` renames a field or a variant, `@TomlTag("kind")` the discriminator, and `@TomlOmit` leaves a
-field out both ways. A field absent from the input takes its default, or `None` for an `Option`, or
-is an error naming it; a key no field has is skipped. TOML has no null, so a field holding `None` is
+field out both ways. A field absent from the input takes its default, or its type's
+[`Missable`](/spec/derivation/#absent-fields-missable) answer (`None` for an `Option`, and a type's
+own where it writes one), or is an error naming it; a key no field has is skipped. `TomlDecoder`
+requires `Missable`, as CBOR's and MessagePack's decoders do, so the formats share one answer and a
+program may import any of them together. TOML has no null, so a field holding `None` is
 left out, and a `None` anywhere else, as an array's element, is an error. The built-in encoders and
 decoders are `bool`, `int` (an integer that fits), `long`, `real` (from a float or an integer),
 `string`, `Toml`, `Zoned`, `Instant` (written in UTC), `DateTime`, `Date`, `Time`, `Option`, `Vector`,

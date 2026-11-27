@@ -1,0 +1,393 @@
+module avin.cbor
+
+import avin.io.IoError
+import avin.io.Reader
+
+// How many bytes one read from a source asks for.
+val readChunkSize: int = 65536
+
+private object NoInput: Reader
+  override read(max: int) -> Result[Array[byte], IoError] = Ok(Array.empty[byte]())
+
+// An item's initial byte and argument: the major type, the additional information, and the argument
+// as 64 bits (the value of a head of 0..23, else the bytes that follow it), with the offset the item
+// began at. Additional information 31 is an indefinite length, or a break.
+private data Head(major: int, info: int, arg: long, start: long)
+
+// An array or map the reader is inside: the elements or entries still to come, -1 for an indefinite
+// length, and for a map read by `nextKey` under `strict` the last key's encoding.
+private class Frame(var remaining: long)
+  var lastKey: Array[byte] = Array.empty[byte]()
+  var hasKey = false
+
+// Reads CBOR from a source an item at a time, as a decoder written for a type does. Each `read` takes
+// a whole scalar; `beginArray` and `beginMap` open a collection, and `nextElement`, `nextEntry` or
+// `nextKey` say whether it has another and close it where it has not, so definite and indefinite
+// lengths read alike. `readValue` takes a whole item as a `Cbor` tree and `skipValue` drops one.
+//
+// The source is read 64 KiB at a time as items need it, and held only as far as the item being read
+// needs. A reader belongs to the thread that reads it. After a call answers `Err`, the reader's
+// position is not meaningful and the document is not read further.
+class CborReader(
+    private val source: Reader,
+    val options: CborOptions,
+    private var chunk: Array[byte],
+    private var end: int,
+    private var ended: bool
+)
+  // The next byte to read in `chunk`, and how many bytes of the document came before `chunk`.
+  private var pos = 0
+  private var base: long = 0
+  private val frames = Buffer[Frame]()
+  // Tags the item being read is inside, counted with the open collections against `maxDepth`.
+  private var tags = 0
+
+  // How many bytes have been read, the offset of the next one.
+  offset() -> long = base + long(pos)
+
+  // How many arrays and maps are open.
+  depth() -> int = frames.length
+
+  // An error at the reader's position.
+  error(message: string) -> CborError = CborError(message, offset())
+
+  private errorAt(at: long, message: string) -> CborError = CborError(message, at)
+
+  // Makes `n` bytes available at `pos`, reading the source as far as needed; an error where the
+  // document would pass `maxSize` or the source ends first.
+  private need(n: int) -> Result[unit, CborError]
+    if base + long(pos) + long(n) > options.maxSize
+      return Err(error(s"the document is longer than the limit of ${options.maxSize} bytes"))
+    while end - pos < n && !ended
+      pull()?
+    if end - pos < n then return Err(error("the input ends inside an item"))
+    Ok(())
+
+  private pull() -> Result[unit, CborError]
+    if chunk.length - end < readChunkSize
+      val live = end - pos
+      val grown = Array.fill(if live * 2 > live + readChunkSize then live * 2 else live + readChunkSize, byte(0))
+      chunk.copyTo(grown, 0, pos, live)
+      chunk = grown
+      base += long(pos)
+      pos = 0
+      end = live
+    val got = source.read(readChunkSize)
+    got match
+      Err(e) -> Err(error(s"the document could not be read: ${e.message}"))
+      Ok(piece) ->
+        if piece.length == 0
+          ended = true
+        else
+          piece.copyTo(chunk, end, 0, piece.length)
+          end += piece.length
+        Ok(())
+
+  // The next byte, not moved past.
+  private peekByte() -> Result[int, CborError]
+    need(1)?
+    Ok(int(chunk(pos)))
+
+  private head() -> Result[Head, CborError]
+    need(1)?
+    val start = offset()
+    val b = int(chunk(pos))
+    pos += 1
+    val major = b >> 5
+    val info = b & 31
+    if info < 24 then return Ok(Head(major, info, long(info), start))
+    val width = if info == 24 then 1 elif info == 25 then 2 elif info == 26 then 4 elif info == 27 then 8 else 0
+    if width == 0
+      if info == 31 && (2 <= major <= 5 || major == 7) then return Ok(Head(major, 31, 0, start))
+      return Err(errorAt(start, s"the additional information $info is reserved"))
+    need(width)?
+    var v: long = 0
+    for i in 0 ..< width
+      v = (v << 8) | long(int(chunk(pos + i)))
+    pos += width
+    if major == 7
+      if info == 24 && v < 32 then return Err(errorAt(start, s"the simple value $v is written in two bytes"))
+    elif options.strict && !shortest(info, v)
+      return Err(errorAt(start, "an argument is not in its shortest form"))
+    Ok(Head(major, info, v, start))
+
+  private shortest(info: int, v: long) -> bool = info match
+    24 -> v >= 24
+    25 -> v >= 256 || v < 0
+    26 -> v >= 65536 || v < 0
+    _ -> v >= 4294967296 || v < 0
+
+  private describe(h: Head) -> string = h.major match
+    0 | 1 -> "an integer"
+    2 -> "a byte string"
+    3 -> "a text string"
+    4 -> "an array"
+    5 -> "a map"
+    6 -> "a tag"
+    _ -> if h.info == 31 then "a break" elif 20 <= h.info <= 23 then "a simple value" elif 25 <= h.info <= 27 then "a float" else "a simple value"
+
+  private expected(what: string, h: Head) -> CborError = errorAt(h.start, s"expected $what, found ${describe(h)}")
+
+  // A definite length of at most `limit`, within what the input can still hold where it is all in
+  // hand: the length is checked before anything is allocated for it.
+  private bound(h: Head, limit: int, what: string) -> Result[int, CborError]
+    if h.arg < 0 || h.arg > long(limit)
+      return Err(errorAt(h.start, s"a $what of ${showUnsigned(h.arg)} is longer than the limit of $limit"))
+    Ok(int(h.arg))
+
+  private piece(n: int) -> Result[Array[byte], CborError]
+    need(n)?
+    val out = chunk.slice(pos, pos + n)
+    pos += n
+    Ok(out)
+
+  private textPiece(n: int) -> Result[string, CborError]
+    val at = offset()
+    val raw = piece(n)?
+    string.fromUtf8(raw) match
+      Ok(s) -> Ok(s)
+      Err(e) -> Err(errorAt(at + e.offset, "a text string is not UTF-8"))
+
+  private bytesFrom(h: Head) -> Result[Array[byte], CborError]
+    if h.major != 2 then return Err(expected("a byte string", h))
+    if h.info != 31 then return piece(bound(h, options.maxBytes, "byte string")?)
+    if options.strict then return Err(errorAt(h.start, "an indefinite length is not deterministic"))
+    val out = Buffer[byte]()
+    while true
+      if peekByte()? == 0xFF
+        pos += 1
+        return Ok(out.toArray())
+      val c = head()?
+      if c.major != 2 || c.info == 31 then return Err(expected("a definite byte string chunk", c))
+      val n = bound(c, options.maxBytes - out.length, "byte string")?
+      for b in piece(n)?
+        out.addOne(b)
+    Ok(out.toArray())
+
+  private textFrom(h: Head) -> Result[string, CborError]
+    if h.major != 3 then return Err(expected("a text string", h))
+    if h.info != 31 then return textPiece(bound(h, options.maxBytes, "text string")?)
+    if options.strict then return Err(errorAt(h.start, "an indefinite length is not deterministic"))
+    val out = StringWriter()
+    var total = 0
+    while true
+      if peekByte()? == 0xFF
+        pos += 1
+        return Ok(out.text)
+      val c = head()?
+      if c.major != 3 || c.info == 31 then return Err(expected("a definite text string chunk", c))
+      val n = bound(c, options.maxBytes - total, "text string")?
+      total += n
+      out.write(textPiece(n)?)
+    Ok(out.text)
+
+  // Opens the array or map `h` heads.
+  private open(h: Head) -> Result[unit, CborError]
+    if frames.length + tags >= options.maxDepth
+      return Err(errorAt(h.start, s"nesting is deeper than the limit of ${options.maxDepth}"))
+    if h.info == 31
+      if options.strict then return Err(errorAt(h.start, "an indefinite length is not deterministic"))
+      frames.addOne(Frame(-1))
+      return Ok(())
+    if h.arg < 0 || h.arg > long(options.maxItems)
+      return Err(
+        errorAt(
+          h.start,
+          s"a collection of ${showUnsigned(h.arg)} items is longer than the limit of ${options.maxItems}"
+        )
+      )
+    // every element is at least a byte, every entry at least two
+    val least = if h.major == 5 then h.arg * 2 else h.arg
+    if ended && long(end - pos) < least
+      return Err(errorAt(h.start, "a collection is longer than the input that remains"))
+    frames.addOne(Frame(h.arg))
+    Ok(())
+
+  beginArray() -> Result[unit, CborError]
+    val h = head()?
+    if h.major != 4 then return Err(expected("an array", h))
+    open(h)
+
+  beginMap() -> Result[unit, CborError]
+    val h = head()?
+    if h.major != 5 then return Err(expected("a map", h))
+    open(h)
+
+  // Whether the open array has another element, closing it where it has not.
+  nextElement() -> Result[bool, CborError]
+    if frames.isEmpty then return Err(error("no array or map is open"))
+    val f = frames(frames.length - 1)
+    if f.remaining < 0
+      if peekByte()? == 0xFF
+        pos += 1
+        frames.remove(frames.length - 1)
+        return Ok(false)
+      return Ok(true)
+    if f.remaining == 0
+      frames.remove(frames.length - 1)
+      return Ok(false)
+    f.remaining -= 1
+    Ok(true)
+
+  // Whether the open map has another entry, closing it where it has not. The key and the value
+  // follow, each an item.
+  nextEntry() -> Result[bool, CborError] = nextElement()
+
+  // The text key of the open map's next entry, None where the map has ended. A key of another type
+  // is an error.
+  nextKey() -> Result[Option[string], CborError]
+    if !nextElement()? then return Ok(None)
+    val at = offset()
+    val h = head()?
+    val key = textFrom(h)?
+    if options.strict
+      val f = frames(frames.length - 1)
+      val encoded = encodeTree(Text(key), true)
+      if f.hasKey && compareBytes(f.lastKey, encoded) >= 0
+        return Err(errorAt(at, "map keys are not in sorted order, without repeats"))
+      f.lastKey = encoded
+      f.hasKey = true
+    Ok(Some(key))
+
+  readText() -> Result[string, CborError] = textFrom(head()?)
+
+  readBytes() -> Result[Array[byte], CborError] = bytesFrom(head()?)
+
+  readBool() -> Result[bool, CborError]
+    val h = head()?
+    if h.major == 7 && h.info == 20 then return Ok(false)
+    if h.major == 7 && h.info == 21 then return Ok(true)
+    Err(expected("a boolean", h))
+
+  private longFrom(h: Head) -> Result[long, CborError]
+    if h.major == 0
+      if h.arg >= 0 then Ok(h.arg) else Err(errorAt(h.start, s"the integer ${showUnsigned(h.arg)} is beyond a long"))
+    elif h.major == 1
+      if h.arg >= 0 then Ok(-1 - h.arg) else Err(
+        errorAt(h.start, s"the integer -1 - ${showUnsigned(h.arg)} is beyond a long")
+      )
+    else
+      Err(expected("an integer", h))
+
+  readLong() -> Result[long, CborError] = longFrom(head()?)
+
+  readInt() -> Result[int, CborError]
+    val h = head()?
+    val n = longFrom(h)?
+    if long(-2147483647) - 1 <= n <= 2147483647 then Ok(int(n)) else Err(
+      errorAt(h.start, s"the integer $n is beyond an int")
+    )
+
+  private floatFrom(h: Head) -> Result[Cbor, CborError]
+    if h.info == 25
+      val bits = int(h.arg)
+      if options.strict && (bits & 0x7FFF) > 0x7C00 && bits != 0x7E00
+        return Err(errorAt(h.start, "a NaN is not the one deterministic NaN"))
+      return Ok(Half(halfToReal(bits)))
+    if h.info == 26
+      val x = real.fromBits32(int.wrap(h.arg))
+      if options.strict && floatWidth(x) != 4 then return Err(errorAt(h.start, "a float is not in its shortest form"))
+      return Ok(Single(x))
+    val x = real.fromBits(h.arg)
+    if options.strict && floatWidth(x) != 8 then return Err(errorAt(h.start, "a float is not in its shortest form"))
+    Ok(Double(x))
+
+  // A float of any width, or an integer as the `real` nearest it.
+  readReal() -> Result[real, CborError]
+    val h = head()?
+    if h.major == 7 && 25 <= h.info <= 27
+      return floatFrom(h)? match
+        Half(x) -> Ok(x)
+        Single(x) -> Ok(x)
+        Double(x) -> Ok(x)
+        _ -> Err(expected("a float", h))
+    if h.major <= 1 then return longFrom(h).map(n -> real(n))
+    Err(expected("a number", h))
+
+  // Whether the next item is a null or undefined, moved past if so.
+  takeNull() -> Result[bool, CborError]
+    if peekByte()? == 0xF6 || chunk(pos) == byte(0xF7)
+      pos += 1
+      return Ok(true)
+    Ok(false)
+
+  // The tag number the next item begins with, moved past, or None where it is not a tag.
+  takeTag() -> Result[Option[long], CborError]
+    if peekByte()? >> 5 != 6 then return Ok(None)
+    Ok(Some(head()?.arg))
+
+  // The next item as a tree.
+  readValue() -> Result[Cbor, CborError] = valueFrom(head()?)
+
+  private valueFrom(h: Head) -> Result[Cbor, CborError] = h.major match
+    0 -> Ok(if h.arg >= 0 then Num(h.arg) else BigUnsigned(h.arg))
+    1 -> Ok(if h.arg >= 0 then Num(-1 - h.arg) else BigNegative(h.arg))
+    2 -> bytesFrom(h).map(b -> Bytes(b))
+    3 -> textFrom(h).map(s -> Text(s))
+    4 ->
+      open(h)?
+      val items = Buffer[Cbor]()
+      while nextElement()?
+        items.addOne(readValue()?)
+      Ok(Arr(items.toVector))
+    5 ->
+      open(h)?
+      val entries = Buffer[(Cbor, Cbor)]()
+      var last = Array.empty[byte]()
+      while nextEntry()?
+        val at = offset()
+        val k = readValue()?
+        if options.strict
+          val encoded = encodeTree(k, true)
+          if entries.length > 0 && compareBytes(last, encoded) >= 0
+            return Err(errorAt(at, "map keys are not in sorted order, without repeats"))
+          last = encoded
+        entries.addOne((k, readValue()?))
+      Ok(Dict(entries.toVector))
+    6 ->
+      if frames.length + tags >= options.maxDepth
+        return Err(errorAt(h.start, s"nesting is deeper than the limit of ${options.maxDepth}"))
+      tags += 1
+      val inner = readValue()?
+      tags -= 1
+      Ok(Tagged(h.arg, inner))
+    _ -> h.info match
+      20 -> Ok(Bool(false))
+      21 -> Ok(Bool(true))
+      22 -> Ok(Null)
+      23 -> Ok(Undefined)
+      24 -> Ok(Simple(int(h.arg)))
+      25 | 26 | 27 -> floatFrom(h)
+      31 -> Err(expected("a value", h))
+      n -> Ok(Simple(n))
+
+  // Moves past the next item, checking it as `readValue` would.
+  skipValue() -> Result[unit, CborError]
+    readValue()?
+    Ok(())
+
+  // Whether the document has more bytes.
+  hasMore() -> Result[bool, CborError]
+    while end - pos < 1 && !ended
+      pull()?
+    Ok(end - pos >= 1)
+
+  // Ends the document: no array or map left open and nothing after the item.
+  finish() -> Result[unit, CborError]
+    if !frames.isEmpty then return Err(error("an array or map is not finished"))
+    if hasMore()? then return Err(error("there is data after the item"))
+    Ok(())
+
+object CborReader
+  // A reader of the document `source` gives, read a piece at a time.
+  fromReader(source: Reader, options: CborOptions = CborOptions()) -> CborReader =
+    CborReader(source, options, Array.empty[byte](), 0, false)
+
+  // A reader of a document in hand.
+  fromBytes(bytes: Array[byte], options: CborOptions = CborOptions()) -> CborReader =
+    CborReader(NoInput, options, bytes, bytes.length, true)
+
+// An unsigned 64-bit number written as the decimal digits it holds.
+private showUnsigned(
+    bits: long
+) -> string = if bits >= 0 then s"$bits" else s"${BigInt(bits) + BigInt("18446744073709551616")}"
