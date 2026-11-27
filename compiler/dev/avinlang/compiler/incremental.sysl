@@ -1,9 +1,9 @@
 module dev.avinlang.compiler
 
 import sysl.buf.{Buf, buf}
-import sysl.checksum.crc32
+import sysl.checksum.{crc32, new_crc32}
 import sysl.container.{Map, map}
-import sysl.fs.{entries, is_dir, make_dir_all, metadata, pending_name, publish_file, read_text, remove_file, set_modified, write_text}
+import sysl.fs.{create, entries, is_dir, make_dir_all, metadata, pending_name, publish_file, read_text, remove_file, set_modified, write_text}
 import sysl.path.stem
 import sysl.slices.sort
 import sysl.text.{StrBuilder, parse_ulong, str_builder, str_builder_with_capacity}
@@ -285,21 +285,57 @@ write_instance_store(store: InstanceStore) -> StoreWritten
         if store.whole.get(name) is Some(_) && set_modified(file, now()).is_ok()
             result.kept += 1
             continue
-        var w = entry_writer()
+        var items: Buf[CacheEntry] = buf()
         for k in sorted
-            val e = row.get(k).unwrap()
-            w.num(usize(e.kind))
-            w.word(e.key)
-            w.text(e.payload)
-        val body = w.finish()
-        val text = s"$ModuleFormat\n${crc32(body.bytes)} ${body.bytes.len}\n" + body
-        if publish(file, text) then result.written += 1
+            items.push(row.get(k).unwrap())
+        if write_module_file(file, items) then result.written += 1
     var manifest = str_builder()
     for n in names
         manifest.push(n + "\n")
     _ = publish(store.dir + "/manifest", manifest.finish())
     result.trimmed = trim_instance_store(store.dir, names)
     result
+
+/** Writes a module file holding `items`, in their order, to `file` under a temporary name and renames
+ * it into place: its format line, its body's checksum and length, then each entry as an
+ * `EntryWriter` writes it. The body is streamed to the file, never made whole in memory: the
+ * checksum and length are taken in a first pass over the entries, and the second writes them, so
+ * what writing a module costs beyond its entries is the file's buffer, however large the module. */
+write_module_file(file: string, items: Buf[CacheEntry]) -> bool
+    var sum = new_crc32()
+    var length = 0usize
+    for e in items
+        val head = entry_head(e)
+        sum.update(head.bytes)
+        sum.update(e.payload.bytes)
+        sum.update(EntryEnd.bytes)
+        length += head.bytes.len + e.payload.bytes.len + EntryEnd.bytes.len
+    val pending = pending_name(file)
+    var out = create(pending) match
+        Ok(f) -> f
+        Err(_) -> return false
+    out.write(s"$ModuleFormat\n${sum.finish()} $length\n".bytes)
+    for e in items
+        out.write(entry_head(e).bytes)
+        out.write(e.payload.bytes)
+        out.write(EntryEnd.bytes)
+    // A file latches a failed write rather than answering it; `read_failure` reports the latch,
+    // whichever way the file failed, and `close` what handing over its buffer met.
+    val failed = out.read_failure() is Some(_)
+    if out.close().is_err() || failed
+        _ = remove_file(pending)
+        return false
+    if publish_file(pending, file).is_err()
+        _ = remove_file(pending)
+        return false
+    true
+
+/** What an `EntryWriter` writes of entry `e` ahead of its payload: its kind, its key, and the payload's
+ * length and colon. */
+private entry_head(e: CacheEntry) -> string = s"${usize(e.kind)} ${e.key} ${e.payload.bytes.len}:"
+
+/** What an `EntryWriter` writes after an entry's payload. */
+private const EntryEnd: string = " "
 
 // Writes `text` to `file` under a temporary name and renames it into place.
 private publish(file: string, text: string) -> bool

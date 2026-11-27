@@ -806,11 +806,41 @@ library_tests_pass()
     defer _ = remove_dir_all(dir)
     var failures = ""
     for level in ["-O0", "-O2"]
-        var said = ""
-        var noted = ""
-        val status = run_cli_in(".", ["avin", "test", tc.library_dir() + "/tests", level], Some(tc), s -> said = said + s + "\n", s -> noted = noted + s + "\n", Stdio.ToPath(dir + "/out"), Stdio.ToPath(dir + "/err"))
-        if status != 0 || !said.contains(" passed, 0 failed") then failures = failures + s"library/tests at $level exited ${status.to_string()}:\n$noted$said\n"
+        failures = failures + tests_failure(tc, tc.library_dir() + "/tests", "library/tests", level, dir)
     if failures != "" then panic(failures)
+
+/** What is wrong with `avin test` on `root` at `level`, named `name`: "" where every test passed, and
+ * otherwise the exit status and all it said, where a test failed, none ran, or the program did not
+ * compile. */
+private tests_failure(tc: Toolchain, root: string, name: string, level: string, dir: string) -> string
+    var said = ""
+    var noted = ""
+    val status = run_cli_in(".", ["avin", "test", root, level], Some(tc), s -> said = said + s + "\n", s -> noted = noted + s + "\n", Stdio.ToPath(dir + "/out"), Stdio.ToPath(dir + "/err"))
+    val none_ran = said.starts_with("0 passed, ") || said.contains("\n0 passed, ")
+    if status != 0 || none_ran || !said.contains(" passed, 0 failed") then s"$name at $level exited ${status.to_string()}:\n$noted$said\n" else ""
+
+// The library's tests are one program, so a file there may use what a sibling declares, as
+// `encoding.avin` uses `crypto.avin`'s `allBytes`; and one file of them that does not compile fails
+// the whole run, which the gate reports.
+@test("a tests directory is one program: a sibling's helper is in scope, and a file that does not compile fails the run")
+tests_directory_is_one_program()
+    val tc = repository_toolchain()
+    val dir = make_temp_dir("avin-tests-one-program").unwrap()
+    defer _ = remove_dir_all(dir)
+    make_dir_all(dir + "/good").unwrap()
+    write_text(dir + "/good/helpers.avin", "allBytes() -> Vector[byte] = Vector.tabulate(256, i -> byte(i))\n\n@test(\"helpers' own\")\nown()\n  assertEq(allBytes().size, 256)\n").unwrap()
+    write_text(dir + "/good/uses.avin", "@test(\"a sibling's helper\")\nsibling()\n  assertEq(allBytes()(255), byte(255))\n").unwrap()
+    assert_eq(tests_failure(tc, dir + "/good", "good", "-O0", dir), "")
+    make_dir_all(dir + "/broken").unwrap()
+    write_text(dir + "/broken/fine.avin", "@test(\"fine\")\nfine()\n  assertEq(1, 1)\n").unwrap()
+    write_text(dir + "/broken/stale.avin", "@test(\"stale\")\nstale()\n  assertEq(allBytes().size, 256)\n").unwrap()
+    val broken = tests_failure(tc, dir + "/broken", "broken", "-O0", dir)
+    assert(broken.starts_with("broken at -O0 exited "))
+    assert(broken.contains("`allBytes` is not defined"))
+    // A directory whose only file holds no test runs none, and that is no pass either.
+    make_dir_all(dir + "/empty").unwrap()
+    write_text(dir + "/empty/none.avin", "helper() -> int = 1\n").unwrap()
+    assert(tests_failure(tc, dir + "/empty", "empty", "-O0", dir) != "")
 
 // A package under `packages/` keeps its own tests in its `tests` directory, which `avin test` on the
 // package runs. A package with no such directory (one whose behaviour needs a window) has none to run.
@@ -823,10 +853,7 @@ package_tests_pass()
     for root in program_cases(tc, "packages")
         if !is_dir(root + "/tests") then continue
         for level in ["-O0", "-O2"]
-            var said = ""
-            var noted = ""
-            val status = run_cli_in(".", ["avin", "test", root, level], Some(tc), s -> said = said + s + "\n", s -> noted = noted + s + "\n", Stdio.ToPath(dir + "/out"), Stdio.ToPath(dir + "/err"))
-            if status != 0 || !said.contains(" passed, 0 failed") then failures = failures + s"$root at $level exited ${status.to_string()}:\n$noted$said\n"
+            failures = failures + tests_failure(tc, root, root, level, dir)
     if failures != "" then panic(failures)
 
 @test("the library's tests directory is no part of the core library every program is compiled with")
