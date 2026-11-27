@@ -1,0 +1,294 @@
+// An interpreter for a small calculator language, read from standard input a line at a time:
+//
+//     let r = 2.5                       names a value
+//     fn area(r) = pi * r ^ 2           defines a function, which may call itself
+//     area(r) + 1                       prints the value of an expression
+//
+// An expression has numbers, names, calls, `+ - * / %`, `^` for powers (grouping to the right),
+// comparisons that give 1 or 0, and `if … then … else …`. Each line goes through the three classic
+// stages: the lexer cuts it into tokens, a recursive-descent parser builds a syntax tree, and the
+// evaluator walks the tree in an environment of names. A mistake at any stage is a value, carried
+// back with `?` to the line that is then reported with the column it was found at, and the session
+// goes on.
+//
+//     avin build main.avin && ./main < ../calc.in
+//
+// expect: exit 0
+import avin.io
+import avin.math
+
+// What went wrong, and where on the line, counting columns from 1.
+data CalcError(column: int, message: string)
+
+impl Display for CalcError
+  display(out: Writer, spec: FormatSpec) = out.write(s"error at column $column: $message")
+
+// ---- Lexing
+
+data Token
+  Number(value: real)
+  Ident(name: string)
+  Symbol(text: string)
+  End
+
+data Lexeme(token: Token, column: int)
+
+val Operators = ["==", "!=", "<=", ">=", "+", "-", "*", "/", "%", "^", "<", ">", "(", ")", ",", "="]
+
+lex(line: string) -> Result[Vector[Lexeme], CalcError]
+  val chars = line.chars
+  val out = Buffer[Lexeme]()
+  var i = 0
+  // The end of the run of characters from `i` that satisfy `p`.
+  runFrom(i: int, p: (char) -> bool) -> int
+    var j = i
+    while j < chars.length && p(chars(j)) do j++
+    j
+  while i < chars.length
+    val c = chars(i)
+    val start = i
+    if c.isWhitespace
+      i++
+    elif c.isDigit
+      i = runFrom(i, ch -> ch.isDigit || ch == '.')
+      val text = chars.slice(start, i).mkString("")
+      text.toRealOption() match
+        Some(v) -> out += Lexeme(Number(v), start + 1)
+        None -> return Err(CalcError(start + 1, s"`$text` is not a number"))
+    elif c.isLetter || c == '_'
+      i = runFrom(i, ch -> ch.isLetterOrDigit || ch == '_')
+      out += Lexeme(Ident(chars.slice(start, i).mkString("")), start + 1)
+    else
+      val rest = chars.slice(i, chars.length).mkString("")
+      Operators.find(rest.startsWith) match
+        Some(op) ->
+          out += Lexeme(Symbol(op), start + 1)
+          i += op.charCount
+        None -> return Err(CalcError(start + 1, s"unexpected `$c`"))
+  out += Lexeme(End, chars.length + 1)
+  Ok(out.toVector)
+
+// ---- Parsing
+
+data Expr
+  Num(value: real)
+  Var(name: string, column: int)
+  Unary(op: string, operand: Expr)
+  Binary(op: string, left: Expr, right: Expr, column: int)
+  Call(name: string, args: Vector[Expr], column: int)
+  If(cond: Expr, yes: Expr, no: Expr)
+
+// A line is a definition of a value, a definition of a function, or an expression to print.
+data Statement
+  Let(name: string, value: Expr)
+  Def(name: string, params: Vector[string], body: Expr)
+  Print(value: Expr)
+
+// The binary operators by how tightly they bind, loosest first; `^` is handled apart, since it
+// groups to the right.
+val Levels: Vector[Vector[string]] = [["==", "!="], ["<", "<=", ">", ">="], ["+", "-"], ["*", "/", "%"]]
+
+class Parser(private val tokens: Vector[Lexeme])
+  private var pos = 0
+
+  private peek -> Token = tokens(pos).token
+  private column -> int = tokens(pos).column
+  private advance() -> Lexeme
+    val t = tokens(pos)
+    if pos < tokens.length - 1 then pos++
+    t
+
+  private isSymbol(text: string) -> bool = peek == Symbol(text)
+  private isWord(word: string) -> bool = peek == Ident(word)
+
+  private fail[T](message: string) -> Result[T, CalcError] = Err(CalcError(column, message))
+
+  private expect(text: string) -> Result[unit, CalcError]
+    if isSymbol(text) || isWord(text)
+      advance()
+      Ok(())
+    else
+      fail(s"expected `$text`, found ${describe(peek)}")
+
+  private name() -> Result[string, CalcError] = peek match
+    Ident(n) if !Keywords.contains(n) ->
+      advance()
+      Ok(n)
+    other -> fail(s"expected a name, found ${describe(other)}")
+
+  statement() -> Result[Statement, CalcError]
+    val result =
+      if isWord("let")
+        advance()
+        val n = name()?
+        expect("=")?
+        Let(n, expression()?)
+      elif isWord("fn")
+        advance()
+        val n = name()?
+        expect("(")?
+        val params = Buffer[string]()
+        if !isSymbol(")")
+          params += name()?
+          while isSymbol(",")
+            advance()
+            params += name()?
+        expect(")")?
+        expect("=")?
+        Def(n, params.toVector, expression()?)
+      else
+        Print(expression()?)
+    if peek != End then return fail(s"expected the end of the line, found ${describe(peek)}")
+    Ok(result)
+
+  expression() -> Result[Expr, CalcError]
+    if isWord("if")
+      advance()
+      val cond = expression()?
+      expect("then")?
+      val yes = expression()?
+      expect("else")?
+      Ok(If(cond, yes, expression()?))
+    else
+      binary(0)
+
+  // Operators of `Levels(level)` and tighter, grouping to the left.
+  private binary(level: int) -> Result[Expr, CalcError]
+    if level == Levels.length then return unary()
+    var left = binary(level + 1)?
+    loop
+      val at = column
+      peek match
+        Symbol(op) if Levels(level).contains(op) ->
+          advance()
+          left = Binary(op, left, binary(level + 1)?, at)
+        _ -> return Ok(left)
+
+  // A minus sign binds more loosely than `^`, so `-2 ^ 2` is -4, and a power may be negative.
+  private unary() -> Result[Expr, CalcError]
+    if !isSymbol("-") then return power()
+    advance()
+    Ok(Unary("-", unary()?))
+
+  private power() -> Result[Expr, CalcError]
+    val base = primary()?
+    val at = column
+    if !isSymbol("^") then return Ok(base)
+    advance()
+    Ok(Binary("^", base, unary()?, at))
+
+  private primary() -> Result[Expr, CalcError]
+    val at = column
+    peek match
+      Number(v) ->
+        advance()
+        Ok(Num(v))
+      Symbol("(") ->
+        advance()
+        val inner = expression()?
+        expect(")")?
+        Ok(inner)
+      Ident(n) if !Keywords.contains(n) ->
+        advance()
+        if !isSymbol("(") then return Ok(Var(n, at))
+        advance()
+        val args = Buffer[Expr]()
+        if !isSymbol(")")
+          args += expression()?
+          while isSymbol(",")
+            advance()
+            args += expression()?
+        expect(")")?
+        Ok(Call(n, args.toVector, at))
+      other -> fail(s"expected an expression, found ${describe(other)}")
+
+val Keywords = ["let", "fn", "if", "then", "else"]
+
+describe(t: Token) -> string = t match
+  Number(v) -> s"the number $v"
+  Ident(n) -> s"`$n`"
+  Symbol(s) -> s"`$s`"
+  End -> "the end of the line"
+
+// ---- Evaluating
+
+data Function(params: Vector[string], body: Expr)
+
+// The names a line sees: values and functions, each in a map of its own. Defining one makes a new
+// environment; an older one is left as it was, which is what a function's body runs in.
+data Env(values: Map[string, real], functions: Map[string, Function])
+
+eval(e: Expr, env: Env, depth: int) -> Result[real, CalcError] = e match
+  Num(v) -> Ok(v)
+  Var(n, at) -> env.values.get(n) match
+    Some(v) -> Ok(v)
+    None -> Err(CalcError(at, s"`$n` is not defined"))
+  Unary(_, operand) -> Ok(-eval(operand, env, depth)?)
+  Binary(op, l, r, at) -> apply(op, eval(l, env, depth)?, eval(r, env, depth)?, at)
+  If(cond, yes, no) -> if eval(cond, env, depth)? != 0.0 then eval(yes, env, depth) else eval(no, env, depth)
+  Call(n, args, at) ->
+    val values = Buffer[real]()
+    for a in args do values += eval(a, env, depth)?
+    call(n, values.toVector, env, depth, at)
+
+call(name: string, args: Vector[real], env: Env, depth: int, at: int) -> Result[real, CalcError]
+  if depth > 200 then return Err(CalcError(at, s"`$name` calls itself too deeply"))
+  (name, args) match
+    ("sqrt", [x]) -> if x < 0.0 then Err(CalcError(at, "the square root of a negative number")) else Ok(math.sqrt(x))
+    ("abs", [x]) -> Ok(math.abs(x))
+    ("max", [a, b]) -> Ok(math.max(a, b))
+    ("min", [a, b]) -> Ok(math.min(a, b))
+    _ -> env.functions.get(name) match
+      None -> Err(CalcError(at, s"`$name` is not a function"))
+      Some(f) if f.params.length != args.length ->
+        Err(CalcError(at, s"`$name` takes ${count(f.params.length, "argument")}, not ${args.length}"))
+      Some(f) ->
+        val locals = env.values ++ f.params.zip(args)
+        eval(f.body, env with {values = locals}, depth + 1)
+
+apply(op: string, a: real, b: real, at: int) -> Result[real, CalcError] = op match
+  "+" -> Ok(a + b)
+  "-" -> Ok(a - b)
+  "*" -> Ok(a * b)
+  "/" | "%" if b == 0.0 -> Err(CalcError(at, "division by zero"))
+  "/" -> Ok(a / b)
+  "%" -> Ok(a - b * math.floor(a / b))
+  "^" -> Ok(math.pow(a, b))
+  "==" -> Ok(truth(a == b))
+  "!=" -> Ok(truth(a != b))
+  "<" -> Ok(truth(a < b))
+  "<=" -> Ok(truth(a <= b))
+  ">" -> Ok(truth(a > b))
+  ">=" -> Ok(truth(a >= b))
+  _ -> fail(s"no operator $op")
+
+truth(b: bool) -> real = if b then 1.0 else 0.0
+
+count(n: int, noun: string) -> string
+count(1, noun) = s"one $noun"
+count(n, noun) = s"$n ${noun}s"
+
+// Runs one line against `env`, answering the environment after it and what to print.
+run(line: string, env: Env) -> Result[(Env, string), CalcError]
+  val statement = Parser(lex(line)?).statement()?
+  statement match
+    Let(n, value) ->
+      val v = eval(value, env, 0)?
+      Ok((env with {values = env.values.updated(n, v)}, s"$n = $v"))
+    Def(n, params, body) ->
+      val defined = env with {functions = env.functions.updated(n, Function(params, body))}
+      Ok((defined, s"$n(${params.mkString(", ")}) defined"))
+    Print(value) -> Ok((env, eval(value, env, 0)?.toString()))
+
+main()
+  var env = Env({"pi": math.Pi, "e": math.E}, {})
+  for line in io.lines()
+    if line.isBlank || line.trim.startsWith("#") then continue
+    println(s"> $line")
+    run(line, env) match
+      Ok((next, shown)) ->
+        env = next
+        println(shown)
+      Err(e) ->
+        println(" ".repeat(e.column + 1) + "^")
+        println(e)

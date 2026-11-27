@@ -1,0 +1,159 @@
+// expect: exit 0
+// `Metadata.kind` and the facts beside it: every kind of entry (a regular file, a directory, a
+// symbolic link, a FIFO, a Unix-domain socket, `/dev/null` as a character device, and a block device
+// where the machine has one to look at), with `isFile` true for a regular file alone; `linkMetadata`
+// against `metadata` on a link, on its target, on a dangling link and on a missing path; `exists`
+// with and without following links; hard-link counts and `isSameFile` through a hard link, a
+// symbolic link, a copy, `.` and a rename; inode and device numbers; owner and group against the
+// program's own ids, and `process.userName`. The links are made through Sysl's `sysl.fs.symlink` and
+// `sysl.fs.hard_link`, and the FIFO by `mkfifo`, none of which `avin.fs` offers.
+import avin.fs
+import avin.net.UnixListener
+import avin.process
+import avin.process.Command
+
+@sysl("sysl.fs.IoError")
+private data SyslIoError
+  NotFound
+  PermissionDenied
+  AlreadyExists
+  NotADirectory
+  IsADirectory
+  DirectoryNotEmpty
+  TooManyOpenFiles
+  NoSpaceLeft
+  Interrupted
+  NotOpen
+  NotPermitted
+  InvalidUtf8(offset: long)
+  NoAttribute
+  Other(code: int)
+
+@sysl("sysl.fs.symlink")
+private symlinkRaw(target: string, link: string) -> Result[unit, SyslIoError]
+
+@sysl("sysl.fs.hard_link")
+private hardLinkRaw(existing: string, fresh: string) -> Result[unit, SyslIoError]
+
+// The temporary directory the test works in, written as `DIR` in what it prints, which an error
+// names, so the output is the same on every run.
+var root = ""
+
+say(line: Any)
+  println(if root == "" then s"$line" else s"$line".replace(root, "DIR"))
+
+// What `metadata` and `linkMetadata` say about `file`, and what the path questions answer.
+describe(label: string, file: string)
+  val followed = fs.metadata(file) match
+    Ok(m) -> s"${m.kind} file=${m.isFile} dir=${m.isDir} link=${m.isLink}"
+    Err(e) -> s"$e"
+  val own = fs.linkMetadata(file) match
+    Ok(m) -> s"${m.kind} file=${m.isFile} dir=${m.isDir} link=${m.isLink}"
+    Err(e) -> s"$e"
+  say(s"$label: $followed | $own | isFile=${fs.isFile(file)} isDir=${fs.isDir(file)}")
+
+// The inode and device of `file`, followed, as one value to compare.
+identity(file: string) -> (long, long) = fs.metadata(file).map(m -> (m.inode, m.device)).getOrElse((-1, -1))
+
+links(file: string) -> long = fs.metadata(file).map(m -> m.links).getOrElse(-1)
+
+main()
+  val dir = fs.createTempDir("avin-fs-kinds").getOrElse("")
+  root = dir
+  val file = dir + "/plain"
+  _ = fs.writeText(file, "hello")
+  // Every kind.
+  describe("regular", file)
+  _ = fs.writeText(dir + "/empty", "")
+  describe("empty", dir + "/empty")
+  describe("directory", dir)
+  say(symlinkRaw(file, dir + "/link").isOk)
+  describe("link to file", dir + "/link")
+  say(symlinkRaw(dir, dir + "/dirlink").isOk)
+  describe("link to directory", dir + "/dirlink")
+  say(symlinkRaw(dir + "/link", dir + "/chain").isOk)
+  describe("link to link", dir + "/chain")
+  say(Command("mkfifo", dir + "/fifo").run().map(s -> s.isSuccess))
+  describe("fifo", dir + "/fifo")
+  val listener = UnixListener.bind(dir + "/sock")
+  say(listener.isOk)
+  describe("socket", dir + "/sock")
+  describe("char device", "/dev/null")
+  // A block device, where the machine has one of the usual names; none is printed as found too, so
+  // the output is the same either way.
+  val disks = ["/dev/disk0", "/dev/sda", "/dev/vda", "/dev/nvme0n1", "/dev/loop0"].filter(d -> fs.exists(d))
+  say(disks.isEmpty || fs.metadata(disks(0)).map(m -> m.kind == fs.BlockDevice && !m.isFile).getOrElse(false))
+  // The kinds compare as values.
+  say(fs.metadata(file).map(m -> m.kind == fs.Regular))
+  say(fs.metadata(dir + "/fifo").map(m -> m.kind == fs.Fifo))
+  say(fs.metadata("/dev/null").map(m -> m.kind == fs.CharDevice))
+  say(fs.metadata(dir + "/sock").map(m -> m.kind == fs.Socket))
+  say(fs.linkMetadata(dir + "/link").map(m -> m.kind == fs.Symlink))
+  // A link's own size is the length of the path it holds; following it gives the file's.
+  say(fs.linkMetadata(dir + "/link").map(m -> m.size == long(file.byteLength)))
+  say(fs.metadata(dir + "/link").map(m -> m.size))
+  // Not a link: `linkMetadata` and `metadata` read the same entry.
+  say(fs.linkMetadata(file).map(m -> (m.inode, m.device)) == fs.metadata(file).map(m -> (m.inode, m.device)))
+  // A link and its target are different entries, the link followed is the target.
+  say(fs.linkMetadata(dir + "/link").map(m -> m.inode) != fs.linkMetadata(file).map(m -> m.inode))
+  say(identity(dir + "/link") == identity(file))
+  // A dangling link: there to `linkMetadata`, missing to `metadata`.
+  say(symlinkRaw(dir + "/nowhere", dir + "/dangling").isOk)
+  describe("dangling", dir + "/dangling")
+  say(s"${fs.exists(dir + "/dangling")} ${fs.exists(dir + "/dangling", followLinks = false)}")
+  say(s"${fs.exists(dir + "/link")} ${fs.exists(dir + "/link", followLinks = false)}")
+  say(s"${fs.exists(file, false)} ${fs.exists(dir, followLinks = false)}")
+  // A missing path, and one through a file, are missing either way.
+  describe("missing", dir + "/missing")
+  say(s"${fs.exists(dir + "/missing")} ${fs.exists(dir + "/missing", followLinks = false)}")
+  say(fs.linkMetadata(file + "/inside"))
+  say(fs.exists(file + "/inside", followLinks = false))
+  // Hard links: the count goes up and down, and every name is the same file.
+  say(links(file))
+  say(hardLinkRaw(file, dir + "/hard").isOk)
+  say(s"${links(file)} ${links(dir + "/hard")}")
+  say(fs.isSameFile(file, dir + "/hard"))
+  say(fs.isSameFile(dir + "/hard", file))
+  say(fs.isSameFile(file, dir + "/link"))
+  say(fs.isSameFile(dir + "/chain", dir + "/hard"))
+  say(fs.isSameFile(file, file))
+  say(fs.isSameFile(dir, dir + "/."))
+  say(fs.isSameFile(dir, dir + "/dirlink"))
+  _ = fs.writeText(dir + "/copy", "hello")
+  say(fs.isSameFile(file, dir + "/copy"))
+  say(fs.isSameFile(file, dir))
+  say(fs.isSameFile(file, dir + "/missing"))
+  say(fs.isSameFile(dir + "/missing", file))
+  say(fs.isSameFile(dir + "/dangling", dir + "/dangling"))
+  // A link to a link counts on the file, not on the link.
+  say(hardLinkRaw(dir + "/hard", dir + "/third").isOk)
+  say(links(file))
+  _ = fs.remove(dir + "/hard")
+  _ = fs.remove(dir + "/third")
+  say(links(file))
+  // A rename keeps the file: the same inode under the new name.
+  val before = identity(dir + "/copy")
+  _ = fs.rename(dir + "/copy", dir + "/moved")
+  say(identity(dir + "/moved") == before)
+  // Inodes: positive, different for different files, one device for one directory.
+  val (plainInode, plainDevice) = identity(file)
+  val (emptyInode, emptyDevice) = identity(dir + "/empty")
+  say(s"${plainInode > 0} ${plainInode != emptyInode} ${plainDevice == emptyDevice}")
+  // Owner and group: what the program creates is the program's user's; its group is the one the
+  // directory holding it has, which is the platform's rule for a new file.
+  fs.metadata(file) match
+    Ok(m) -> say(s"${m.owner == process.userId()} ${m.owner >= 0} ${m.group >= 0}")
+    Err(e) -> say(e)
+  say(fs.metadata(file).map(m -> m.group) == fs.metadata(dir).map(m -> m.group))
+  say(fs.metadata(dir).map(m -> m.owner == process.userId()))
+  say(process.groupId() >= 0)
+  say(process.userName(process.userId()).map(n -> n.nonEmpty))
+  say(process.userName(0))
+  say(process.userName(-1))
+  say(process.userName((4_294_967_296: long)))
+  say(process.userName((4_000_000_000: long)))
+  // Unicode names report their kind as any other.
+  _ = fs.writeText(dir + "/日本語-é", "x")
+  describe("unicode", dir + "/日本語-é")
+  _ = listener.map(l -> l.close())
+  _ = fs.removeDirAll(dir)

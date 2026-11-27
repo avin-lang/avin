@@ -1,7 +1,8 @@
 // `avin.uuid.Uuid`: parsing and writing the canonical form, the RFC 9562 example values, text that
 // is not an identifier, version and variant, random identifiers, ordering, hashing and use as a key,
 // and the HTTP parameter reading.
-import avin.uuid.Uuid
+import avin.uuid.{Uuid, UuidGenerator}
+import avin.time.{epochMicros, epochMillis, now}
 import avin.encoding.toHex
 import avin.net.http.FromParam
 import avin.threads.spawn
@@ -157,6 +158,123 @@ uuidFromParam()
   assertEq(paramParse[Uuid]("nope"), None)
   assertEq(paramParse[Uuid](""), None)
   assertEq(paramKind[Uuid](), "a UUID")
+
+@test("v7At puts the milliseconds first, with version 7 and variant 2, and timestamp reads them back")
+uuidV7Timestamp()
+  val at = epochMillis(1645557742000)
+  val id = Uuid.v7At(at)
+  assertEq(id.version(), 7)
+  assertEq(id.variant(), 2)
+  assertEq(id.toString().take(13), "017f22e2-79b0")
+  assertEq(id.timestamp(), Some(at))
+  assertEq(Uuid.v7At(epochMillis(0)).timestamp(), Some(epochMillis(0)))
+  assertEq(Uuid.v7At(epochMillis(0)).toString().take(13), "00000000-0000")
+  val top = epochMillis(281474976710655)
+  assertEq(Uuid.v7At(top).timestamp(), Some(top))
+  assertEq(Uuid.v7At(top).toString().take(13), "ffffffff-ffff")
+  assertEq(Uuid.v7At(epochMicros(1999)).timestamp(), Some(epochMillis(1)))
+  assertEq(Uuid.v7At(epochMillis(-5)).timestamp(), Some(epochMillis(0)))
+  assertEq(Uuid.v7At(epochMillis(281474976710656)).timestamp(), Some(top))
+  assert(Uuid.v7At(at) != Uuid.v7At(at))
+  assertEq(Uuid.parse(id.toString()).get.timestamp(), Some(at))
+
+@test("timestamp is None for every version but 7")
+uuidTimestampOtherVersions()
+  assertEq(Uuid.random().timestamp(), None)
+  assertEq(Uuid.Nil.timestamp(), None)
+  assertEq(Uuid.Max.timestamp(), None)
+  assertEq(Uuid.parse("c232ab00-9414-11ec-b3c8-9f6bdeced846").get.timestamp(), None)
+  assertEq(Uuid.parse("1ec9414c-232a-6b00-b3c8-9f6bdeced846").get.timestamp(), None)
+  assertEq(Uuid.parse("017f22e2-79b0-7cc3-98c4-dc0c0c07398f").get.timestamp(), Some(epochMillis(1645557742000)))
+
+@test("v7 is stamped with the wall clock, version 7 and variant 2")
+uuidV7Now()
+  val before = now()
+  val id = Uuid.v7()
+  val after = now()
+  assertEq(id.version(), 7)
+  assertEq(id.variant(), 2)
+  val t = id.timestamp().get
+  assert(before.epochMillis <= t.epochMillis <= after.epochMillis)
+  assertEq(Uuid.parse(id.toString()), Some(id))
+  assertEq(Uuid.fromBytes(id.bytes()), Some(id))
+
+@test("100000 v7 identifiers from one thread are strictly increasing, as values and as text")
+uuidV7OneThread()
+  var prev = Uuid.v7()
+  for i in 0 ..< 100000
+    val next = Uuid.v7()
+    assert(next > prev)
+    assert(next.toString() > prev.toString())
+    prev = next
+
+@test("v7 identifiers from 8 threads are all different and each thread's are in order")
+uuidV7Threads()
+  val threads = Vector.tabulate(8, t -> spawn(() -> Vector.tabulate(5000, i -> Uuid.v7())))
+  val runs = threads.map(th -> th.join())
+  for run in runs
+    assertEq(run.length, 5000)
+    for i in 1 ..< run.length do assert(run(i) > run(i - 1))
+  val all = runs.flatten
+  assertEq(all.toSet.size, 40000)
+
+@test("a generator counts within a millisecond and sorts strictly, whatever the clock reads")
+uuidGeneratorCounter()
+  val g = UuidGenerator()
+  val at = epochMillis(1700000000000)
+  val ids = Vector.tabulate(5000, i -> g.next(at))
+  for i in 1 ..< ids.length do assert(ids(i) > ids(i - 1))
+  for id in ids
+    assertEq(id.version(), 7)
+    assertEq(id.variant(), 2)
+  assertEq(ids(0).timestamp(), Some(at))
+  assertEq(ids(2000).timestamp(), Some(at))
+  val later = g.next(epochMillis(1700000000000 + 100000))
+  assert(later > ids(4999))
+  assertEq(later.timestamp(), Some(epochMillis(1700000000000 + 100000)))
+
+@test("a counter that overflows within one millisecond carries into the timestamp and stays ordered")
+uuidGeneratorOverflow()
+  val g = UuidGenerator()
+  val at = epochMillis(1700000000000)
+  val ids = Vector.tabulate(10000, i -> g.next(at))
+  for i in 1 ..< ids.length do assert(ids(i) > ids(i - 1))
+  assert(ids(9999).timestamp().get.epochMillis > at.epochMillis)
+
+@test("a clock stepping back keeps the identifiers increasing and the timestamp at its last value")
+uuidGeneratorClockBack()
+  val g = UuidGenerator()
+  val a = g.next(epochMillis(1700000005000))
+  val b = g.next(epochMillis(1700000001000))
+  val c = g.next(epochMillis(0))
+  val d = g.next(epochMillis(-1000000))
+  assert(a < b && b < c && c < d)
+  assertEq(b.timestamp(), a.timestamp())
+  assertEq(d.timestamp(), a.timestamp())
+  val e = g.next(epochMillis(1700000009000))
+  assert(e > d)
+  assertEq(e.timestamp(), Some(epochMillis(1700000009000)))
+
+@test("generators are independent of each other and of v7")
+uuidGeneratorIndependent()
+  val g = UuidGenerator()
+  val h = UuidGenerator()
+  val x = g.next(epochMillis(1700000050000))
+  val y = h.next(epochMillis(1700000000000))
+  assertEq(y.timestamp(), Some(epochMillis(1700000000000)))
+  assert(y < x)
+  assert(Uuid.v7() > Uuid.v7At(epochMillis(1)))
+
+@test("v7 under allocation pressure stays ordered and parseable")
+uuidV7Gc()
+  var prev = Uuid.v7()
+  for i in 0 ..< 20000
+    val junk = Vector.tabulate(50, j -> s"$i-$j")
+    val next = Uuid.v7()
+    assert(next > prev)
+    assertEq(Uuid.parse(next.toString()), Some(next))
+    assert(junk.length == 50)
+    prev = next
 
 // What a handler's `paramAs[T]` reads `text` as, through the trait.
 paramParse[T: FromParam](text: string) -> Option[T] = T.parse(text)

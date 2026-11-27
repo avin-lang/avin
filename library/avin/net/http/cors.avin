@@ -1,0 +1,114 @@
+module avin.net.http
+
+// Cross-origin resource sharing: a middleware that lets a browser page from another origin read a
+// server's responses. A request carrying an `Origin` the server allows is answered with
+// `Access-Control-Allow-Origin`; a preflight, the `OPTIONS` request a browser sends first to ask
+// whether the real one may be made, is answered `204` by the middleware itself and never reaches
+// the handler.
+
+import avin.time.Duration
+
+// The CORS policy of a server, and the middleware that applies it.
+//
+// An origin is allowed if `origins` holds it (compared exactly, as a browser compares it), if `origins` holds
+// `"*"`, or if `allowOrigin` says so. Where `"*"` is the policy and credentials are not allowed,
+// every response says `Access-Control-Allow-Origin: *`; otherwise it echoes the request's origin
+// and carries `Vary: Origin`, merged into any `Vary` the handler set. `"*"` together with
+// `credentials = true` traps, since a browser refuses it and the policy would not do what it says.
+// A request with no `Origin` is not a cross-origin one and is passed on untouched, and so is one
+// whose origin is not allowed, answered with no CORS header at all.
+//
+// A preflight (`OPTIONS` with an `Origin` and an `Access-Control-Request-Method`) is answered `204`
+// whatever its origin. One from an allowed origin asking for a method in `methods` and headers in
+// `headers` is given `Access-Control-Allow-Methods`, `Access-Control-Allow-Headers` (the requested
+// headers where `headers` is empty, so any is allowed), `Access-Control-Max-Age` where `maxAge` is
+// given, and `Access-Control-Allow-Credentials`; one asking for more is given none of them, which
+// is how a browser is told to refuse. A header is compared without regard to case, a method with it.
+// `exposed` names the response headers a page may read, on every allowed response.
+// A `maxAge` below zero traps.
+class Cors(
+    val origins: Vector[string] = ["*"],
+    private val allowOrigin: @sendable (string) -> bool = _ -> false,
+    val methods: Vector[string] = ["GET", "HEAD", "POST"],
+    val headers: Vector[string] = Vector.empty[string](),
+    val exposed: Vector[string] = Vector.empty[string](),
+    val credentials: bool = false,
+    val maxAge: Option[Duration] = None
+): Sendable
+  if credentials && origins.contains("*")
+    fail("a CORS policy of origin `*` with credentials: name the origins, or give allowOrigin")
+  maxAge match
+    Some(d) -> if d.micros < 0 then fail(s"a CORS max age of $d: it is at least zero")
+    None -> ()
+
+  // Whether the policy is `*`, an answer the same whatever the origin.
+  private val wildcard: bool = !credentials && origins.contains("*")
+
+  // The middleware that applies the policy around `next`.
+  middleware -> (Handler) -> Handler = next -> request -> request.header("Origin") match
+    None -> varied(next(request))
+    Some(origin) ->
+      if isPreflight(request) then preflight(request, origin) else actual(next, request, origin)
+
+  // Whether `origin` is allowed.
+  allows(origin: string) -> bool =
+    origins.contains("*") || origins.contains(origin) || allowOrigin(origin)
+
+  private isPreflight(request: ServerRequest) -> bool =
+    request.method == "OPTIONS" && request.header("Access-Control-Request-Method").isDefined
+
+  // `response`, saying its answer depends on the origin where the policy is not `*`.
+  private varied(response: Response) -> Response = if wildcard then response else withVaryOrigin(response)
+
+  // The value of `Access-Control-Allow-Origin` for an allowed `origin`.
+  private allowed(origin: string) -> string = if wildcard then "*" else origin
+
+  private actual(next: Handler, request: ServerRequest, origin: string) -> Response
+    val response = next(request)
+    if !allows(origin) then return varied(response)
+    var r = varied(response).withHeader("Access-Control-Allow-Origin", allowed(origin))
+    if credentials then r = r.withHeader("Access-Control-Allow-Credentials", "true")
+    if !exposed.isEmpty then r = r.withHeader("Access-Control-Expose-Headers", exposed.mkString(", "))
+    r
+
+  private preflight(request: ServerRequest, origin: string) -> Response
+    val base = varied(Response.empty(204))
+    if !allows(origin) then return base
+    val method = request.header("Access-Control-Request-Method").getOrElse("")
+    val asked = requestedHeaders(request)
+    val headersOk = headers.isEmpty || asked.forall(a -> headers.exists(h -> h.equalsIgnoreCase(a)))
+    if !methods.contains(method) || !headersOk then return base
+    var r = base.withHeader("Access-Control-Allow-Origin", allowed(origin))
+    if credentials then r = r.withHeader("Access-Control-Allow-Credentials", "true")
+    r = r.withHeader("Access-Control-Allow-Methods", methods.mkString(", "))
+    val allowedHeaders = if headers.isEmpty then asked else headers
+    if !allowedHeaders.isEmpty then r = r.withHeader("Access-Control-Allow-Headers", allowedHeaders.mkString(", "))
+    maxAge match
+      Some(d) -> r = r.withHeader("Access-Control-Max-Age", (d.micros / 1000000).toString())
+      None -> ()
+    r
+
+// The header names an `Access-Control-Request-Headers` asks for, trimmed, none of them empty.
+private requestedHeaders(request: ServerRequest) -> Vector[string] =
+  request.header("Access-Control-Request-Headers").getOrElse("").split(",").map(h -> h.trim).filter(h -> !h.isEmpty)
+
+// `response` with `Origin` in its `Vary`.
+private withVaryOrigin(response: Response) -> Response = withVary(response, "Origin")
+
+// `response` with the header `name` in its `Vary`: added to the value the handler set, or made the
+// value where it set none. A `Vary` already naming it, or `*`, is left as it is.
+private withVary(response: Response, name: string) -> Response
+  val existing = response.headers.filter(h -> h.0.equalsIgnoreCase("Vary"))
+  if existing.isEmpty then return response.withHeader("Vary", name)
+  val names = existing.flatMap(h -> h.1.split(",").map(n -> n.trim))
+  if names.exists(n -> n == "*" || n.equalsIgnoreCase(name)) then return response
+  val others = response.headers.filter(h -> !h.0.equalsIgnoreCase("Vary"))
+  val merged = existing.map(h -> h.1).mkString(", ") + s", $name"
+  Response(
+    response.status,
+    response.reason,
+    others :+ ("Vary", merged),
+    response.body,
+    response.streamed,
+    response.upgraded
+  )

@@ -154,7 +154,7 @@ lock_waiters_park()
     join_n(me, n + 1)
     assert_eq(contended.taken.load(), u32(n))
     val l: *ParkLock = ptr_cast(contended.lock)
-    assert(!l.held)
+    assert_eq(l.state.load(), 0u32)
     assert(l.waiting.head == null)
     joints.slots[63] = null
     contended.lock = null
@@ -521,7 +521,7 @@ private queue_length(q: *WaitQueue) -> usize
     q.guard.unlock()
     n
 
-@test("a lock let go goes to the thread that has waited for it longest")
+@test("with no thread coming for it meanwhile, a lock let go goes to its waiters in the order they came")
 locks_go_in_turn()
     val me = thread_attach()
     with_joints(me)
@@ -546,7 +546,7 @@ locks_go_in_turn()
     assert_eq(queued.count, 8usize)
     for i in 0..<8
         assert_eq(queued.taken[i], expected[i])
-    assert(!l.held)
+    assert_eq(l.state.load(), 0u32)
     joints.slots[63] = null
     queued.lock = null
     without_joints(me)
@@ -672,19 +672,28 @@ private struct Bounds
 
 private var bounds: Bounds = Bounds(Atomic(0), Atomic(0), Atomic(0))
 
+// The lowest and highest addresses of the stack `p` runs on, or nulls where it has none. Read in a
+// function that returns first, so the share of the stack the match takes ends before any yield.
+private stack_low_of(p: *Lwt) -> *u8 = p.stack match
+    Some(st) -> st.low()
+    None -> null
+
+private stack_high_of(p: *Lwt) -> *u8 = p.stack match
+    Some(st) -> st.high()
+    None -> null
+
 private look_at_bounds(c: *Context, run: *u8) -> unit
     val b: *Bounds = ptr_cast(run)
     val p: *Lwt = ptr_cast(c)
     var mark: u8 = 0
-    p.stack match
-        Some(st) ->
-            val before = stack_guard_low() == st.low()
-            yield_now(c)
-            val after = stack_guard_low() == st.low()
-            if before && after then _ = b.exact.add(1)
-            val at = usize(&mark)
-            if usize(st.low()) < at && at < usize(st.high()) then _ = b.inside.add(1)
-        None -> ()
+    val low = stack_low_of(p)
+    if low != null
+        val before = stack_guard_low() == low
+        yield_now(c)
+        val after = stack_guard_low() == stack_low_of(p)
+        if before && after then _ = b.exact.add(1)
+        val at = usize(&mark)
+        if usize(low) < at && at < usize(stack_high_of(p)) then _ = b.inside.add(1)
     _ = b.runs.add(1)
 
 // Starts `n` threads looking at their bounds on stacks of `size` bytes, and joins them.

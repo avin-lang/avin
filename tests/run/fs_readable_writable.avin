@@ -1,0 +1,71 @@
+// expect: exit 0
+// `fs.isReadable` and `fs.isWritable` across the owner's permission bits (`0o000`, `0o400`,
+// `0o200`, `0o600`, and `0o044`, which grants the group and others but not the owner), for a file
+// and a directory, through a symbolic link, for a dangling link and for missing paths. The superuser
+// may read and write whatever the bits say, so where the test runs as user 0 each line expects
+// `true` for it; everywhere else the bits decide.
+import avin.fs
+import avin.process
+
+@sysl("sysl.fs.IoError")
+private data SyslIoError
+  NotFound
+  PermissionDenied
+  AlreadyExists
+  NotADirectory
+  IsADirectory
+  DirectoryNotEmpty
+  TooManyOpenFiles
+  NoSpaceLeft
+  Interrupted
+  NotOpen
+  NotPermitted
+  InvalidUtf8(offset: long)
+  NoAttribute
+  Other(code: int)
+
+@sysl("sysl.fs.symlink")
+private symlinkRaw(target: string, link: string) -> Result[unit, SyslIoError]
+
+val superuser = process.userId() == 0
+
+// What the two questions answer for `file` with mode `bits`, each against what the bits promise.
+check(file: string, bits: int)
+  _ = fs.setPermissions(file, bits)
+  val canRead = superuser || (bits & 0o400) != 0
+  val canWrite = superuser || (bits & 0o200) != 0
+  println(f"${bits}%03o ${fs.isReadable(file) == canRead} ${fs.isWritable(file) == canWrite}")
+
+main()
+  val dir = fs.createTempDir("avin-fs-access").getOrElse("")
+  val file = dir + "/f"
+  _ = fs.writeText(file, "x")
+  println(s"${fs.isReadable(file)} ${fs.isWritable(file)}")
+  for bits in [0o000, 0o400, 0o200, 0o600, 0o044, 0o066, 0o700]
+    check(file, bits)
+  // The answer agrees with what opening the file finds.
+  _ = fs.setPermissions(file, 0o200)
+  println(fs.readText(file).isOk == fs.isReadable(file))
+  _ = fs.setPermissions(file, 0o400)
+  println(fs.writeText(file, "y").isOk == fs.isWritable(file))
+  // A directory: reading is listing, writing is adding entries.
+  val sub = dir + "/d"
+  _ = fs.createDir(sub)
+  for bits in [0o700, 0o500, 0o300, 0o000]
+    check(sub, bits)
+  _ = fs.setPermissions(sub, 0o700)
+  // A link is followed: it answers for its target, whatever its own bits.
+  _ = fs.setPermissions(file, 0o400)
+  _ = symlinkRaw(file, dir + "/link")
+  println(s"${fs.isReadable(dir + "/link")} ${fs.isWritable(dir + "/link") == superuser}")
+  _ = symlinkRaw(dir + "/nowhere", dir + "/dangling")
+  println(s"${fs.isReadable(dir + "/dangling")} ${fs.isWritable(dir + "/dangling")}")
+  // Missing paths, and a path through a file, answer `false`.
+  println(s"${fs.isReadable(dir + "/missing")} ${fs.isWritable(dir + "/missing")}")
+  println(s"${fs.isReadable(file + "/inside")} ${fs.isWritable(file + "/inside")}")
+  println(s"${fs.isReadable("")} ${fs.isWritable("")}")
+  // A Unicode name.
+  _ = fs.writeText(dir + "/é→日", "x")
+  println(s"${fs.isReadable(dir + "/é→日")} ${fs.isWritable(dir + "/é→日")}")
+  _ = fs.setPermissions(file, 0o600)
+  _ = fs.removeDirAll(dir)

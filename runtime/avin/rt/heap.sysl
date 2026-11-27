@@ -4,8 +4,10 @@ import sh.sysl.gc
 import sysl.env
 import sysl.fiber
 import sysl.raw.ptr_cast
+import sysl.slices.copy
 import sysl.sync.*
 import sysl.threads.{Condvar, Mutex, SleepLock}
+import sysl.time.monotonic
 
 // The collected heap. Objects are allocated by compiled code through `avin_rt_alloc` and found by
 // the collector through the shadow stacks: every thread has a context, which compiled code receives
@@ -104,6 +106,9 @@ struct Context
     request: *u8
     /** How many bytes of objects the thread has allocated, headers not counted. */
     allocated: usize
+    /** The reason of the trap the thread is in, an Avin string, or null while it is in none; a root of
+     * every collection, since the frames of the code that trapped are dropped (`recovery.sysl`). */
+    trap_reason: *u8
 
 @assert(offsetof(Context, caller) == 24, "the compiler writes a context's caller site at 24")
 @assert(offsetof(Context, owner) == OwnerOffset, "the compiler reads a context's owner at 32")
@@ -115,7 +120,7 @@ const Running: u32 = 0
 const Safe: u32 = 1
 
 /** A context no thread is running yet: safe, with an empty stack, and an owner of its own. */
-new_context() -> Context = Context(null, null, Atomic(Safe), null, fresh_owner(), null, null, 0, null, new_waiter(), null, 0, Atomic(0), Atomic(0), null, 0, 0, null, 0)
+new_context() -> Context = Context(null, null, Atomic(Safe), null, fresh_owner(), null, null, 0, null, new_waiter(), null, 0, Atomic(0), Atomic(0), null, 0, 0, null, 0, null)
 
 /** One operating system thread's state: the chunk of the heap that the contexts running on the thread
  * allocate from with no lock, and, on a worker of the scheduler, what the scheduler keeps about the
@@ -269,6 +274,66 @@ var settled: usize = 0
 /** How many collections the program has run. */
 var collections: usize = 0
 
+extern "avin_rt_page_size" c_page_size() -> usize
+extern "avin_rt_heap_release" c_heap_release(at: *u8, len: usize) -> i32
+
+/** The system's page size, which the collector releases whole pages of. */
+var page_size: usize = c_page_size()
+
+/** How many page releases the system refused; a refused range stays resident and correct. */
+var heap_releases_refused: usize = 0
+
+/** Whether an `AVIN_GC_RELEASE` of `text` asks for the heap's free pages to be given back: anything
+ * but `0`, and unset. */
+release_setting_of(text: Option[string]) -> bool = text != Some("0")
+
+// The collector's release hook: the whole pages of a free run, given back to the system. It runs
+// inside a collection, under the heap lock with every other thread stopped.
+@export("avin_rt_release_pages")
+release_heap_pages(at: *u8, len: usize, h: *gc.Heap)
+    if c_heap_release(at, len) != 0 then heap_releases_refused += 1
+
+/** `AVIN_GC_RELEASE`: whether a collection gives the whole pages of large free runs back to the
+ * system, so that what a program has dropped stops counting toward its resident size. On unless it
+ * is `0`. */
+var releasing: bool = release_setting_of(env.get("AVIN_GC_RELEASE"))
+
+/** How many bytes of free heap pages the collections have given back to the system so far. */
+released_heap_bytes() -> usize = gc.released_bytes(&space)
+
+/** Whether a collection of a heap whose arena reaches `used` bytes, after one that left `settled`
+ * live and allowed `budget` before the next, gives free pages back: only when the arena holds more
+ * than twice the budget beyond what was live. A heap that reaches no further than its steady
+ * allocation between collections would take every released page back before the next one, paying
+ * for each page twice and keeping nothing; a heap that has dropped a burst reaches far past it. */
+releases_after(used: usize, settled: usize, budget: usize) -> bool = used > settled && used - settled > budget * 2
+
+/** The least time between two collections that release, in microseconds. A heap whose live objects
+ * sit high in the arena keeps reaching far past what it holds, and its steady allocation goes on
+ * reusing the free pages below them: released at every collection, those pages would be taken back
+ * at every one. Released at most this often, they cost a page fault each once in this long. */
+const ReleaseInterval: long = 1000000
+
+/** Whether a collection at `now` may release, when the last that did was at `last`, or never, when
+ * `last` is negative. */
+release_due(now: long, last: long) -> bool = last < 0 || now - last >= ReleaseInterval
+
+/** When the last collection that released ran, on the monotonic clock in microseconds; negative
+ * while none has. */
+var last_release: long = -1
+
+// Sets the release hook for the collection about to run: on when the heap reaches far enough past
+// what it holds for releasing to keep pages given back, and no collection has released for a
+// while; off otherwise. A collection with the hook off leaves its free runs as they would be with
+// none, for a later one to release.
+private choose_release()
+    var worth = releasing && releases_after(gc.used(&space), settled, budget)
+    if worth
+        val now = monotonic().us
+        worth = release_due(now, last_release)
+        if worth then last_release = now
+    _ = gc.release_pages(&space, if worth then &release_heap_pages else null, page_size)
+
 // The tracer of every object. A reference may be null or to a constant object outside the heap;
 // the collector ignores both.
 @export("avin_rt_trace")
@@ -293,6 +358,7 @@ private roots(h: *gc.Heap)
         mark_frames(h, c.top)
         mark_defers(h, c)
         if c.request != null then gc.mark(h, c.request)
+        if c.trap_reason != null then gc.mark(h, c.trap_reason)
         c = c.next
 
 /** The frames of module-level values, linked through `prev`: each program's references that live
@@ -554,6 +620,7 @@ collect_now()
     while k != null
         gc.retire(&space, &k.chunk)
         k = k.next
+    choose_release()
     gc.collect(&space, &roots)
     collections += 1
     val live = gc.live_size(&space)
@@ -577,6 +644,42 @@ private collect_stopped(c: *Context)
 collect(c: *Context)
     lock_heap(c)
     collect_stopped(c)
+    heap_lock.unlock()
+
+/** How many mappings of files, and how many of their bytes, may be made between two collections
+ * before a mapping collects. A mapping costs the heap one small object but holds address space and
+ * one of the system's map entries until its finalizer unmaps it, which only a collection runs, so a
+ * program that maps in a loop and drops what it maps must collect for the mappings' sake as well as
+ * for the heap's. A thousand stays far inside the 65530 map entries Linux allows a process by
+ * default, and a tebibyte far inside the 128 TiB of a process's address space. */
+private const MappingsPerCollection: usize = 1024
+private const MappedBytesPerCollection: u64 = 1099511627776
+
+/** The mappings made since the collection numbered `mapped_epoch`, and their bytes. */
+private var mapped_count: usize = 0
+private var mapped_bytes: u64 = 0
+private var mapped_epoch: usize = 0
+
+/** Counts one mapping of `bytes` bytes just made by the calling thread, and collects, so that
+ * dropped mappings are unmapped, once the mappings made since the last collection reach either
+ * limit. Called by `avin.fs` after each mapping, outside any call that waits. */
+charge_mapping(bytes: long)
+    val c = current_context
+
+    if c == null then return
+
+    lock_heap(c)
+
+    if mapped_epoch != collections
+        mapped_epoch = collections
+        mapped_count = 0
+        mapped_bytes = 0
+
+    mapped_count += 1
+    mapped_bytes += u64(bytes)
+
+    if mapped_count >= MappingsPerCollection || mapped_bytes >= MappedBytesPerCollection then collect_stopped(c)
+
     heap_lock.unlock()
 
 /** The main thread's context, attached and running, for the program's entry function, which passes on
@@ -611,10 +714,35 @@ allocate_sized(ctx: *Context, d: *Descriptor, size: usize) -> *u8
         if p != null then return p
     allocate_locked(ctx, d, size)
 
+/** The delayed argument `p` where something that may outlive the call it was passed to is about to
+ * hold it: `p` itself where it is on the heap or a constant, which holds nothing, and otherwise, a
+ * closure compiled code made in its own frame, a copy of it on the heap. A closure in a frame never
+ * holds another one in a frame (compiled code keeps each it captures here first), so the copy holds
+ * only what lives on its own. The frame that made `p` keeps every reference `p` holds alive while
+ * this allocates. */
+@export("avin_rt_keep_delayed")
+keep_delayed(ctx: *Context, p: *u8) -> *u8
+    val at = usize(p)
+    val start = usize(&block[0])
+    if start <= at && at < start + block.len then return p
+    val d = descriptor_of(p)
+    if d.size == 0 then return p
+    val q = allocate(ctx, d)
+    copy(q[0..<d.size], p[0..<d.size])
+    published(q)
+
 /** How many bytes of objects the calling thread has allocated since it began, headers not counted:
  * the difference across a stretch of code is what that code allocated, which tests of the library's
  * allocation read. */
 allocated_bytes() -> long = if current_context == null then 0 else long(current_context.allocated)
+
+/** Collects now, stopping every other thread for it, and answers how many bytes of objects are still
+ * live: what a test of the library's lifetimes reads before and after letting objects go, to see that
+ * nothing kept them. A call's frames are consistent, as at any call that may allocate. */
+live_bytes_after_collection() -> long
+    if current_context == null then return 0
+    collect(current_context)
+    long(gc.live_size(&space))
 
 // The allocation a carrier's chunk cannot serve: the chunk is spent, or the object is too large for
 // any chunk. Under stress every allocation comes here, collects first, and is then taken from a

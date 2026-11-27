@@ -1,0 +1,78 @@
+// expect: exit 0
+// Sixteen threads take one mutex in a tight loop, so that threads coming for it compete with the
+// waiters a release wakes: no two bodies ever run at once, no increment is lost, and the counts are
+// exact, with short bodies, with bodies long enough that waiters park, and with the two mixed. Then
+// four producers and four consumers share a queue through the mutex's conditions while the mutex is
+// contended: every value is taken exactly once, and the sum is right.
+import avin.threads.{Mutex, scope}
+
+class Shared()
+  var n = 0
+  var inside = false
+  var overlaps = 0
+
+// A few hundred steps of arithmetic, done while the mutex is held so that other threads find it busy.
+work(rounds: int) -> int
+  var x = 1
+  for i in 0 ..< rounds do x = (x * 31 + i) % 1000003
+  x
+
+// Runs `threads` threads each taking one mutex `times` times, with a body of `rounds` steps on every
+// `every`th take and of none on the others, and answers the count and the overlaps it saw.
+hammer(threads: int, times: int, rounds: int, every: int) -> (int, int)
+  val m = Mutex(Shared())
+  val total = Mutex(0)
+  scope(s ->
+    for _ in 0 ..< threads
+      s.spawn(() ->
+        for i in 0 ..< times
+          val r = if i % every == 0 then rounds else 0
+          m.with(c ->
+            if c.inside then c.overlaps += 1
+            c.inside = true
+            c.n += 1
+            if r > 0 && work(r) < 0 then c.overlaps += 1
+            c.inside = false)
+          if i % 7 == 0 then _ = total.update(x -> x + 1)))
+  val expectedTotal = threads * ((times + 6) / 7)
+  val n = m.with(c -> c.n)
+  val overlaps = m.with(c -> c.overlaps)
+  if total.get() != expectedTotal then println(s"lost updates: ${total.get()} of $expectedTotal")
+  (n, overlaps)
+
+producersAndConsumers() -> int
+  val queue = Mutex(Deque[int]())
+  val ready = queue.condition()
+  val producers = 4
+  val per = 5000
+  val sums = Mutex(0)
+  scope(s ->
+    for p in 0 ..< producers
+      s.spawn(() ->
+        for i in 1 .. per
+          val v = p * per + i
+          queue.with(q ->
+            q.append(v)
+            ready.notify()))
+    for _ in 0 ..< 4
+      s.spawn(() ->
+        var sum = 0
+        for _ in 0 ..< per
+          sum += queue.with(q ->
+            while q.isEmpty do ready.wait()
+            q.removeHead())
+        _ = sums.update(x -> x + sum)))
+  sums.get()
+
+main() -> int
+  val (short, shortOverlaps) = hammer(16, 20000, 0, 1)
+  println(s"short: $short taken, $shortOverlaps overlaps")
+  val (slow, slowOverlaps) = hammer(16, 500, 300, 1)
+  println(s"long: $slow taken, $slowOverlaps overlaps")
+  val (mixed, mixedOverlaps) = hammer(16, 4000, 300, 10)
+  println(s"mixed: $mixed taken, $mixedOverlaps overlaps")
+  val sum = producersAndConsumers()
+  val n = 4 * 5000
+  val expected = n * (n + 1) / 2
+  println(s"producers and consumers: ${if sum == expected then "every value once" else s"sum $sum, not $expected"}")
+  if short == 320000 && slow == 8000 && mixed == 64000 && shortOverlaps + slowOverlaps + mixedOverlaps == 0 && sum == expected then 0 else 1

@@ -1,0 +1,80 @@
+// A parallel file hasher: walks a directory tree, hands each file to a pool of worker threads over a
+// bounded channel, and prints the SHA-256 of every file, sorted by path, in the format checksum
+// tools use. Each worker reads its file in pieces, so a large file is never held in memory whole.
+// Files whose contents are the same are then listed together.
+//
+//     avin build main.avin -o hasher && ./hasher ~/Documents 8
+//
+// With no directory it hashes a small tree it writes for the purpose, and removes it after.
+//
+// expect: exit 0
+import avin.crypto.{Sha256, toHex}
+import avin.fs
+import avin.io.IoError
+import avin.threads.{Channel, scope}
+
+data Hashed(path: string, digest: Result[string, string])
+
+// Every file under `dir`, as paths relative to it, in the order a listing sorts them.
+filesUnder(dir: string, prefix: string = "") -> Result[Vector[string], IoError]
+  var found = Vector.empty[string]()
+  for name in fs.listDir(dir + "/" + prefix)?
+    val relative = if prefix == "" then name else s"$prefix/$name"
+    found = if fs.isDir(s"$dir/$relative") then found ++ filesUnder(dir, relative)? else found :+ relative
+  Ok(found)
+
+// The SHA-256 of a file, read 64 KiB at a time.
+hashFile(file: string) -> Result[string, IoError]
+  val f = fs.open(file)?
+  defer _ = f.close()
+  val hasher = Sha256()
+  var piece = f.read(65536)?
+  while piece.length > 0
+    hasher.update(piece.toVector)
+    piece = f.read(65536)?
+  Ok(toHex(hasher.finish()))
+
+// Hashes every file on `workers` threads. The channel of paths holds at most twice as many as there
+// are workers, so the walk never runs far ahead of the hashing.
+hashAll(root: string, paths: Vector[string], workers: int) -> Vector[Hashed]
+  val jobs = Channel[string](2 * workers)
+  val results = Channel[Hashed]()
+  scope(s ->
+    for _ in 1 .. workers
+      s.spawn(() ->
+        for path in jobs
+          results.send(Hashed(path, hashFile(s"$root/$path").mapErr(_.message))))
+    for path in paths do jobs.send(path)
+    jobs.close())
+  results.close()
+  results.toVector.sortBy(_.path)
+
+// A small tree to hash: text, an empty file, a binary one, and two files holding the same bytes.
+writeSample(root: string) -> Result[unit, IoError]
+  fs.createDirAll(root + "/docs/notes")?
+  fs.createDirAll(root + "/src")?
+  fs.writeText(root + "/README", "a tree to hash\n")?
+  fs.writeText(root + "/docs/intro.txt", "Hashing is done in parallel.\n")?
+  fs.writeText(root + "/docs/notes/copy.txt", "Hashing is done in parallel.\n")?
+  fs.writeText(root + "/docs/notes/empty", "")?
+  fs.writeText(root + "/src/main.txt", "x".repeat(200000))?
+  fs.writeBytes(root + "/src/bytes.bin", Array.tabulate(256, i -> byte(i)))
+
+main(args: Vector[string]) -> Result[unit, IoError]
+  val workers = args.lift(1).flatMap(_.toIntOption()).getOrElse(4)
+  val sample = if args.isEmpty then Some(fs.tempDir("hasher")?) else None
+  defer sample.foreach(t -> _ = t.close())
+  val root = sample match
+    Some(t) ->
+      writeSample(t.path)?
+      t.path
+    None -> args(0)
+  val hashed = hashAll(root, filesUnder(root)?, workers)
+  for h in hashed
+    h.digest match
+      Ok(hex) -> println(s"$hex  ${h.path}")
+      Err(message) -> eprintln(s"${h.path}: $message")
+  val same = hashed.flatMap(h -> h.digest.ok.map(d -> (d, h.path))).groupBy(_.0).values
+  for group in same.filter(_.length > 1).map(_.map(_.1).sorted).sortBy(_(0))
+    println(s"the same contents: ${group.mkString(", ")}")
+  Ok(())

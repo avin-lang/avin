@@ -1,0 +1,83 @@
+// expect: exit 0
+// Many children with piped streams. Three hundred, one after another, each with all three streams
+// piped and every end closed: more ends than a program may hold open at once (256 by default on
+// macOS) were they not given back. Fifty at once, each driven by a lightweight thread of its own that
+// parks on the runtime's poller while it waits, each echoing its own bytes back. And no pipe leaks
+// into another child: the program's ends are closed on exec, read back with `F_GETFD`; `ls /dev/fd`
+// started while children's pipes are open lists only the standard streams and its own; and `cat`,
+// whose input the program holds, sees the end of its input when the program closes it although
+// another child was started meanwhile and is still running.
+import avin.io.IoError
+import avin.process
+import avin.process.{Child, Command}
+import avin.threads.spawn
+
+ok[T](r: Result[T, IoError]) -> T = r match
+  Ok(v) -> v
+  Err(e) -> fail(e.message)
+
+@sysl("avin.rt.pipe_closes_on_exec")
+closesOnExec(fd: int) -> bool
+
+@sysl("avin.rt.socket_parks")
+parks() -> long
+
+words(text: string) -> string = text.split("\n").filter(w -> w.nonEmpty).mkString(" ")
+
+// Whether `ls /dev/fd` listed only the standard streams and its own.
+clean(text: string) -> bool = words(text) == (if process.os() == process.MacOS then "0 1 2 3 4" else "0 1 2 3")
+
+piped(c: Command) -> Child = c.pipeInput().pipeOutput().pipeErrors().start().ok.get
+
+main() -> int
+  // One after another, every end closed each time.
+  var echoed = 0
+  for i in 0 ..< 300
+    val child = piped(Command("/bin/sh", "-c", "read x; echo \"$x\"; echo e >&2"))
+    ok(child.stdin().writeText(s"$i\n"))
+    ok(child.stdin().close())
+    if ok(child.stdout().readLine()) == Some(s"$i") then echoed += 1
+    _ = ok(child.stderr().readAll())
+    _ = child.waitFor().ok.get
+    ok(child.stdout().close())
+    ok(child.stderr().close())
+  println(s"one after another: $echoed of 300 echoed")
+
+  // Fifty at once, each in a lightweight thread that parks while it waits.
+  val before = parks()
+  val threads = (0 ..< 50).map(i -> spawn(() ->
+    val child = piped(Command("cat"))
+    val payload = s"child $i ".repeat(1000)
+    ok(child.stdin().writeText(payload))
+    ok(child.stdin().close())
+    val back = string.fromUtf8Lossy(ok(child.stdout().readAll()))
+    _ = child.waitFor()
+    ok(child.stdout().close())
+    ok(child.stderr().close())
+    back == payload)).toVector
+  val right = threads.map(t -> t.join()).count(b -> b)
+  println(s"at once: $right of 50 echoed their own bytes, parked: ${parks() > before}")
+
+  // The program's ends are closed on exec.
+  val held = piped(Command("cat"))
+  val ends = [
+    held.stdin().writabilityDescriptor(),
+    held.stdout().readinessDescriptor(),
+    held.stderr().readinessDescriptor()
+  ]
+  println(s"ends closed on exec: ${ends.map(fd -> fd >= 3 && closesOnExec(fd))}")
+
+  // A child started meanwhile sees none of them.
+  println(s"ls sees only its own: ${clean(Command("/bin/ls", "/dev/fd").output().ok.get)}")
+  val listing = piped(Command("/bin/ls", "/dev/fd"))
+  println(s"a piped ls sees only its own: ${clean(string.fromUtf8Lossy(ok(listing.stdout().readAll())))}")
+  _ = listing.waitFor()
+
+  // `cat` ends when its input is closed, though a child started after it still runs.
+  val other = piped(Command("cat"))
+  ok(held.stdin().close())
+  println(s"cat saw the end of its input: ${ok(held.stdout().readAll()).length}, ${held.waitFor().ok.get}")
+  println(s"the other still runs: ${other.isAlive()}")
+  ok(other.stdin().close())
+  println(s"then ends: ${other.waitFor().ok.get}")
+  0

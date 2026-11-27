@@ -1,0 +1,206 @@
+module avin.msgpack
+
+// MessagePack: a binary data format of integers, floats, strings, binary data, arrays, maps and
+// extensions. A value is a `Msgpack` tree; bytes are read into one with `parse` and written from one
+// with `encodeTree`; a program's own types go to and from bytes through `derives MsgpackEncoder,
+// MsgpackDecoder`, as in `encode(person)` and `decode[Person](bytes)`. `MsgpackReader` and
+// `MsgpackWriter` do the same a piece at a time over an `avin.io.Reader` and an `avin.io.ByteWriter`.
+//
+// Everything that arrives from outside is checked against `MsgpackOptions`: how deep arrays and maps
+// nest, how many elements a collection holds, how long a string is and how many bytes a document may
+// take altogether. A length that promises more than the input holds is an error before anything is
+// allocated for it.
+
+import avin.io.Reader
+
+// A MessagePack value. An integer that fits a `long` is a `Num`; one from 2^63 to 2^64 - 1 is
+// `BigUint`, holding the same 64 bits. A float keeps the width it was read at. An extension is its
+// type, -128..127, and its bytes; type -1 is the timestamp (`Msgpack.timestamp`, `asTimestamp`).
+data Msgpack
+  Nil
+  Bool(value: bool)
+  Num(value: long)
+  BigUint(bits: long)
+  Single(value: real)
+  Double(value: real)
+  Str(value: string)
+  Bin(value: Array[byte])
+  Arr(items: Vector[Msgpack])
+  Dict(entries: Vector[(Msgpack, Msgpack)])
+  Ext(kind: int, data: Array[byte])
+
+// One step of the path to a value at fault: a map's text key, or an array's index.
+data PathStep
+  Key(name: string)
+  Index(at: int)
+
+// What is wrong with the bytes, and the offset of the first byte it concerns; a derived decoder adds
+// the path of the value at fault, outermost step first.
+data MsgpackError(message: string, offset: long, path: List[PathStep] = [])
+
+impl MsgpackError
+  // The error with `name`'s key in front of its path.
+  inField(name: string) -> MsgpackError = MsgpackError(message, offset, Key(name) :: path)
+
+  // The error with the element `i` in front of its path.
+  atIndex(i: int) -> MsgpackError = MsgpackError(message, offset, Index(i) :: path)
+
+  // The path written out: keys joined by `.`, an index in brackets, so `items[2].name`.
+  pathText() -> string
+    val out = StringWriter()
+    var first = true
+    for step in path
+      step match
+        Key(name) ->
+          if !first then out.writeChar('.')
+          out.write(name)
+        Index(i) -> out.write(s"[$i]")
+      first = false
+    out.text
+
+impl Error for MsgpackError
+
+impl Display for MsgpackError
+  display(out: Writer, spec: FormatSpec)
+    val place = if path.isEmpty then "" else s"${pathText()}: "
+    out.writeField(s"$place$message at byte $offset", spec)
+
+// The limits on what is read. The defaults suit a server reading a request: a document of up to 64 MiB
+// nested 128 deep, no collection of more than a million elements, no string of more than 16 MiB. With
+// `strict`, the reader accepts only the shortest form of every integer and length, floats at their
+// shortest exact width, and map keys sorted without repeats (for a tree, and for the text keys a
+// derived decoder reads).
+data MsgpackOptions(
+    maxDepth: int = 128,
+    maxItems: int = 1048576,
+    maxBytes: int = 16777216,
+    maxSize: long = 67108864,
+    strict: bool = false
+)
+
+// The bytes of a document read as a tree, or the first thing wrong with them, with nothing after it.
+parse(bytes: Array[byte], options: MsgpackOptions = MsgpackOptions()) -> Result[Msgpack, MsgpackError]
+  val r = MsgpackReader.fromBytes(bytes, options)
+  val value = r.readValue()?
+  r.finish()?
+  Ok(value)
+
+// As `parse(bytes)`, read a piece at a time from `source`.
+parse(source: Reader, options: MsgpackOptions = MsgpackOptions()) -> Result[Msgpack, MsgpackError]
+  val r = MsgpackReader.fromReader(source, options)
+  val value = r.readValue()?
+  r.finish()?
+  Ok(value)
+
+// The tree as bytes, as `encode` writes it. Every integer and length takes its shortest form and every
+// float the width it has. With `deterministic`, a float takes the shortest width that holds it exactly
+// and a map's entries are sorted by their encoded keys, so equal trees give equal bytes.
+encodeTree(value: Msgpack, deterministic: bool = false) -> Array[byte]
+  val w = MsgpackWriter.toBytes(deterministic)
+  w.value(value)
+  w.toArray()
+
+object Msgpack
+  // The timestamp extension of `seconds` since the Unix epoch and `nanos` of a second after them,
+  // 0..999999999, in the shortest of its three forms: 4 bytes where `nanos` is 0 and the seconds fit
+  // 32 bits unsigned, 8 where the seconds fit 34 bits unsigned, 12 otherwise. A `nanos` outside its
+  // range traps.
+  timestamp(seconds: long, nanos: int = 0) -> Msgpack
+    if !(0 <= nanos < 1000000000) then fail(s"$nanos is not a count of nanoseconds within a second")
+    if nanos == 0 && 0 <= seconds < 4294967296
+      return Ext(-1, bigEndian(seconds, 4))
+    if 0 <= seconds < 17179869184
+      return Ext(-1, bigEndian((long(nanos) << 34) | seconds, 8))
+    val head = bigEndian(long(nanos), 4)
+    val tail = bigEndian(seconds, 8)
+    Ext(-1, Array.tabulate(12, i -> if i < 4 then head(i) else tail(i - 4)))
+
+impl Msgpack
+  asBool -> Option[bool] = self match
+    Bool(b) -> Some(b)
+    _ -> None
+
+  isNil -> bool = self match
+    Nil -> true
+    _ -> false
+
+  // The integer, where it fits a `long`.
+  asLong -> Option[long] = self match
+    Num(n) -> Some(n)
+    _ -> None
+
+  // The integer as a `BigInt`.
+  asInteger -> Option[BigInt] = self match
+    Num(n) -> Some(BigInt(n))
+    BigUint(bits) -> Some(BigInt(bits) + BigInt("18446744073709551616"))
+    _ -> None
+
+  // The number as a `real`: a float, or an integer rounded to the nearest.
+  asReal -> Option[real] = self match
+    Single(x) -> Some(x)
+    Double(x) -> Some(x)
+    Num(n) -> Some(real(n))
+    _ -> None
+
+  asText -> Option[string] = self match
+    Str(s) -> Some(s)
+    _ -> None
+
+  asBytes -> Option[Array[byte]] = self match
+    Bin(b) -> Some(b)
+    _ -> None
+
+  asVector -> Option[Vector[Msgpack]] = self match
+    Arr(items) -> Some(items)
+    _ -> None
+
+  asEntries -> Option[Vector[(Msgpack, Msgpack)]] = self match
+    Dict(entries) -> Some(entries)
+    _ -> None
+
+  // The value of a map's entry whose key is the string `key`, the last where there are several.
+  get(key: string) -> Option[Msgpack] = self match
+    Dict(entries) ->
+      var k = entries.length - 1
+      while k >= 0
+        if entries(k).0 == Str(key) then return Some(entries(k).1)
+        k -= 1
+      None
+    _ -> None
+
+  // An array's element at `index`.
+  get(index: int) -> Option[Msgpack] = self match
+    Arr(items) -> if 0 <= index < items.length then Some(items(index)) else None
+    _ -> None
+
+  // The seconds and nanoseconds of a timestamp extension, in any of its three forms; None for any
+  // other value, and for an extension of type -1 that is not a timestamp: of another length, or with
+  // 1,000,000,000 nanoseconds or more.
+  asTimestamp -> Option[(long, int)] = self match
+    Ext(-1, data) ->
+      if data.length == 4
+        Some((fromBigEndian(data, 0, 4), 0))
+      elif data.length == 8
+        val v = fromBigEndian(data, 0, 8)
+        val nanos = (v >> 34) & 0x3FFFFFFF
+        if nanos >= 1000000000 then None else Some((v & 0x3FFFFFFFF, int(nanos)))
+      elif data.length == 12
+        val nanos = fromBigEndian(data, 0, 4)
+        if nanos >= 1000000000 then None else Some((fromBigEndian(data, 4, 8), int(nanos)))
+      else
+        None
+    _ -> None
+
+// The `width` low bytes of `n`, most significant first.
+bigEndian(n: long, width: int) -> Array[byte] = Array.tabulate(
+  width,
+  i -> byte(int((n >> long((width - 1 - i) * 8)) & 255))
+)
+
+// The `width` bytes of `data` from `at` as a number, the first most significant; with eight, a
+// signed 64-bit one, and with fewer, an unsigned one.
+fromBigEndian(data: Array[byte], at: int, width: int) -> long
+  var v: long = 0
+  for i in 0 ..< width
+    v = (v << 8) | long(int(data(at + i)))
+  v

@@ -1,0 +1,158 @@
+// expect: exit 0
+// Cookies: `Cookie` headers read leniently into pairs (spaces, quotes, empty values, `=` in values,
+// duplicates kept in order, bad pairs skipped), every `SetCookie` attribute written, the checks a
+// cookie passes where it is made, and `Set-Cookie` read back into the same type.
+import avin.net.http.{Cookie, CookieError, Lax, Response, SameSite, ServerRequest, SetCookie, Strict, Unrestricted}
+import avin.time.{Instant, epochSeconds}
+
+pairs(header: string) -> string = Cookie.parse(header).map(c -> s"${c.name}=[${c.value}]").mkString(" ")
+
+// What a `Set-Cookie` value reads as: the cookie written again, or the refusal.
+back(text: string) -> string = SetCookie.parse(text) match
+  Ok(c) -> c.header
+  Err(e) -> e.message
+
+main()
+  // The Cookie header.
+  println(pairs(""))
+  println(pairs("a=1"))
+  println(pairs("a=1; b=2;c=3"))
+  println(pairs("  a = 1 ;  b=2  "))
+  println(pairs("a=; b=2"))
+  println(pairs("a=b=c; d==; e=x=y="))
+  println(pairs("a=\"quoted\"; b=\"\"; c=\"half; d=4"))
+  println(pairs("a=1; a=2; b=3; a=4"))
+  println(pairs(";;a=1;;; ;b=2;"))
+  println(pairs("novalue; a=1; =orphan; b=2"))
+  println(pairs("bad name=1; a=1; (x)=2; b=2"))
+  println(pairs("a=has space; b=2; c=com,ma; d=back\\slash; e=5"))
+  println(pairs("a=café; b=2; c=\"in side\"; d=4"))
+  println(pairs("a=\"x\"y\"; b=2"))
+  println(pairs("a=1,b=2; c=3"))
+  println(pairs("a=!#$%&'()*+-./:<=>?@[]^_`{|}~; b=2"))
+  var many = ""
+  for i in 0 ..< 60
+    many = many + (if i == 0 then "" else "; ") + s"k$i=v$i"
+  val read = Cookie.parse(many)
+  println(s"${read.size} ${read(0)} ${read(59)}")
+
+  // On a request: several headers in order, any case of the name, a lookup of the first.
+  val request = ServerRequest(
+    "GET",
+    "/",
+    Vector(("Cookie", "a=1; b=2"), ("Host", "x"), ("cookie", "a=3; c=4"), ("COOKIE", "bad; d=5"))
+  )
+  println(request.cookies().map(c -> s"${c.name}${c.value}").mkString(","))
+  println(s"${request.cookie("a")} ${request.cookie("c")} ${request.cookie("d")} ${request.cookie("z")}")
+  println(s"${request.cookie("A")} ${ServerRequest("GET", "/").cookies().size}")
+
+  // Every attribute written, alone and together.
+  println(SetCookie("id", "abc").header)
+  println(SetCookie("id", "").header)
+  println(SetCookie("id", "abc", maxAge = Some(long(3600))).header)
+  println(SetCookie("id", "abc", maxAge = Some(long(0))).header)
+  println(SetCookie("id", "abc", maxAge = Some(long(-5))).header)
+  println(SetCookie("id", "abc", expires = Some(epochSeconds(784111777))).header)
+  println(SetCookie("id", "abc", expires = Some(Instant.Epoch)).header)
+  println(SetCookie("id", "abc", domain = Some("example.com")).header)
+  println(SetCookie("id", "abc", path = Some("/app/x")).header)
+  println(SetCookie("id", "abc", secure = true).header)
+  println(SetCookie("id", "abc", httpOnly = true).header)
+  println(SetCookie("id", "abc", sameSite = Some(Strict)).header)
+  println(SetCookie("id", "abc", sameSite = Some(Lax)).header)
+  println(SetCookie("id", "abc", sameSite = Some(Unrestricted), secure = true).header)
+  println(SetCookie("id", "abc", secure = true, partitioned = true).header)
+  val all = SetCookie(
+    "sid",
+    "v1",
+    expires = Some(epochSeconds(784111777)),
+    maxAge = Some(long(60)),
+    domain = Some("example.com"),
+    path = Some("/"),
+    secure = true,
+    httpOnly = true,
+    sameSite = Some(Lax),
+    partitioned = true
+  )
+  println(all.header)
+  println(SetCookie("__Host-s", "1", path = Some("/"), secure = true).header)
+  println(SetCookie("__Secure-s", "1", secure = true, domain = Some("example.com")).header)
+  println(SetCookie("__host-s", "1", path = Some("/"), secure = true).header)
+  println(SetCookie("x__Host-s", "1").header)
+  println(SetCookie("t", "a=b=c").header)
+
+  // On a response: one header each, never folded, others untouched.
+  val r = Response(200, "OK", Vector(("Content-Type", "text/plain")), Array.empty[byte]())
+    .setCookie(SetCookie("a", "1", secure = true))
+    .setCookie(SetCookie("b", "2", httpOnly = true))
+    .setCookie(SetCookie("a", "3"))
+  println(r.headers.map(h -> s"${h.0}: ${h.1}").mkString(" | "))
+  println(
+    r.cookies().map(
+      c -> s"${c.name}=${c.value}${if c.secure then "S" else ""}${if c.httpOnly then "H" else ""}"
+    ).mkString(",")
+  )
+  println(Response(200, "OK", Vector.empty[(string, string)](), Array.empty[byte]()).cookies().size)
+  val mixed = Response(
+    200,
+    "OK",
+    Vector(("set-cookie", "ok=1"), ("Set-Cookie", "no equals"), ("SET-COOKIE", "bad name=1"), ("Set-Cookie", "z=2")),
+    Array.empty[byte]()
+  )
+  println(mixed.cookies().map(c -> c.name).mkString(","))
+
+  // Round trips, each written, read and written again.
+  for c in [
+    SetCookie("id", "abc"),
+    SetCookie("id", "", maxAge = Some(long(0))),
+    SetCookie("id", "x=y", expires = Some(epochSeconds(784111777)), domain = Some("example.com"), path = Some("/p")),
+    all,
+    SetCookie("n", "1", sameSite = Some(Strict), httpOnly = true),
+    SetCookie("n", "1", sameSite = Some(Unrestricted), secure = true)
+  ]
+    val again = SetCookie.parse(c.header).getOrElse(SetCookie("fail", "1"))
+    println(
+      s"${again.header == c.header} ${again.name} ${again.value} ${again.maxAge} ${again.expires == c.expires} ${again.sameSite}"
+    )
+
+  // Reading Set-Cookie: case of names, spaces, quotes, a leading dot, last attribute wins, unknown and
+  // unreadable attributes left out.
+  println(back("id=abc"))
+  println(back(" id = \"abc\" ; PATH = /x ; DOMAIN=.Example.COM ; SECURE ; httponly ; SameSite=STRICT"))
+  println(back("a=1; Path=/one; Path=/two; Max-Age=5; Max-Age=9"))
+  println(back("a=1; Flavour=sweet; Priority=High; Extra"))
+  println(back("a=1; Expires=yesterday"))
+  println(back("a=1; Expires=Sun, 06 Nov 1994 08:49:37 GMT"))
+  println(back("a=1; Expires=Sunday, 06-Nov-94 08:49:37 GMT"))
+  println(back("a=1; Max-Age=soon"))
+  println(back("a=1; Max-Age=-1"))
+  println(back("a=1; Max-Age=0"))
+  println(back("a=1; Path=relative"))
+  println(back("a=1; Path="))
+  println(back("a=1; Domain="))
+  println(back("a=1; Domain=."))
+  println(back("a=1; SameSite=Sideways"))
+  println(back("a=1; SameSite"))
+  println(back("a=1;"))
+  println(back("a=1; ; ;"))
+
+  // What reading refuses.
+  println(back(""))
+  println(back("novalue"))
+  println(back("=v"))
+  println(back("a b=1"))
+  println(back("a=b c"))
+  println(back("a=b,c"))
+  println(back("a=é"))
+  println(back("a=1; SameSite=None"))
+  println(back("a=1; Secure; SameSite=None"))
+  println(back("a=1; Partitioned"))
+  println(back("a=1; Secure; Partitioned"))
+  println(back("__Host-a=1; Secure; Path=/"))
+  println(back("__Host-a=1; Secure"))
+  println(back("__Host-a=1; Path=/"))
+  println(back("__Host-a=1; Secure; Path=/; Domain=example.com"))
+  println(back("__Secure-a=1; Secure"))
+  println(back("__Secure-a=1"))
+  println(back("__SECURE-a=1"))
+  println(back("a=1; Domain=bad_host.com"))

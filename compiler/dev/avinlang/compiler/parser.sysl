@@ -692,7 +692,14 @@ private infix_call(left: &Expr, t: Spanned[Token], name: string, p: *Parser) -> 
             p.report.add(error(t.span, s"an infix call starts on its receiver's line: end that line with `$name` to put the argument on the next"))
             break
     if !p.at_kind(Indent) && (p.at_line_end() || argument_cannot_start(p))
-        val receiver = from_utf8_unchecked(p.src.text(left.span))
+        // A receiver that is itself an error (already reported) leaves nothing to suggest.
+        if left.kind is Invalid then return Expr(left.span.to(t.span), Invalid)
+        // A receiver that spans lines is a block, not a short example: it is quoted as `…`.
+        var receiver = from_utf8_unchecked(p.src.text(left.span))
+        for b in p.src.text(left.span)
+            if b == u8('\n')
+                receiver = "…"
+                break
         p.report.add(error(t.span, s"`$name` has no argument: an infix call takes one, and there is no postfix form; a member is reached with a dot, as `$receiver.$name`, or `$receiver.$name()` for a method declared with an empty parameter list"))
         return Expr(left.span.to(t.span), Invalid)
     val arg = if p.at_kind(Indent) then parse_body(p, false) else expression(p, InfixBinding)
@@ -969,8 +976,34 @@ private callee_name(callee: &Expr) -> string = callee.kind match
  * `f(_, 2) + 1` is `x -> f(x, 2) + 1`. Every other argument and every lambda, block, `if` and
  * `match` keeps its own `_`. A value that is `_` alone is no lambda of its own. Where the lambda
  * would only call a named function with its parameters in order, `f(_)`, it is that function, which
- * is passed as `f`. */
+ * is passed as `f`.
+ *
+ * A value whose result is another expression's passes the place on: each branch of an `if`, each
+ * arm of a `match` and the last line of a block yielding its value is a place of its own, so
+ * `if up then _ + 1 else _ - 1` is two lambdas, and the condition, subject, guards and earlier lines
+ * keep their own `_`. */
 placeholder_scope(p: *Parser, value: &Expr) -> &Expr
+    value.kind match
+        If(condition, yes, no) ->
+            val then_part = placeholder_scope(p, yes)
+            val else_part: Option[&Expr] = no match
+                Some(e) -> Some(placeholder_scope(p, e))
+                None -> None
+            return Expr(value.span, If(condition, then_part, else_part))
+        Match(subject, arms) ->
+            var scoped: Buf[Arm] = buf()
+            for a in arms
+                scoped.push(Arm(a.pattern, a.guard, placeholder_scope(p, a.body)))
+            return Expr(value.span, Match(subject, scoped))
+        Block(items, false) ->
+            if items.len() == 0 then return value
+            val last = items.len() - 1
+            var lines: Buf[&Expr] = buf()
+            for i in 0..<last
+                lines.push(items[i])
+            lines.push(placeholder_scope(p, items[last]))
+            return Expr(value.span, Block(lines, false))
+        _ -> ()
     if value.kind is Name("_") then return value
     var params: Buf[LambdaParam] = buf()
     val body = with_placeholders(value, &params)

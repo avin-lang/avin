@@ -1,0 +1,215 @@
+// expect: exit 0
+// `fs.copyAll`: a tree with files, empty and nested directories, links and Unicode names copied whole;
+// the destination absent, a file, an empty directory, a full one, with `replace` both ways; `merge`
+// into a directory (files replaced or refused, a file in a directory's place, a directory in a file's
+// place, the entries before a refusal kept); the `rwx` bits of each directory, and times with
+// `attributes`; links copied as links or followed, and a link leading back up refused when followed;
+// a destination inside the source; a file or a link given as the source; a failure part way leaving
+// no trace (a read-only directory already copied included); a deep tree and a wide one.
+import avin.fs
+import avin.io.IoError
+import avin.process.Command
+import avin.time
+
+var root = ""
+
+say(line: Any)
+  println(if root == "" then s"$line" else s"$line".replace(root, "DIR"))
+
+outcome(r: Result[unit, IoError]) -> string = r match
+  Ok(_) -> "ok"
+  Err(e) -> e.message
+
+debris(dir: string) -> int = fs.listDir(dir).map(names -> names.count(n -> n.contains(".pending-"))).getOrElse(-1)
+
+perm(file: string) -> string = fs.linkMetadata(file).map(m -> f"0o${m.permissions}%o").getOrElse("none")
+
+// Every entry under `dir`, one per line: a directory with `/`, a link with what it holds, a file with
+// its text.
+tree(dir: string) -> string = entries(dir, "").mkString(" | ")
+
+entries(dir: string, prefix: string) -> Vector[string]
+  var out = Vector.empty[string]()
+  for name in fs.listDir(dir).getOrElse(Vector.empty[string]())
+    val p = dir + "/" + name
+    val m = fs.linkMetadata(p)
+    if m.map(x -> x.isLink).getOrElse(false)
+      out = out :+ s"$prefix$name -> ${fs.readLink(p).getOrElse("?")}"
+    elif fs.isDir(p)
+      out = out :+ s"$prefix$name/"
+      for e in entries(p, prefix + name + "/")
+        out = out :+ e
+    else
+      out = out :+ s"$prefix$name = ${fs.readText(p).getOrElse("?")}"
+  out
+
+main()
+  val dir = fs.createTempDir("avin-fs-copy-tree") match
+    Ok(d) -> d
+    Err(e) ->
+      say(s"no directory: $e")
+      return
+  root = dir
+  val src = dir + "/src"
+  _ = fs.writeText(src + "/a.txt", "a", createParents = true)
+  _ = fs.writeText(src + "/sub/b.txt", "b", createParents = true)
+  _ = fs.writeText(src + "/sub/deeper/c.txt", "c", createParents = true)
+  _ = fs.createDirAll(src + "/empty")
+  _ = fs.writeText(src + "/ünï ☃", "snow", createParents = true)
+  _ = fs.symlink("a.txt", src + "/rel")
+  _ = fs.symlink("sub", src + "/dirlink")
+  say(tree(src))
+  // A fresh copy is the same tree, and the source is untouched.
+  say(outcome(fs.copyAll(src, dir + "/one")))
+  say(tree(dir + "/one"))
+  say(tree(src) == tree(dir + "/one"))
+  say(fs.isSameFile(src + "/a.txt", dir + "/one/a.txt"))
+  // An empty directory copies to an empty directory.
+  say(outcome(fs.copyAll(src + "/empty", dir + "/empty2")))
+  say(s"${fs.isDir(dir + "/empty2")} ${fs.listDir(dir + "/empty2")}")
+  // Without `merge`, `to` is replaced as `rename` replaces it: a full directory is refused either way,
+  // an empty one is replaced only with `replace`, and a file is refused, `AlreadyExists` without
+  // `replace` and `NotADirectory` with it.
+  say(outcome(fs.copyAll(src, dir + "/one")))
+  say(outcome(fs.copyAll(src, dir + "/one", replace = false)))
+  _ = fs.createDir(dir + "/hollow")
+  say(outcome(fs.copyAll(src, dir + "/hollow", replace = false)))
+  say(outcome(fs.copyAll(src, dir + "/hollow")))
+  say(tree(dir + "/hollow") == tree(src))
+  _ = fs.writeText(dir + "/afile", "a file")
+  say(outcome(fs.copyAll(src, dir + "/afile", replace = false)))
+  say(fs.readText(dir + "/afile"))
+  say(outcome(fs.copyAll(src, dir + "/afile")))
+  say(fs.readText(dir + "/afile"))
+  _ = fs.symlink(dir + "/hollow", dir + "/alink")
+  say(outcome(fs.copyAll(src, dir + "/alink")))
+  say(fs.isLink(dir + "/alink"))
+  say(debris(dir))
+  // `merge`: into a directory holding some of the same names.
+  val into = dir + "/into"
+  _ = fs.writeText(into + "/a.txt", "old a", createParents = true)
+  _ = fs.writeText(into + "/mine.txt", "mine", createParents = true)
+  _ = fs.writeText(into + "/sub/b.txt", "old b", createParents = true)
+  _ = fs.writeText(into + "/sub/theirs.txt", "theirs", createParents = true)
+  say(outcome(fs.copyAll(src, into, merge = true)))
+  say(tree(into))
+  // `merge` with `replace = false` stops at the first name taken, keeping what it copied before.
+  val second = dir + "/second"
+  _ = fs.writeText(second + "/sub/b.txt", "taken", createParents = true)
+  say(outcome(fs.copyAll(src, second, merge = true, replace = false)))
+  say(tree(second))
+  // `merge` makes a missing `to`, and with `createParents` the directories above it.
+  say(outcome(fs.copyAll(src, dir + "/made/above/here", merge = true, createParents = true)))
+  say(tree(dir + "/made/above/here") == tree(src))
+  // A directory where a file is: replaced with `replace`, refused without; a file onto a directory is
+  // refused and the directory kept.
+  val clash = dir + "/clash"
+  _ = fs.writeText(clash + "/sub", "a file named sub", createParents = true)
+  say(outcome(fs.copyAll(src, clash, merge = true, replace = false)))
+  say(fs.readText(clash + "/sub"))
+  say(outcome(fs.copyAll(src, clash, merge = true)))
+  say(fs.isDir(clash + "/sub"))
+  val clash2 = dir + "/clash2"
+  _ = fs.writeText(clash2 + "/a.txt/inside", "keep", createParents = true)
+  say(outcome(fs.copyAll(src, clash2, merge = true)))
+  say(fs.readText(clash2 + "/a.txt/inside"))
+  // The `rwx` bits of each directory come along, set once its contents are in, so a read-only one
+  // still gets them.
+  val modes = dir + "/modes"
+  _ = fs.writeText(modes + "/ro/inside", "inside", createParents = true)
+  _ = fs.createDirAll(modes + "/group")
+  _ = fs.setPermissions(modes + "/group", 0o750)
+  _ = fs.setPermissions(modes + "/ro", 0o555)
+  _ = fs.setPermissions(modes, 0o711)
+  say(outcome(fs.copyAll(modes, dir + "/modes2")))
+  say(s"${perm(dir + "/modes2")} ${perm(dir + "/modes2/group")} ${perm(dir + "/modes2/ro")}")
+  say(fs.readText(dir + "/modes2/ro/inside"))
+  // A merged directory that was there keeps its own bits, unless `attributes`.
+  _ = fs.createDir(dir + "/mine")
+  _ = fs.setPermissions(dir + "/mine", 0o700)
+  _ = fs.copyAll(modes, dir + "/mine", merge = true)
+  say(perm(dir + "/mine"))
+  _ = fs.setPermissions(dir + "/mine/ro", 0o755)
+  _ = fs.copyAll(modes, dir + "/mine", merge = true, attributes = true)
+  say(perm(dir + "/mine"))
+  // `attributes` carries the times of files and directories alike; without it they are new.
+  val past = time.epochSeconds(1_000_000_000)
+  _ = fs.setModified(src + "/sub/b.txt", past)
+  _ = fs.setModified(src + "/sub/deeper", past)
+  _ = fs.setModified(src + "/sub", past)
+  say(outcome(fs.copyAll(src, dir + "/timed", attributes = true)))
+  say(
+    s"${fs.modified(dir + "/timed/sub/b.txt").map(t -> t == past)} ${fs.modified(dir + "/timed/sub/deeper").map(t -> t == past)} ${fs.modified(dir + "/timed/sub").map(t -> t == past)}"
+  )
+  _ = fs.copyAll(src, dir + "/untimed")
+  say(
+    s"${fs.modified(dir + "/untimed/sub/b.txt").map(t -> t == past)} ${fs.modified(dir + "/untimed/sub").map(t -> t == past)}"
+  )
+  // Links are links unless followed; followed, a link to a directory copies the directory.
+  say(s"${fs.isLink(dir + "/one/dirlink")} ${fs.readLink(dir + "/one/dirlink")}")
+  say(outcome(fs.copyAll(src, dir + "/followed", followLinks = true)))
+  say(tree(dir + "/followed"))
+  // A link leading back to a directory above it: copied as a link, and refused when followed, with
+  // nothing left behind.
+  val cycle = dir + "/loop"
+  _ = fs.writeText(cycle + "/x/file", "x", createParents = true)
+  _ = fs.symlink("..", cycle + "/x/up")
+  say(outcome(fs.copyAll(cycle, dir + "/loop2")))
+  say(tree(dir + "/loop2"))
+  say(outcome(fs.copyAll(cycle, dir + "/loop3", followLinks = true)))
+  say(fs.exists(dir + "/loop3"))
+  // A destination inside the source, or the source itself, is refused before anything is made.
+  say(outcome(fs.copyAll(src, src + "/sub/inner")))
+  say(outcome(fs.copyAll(src, src, merge = true)))
+  say(outcome(fs.copyAll(src + "/sub", src + "/sub/deeper/x", createParents = true)))
+  say(outcome(fs.copyAll(dir + "/one/dirlink", dir + "/one/sub/x", followLinks = true)))
+  say(s"${fs.exists(src + "/sub/inner")} ${fs.exists(src + "/sub/deeper/x")}")
+  // A sibling whose name starts with the source's is not inside it.
+  say(outcome(fs.copyAll(src + "/sub", src + "/subway")))
+  say(tree(src + "/subway") == tree(src + "/sub"))
+  _ = fs.removeAll(src + "/subway")
+  // A file and a link given as the source are copied as `copy` copies them.
+  say(outcome(fs.copyAll(src + "/a.txt", dir + "/single")))
+  say(fs.readText(dir + "/single"))
+  say(outcome(fs.copyAll(src + "/rel", dir + "/single-link")))
+  say(fs.readLink(dir + "/single-link"))
+  say(outcome(fs.copyAll(src + "/rel", dir + "/single-followed", followLinks = true)))
+  say(fs.isLink(dir + "/single-followed"))
+  say(outcome(fs.copyAll(dir + "/missing", dir + "/x")))
+  say(outcome(fs.copyAll(src, dir + "/no/such/x")))
+  // A failure part way removes all the copy made, a read-only directory it had copied included, and
+  // names the entry it stopped at.
+  val bad = dir + "/bad"
+  _ = fs.writeText(bad + "/a_ro/inside", "inside", createParents = true)
+  _ = fs.setPermissions(bad + "/a_ro", 0o555)
+  _ = fs.writeText(bad + "/z_locked", "locked")
+  _ = fs.setPermissions(bad + "/z_locked", 0o000)
+  say(outcome(fs.copyAll(bad, dir + "/bad2")))
+  say(s"${fs.exists(dir + "/bad2")} ${debris(dir)}")
+  // The same failure while merging keeps the entries before it.
+  say(outcome(fs.copyAll(bad, dir + "/bad3", merge = true)))
+  say(tree(dir + "/bad3"))
+  _ = fs.setPermissions(bad + "/z_locked", 0o600)
+  _ = fs.setPermissions(dir + "/bad3/a_ro", 0o755)
+  // A FIFO inside the tree is refused by name, and nothing waits on it.
+  val pipes = dir + "/pipes"
+  _ = fs.writeText(pipes + "/before", "before", createParents = true)
+  say(Command("mkfifo", pipes + "/fifo").run().map(s -> s.isSuccess))
+  say(outcome(fs.copyAll(pipes, dir + "/pipes2")))
+  say(fs.exists(dir + "/pipes2"))
+  // Deep and wide trees.
+  var deep = dir + "/deep"
+  for i in 0 ..< 40
+    deep = deep + s"/d$i"
+  _ = fs.writeText(deep + "/bottom", "bottom", createParents = true)
+  say(outcome(fs.copyAll(dir + "/deep", dir + "/deep2")))
+  say(fs.readText(deep.replace(dir + "/deep/", dir + "/deep2/") + "/bottom"))
+  for i in 0 ..< 300
+    _ = fs.writeText(dir + s"/wide/f$i", s"file $i", createParents = true)
+  say(outcome(fs.copyAll(dir + "/wide", dir + "/wide2")))
+  say(s"${fs.listDir(dir + "/wide2").map(n -> n.length)} ${fs.readText(dir + "/wide2/f299")}")
+  _ = fs.setPermissions(dir + "/modes2/ro", 0o755)
+  _ = fs.setPermissions(dir + "/mine/ro", 0o755)
+  _ = fs.setPermissions(modes + "/ro", 0o755)
+  _ = fs.setPermissions(bad + "/a_ro", 0o755)
+  say(fs.removeDirAll(dir))

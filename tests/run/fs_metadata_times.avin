@@ -1,0 +1,85 @@
+// expect: exit 0
+// `Metadata.accessed` and `Metadata.changed` beside `modified`: all three near now on a new file;
+// `setModified` moving the access time with the modification time and the change time to now, which
+// no ordinary call sets back; a read moving neither the modification nor the change time, and the
+// access time only to now if at all; a write moving the modification and change times; a permission
+// change moving the change time alone; and the same for a directory and through a symbolic link.
+// Times are compared with a tolerance, never printed, and nothing sleeps.
+import avin.fs
+import avin.time
+import avin.time.Instant
+
+@sysl("sysl.fs.IoError")
+private data SyslIoError
+  NotFound
+  PermissionDenied
+  AlreadyExists
+  NotADirectory
+  IsADirectory
+  DirectoryNotEmpty
+  TooManyOpenFiles
+  NoSpaceLeft
+  Interrupted
+  NotOpen
+  NotPermitted
+  InvalidUtf8(offset: long)
+  NoAttribute
+  Other(code: int)
+
+@sysl("sysl.fs.symlink")
+private symlinkRaw(target: string, link: string) -> Result[unit, SyslIoError]
+
+val zero = time.epochMicros(0)
+
+// Whether `t` is within two seconds of the span from `from` to now: the file system's clock and the
+// program's may disagree by its resolution.
+recent(t: Instant, from: Instant) -> bool =
+  time.epochMicros(from.epochMicros - 2_000_000) <= t <= time.epochMicros(time.now().epochMicros + 2_000_000)
+
+accessed(file: string) -> Instant = fs.metadata(file).map(m -> m.accessed).getOrElse(zero)
+changed(file: string) -> Instant = fs.metadata(file).map(m -> m.changed).getOrElse(zero)
+modified(file: string) -> Instant = fs.metadata(file).map(m -> m.modified).getOrElse(zero)
+
+main()
+  val dir = fs.createTempDir("avin-fs-times").getOrElse("")
+  val file = dir + "/t"
+  val start = time.now()
+  _ = fs.writeText(file, "one")
+  // A new file: all three times are now.
+  println(s"${recent(modified(file), start)} ${recent(accessed(file), start)} ${recent(changed(file), start)}")
+  // `setModified` sets both the modification and the access time, and not the change time, which
+  // moves to now because the entry changed.
+  val past = time.epochSeconds(1_000_000_000)
+  _ = fs.setModified(file, past)
+  println(s"${modified(file) == past} ${accessed(file) == past} ${recent(changed(file), start)}")
+  // A read leaves the modification and change times. Whether it moves the access time is the file
+  // system's choice: one that records reads moves it to now, and one that does not (macOS's) leaves it.
+  val changedBefore = changed(file)
+  _ = fs.readText(file)
+  println(s"${accessed(file) == past || recent(accessed(file), start)} ${modified(file) == past}")
+  println(changed(file) == changedBefore)
+  // A write moves the modification time, and the change time with it.
+  val beforeWrite = time.now()
+  _ = fs.writeText(file, "two")
+  println(s"${recent(modified(file), beforeWrite)} ${changed(file) >= changedBefore}")
+  // A permission change moves the change time and leaves the modification time.
+  _ = fs.setModified(file, past)
+  val changedAfterSet = changed(file)
+  _ = fs.setPermissions(file, 0o600)
+  println(s"${changed(file) >= changedAfterSet} ${recent(changed(file), start)} ${modified(file) == past}")
+  // The change time is never earlier than the modification time an ordinary call can set.
+  println(changed(file) > modified(file))
+  // A directory has all three times too, and adding an entry moves its modification time.
+  _ = fs.setModified(dir, past)
+  println(s"${modified(dir) == past} ${accessed(dir) == past}")
+  _ = fs.writeText(dir + "/new", "")
+  println(s"${recent(modified(dir), start)} ${recent(changed(dir), start)}")
+  // Through a symbolic link the times are the target's; the link's own are its own.
+  _ = symlinkRaw(file, dir + "/link")
+  println(
+    fs.metadata(dir + "/link").map(
+      m -> (m.modified, m.accessed, m.changed)
+    ) == fs.metadata(file).map(m -> (m.modified, m.accessed, m.changed))
+  )
+  println(fs.linkMetadata(dir + "/link").map(m -> m.modified != past && recent(m.modified, start)))
+  _ = fs.removeDirAll(dir)

@@ -39,7 +39,7 @@ A missing tool is reported by name, with what installs it.
 
 Working on the compiler, the library or the runtime needs:
 
-- Sysl 0.10.7, with a checkout of Sysl's `parsing` package at `../../sysl-lang/parsing` relative to
+- Sysl 0.14.0, with a checkout of Sysl's `parsing` package at `../../sysl-lang/parsing` relative to
   the repository: the repository is cloned into a directory named for its organization
   (`avin-lang/avin`), beside a `sysl-lang` directory holding `sysl-lang/parsing`
 - clang on `PATH`
@@ -256,6 +256,80 @@ line, `./tool.avin data.json` is `avin ./tool.avin data.json`, and every argumen
 the program's own; `avin run tool.avin -O0 -- data.json` keeps the usual rule, with `-O0` avin's. The
 [packages chapter](/spec/packages/#programs-of-one-file) has the rules.
 
+## The interactive session
+
+`avin repl` starts a session: each declaration, import, statement or expression entered is checked,
+built and run at once. An expression's value is shown with its type and kept under the next name
+`res0`, `res1`, …; a `val` or `var` is shown by its own name, and a function by its header:
+
+```text
+avin> 1 + 2
+res0: int = 3
+avin> val greeting = "hello"
+greeting: string = "hello"
+avin> twice(n: int) = n * 2
+twice(n: int) -> int
+avin> twice(res0)
+res1: int = 6
+avin> import avin.threads.spawn
+avin> val worker = spawn(() -> twice(21))
+worker: Thread[int] = Thread[int]
+avin> worker.join()
+res2: int = 42
+```
+
+A session is a program that grows. Imports go to its top, and everything else into `main`, each
+input a block nested in the one before it, so a name entered again hides the earlier one from the
+inputs after it. A declaration of types is a module of its own, and so is a function or a `val` that
+uses no `var` or other local of the session's code, so the classes and functions entered after it
+can call or read it, and keep the one they were declared after when it is entered again:
+
+```text
+avin> twice(n: int) = n * 2
+twice(n: int) -> int
+avin> class Doubler
+    |   run(n: int) -> int = twice(n)
+    |
+class Doubler
+avin> twice(n: int) = n * 3
+twice(n: int) -> int
+avin> Doubler().run(4)
+res0: int = 8
+```
+
+A function or `val` that uses a `var` of the session's stays in its code, where declarations cannot
+reach it; and the session's code sees a type declared again in place of the earlier one, so a new
+declaration is refused where earlier code no longer checks against it. After each input the whole
+program is built, through the same cache `avin run` uses,
+and run; what the earlier inputs write is not shown again. That costs something worth knowing: an
+earlier input runs again each time, so its side effects repeat, unseen, and a value it computes
+afresh (a random number, the time) may differ from the one shown when it was entered. An input that
+does not check, traps, or ends the program is left out, and the session goes on without it; a
+diagnostic or a trap names its place in the input as it was typed.
+
+An input that opens a block (an `if`, a `for`, a function's body, a type's declaration with its
+members) goes on over the lines after it until an empty line; so does one with a bracket left open
+or ending with an operator. At a terminal the input is edited whole: Enter on an unfinished input
+begins a new line under a `|` prompt, indented for what the line above opened, and the arrow keys
+move through its lines and, past the first or the last, through the inputs entered before. Tab
+completes the name before the cursor (a local, a declaration, a member after a `.`, a module after
+`import`), listing the choices when there are several, and indents at a line's start. Ctrl-C
+abandons an input or stops a running one, and Ctrl-D on an empty input ends the session. Read from a
+file or a pipe, the session prints no prompts.
+
+| Command | |
+| --- | --- |
+| `:type <expression>` | the expression's type, without running it |
+| `:imports` | the session's imports |
+| `:load <file>` | each import and top-level declaration of the file, entered in turn; a `main` in it becomes a function the session can call |
+| `:reset` | forget every input |
+| `:help` | the commands |
+| `:quit` | end the session |
+
+In a package, or a directory holding a program, the session may import the program's modules, and
+reads its dependencies; the program's own root module, with its `main`, is left out, the session
+taking its place.
+
 ## Formatting
 
 `avin fmt` rewrites every `.avin` and `.lavin` file under the paths it is given (the current
@@ -274,6 +348,35 @@ that a function's signature and its clauses stay together with no blank line amo
 literate file only the program is formatted, inside its four-column margin. A file that does not
 parse is left alone and its errors are reported. The [decisions](/spec/decisions/) list the style
 in full; the language server formats with the same rules.
+
+## API documentation
+
+`avin doc` writes a program's API documentation as a static site: a page per module, listing every
+public declaration with its header and its [doc comment](/spec/declarations/#doc-comments), and an
+index of the modules with a box that searches every name. A type named in a signature links to its
+declaration, in another module, a dependency or the standard library, whose pages the program reads
+are written beside its own. The pages are plain HTML with one stylesheet, light or dark as the
+reader's system is, and fetch nothing from anywhere.
+
+```sh
+./compiler/avin doc hello
+./compiler/avin doc hello -o site
+./compiler/avin doc hello --check
+./compiler/avin doc --std -o std
+```
+
+- **The program is checked first**, as `avin check` checks it, with every feature on; one that does
+  not check is refused with its diagnostics. A package, a directory of modules and one file are each
+  documented; a test module and a `private` declaration are not.
+- **The pages go to `-o`**, or to `.avin/doc` beside the program, which a package's `.gitignore`
+  already names. A directory is written only when it is new, empty, or one `avin doc` wrote before,
+  whose old pages it replaces.
+- **`--check` writes nothing**, and fails on a doc comment's link that leads nowhere and on an Avin
+  block in one that does not parse, for a build or a commit hook. Without it the same problems are
+  warnings.
+- **`--std-url <url>`** links the standard library's names to its pages published at that URL
+  instead of writing them beside the program's. **`avin doc --std`** documents the whole standard
+  library.
 
 ## The compiler's tests
 

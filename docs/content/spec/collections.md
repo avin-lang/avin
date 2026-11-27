@@ -1203,7 +1203,7 @@ val q = PriorityQueue[int]()
 q.enqueue(3, 9, 1)
 q += 5
 q.head           // 9, left in the queue
-q.dequeue        // 9
+q.dequeue()      // 9
 q.dequeueAll()     // [5, 3, 1], and q is empty
 
 val soonest = PriorityQueue.withOrdering(reverseOrder(compareBy((t: Task) -> t.due)))
@@ -1392,6 +1392,29 @@ for (name, age) in people
   println(name)
 ```
 
+A loop takes the clauses a comprehension does (below): several generators separated by commas,
+`if` guards after each, and value definitions `pattern = value` between them. It runs as the loops
+they would be written as one inside another: each generator a `for` over its source inside the one
+before it, each guard an `if` around the rest, each definition a `val` before the rest. So a later
+source is evaluated anew for each element of the earlier generators, a guard is tested once for each
+element that reaches it, and `break` and `continue` act on the innermost generator's loop, as in the
+nested form; `return` leaves the function from any depth. Each generator is counted, indexed or
+iterated as a loop of its own is, so a loop over ranges and arrays allocates nothing.
+
+```text
+for i in 0 ..< n, j in i + 1 ..< n if a(i) > a(j) do swaps += 1
+// runs as
+for i in 0 ..< n
+  for j in i + 1 ..< n
+    if a(i) > a(j) then swaps += 1
+
+for x in xs if x > 0, y = f(x), z in g(y)
+  println(z)
+```
+
+The one-to-a-line block form after `for` is a comprehension's alone: a loop's clauses go on the
+`for` line, and an indented line after them is its body.
+
 ### Generators, guards and `yield`
 
 A comprehension is `for`, one or more generators separated by commas, and `yield` with the value
@@ -1400,7 +1423,15 @@ and any number of guards, `if condition`, may follow it. Between the generators,
 come value definitions, `pattern = value`, each with guards of its own. When the generators do not
 fit on one line they go one to a line in an indented block after `for`, a line starting with `if`
 adding a guard to the generator or definition above it, and `yield` starts the line after the block.
-`yield` is a keyword.
+Generators on the `for` line may also be followed by `yield` on the next line, indented under it, with
+its value on the rest of that line or in a block indented under `yield`; nothing else follows the
+`yield` line inside that indentation. `yield` is a keyword.
+
+```text
+others(c: int) -> Vector[int] =
+  for d in 0 ..< 3 if d != c
+    yield d
+```
 
 ```text
 val pairs = for x in xs, y in ys if x < y yield (x, y)
@@ -1505,5 +1536,5 @@ that every element matches; a pattern some elements would not match is an error,
 bindings are visible to the generator's guards and to everything after it, and each element is a
 new binding. A guard is a `bool`. The guards, the value definitions and the yielded value are
 functions passed to the sources' methods, so `return`, `break`, `continue` and `?` cannot leave
-them, though a loop inside the yielded block may be left as usual. A `for` without `yield` has one
-generator, no guards and no value definitions.
+them, though a loop inside the yielded block may be left as usual. A `for` without `yield` is not
+built of these calls but of nested loops, which `break`, `continue` and `return` leave as usual.

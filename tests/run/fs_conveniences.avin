@@ -1,0 +1,220 @@
+// `avin.fs` conveniences: lines read eagerly and lazily, lines written, atomic writes, writes that
+// make the directories above, and removal of a whole path.
+import avin.fs
+import avin.io.{IoError, NotFound, PermissionDenied, AlreadyExists}
+import avin.process
+import avin.process.Command
+
+// The temporary directory the test works in, written as `DIR` in what it prints.
+var root = ""
+
+say(line: Any)
+  println(s"$line".replace(root, "DIR"))
+
+kindOf[T](r: Result[T, IoError]) -> string = r match
+  Ok(_) -> "ok"
+  Err(e) -> e.kind match
+    NotFound -> "NotFound"
+    PermissionDenied -> "PermissionDenied"
+    AlreadyExists -> "AlreadyExists"
+    _ -> s"other ${e.kind}"
+
+lines(file: string) -> Vector[string] = fs.readLines(file) match
+  Ok(v) -> v
+  Err(e) -> ["ERR " + e.message]
+
+// Every item `fs.lines` gives, errors shown as `!`.
+streamed(file: string) -> Vector[string]
+  val reader = fs.lines(file) match
+    Ok(r) -> r
+    Err(e) -> return ["ERR " + e.message]
+  val out = Buffer[string]()
+  while reader.hasNext()
+    reader.next() match
+      Ok(l) -> out.addOne(l)
+      Err(e) -> out.addOne("!" + e.message)
+  out.toVector
+
+main()
+  val dir = fs.createTempDir("avin-fs-conv") match
+    Ok(d) -> d
+    Err(e) ->
+      println(s"no directory: $e")
+      return
+  root = dir
+  val f = dir + "/f"
+
+  // readLines and lines over the shapes of a file.
+  _ = fs.writeText(f, "")
+  say(s"empty: ${lines(f)} ${streamed(f)}")
+  _ = fs.writeText(f, "\n")
+  say(s"one empty line: ${lines(f)} ${streamed(f)}")
+  _ = fs.writeText(f, "a")
+  say(s"no newline: ${lines(f)} ${streamed(f)}")
+  _ = fs.writeText(f, "a\nb\n")
+  say(s"final newline: ${lines(f)} ${streamed(f)}")
+  _ = fs.writeText(f, "a\nb")
+  say(s"final line kept: ${lines(f)} ${streamed(f)}")
+  _ = fs.writeText(f, "a\r\nb\r\n\r\nc")
+  say(s"crlf: ${lines(f)} ${streamed(f)}")
+  _ = fs.writeText(f, "a\n\n\nb\n")
+  say(s"blank lines: ${lines(f)} ${streamed(f)}")
+  _ = fs.writeText(f, "héllo\n日本語\r\n😀 x\n")
+  say(s"unicode: ${lines(f)} ${streamed(f)}")
+  _ = fs.writeBytes(f, [byte(104), byte(255), byte(10), byte(105)])
+  say(s"invalid utf-8: ${lines(f).map(l -> l.byteLength)}")
+  say(s"missing: ${kindOf(fs.readLines(dir + "/nope"))} ${kindOf(fs.lines(dir + "/nope"))}")
+  say(s"directory: ${kindOf(fs.readLines(dir))} ${kindOf(fs.lines(dir))}")
+
+  // Early stop: close() ends the iteration, closing twice is fine.
+  _ = fs.writeText(f, "1\n2\n3\n")
+  val r = fs.lines(f).get()
+  say(s"first: ${r.next()}")
+  say(s"close: ${kindOf(r.close())} ${r.hasNext()} ${kindOf(r.close())}")
+  // Exhausted: the file is closed at once, so it can be removed and a second hasNext is false.
+  val r2 = fs.lines(f).get()
+  say(s"count: ${r2.size} ${r2.hasNext()}")
+  say(s"lazy map: ${fs.lines(f).get().take(2).map(x -> x.get()).toVector}")
+
+  // A huge file streams in bounded memory: 96 MiB, 98304 lines of 1023 bytes.
+  val big = dir + "/big"
+  val w = fs.create(big).get()
+  val row = "x".repeat(1023) + "\n"
+  for k in 0 ..< 98304
+    _ = w.writeText(row)
+  _ = w.close()
+  say(s"big size: ${fs.size(big).get()}")
+  val me = process.pid()
+  val before = process.residentBytes(me).get()
+  var count = 0
+  var most = before
+  val bigLines = fs.lines(big).get()
+  while bigLines.hasNext()
+    bigLines.next().get()
+    count += 1
+    if count % 8192 == 0
+      val now = process.residentBytes(me).get()
+      if now > most then most = now
+  say(s"big lines: $count")
+  say(s"bounded: ${most - before < long(32 * 1024 * 1024)}")
+  _ = fs.remove(big)
+
+  // writeLines writes `\n`, whatever the lines hold.
+  say(fs.writeLines(f, ["a", "b", ""]))
+  say(s"bytes: ${fs.readBytes(f).get().mkString(" ")}")
+  say(fs.writeLines(f, Vector.empty[string]()))
+  say(s"empty list: ${fs.size(f).get()}")
+  _ = fs.writeLines(f, ["héllo", "日本語"])
+  say(s"round trip: ${lines(f)}")
+  _ = fs.writeLines(f, ["x\ty"])
+  say(s"tab: ${lines(f)}")
+  say(s"into missing dir: ${kindOf(fs.writeLines(dir + "/no/dir/f", ["a"]))}")
+  say(
+    s"createParents: ${kindOf(fs.writeLines(dir + "/p/q/f", ["a", "b"], createParents = true))} ${lines(dir + "/p/q/f")}"
+  )
+
+  // writeText and writeBytes with createParents.
+  say(kindOf(fs.writeText(dir + "/t/u/f", "x")))
+  say(kindOf(fs.writeText(dir + "/t/u/f", "x", createParents = true)))
+  say(fs.readText(dir + "/t/u/f"))
+  say(kindOf(fs.writeBytes(dir + "/t/v/f", [byte(1)], createParents = true)))
+  say(kindOf(fs.writeText(dir + "/t/u/f", "again", createParents = true)))
+  say(fs.readText(dir + "/t/u/f"))
+  say(kindOf(fs.writeText(dir + "/f/under-a-file", "x", createParents = true)))
+
+  // Atomic writes: made, replaced, no debris, empty and large contents.
+  val a = dir + "/atomic"
+  say(kindOf(fs.writeTextAtomic(a, "one")))
+  say(fs.readText(a))
+  say(kindOf(fs.writeTextAtomic(a, "two, longer")))
+  say(fs.readText(a))
+  say(kindOf(fs.writeTextAtomic(a, "")))
+  say(fs.readText(a))
+  say(kindOf(fs.writeBytesAtomic(a, [byte(0), byte(255)])))
+  say(fs.readBytes(a))
+  say(kindOf(fs.writeBytesAtomic(a, Array.fill(1000000, byte(7)))))
+  say(fs.size(a))
+  say(kindOf(fs.writeTextAtomic(dir + "/ap/aq/f", "x")))
+  say(kindOf(fs.writeTextAtomic(dir + "/ap/aq/f", "x", createParents = true)))
+  say(fs.readText(dir + "/ap/aq/f"))
+  say(fs.listDir(dir + "/ap/aq"))
+  say(kindOf(fs.writeTextAtomic(dir, "x")))
+  say(s"dir untouched: ${fs.isDir(dir)}")
+  // Many writes leave no pending files behind.
+  val many = dir + "/many"
+  _ = fs.createDir(many)
+  for i in 0 ..< 20
+    _ = fs.writeTextAtomic(many + "/f", s"v$i")
+  say(s"${fs.listDir(many)} ${fs.readText(many + "/f")}")
+
+  // A forced failure: the directory is not writable, so the rename cannot happen. The original
+  // stays, and no pending file is left.
+  val locked = dir + "/locked"
+  _ = fs.createDir(locked)
+  _ = fs.writeText(locked + "/f", "original")
+  _ = Command("chmod", "555", locked).run()
+  if fs.writeText(locked + "/probe", "x").isOk
+    say("mode does not bind")
+    _ = fs.remove(locked + "/probe")
+  else
+    say(kindOf(fs.writeTextAtomic(locked + "/f", "replacement")))
+    say(kindOf(fs.writeBytesAtomic(locked + "/f", [byte(1)])))
+    say(kindOf(fs.writeTextAtomic(locked + "/g", "new")))
+    say(s"${fs.readText(locked + "/f")} ${fs.listDir(locked)}")
+  _ = Command("chmod", "755", locked).run()
+
+  // removeAll: a file, an empty directory, a nested tree, links, and what is not there.
+  val file1 = dir + "/r1"
+  _ = fs.writeText(file1, "x")
+  say(s"file: ${kindOf(fs.removeAll(file1))} ${fs.exists(file1)}")
+  val empty = dir + "/r2"
+  _ = fs.createDir(empty)
+  say(s"empty dir: ${kindOf(fs.removeAll(empty))} ${fs.exists(empty)}")
+  val tree = dir + "/tree"
+  _ = fs.writeText(tree + "/a/b/c/deep", "x", createParents = true)
+  _ = fs.writeText(tree + "/a/top", "x")
+  _ = fs.writeText(tree + "/.hidden", "x")
+  _ = fs.createDirAll(tree + "/a/emptydir")
+  say(s"tree: ${kindOf(fs.removeAll(tree))} ${fs.exists(tree)}")
+  val target = dir + "/target"
+  _ = fs.writeText(target + "/keep", "kept", createParents = true)
+  _ = fs.createDirAll(dir + "/holder")
+  _ = fs.symlink(target, dir + "/holder/link")
+  _ = fs.symlink(target, dir + "/dirlink")
+  say(
+    s"link to dir: ${kindOf(fs.removeAll(dir + "/dirlink"))} ${fs.exists(dir + "/dirlink")} ${fs.readText(target + "/keep")}"
+  )
+  say(
+    s"link inside tree: ${kindOf(fs.removeAll(dir + "/holder"))} ${fs.exists(dir + "/holder")} ${fs.readText(target + "/keep")}"
+  )
+  _ = fs.symlink(target + "/keep", dir + "/filelink")
+  say(
+    s"link to file: ${kindOf(fs.removeAll(dir + "/filelink"))} ${fs.exists(dir + "/filelink")} ${fs.readText(target + "/keep")}"
+  )
+  _ = fs.symlink(dir + "/nowhere", dir + "/dangling")
+  say(s"dangling: ${kindOf(fs.removeAll(dir + "/dangling"))} ${fs.isLink(dir + "/dangling")}")
+  say(s"missing: ${kindOf(fs.removeAll(dir + "/never"))}")
+  say(fs.removeAll(dir + "/never"))
+  say(s"under a file: ${kindOf(fs.removeAll(target + "/keep/x"))}")
+
+  // removeIfExists: both ways, for a file and for a tree, and a second call.
+  _ = fs.writeText(dir + "/i1", "x")
+  say(fs.removeIfExists(dir + "/i1"))
+  say(fs.removeIfExists(dir + "/i1"))
+  say(fs.removeIfExists(dir + "/never"))
+  _ = fs.writeText(dir + "/itree/x/y", "x", createParents = true)
+  say(fs.removeIfExists(dir + "/itree"))
+  say(fs.exists(dir + "/itree"))
+  _ = fs.symlink(dir + "/nowhere", dir + "/dangling2")
+  say(fs.removeIfExists(dir + "/dangling2"))
+  _ = fs.symlink(target, dir + "/dirlink2")
+  say(s"${fs.removeIfExists(dir + "/dirlink2")} ${fs.readText(target + "/keep")}")
+  say(fs.removeIfExists(dir + "/target"))
+  say(fs.exists(target))
+
+  _ = fs.removeDirAll(dir)
+
+impl[T] Result[T, IoError]
+  get() -> T = self match
+    Ok(v) -> v
+    Err(e) -> fail(s"unexpected $e")

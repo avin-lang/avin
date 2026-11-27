@@ -131,13 +131,19 @@ parse_line_body(p: *Parser, discard: bool) -> &Expr
 
 // `else`, `elif` and `end` may continue a form on the line after its indented body.
 private following(p: *Parser, word: string) -> bool
-    if p.at(word) then return true
-    if !p.at_kind(Newline) || p.ahead(1) != word then return false
+    // `end` closes a form only when a name follows it: `end = at` is the word `end` used as a name,
+    // and is left for the statement parser to report as one error.
     if word == "end"
-        val label = p.toks.peek_at(2) match
+        val skip = if p.at_kind(Newline) then 1usize else 0usize
+        if p.ahead(skip) != word then return false
+        val label = p.toks.peek_at(skip + 1) match
             Some(value) -> value
             None -> return false
         if label.value != Word then return false
+        if skip == 1 then p.toks.advance()
+        return true
+    if p.at(word) then return true
+    if !p.at_kind(Newline) || p.ahead(1) != word then return false
     p.toks.advance()
     true
 
@@ -152,11 +158,13 @@ optional_end(p: *Parser, name: string, indented: bool)
     if !indented then p.report.add(error(at, s"`end $actual` cannot close a one-line form"))
     if actual != name then p.report.add(error(at, s"`end $actual` cannot close `$name`; expected `end $name`"))
 
-// `val x = value`, or a binding that takes a value apart: `val q, r = value`, `val (a, b) = value`.
+// `val x = value`, or a binding that takes a value apart: `val q, r = value`, `val (a, b) = value`,
+// `val Point(x, y) = value`, `val Shape.Point(x, y) = value`, `val whole @ Point(x, y) = value`.
 parse_binding(p: *Parser, at: Span, mutable: bool) -> &Expr
     var pattern: Option[&Pattern] = None
     var name = ""
-    if p.at("(") || p.ahead(1) == ","
+    val next = p.ahead(1)
+    if p.at("(") || next == "," || p.at_kind(Word) && (next == "(" || next == "." || next == "@")
         val first = parse_untyped_pattern(p)
         if p.at(",")
             var items: Buf[&Pattern] = buf()
@@ -256,28 +264,71 @@ parse_for(p: *Parser, at: Span) -> &Expr
         clause(p, &clauses)
         while p.accept(",") do clause(p, &clauses)
     val generators = grouped(p, clauses)
+    // `yield` may start a line indented under the clauses, which continues the `for`.
+    val continued = p.at_kind(Indent) && p.ahead(1) == "yield"
+    if continued then p.toks.advance()
     if p.accept("yield")
         val indented = p.at_kind(Indent)
         // Inside brackets whose commas separate items a comma ends a one-line `yield` value.
         val body = if p.in_list && !indented then expression(p, 0) else parse_line_body(p, false)
-        optional_end(p, "for", indented)
+        if continued && !p.toks.at_end() && !p.accept_kind(Dedent)
+            p.report.add(error(p.toks.here(), "a `for` whose `yield` starts a line under its clauses ends with that `yield`'s value"))
+            // The lines after it, to the end of the indented `yield` line's block, are skipped.
+            var depth = 1
+            while depth > 0
+                val t = p.toks.advance() match
+                    Some(t) -> t
+                    None -> break
+                if t.value == Indent then depth += 1
+                elif t.value == Dedent then depth -= 1
+        optional_end(p, "for", indented || continued)
         if generators.len() == 0 then return Expr(at.to(p.ended()), Invalid)
         return Expr(at.to(p.ended()), ForYield(generators, body))
     if generators.len() == 0
         p.accept("do")
         parse_body(p, true)
         return Expr(at.to(p.ended()), Invalid)
-    val first = generators[0]
-    if generators.len() > 1 || first.guards.len() > 0
-        p.report.add(error(first.span.to(generators[generators.len() - 1].span), "a `for` without `yield` has one generator and no guards; nest the loops, or test in the body"))
-    else if first.definitions.len() > 0
-        p.report.add(error(first.definitions[0].span, "a value definition between generators needs `yield`; a `for` without it binds the value in its body"))
     val do_word = p.accept("do")
     val indented = p.at_kind(Indent)
     if !do_word && !indented then p.report.add(error(p.toks.here(), "a one-line `for` needs `do`"))
     val body = parse_body(p, true)
     optional_end(p, "for", indented)
-    Expr(at.to(p.ended()), For(first.pattern, first.source, body))
+    Expr(at.to(p.ended()), nested_loops(generators, body).kind)
+
+// A `for` without `yield` is the loops its generators would be written as one inside another: each
+// generator's guards test in the loop it starts, each value definition binds a `val` there, and the
+// body runs in the innermost loop, so `break` and `continue` act on the innermost generator's loop and
+// `return` leaves the function, exactly as in the nested form.
+private nested_loops(generators: Buf[Generator], body: &Expr) -> &Expr
+    var inner = body
+    var i = generators.len()
+    while i > 0
+        i -= 1
+        val g = generators[i]
+        var d = g.definitions.len()
+        while d > 0
+            d -= 1
+            val definition = g.definitions[d]
+            inner = guarded(definition.guards, inner)
+            var items: Buf[&Expr] = buf()
+            definition.pattern.kind match
+                Name(n) -> items.push(Expr(definition.span, Binding(n, None, definition.value, false)))
+                Wildcard -> items.push(definition.value)
+                _ -> items.push(Expr(definition.span, Destructure(definition.pattern, None, definition.value, false)))
+            items.push(inner)
+            inner = Expr(definition.span.to(inner.span), Block(items, true))
+        inner = guarded(g.guards, inner)
+        inner = Expr(g.span.to(inner.span), For(g.pattern, g.source, inner))
+    inner
+
+// `body` run only where every guard holds, the first tested first.
+private guarded(guards: Buf[&Expr], body: &Expr) -> &Expr
+    var inner = body
+    var i = guards.len()
+    while i > 0
+        i -= 1
+        inner = Expr(guards[i].span.to(inner.span), If(guards[i], inner, None))
+    inner
 
 /** A comprehension's clauses as they are written, before they are grouped into generators. */
 private enum Clause

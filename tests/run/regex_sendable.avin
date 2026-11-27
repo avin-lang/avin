@@ -1,0 +1,128 @@
+// expect: exit 0
+// A compiled `Regex` is sendable: a module's `val` and a local one are captured by `spawn` bodies,
+// sent on channels and held in sendable data, and many threads match with one regex at once, each
+// search keeping its own state. Every kind of operation a program holds is matched from every
+// thread: literals, classes below and above 128, alternation, repetitions of each kind, groups,
+// lookaround, back references and the Unicode tables, which the first thread to need one decodes.
+// A `Match` and a `Pattern` are sendable too.
+import avin.regex.{Match, Pattern, Regex}
+import avin.threads.{Atomic, Channel, scope, spawn}
+
+val word = Regex("[a-z]+")
+val date = Regex("(\\d{4})-(\\d{2})-(\\d{2})")
+val choice = Regex("cat|dog|bird")
+val nested = Regex("(?:ab|cd)+(x)?")
+val varying = Regex("(a+b?)+c")
+val look = Regex("(?<=\\$)\\d+(?!%)")
+val doubled = Regex("(\\w)\\1")
+val greek = Regex("\\p{IsGreek}+")
+val letters = Regex("\\p{L}+")
+val caseless = Regex("(?i)straße")
+val latin = Regex("[éàü]+")
+val lazy = Regex("<.+?>")
+val possessive = Regex("a*+b")
+val atomic = Regex("(?>ab|a)c")
+val blocks = Regex("\\p{InCyrillic}+")
+
+val texts: Vector[string] = [
+  "the cat sat on 2024-01-31 with a dog",
+  "abcdabx cd aab aabac aaabc $42 $7% ok",
+  "book see all llama Ωμέγα λόγος",
+  "STRASSE Straße straße café à über",
+  "<a><bb> aaab ab abc ac Привет мир"
+]
+
+// What every regex finds in `t`, as one line.
+survey(t: string) -> string
+  val parts = Vector(
+    word.findAllIn(t).toVector.mkString(","),
+    date.findFirstMatchIn(t).map(m -> m.subgroups.map(g -> g.getOrElse("-")).mkString("/")).getOrElse("none"),
+    choice.findAllIn(t).toVector.mkString(","),
+    nested.findAllIn(t).toVector.mkString(","),
+    varying.findAllIn(t).toVector.mkString(","),
+    look.findAllIn(t).toVector.mkString(","),
+    doubled.findAllIn(t).toVector.mkString(","),
+    greek.findAllIn(t).toVector.mkString(","),
+    letters.findAllIn(t).toVector.length.toString(),
+    caseless.findAllIn(t).toVector.mkString(","),
+    latin.findAllIn(t).toVector.mkString(","),
+    lazy.findAllIn(t).toVector.mkString(","),
+    possessive.findAllIn(t).toVector.mkString(","),
+    atomic.findAllIn(t).toVector.mkString(","),
+    blocks.findAllIn(t).toVector.mkString(","),
+    word.replaceAllIn(t, m -> m.matched.toUpper).byteLength.toString(),
+    word.split(t).length.toString()
+  )
+  parts.mkString(" | ")
+
+// Runs `survey` over every text on `threads` threads at once, `rounds` times each, and counts the
+// answers that differ from `expected`.
+mismatches(threads: int, rounds: int, expected: Vector[string]) -> int
+  val wrong = Atomic(0)
+  scope(s ->
+    for k in 0 ..< threads
+      s.spawn(() ->
+        for r in 0 ..< rounds
+          for i in 0 ..< texts.length
+            val at = (i + k + r) % texts.length
+            if survey(texts(at)) != expected(at) then wrong.add(1)
+        0))
+  wrong.load()
+
+// A regex handed over as a value: a sendable parameter of a generic function.
+countOn[T: Sendable](value: T, @sendable f: (T) -> int) -> int = spawn(() -> f(value)).join()
+
+data Rule(name: string, re: Regex)
+
+main() -> int
+  // The answers on one thread, before any other thread has touched a regex.
+  val expected = texts.map(survey)
+  for line in expected do println(line)
+
+  // Many threads at once over the module's regexes.
+  println(s"mismatches: ${mismatches(8, 3, expected)}")
+
+  // A local regex captured by a spawned body.
+  val digits = Regex("\\d+")
+  val t = spawn(() -> digits.findAllIn("a1b22c333").toVector.mkString(","))
+  println(t.join())
+
+  // A regex sent on a channel, used by the receiving threads.
+  val ch = Channel[Regex](4)
+  val total = Atomic(0)
+  scope(s ->
+    for _ in 0 ..< 4
+      s.spawn(() ->
+        ch.receive() match
+          Some(re) -> total.add(re.findAllIn("x1 y22 z333").toVector.length)
+          None -> 0)
+    for _ in 0 ..< 4
+      ch.send(digits))
+  println(s"channel total ${total.load()}")
+
+  // A regex inside sendable data, and handed to a generic function bounded by `Sendable`.
+  val rule = Rule("word", word)
+  println(countOn(rule, r -> r.re.findAllIn("one two three").toVector.length))
+  println(countOn(word, re -> if re.matches("abc") then 1 else 0))
+
+  // A match a thread answers, and one sent on a channel.
+  val found: Option[Match] = spawn(() -> date.findFirstMatchIn("due 1999-12-31.")).join()
+  found match
+    Some(m) -> println(s"${m.matched} ${m.start()} ${m.end()} ${m.group(1)} ${m.start(3)}")
+    None -> println("no match")
+  val matches = Channel[Match](1)
+  val got = spawn(() -> matches.receive().map(m -> m.group(2).getOrElse("-")).getOrElse("closed"))
+  date.findFirstMatchIn("on 2001-02-03") match
+    Some(m) -> matches.send(m)
+    None -> ()
+  println(got.join())
+
+  // A pattern, which a regex hands out, is sendable as well.
+  val p: Pattern = word.pattern
+  println(spawn(() -> p.split("a1b2c").mkString(",") + " " + p.groupCount.toString()).join())
+
+  // Unanchored and step-limited copies are regexes like any other.
+  val loose = word.unanchored
+  val limited = word.withStepLimit(1000)
+  println(spawn(() -> s"${loose.matches("12ab34")} ${limited.matches("abc")} ${word.matches("12ab34")}").join())
+  0

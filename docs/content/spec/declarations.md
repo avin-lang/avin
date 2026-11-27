@@ -522,7 +522,13 @@ data Option[+T]
 ```
 
 The single-line form declares a one-variant type whose variant has the type's name. Variants are
-constructors, not types: `Some(1)` has type `Option[int]`. A variant is a name of its module, and
+constructors, not types: `Some(1)` has type `Option[int]`. A variant without fields is a value
+(`None`); one with fields, named and not called, is its constructor as a function value, as a
+class's name is: a function of all its fields, in order, to its data type or a refined variant's
+declared instance, so `[1, 2].map(Some)` is `[Some(1), Some(2)]` and `val f = Circle` is a
+`(real) -> Shape`. A generic variant takes its instance from the function type expected there, whose
+result also decides between variants sharing a name, or from written type arguments, `Some[int]`;
+where a value of the variant's own type is expected, the variant is to be called. A variant is a name of its module, and
 several data types of one module, in one file or in several, may each have a variant of one name:
 
 ```text
@@ -1182,16 +1188,22 @@ value: `Add`'s `zero` and `Mul`'s `one` are the identities of their operators.
   and `Lone.hi` without a call is a function value bound to it. Where the type has a static member
   of the name, `Lone.unit()`, the name is the type's and calls the static member; a value's method
   of that name is then called on a value.
-- **In a trait a static member has no body**: a trait's default bodies are shared by every
-  conforming type, and a static member is each type's own. `Self` in its signature is the
-  implementing type, as in a method's. A trait never overrides a static member, and its default
-  bodies cannot call one on `Self`, which there is no one type; a
+- **In a trait a static member may have a default body**, which is compiled separately for each
+  conforming type that gives none of its own, with `Self` that type: `static whenMissing() ->
+  Option[Self] = None`. A static member is each type's own, so its default is no shared code, as a
+  method's default is, but one copy per type, as a [derive template](/spec/derivation/)'s body is.
+  `Self` in its signature is the implementing type, as in a method's. A static default body may call
+  the trait's other static members on `Self` (`Self.label()`), each the type's own. A method's default
+  body cannot call one on `Self`, which there is no one type; a
   [constructor trait](/spec/generics/#constructor-traits)'s defaults, compiled for each implementing
-  constructor, can.
-- **Every implementation gives it, with a body**, marked `static` as the trait's member is: an impl,
-  and a class's body with `override static`. An abstract class gives it too, since it belongs to the
-  type and not to a subclass's objects. A static member is static exactly where the trait's member
-  is, and is a trait's member, an implementation of one, or a
+  constructor, can. A trait never overrides a static member.
+- **Every implementation gives it, with a body, unless the trait's member has a default**, marked
+  `static` as the trait's member is: an impl, and a class's body with `override static`. An abstract
+  class gives it too, since it belongs to the type and not to a subclass's objects. A built-in type
+  takes a static default, as any type does, since no value is involved. The default is reached on the
+  type's name, through a bound by the trait, and through a bound by a trait requiring it. A static
+  member is static exactly where the trait's member is, and is a trait's member, an implementation of
+  one, or a
   [built-in type's own](#static-members-of-built-in-types). A class or `data` type keeps what belongs
   to the type in its companion object.
 - **A static member's body has no `self`**: neither `self` nor the members of a value by bare name.
@@ -1288,7 +1300,8 @@ implementing type, whose methods the trait's are. A conformance to such a trait 
 A built-in type conforms to a trait only through an impl, and meets the trait as a bound: each
 instance of generic code calls the impl's method directly. A built-in value is not an object, so a
 trait's default bodies, which every conforming object shares, do not reach it: an impl for a
-built-in type implements every method of the trait, defaults included.
+built-in type implements every method of the trait, defaults included. A static member's default,
+which belongs to no value, reaches it as it reaches any type.
 
 - **An impl adds methods, never state.** Its body declares methods only: no fields and no
   statements. A method an impl in a class's or an object's module adds to it is one of its methods,
@@ -1357,7 +1370,10 @@ built-in type implements every method of the trait, defaults included.
   out, as `impl[A] (A, int)` adds to the pairs whose second part is an `int`.
 - **An impl without `for` whose type is a trait adds methods to the trait** (`impl[T] Seq[T]`,
   `impl[T: Display] Seq[T]`). Every value whose type conforms to the trait has
-  them: a class or `data` type implementing it, the trait's own type, a type parameter it bounds.
+  them: a class or `data` type implementing it, a built-in, opaque or tuple type implementing it
+  (`impl Plain for int` gives `5.loud(1)` the `loud` an `impl Plain` adds), the trait's own type, a
+  type parameter it bounds. They are called and taken as function values as the type's own methods
+  are: `val f = 5.loud` is an `(int) -> string`.
   Inside them `self` is the value and `Self` its type; the trait's methods, and those other impls add
   to it, are in scope by bare name. They reach the value only through the trait's methods, so they
   are not variance positions: `contains(element: T)` is written on `Seq[+T]`. The methods an impl
@@ -1546,9 +1562,9 @@ the constructor's parameter type is the more specific.
   called by the object's name the same way.
 - **As a function value.** Where a function type is expected, the name of an object that declares
   `apply` is its companion class's constructor or the `apply` whose parameters accept that type's,
-  chosen as for any overloaded function used as a value: `[1, 2].map(Pair)`. A variant with fields
-  is not a value, so a data type's companion offers its `apply` methods alone. Elsewhere the bare
-  name is the object.
+  chosen as for any overloaded function used as a value: `[1, 2].map(Pair)`. For a data type's
+  companion, a variant of the object's name is one of those choices, as it is at a call. Elsewhere
+  the bare name is the object.
   An object that is itself of a function type stays that value.
 - `Name.apply(…)` is an ordinary member call, and chooses among the `apply` methods alone.
 
@@ -1824,6 +1840,40 @@ main() = println(s"${circleArea(Circle(2))}")
 - **Modules may import one another**, in a cycle if need be: the program is compiled whole. Its
   module-level values initialize before `main`, each after the values its initializer needs, across
   modules as within one.
+
+## Doc comments
+
+**The comment directly above a declaration documents it**: the run of `//` lines with no blank line
+between them and the declaration, any annotations between skipped. The comment above a file's
+`module` line documents the module. Nothing else marks a doc comment: the language server's hover
+shows it under the declaration's header, and [`avin doc`](/getting-started/#api-documentation)
+writes it into the program's pages.
+
+````avin
+// A shape in the plane; [area] measures one.
+//
+// ```
+// val s = Circle(1.0)
+// println(area(s))
+// ```
+data Shape
+  // A circle of the given radius.
+  Circle(radius: real)
+  Rect(width: real, height: real)
+````
+
+- **It is Markdown**, with GitHub's extensions. Each line loses its `//` and one space after it;
+  what is left keeps its indentation, so a code block indented in the comment stays one.
+- **A block with no language, or marked `avin`, is Avin code**, coloured as Avin; `avin doc --check`
+  fails on one that parses neither as declarations nor as the statements of a function's body. A
+  block of anything else names its language (`text`, `sh`).
+- **A link to a declaration** is written with its path as the destination, `[the map](Vector.map)`,
+  or as `[Name]` or `` [`Name`] `` alone. The path is found from the declaration the comment
+  documents: a member of its type, then a declaration of its module, then a full path such as
+  `avin.fs.File` or a module's name, then the prelude, then the one declaration of the program with
+  that name. `[Name]` that names nothing is left as the text it is; `` [`Name`] `` that names nothing,
+  and a destination that names neither a declaration nor a page of the documentation, are what
+  `avin doc --check` fails on.
 
 ## Literate source
 

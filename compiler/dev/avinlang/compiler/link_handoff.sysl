@@ -1,0 +1,154 @@
+module dev.avinlang.compiler
+
+import sysl.buf.{Buf, buf}
+import sysl.env.current_exe
+import sysl.fs.{make_temp_dir, read_text, remove_dir_all, write_text}
+import sysl.process.exec
+
+// A build's link runs in a compiler that never compiled anything. The compiler that compiled the
+// program writes what the link needs to a directory of its own (the module's text, the archive and
+// the C flags it links, the program's tests) and becomes a new compiler with `exec`, run with the
+// command it was given and the directory: that one does what the command does up to its compilation,
+// takes the compilation from the directory in its place, and links. Compiling leaves gigabytes of
+// small allocations that the allocator keeps for the life of the process once they are freed, and
+// with the process image gone they are no longer resident beside the clangs of the link.
+//
+// Only the compiler's own `main` allows the hand-off, so a compiler run in memory, as its tests run
+// it, compiles and links in one process as before.
+
+/** The first argument of a compiler that is handed a compilation, followed by the directory that
+ * holds it and then the command the compiler that compiled it was run with. */
+const LinkHandoffFlag: string = "--linking-handed"
+
+/** The first line of the file of a handed compilation that names what the link reads. */
+private const HandoffFormat: string = "avin link 1"
+
+// The command this process was run with, without the hand-off's arguments, for the compiler it is
+// handed to; whether this process may hand a link off; and the directory of a compilation handed to
+// it, until it is taken.
+private var handoff_args: Buf[string] = buf()
+private var handoff_allowed: bool = false
+private var handed_dir: string = ""
+
+/** The command a compiler run with `args` is to carry out, and the directory of a compilation handed
+ * to it: `args` itself and none, or for `<exe> --linking-handed <dir> <command>...`, `<exe>
+ * <command>...` and `<dir>`. */
+handoff_split(args: []const string) -> (Buf[string], Option[string])
+    var command: Buf[string] = buf()
+    if args.len >= 3 && args[1] == LinkHandoffFlag
+        command.push(args[0])
+        for i in 3..<args.len
+            command.push(args[i])
+        return (command, Some(args[2]))
+    for a in args
+        command.push(a)
+    (command, None)
+
+/** Called by the compiler's `main` with the command it carries out and the directory of a compilation
+ * handed to it, if one was: a compiler that was handed one takes it in place of compiling and hands
+ * nothing on; any other may hand its link off. */
+start_link_handoff(command: []const string, handed: Option[string])
+    var kept: Buf[string] = buf()
+    for a in command
+        kept.push(a)
+    handoff_args = kept
+    handed match
+        Some(dir) ->
+            handed_dir = dir
+            handoff_allowed = false
+        None ->
+            handed_dir = ""
+            handoff_allowed = true
+
+/** Turns the hand-off off and forgets any handed compilation, as a compiler run in memory has it. */
+stop_link_handoff()
+    handoff_args = buf()
+    handoff_allowed = false
+    handed_dir = ""
+
+/** Removes a handed compilation the command never took, as one that stopped before its build does. */
+forget_handed()
+    if handed_dir == "" then return
+    _ = remove_dir_all(handed_dir)
+    handed_dir = ""
+
+/** Whether a compilation was handed to this compiler and not yet taken: its build log goes on from
+ * the compiler that compiled it rather than starting again. */
+link_handed() -> bool = handed_dir != ""
+
+/** The compilation handed to this compiler, once: the directory is read and removed. `None` when none
+ * was handed, or when it cannot be read, in which case the caller compiles the program itself. */
+handed_compilation() -> Option[Compilation]
+    if handed_dir == "" then return None
+    val dir = handed_dir
+    handed_dir = ""
+    val began = phase_start()
+    val read = read_handoff(dir)
+    _ = remove_dir_all(dir)
+    read match
+        Some(compiled) ->
+            _ = phase_done("restore", began, s"bytes=${compiled.llvm.unwrap_or("").len}")
+            Some(compiled)
+        None -> None
+
+/** Hands the link of `compiled` to a new compiler, and answers only if it could not: when this process
+ * may not hand off, or the compilation cannot be written, or the compiler cannot be started, the
+ * caller links here as it always could. */
+hand_off_link(compiled: Compilation)
+    if !handoff_allowed || handoff_args.len() == 0 then return
+    val exe = current_exe() match
+        Some(e) -> e
+        None -> return
+    val began = phase_start()
+    val dir = make_temp_dir("avin-handoff") match
+        Ok(d) -> d
+        Err(_) -> return
+    if !write_handoff(dir, compiled)
+        _ = remove_dir_all(dir)
+        return
+    var argv: Buf[string] = buf()
+    argv.push(LinkHandoffFlag)
+    argv.push(dir)
+    for i in 1..<handoff_args.len()
+        argv.push(handoff_args[i])
+    _ = phase_done("handoff", began, s"bytes=${compiled.llvm.unwrap_or("").len}")
+    // Answers only on failure.
+    _ = exec(exe, argv.view())
+    _ = remove_dir_all(dir)
+
+/** Writes `compiled` to `dir` for `read_handoff`: `program.ll`, `link` (the format, then `archive
+ * <path>` for a program with Sysl bindings and a `c <flag>` line for each C flag) and `tests`. */
+write_handoff(dir: string, compiled: Compilation) -> bool
+    var link = HandoffFormat + "\n"
+    if compiled.archive is Some(a) then link = link + "archive " + a + "\n"
+    for flag in compiled.c_link
+        link = link + "c " + flag + "\n"
+    write_text(dir + "/program.ll", compiled.llvm.unwrap_or("")).is_ok() &&
+        write_text(dir + "/link", link).is_ok() &&
+        write_text(dir + "/tests", tests_record(HandoffFormat, compiled.tests)).is_ok()
+
+/** The compilation `write_handoff` wrote to `dir`, or `None` when any part of it is missing or not
+ * what it wrote. */
+read_handoff(dir: string) -> Option[Compilation]
+    val llvm = read_text(dir + "/program.ll") match
+        Ok(t) -> t
+        Err(_) -> return None
+    val link = read_text(dir + "/link") match
+        Ok(t) -> t
+        Err(_) -> return None
+    val tests_text = read_text(dir + "/tests") match
+        Ok(t) -> t
+        Err(_) -> return None
+    val tests = tests_of_record(tests_text, HandoffFormat) match
+        Some(t) -> t
+        None -> return None
+    val lines = link.lines()
+    if lines.len == 0 || lines[0] != HandoffFormat then return None
+    var archive: Option[string] = None
+    var c_link: Buf[string] = buf()
+    for i in 1..<lines.len
+        val line = lines[i]
+        if line.starts_with("archive ") && archive is None then archive = Some(line[8..])
+        elif line.starts_with("c ") then c_link.push(line[2..])
+        else return None
+    Some(Compilation("", Some(llvm), archive, tests, c_link))

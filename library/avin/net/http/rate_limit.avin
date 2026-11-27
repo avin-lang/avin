@@ -3,10 +3,10 @@ module avin.net.http
 // Rate limiting: a middleware giving each client a token bucket, a request taking a token and one
 // arriving at an empty bucket answered `429 Too Many Requests` with a `Retry-After` saying when the
 // next token comes. Buckets are kept by a key, the client's address unless the limiter is given
-// another way to tell clients apart, and a bucket full again is forgotten, since a new one would be
-// the same, so the memory held follows the clients sending now and never passes a bound.
+// another way to tell clients apart. The buckets are `avin.resilience`'s `RateLimiter`, which limits
+// work of any kind.
 
-import avin.threads.Mutex
+import avin.resilience
 import avin.time.{Duration, monotonic, seconds}
 
 // The key a limiter keeps a request's bucket by unless given another: the client's address, or `""`
@@ -30,19 +30,7 @@ class RateLimiter(
     private val clock: Clock = monotonic,
     private val errors: ErrorPage = plainError
 ): Sendable
-  if rate < 1 then fail(s"a rate of $rate tokens: it is at least one")
-  if burst < 1 then fail(s"a burst of $burst tokens: it is at least one")
-  if maxKeys < 1 then fail(s"a limit of $maxKeys keys: it is at least one")
-  if per.micros < long(rate) then fail(s"$rate tokens every $per: each token needs at least a microsecond")
-
-  // The time between one token and the next, in microseconds.
-  private val interval: long = per.micros / long(rate)
-
-  // How far ahead of now a bucket's next token may be due and still leave a token to take: a bucket
-  // of `burst` tokens is empty once its last is spent, `burst` intervals' filling away.
-  private val slack: long = interval * long(burst - 1)
-
-  private val buckets = Mutex(Buckets())
+  private val buckets = resilience.RateLimiter(rate, per, burst, maxKeys, clock)
 
   // The middleware that answers a request whose bucket is empty `429`, with `Retry-After` in whole
   // seconds, at least one, and passes every other on.
@@ -52,50 +40,12 @@ class RateLimiter(
 
   // Takes a token from the bucket of `k`: `Ok` where there was one, and `Err` of how long until the
   // next comes where there was none.
-  admit(k: string) -> Result[unit, Duration]
-    val now = clock().micros
-    val i = interval
-    val s = slack
-    val most = maxKeys
-    val waitMicros = buckets.with(b -> b.take(k, now, i, s, most))
-    if waitMicros == 0 then Ok(()) else Err(Duration(waitMicros))
+  admit(k: string) -> Result[unit, Duration] = buckets.admit(k)
 
   // How many buckets are held now.
-  size -> int = buckets.with(b -> b.due.size)
+  size -> int = buckets.size
 
 // `wait` in whole seconds, a part of one counting as one, and at least one.
 private retryAfter(wait: Duration) -> long
   val whole = (wait.micros + 999999) / 1000000
   if whole < 1 then 1 else whole
-
-// Every bucket held, each kept as the time its next token is due, on the clock's microseconds: a
-// bucket whose time has come is full, the burst's worth of tokens being due before it.
-private class Buckets()
-  var due = HashMap.empty[string, long]()
-
-  // Takes a token from `k`'s bucket at `now`, answering zero, or answers how many microseconds until
-  // it has one.
-  take(k: string, now: long, interval: long, slack: long, maxKeys: int) -> long
-    val held = due.get(k)
-    val next = held match
-      Some(t) -> if t > now then t else now
-      None -> now
-    if next - now > slack then return next - now - slack
-    if held.isEmpty && due.size >= maxKeys then makeRoom(now)
-    due = due.updated(k, next + interval)
-    0
-
-  // Forgets every bucket full again by `now`, or, where none is, the one nearest to full.
-  private makeRoom(now: long)
-    val kept = due.filter((_, t) -> t > now)
-    if kept.size < due.size
-      due = kept
-      return
-    var nearest: Option[(string, long)] = None
-    for (k, t) in due
-      nearest match
-        Some((_, n)) -> if t < n then nearest = Some((k, t))
-        None -> nearest = Some((k, t))
-    nearest match
-      Some((k, _)) -> due = due.removed(k)
-      None -> ()

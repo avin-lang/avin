@@ -1,0 +1,102 @@
+// expect: exit 0
+// An open file a mutex keeps is written by whichever thread holds the mutex: eight threads append
+// two hundred lines each, every one whole, and the thread that made the mutex writes after them; the
+// file never has to be reopened. A body that waits on the mutex's condition gives the file up while
+// it sleeps, so the thread that takes the mutex meanwhile writes it, and the waiter writes again once
+// it wakes. A read-write lock's writes and reads hand the file on the same way, one body after
+// another. A mutex whose body never touches the file leaves it for the next.
+import avin.fs
+import avin.io.IoError
+import avin.threads.{Channel, Mutex, RwLock, scope, spawn}
+
+ok[T](r: Result[T, IoError]) -> T = r match
+  Ok(v) -> v
+  Err(e) -> fail(e.message)
+
+class Holder(val files: Buffer[fs.File])
+
+holderIn(dir: string) -> Holder
+  val files = Buffer[fs.File]()
+  files.append(ok(fs.create(dir + "/g0.log")))
+  files.append(ok(fs.create(dir + "/g1.log")))
+  Holder(files)
+
+lines(file: string) -> Vector[string] = ok(fs.readText(file)).split("\n").filter(l -> !l.isEmpty)
+
+main() -> int
+  val dir = ok(fs.createTempDir("file-threads"))
+  val path = dir + "/many.log"
+  val log = Mutex(ok(fs.append(path)))
+  scope(s ->
+    for t in 0 ..< 8
+      s.spawn(() ->
+        for i in 0 ..< 200
+          log.with(f -> ok(f.writeText(s"t$t line $i\n")))
+        ()))
+  log.with(f -> ok(f.writeText("main last\n")))
+  log.with(f -> ok(f.flush()))
+  val got = lines(path)
+  println(got.length)
+  var whole = true
+  for t in 0 ..< 8
+    for i in 0 ..< 200
+      if !got.contains(s"t$t line $i") then whole = false
+  println(whole)
+  println(got.last)
+
+  // A waiter gives the file up while it sleeps.
+  val waited = dir + "/waited.log"
+  val state = Mutex(ok(fs.create(waited)))
+  val ready = state.condition()
+  val turn = Mutex(0)
+  val started = Channel[int]()
+  val waiter = spawn(() ->
+    state.with(f ->
+      ok(f.writeText("before the wait\n"))
+      started.send(1)
+      while turn.get() < 2 do ready.wait()
+      ok(f.writeText("after the wait\n"))))
+  _ = started.receive()
+  state.with(f ->
+    ok(f.writeText("while it waits\n"))
+    turn.set(2)
+    ready.notifyAll())
+  waiter.join()
+  state.with(f -> ok(f.close()))
+  println(lines(waited))
+
+  // A read-write lock's bodies hand the file on.
+  val rw = dir + "/rw.log"
+  val shared = RwLock(ok(fs.createUpdate(rw)))
+  scope(s ->
+    for t in 0 ..< 4
+      s.spawn(() ->
+        for i in 0 ..< 50
+          shared.write(f -> ok(f.writeText(s"w$t.$i\n")))
+        ()))
+  val size = shared.write(f -> ok(f.size()))
+  val readSize = spawn(() -> shared.read(f -> ok(f.size()))).join()
+  println(size)
+  println(readSize == size)
+  println(lines(rw).length)
+
+  // A body that does not touch the file leaves it in transit, and a thread that never used the mutex
+  // before takes it.
+  val idle = Mutex(ok(fs.create(dir + "/idle.log")))
+  println(idle.with(_ -> 7))
+  spawn(() -> idle.with(f -> ok(f.writeText("taken\n")))).join()
+  idle.with(f -> ok(f.close()))
+  println(lines(dir + "/idle.log"))
+  // Files inside a collection and an object the mutex keeps are handed on as well.
+  val group = Mutex(holderIn(dir))
+  scope(s ->
+    for t in 0 ..< 4
+      s.spawn(() ->
+        for i in 0 ..< 25
+          group.with(h -> ok(h.files(i % 2).writeText(s"$t.$i\n")))
+        ()))
+  group.with(h ->
+    for f in h.files do ok(f.close()))
+  println(lines(dir + "/g0.log").length + lines(dir + "/g1.log").length)
+  _ = fs.removeDirAll(dir)
+  if got.length == 1601 && whole then 0 else 1

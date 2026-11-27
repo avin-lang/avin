@@ -1,0 +1,274 @@
+module avin.cbor
+
+// Encoding and decoding a program's own types. `derives CborEncoder` and `derives CborDecoder` give a
+// data type or a class an encoder and a decoder written for its own fields: a value is a map of its
+// fields by name, and a value of a type of several variants also carries its variant's name under a
+// discriminator key written first.
+
+import avin.io.ByteWriter
+import avin.io.IoError
+import avin.io.Reader
+
+// A value that writes itself as CBOR. `isCborNone` is whether the value is an `Option`'s `None`, which a
+// field marked `@CborOmitNone` leaves out.
+trait CborEncoder
+  encode(out: CborWriter)
+  isCborNone() -> bool = false
+
+// A value read from CBOR. The value of a field absent from the input is the core's `Missable` answer
+// for its type, the one every format's decoder shares: `Some(None)` for an `Option`, and otherwise
+// `None`, an absence that is an error.
+trait CborDecoder: Missable
+  static decode(r: CborReader) -> Result[Self, CborError]
+
+// A field's or a variant's name in the map, in place of its name in the program.
+data CborKey(name: string)
+impl Annotation for CborKey
+
+// The discriminator key of a type of several variants, in place of `"type"`.
+data CborTag(key: string)
+impl Annotation for CborTag
+
+// A field never written, and skipped where the input has it: a decoded value takes the field's default.
+object CborOmit: Annotation
+
+// A field left out of the map where its value is `None`, rather than written as `null`.
+object CborOmitNone: Annotation
+
+// `value` as CBOR. With `deterministic`, the bytes are the deterministic encoding of RFC 8949
+// section 4.2: every map's entries sorted by their encoded keys, every float at its shortest width.
+encode[A: CborEncoder](value: A, deterministic: bool = false) -> Array[byte]
+  val out = CborWriter.toBytes(false)
+  value.encode(out)
+  if !deterministic then return out.toArray()
+  parse(out.toArray()) match
+    Ok(tree) -> encodeTree(tree, true)
+    Err(e) -> fail(s"the encoder wrote bytes that are not CBOR: $e")
+
+// `value` written to `sink`, a piece at a time; the first failure to write is the `Err`. The bytes are
+// those `encode(value)` gives, without `deterministic`.
+encodeTo[A: CborEncoder](sink: ByteWriter, value: A) -> Result[unit, IoError]
+  val out = CborWriter.to(sink)
+  value.encode(out)
+  out.finish()
+
+// The value of type `A` that `bytes` hold, with nothing after it, or the first thing wrong with them,
+// its path naming where in the document the value at fault is.
+decode[A: CborDecoder](bytes: Array[byte], options: CborOptions = CborOptions()) -> Result[A, CborError] =
+  decodeAll[A](CborReader.fromBytes(bytes, options))
+
+// The value of type `A` that the document `source` gives, read as it arrives.
+decode[A: CborDecoder](source: Reader, options: CborOptions = CborOptions()) -> Result[A, CborError] =
+  decodeAll[A](CborReader.fromReader(source, options))
+
+// The value of type `A` that the tree `tree` holds, as `decode` reads the bytes it encodes to.
+decode[A: CborDecoder](tree: Cbor, options: CborOptions = CborOptions()) -> Result[A, CborError] =
+  decodeAll[A](CborReader.fromBytes(encodeTree(tree), options))
+
+// The tree that `encode` writes `value` as.
+toTree[A: CborEncoder](value: A) -> Cbor = parse(encode(value)) match
+  Ok(tree) -> tree
+  Err(e) -> fail(s"the encoder wrote bytes that are not CBOR: $e")
+
+private decodeAll[A: CborDecoder](r: CborReader) -> Result[A, CborError]
+  val value = A.decode(r)?
+  r.finish()?
+  Ok(value)
+
+private keyOf(f: FieldShape) -> string = f.annotation[CborKey]().map(k -> k.name).getOrElse(f.name)
+
+private nameOf(v: VariantShape) -> string = v.annotation[CborKey]().map(k -> k.name).getOrElse(v.name)
+
+private tagOf(t: TypeShape) -> string = t.annotation[CborTag]().map(tag -> tag.key).getOrElse("type")
+
+// The built-in types: a `bool`, the integers, a `real` at its shortest width, a string as a text
+// string, a byte array as a byte string, a `Cbor` as itself.
+
+impl CborEncoder for bool
+  encode(out: CborWriter) = out.bool(self)
+  isCborNone() -> bool = false
+
+impl CborDecoder for bool
+  static decode(r: CborReader) -> Result[bool, CborError] = r.readBool()
+
+impl CborEncoder for int
+  encode(out: CborWriter) = out.integer(long(self))
+  isCborNone() -> bool = false
+
+impl CborDecoder for int
+  static decode(r: CborReader) -> Result[int, CborError] = r.readInt()
+
+impl CborEncoder for long
+  encode(out: CborWriter) = out.integer(self)
+  isCborNone() -> bool = false
+
+impl CborDecoder for long
+  static decode(r: CborReader) -> Result[long, CborError] = r.readLong()
+
+impl CborEncoder for real
+  encode(out: CborWriter) = out.float(self)
+  isCborNone() -> bool = false
+
+impl CborDecoder for real
+  static decode(r: CborReader) -> Result[real, CborError] = r.readReal()
+
+impl CborEncoder for string
+  encode(out: CborWriter) = out.textString(self)
+  isCborNone() -> bool = false
+
+impl CborDecoder for string
+  static decode(r: CborReader) -> Result[string, CborError] = r.readText()
+
+impl CborEncoder for Array[byte]
+  encode(out: CborWriter) = out.byteString(self)
+  isCborNone() -> bool = false
+
+impl CborDecoder for Array[byte]
+  static decode(r: CborReader) -> Result[Array[byte], CborError] = r.readBytes()
+
+impl CborEncoder for Cbor
+  encode(out: CborWriter) = out.value(self)
+
+impl CborDecoder for Cbor
+  static decode(r: CborReader) -> Result[Cbor, CborError] = r.readValue()
+
+impl Missable for Cbor
+
+// An `Option` is `null` when it is `None`, and its value otherwise; a field of an `Option` type absent
+// from the input is `None`. A `null` or an `undefined` reads as `None`.
+impl[A: CborEncoder] CborEncoder for Option[A]
+  encode(out: CborWriter) = self match
+    Some(a) -> a.encode(out)
+    None -> out.writeNull()
+  override isCborNone() -> bool = self is None
+
+impl[A: CborDecoder] CborDecoder for Option[A]
+  static decode(r: CborReader) -> Result[Option[A], CborError]
+    if r.takeNull()? then Ok(None) else A.decode(r).map(a -> Some(a))
+
+// A vector and a list are arrays, the path of an error in an element naming its index.
+impl[A: CborEncoder] CborEncoder for Vector[A]
+  encode(out: CborWriter)
+    out.beginArray(self.length)
+    for a in self
+      a.encode(out)
+
+impl[A: CborDecoder] CborDecoder for Vector[A]
+  static decode(r: CborReader) -> Result[Vector[A], CborError] = decodeElements[A](r)
+
+private decodeElements[A: CborDecoder](r: CborReader) -> Result[Vector[A], CborError]
+  r.beginArray()?
+  val items = Buffer[A]()
+  while r.nextElement()?
+    items.addOne(A.decode(r).mapErr(e -> e.atIndex(items.length))?)
+  Ok(items.toVector)
+
+impl[A: CborEncoder] CborEncoder for List[A]
+  encode(out: CborWriter)
+    out.beginArray(self.length)
+    for a in self
+      a.encode(out)
+
+impl[A: CborDecoder] CborDecoder for List[A]
+  static decode(r: CborReader) -> Result[List[A], CborError] = decodeElements[A](r).map(items -> items.toList)
+
+// A map, a `HashMap` or a `TreeMap`, is a CBOR map of its entries in the map's own order, a key of any
+// type the program can encode; a key written twice in the input keeps its last value.
+impl[K: CborEncoder, A: CborEncoder] CborEncoder for HashMap[K, A]
+  encode(out: CborWriter) = encodeEntries(out, self.size, self.iterator())
+
+impl[K: CborDecoder, A: CborDecoder] CborDecoder for HashMap[K, A]
+  static decode(r: CborReader) -> Result[HashMap[K, A], CborError] = decodeEntries(r, HashMap.newBuilder[K, A]())
+
+impl[K: CborEncoder, A: CborEncoder] CborEncoder for TreeMap[K, A]
+  encode(out: CborWriter) = encodeEntries(out, self.size, self.iterator())
+
+impl[K: CborDecoder, A: CborDecoder] CborDecoder for TreeMap[K, A]
+  static decode(r: CborReader) -> Result[TreeMap[K, A], CborError] = decodeEntries(r, TreeMap.newBuilder[K, A]())
+
+private encodeEntries[K: CborEncoder, A: CborEncoder](out: CborWriter, length: int, entries: Iterator[(K, A)])
+  out.beginMap(length)
+  for (k, a) in entries
+    k.encode(out)
+    a.encode(out)
+
+private decodeEntries[K: CborDecoder, A: CborDecoder, M](
+    r: CborReader,
+    entries: Builder[(K, A), M]
+) -> Result[M, CborError]
+  r.beginMap()?
+  var n = 0
+  while r.nextEntry()?
+    val k = K.decode(r).mapErr(e -> e.atIndex(n))?
+    entries.addOne((k, A.decode(r).mapErr(e -> e.atIndex(n))?))
+    n += 1
+  Ok(entries.result())
+
+// The derived encoder: a map of the value's fields, by name, each written by its own type's encoder.
+// A type of several variants writes its variant's name first, under its discriminator key.
+derive CborEncoder for T
+  encode(out: CborWriter)
+    val count = T.walk(self, FieldCounter(T.shape(), 0)).count
+    T.walk(self, FieldWriter(out, T.shape(), count))
+
+private data FieldCounter(shape: TypeShape, count: int)
+
+impl ShapeVisitor for FieldCounter
+  variant(v: VariantShape) -> FieldCounter = FieldCounter(shape, if shape.variantCount > 1 then 1 else 0)
+
+impl FieldCounter
+  field[F: CborEncoder](f: FieldShape, value: F) -> FieldCounter =
+    if f.has(CborOmit) || (value.isCborNone() && f.has(CborOmitNone)) then self else FieldCounter(shape, count + 1)
+
+private data FieldWriter(out: CborWriter, shape: TypeShape, count: int)
+
+impl ShapeVisitor for FieldWriter
+  variant(v: VariantShape) -> FieldWriter
+    out.beginMap(count)
+    if shape.variantCount > 1
+      out.textString(tagOf(shape))
+      out.textString(nameOf(v))
+    self
+
+impl FieldWriter
+  field[F: CborEncoder](f: FieldShape, value: F) -> FieldWriter
+    if !f.has(CborOmit) && !(value.isCborNone() && f.has(CborOmitNone))
+      out.textString(keyOf(f))
+      value.encode(out)
+    self
+
+// The derived decoder reads as the bytes come: the discriminator first, where the type has several
+// variants, then each key, decoding its value at that field's type. A key no field has is skipped, a
+// key written twice is an error, and a field absent from the input takes its default, or its type's
+// `whenMissing`, or is an error naming it. The deriving type keeps `Missable`'s default, `None`, unless
+// it implements `Missable` itself.
+derive CborDecoder for T
+  static decode(r: CborReader) -> Result[T, CborError] = T.build(FieldReader(r))
+
+private data FieldReader(r: CborReader)
+
+impl ShapeBuilder[CborError] for FieldReader
+  variant(t: TypeShape) -> Result[int, CborError]
+    r.beginMap()?
+    if t.variantCount == 1 then return Ok(0)
+    val tag = tagOf(t)
+    if r.nextKey()? != Some(tag) then return Err(r.error(s"expected \"$tag\" first, naming the variant"))
+    val name = r.readText().mapErr(e -> e.inField(tag))?
+    t.variants.find(v -> nameOf(v) == name) match
+      Some(v) -> Ok(v.index)
+      None -> Err(r.error(s"unknown variant \"$name\"").inField(tag))
+
+  next(v: VariantShape) -> Result[Option[int], CborError]
+    while r.nextKey()? is Some(key)
+      if v.fields.find(f -> !f.has(CborOmit) && keyOf(f) == key) is Some(f) then return Ok(Some(f.index))
+      r.skipValue()?
+    Ok(None)
+
+  duplicate(f: FieldShape) -> CborError = r.error(s"duplicate field \"${keyOf(f)}\"")
+
+impl FieldReader
+  field[F: CborDecoder](f: FieldShape) -> Result[F, CborError] = F.decode(r).mapErr(e -> e.inField(keyOf(f)))
+
+  missing[F: CborDecoder](f: FieldShape) -> Result[F, CborError] = F.whenMissing() match
+    Some(value) -> Ok(value)
+    None -> Err(r.error(s"missing field \"${keyOf(f)}\""))

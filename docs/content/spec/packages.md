@@ -861,7 +861,7 @@ source checkout. Its version is the compiler's. It is never a dependency: no man
   error at the import, listing the modules under the deepest prefix that exists:
 
 ```text
-error: the standard library has no module `avin.regx`; the modules under `avin` are `avin.actors`, `avin.c`, `avin.cli`, `avin.collections`, `avin.crypto`, `avin.fs`, `avin.io`, `avin.math`, `avin.net`, `avin.process`, `avin.random`, `avin.regex`, `avin.signal`, `avin.target`, `avin.threads`, `avin.time`
+error: the standard library has no module `avin.regx`; the modules under `avin` are `avin.actors`, `avin.c`, `avin.cache`, `avin.cbor`, `avin.cli`, `avin.collections`, `avin.compress`, `avin.crypto`, `avin.diff`, `avin.encoding`, `avin.fs`, `avin.html`, `avin.io`, `avin.log`, `avin.math`, `avin.metrics`, `avin.msgpack`, `avin.net`, `avin.process`, `avin.random`, `avin.regex`, `avin.resilience`, `avin.signal`, `avin.sqlite`, `avin.target`, `avin.threads`, `avin.time`, `avin.toml`, `avin.uuid`
  --> app/main.avin:1:8
 ```
 
@@ -936,5 +936,8 @@ names its dependencies.
 - `avin vendor [<package>]` copies what the project resolves to into its
   [`vendor/`](#vendoring). It and `build`, `run`, `check` and `test` take the
   [feature flags](#on-the-command-line).
+- `avin doc [<package>]` writes the package's [API documentation](/getting-started/#api-documentation),
+  its dependencies' and the standard library's modules it reads written beside its own so every
+  link stays inside the site, with every feature on.
 - `avin lsp` analyzes a file in a package as the package, with its dependencies as the cache holds
   them, and an `avin.hocon` as a manifest, telling it what is wrong with it at its place.

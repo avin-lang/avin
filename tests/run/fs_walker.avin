@@ -1,0 +1,200 @@
+// expect: exit 0
+// `walker`, `walk` with options, and `find`: a lazy walk of a tree, pre- and post-order, `maxDepth`,
+// `includeRoot`, `prune`, symbolic links followed and not (a link back up the tree ends), a directory
+// that cannot be listed reported or ending the walk, Unicode names, and the walk listing each
+// directory only when it reaches it. The mode is set with `chmod`; where the program runs as a user
+// the mode does not bind, that is said and the unreadable part is left out.
+import avin.fs
+import avin.fs.Entry
+import avin.io.IoError
+import avin.process.Command
+
+shown(e: Entry) -> string
+  val dir = if e.isDir then "/" else ""
+  val link = if e.isLink then "~" else ""
+  val error = e.error.map(x -> s" !${x.kind}").getOrElse("")
+  s"${e.relative}@${e.depth}$dir$link$error"
+
+steps(it: Iterator[Result[Entry, IoError]]) -> string =
+  it.map(r -> r match
+    Ok(e) -> shown(e)
+    Err(x) -> s"Err(${x.kind})"
+  ).mkString(" ")
+
+// Paths `find` answered, written from `root`.
+under(root: string, r: Result[Vector[string], IoError]) -> Result[Vector[string], IoError] =
+  r.map(ps -> ps.map(p -> fs.relativeTo(p, root).getOrElse(p)))
+
+main()
+  val dir = fs.createTempDir("avin-walker") match
+    Ok(d) -> d
+    Err(e) ->
+      println(s"no directory: $e")
+      return
+  val at = (rel: string) -> fs.join(dir, rel)
+  val t = at("t")
+  _ = fs.createDirAll(fs.join(t, "b/d/f"))
+  _ = fs.writeText(fs.join(t, "a.txt"), "")
+  _ = fs.writeText(fs.join(t, "b/c.txt"), "")
+  _ = fs.writeText(fs.join(t, "b/d/e.txt"), "")
+  _ = fs.writeText(fs.join(t, "b/d/f/g.txt"), "")
+  _ = fs.createDir(fs.join(t, "empty"))
+  _ = fs.createDir(fs.join(t, ".hid"))
+  _ = fs.writeText(fs.join(t, ".hid/h.txt"), "")
+  _ = fs.createDir(fs.join(t, "文件"))
+  _ = fs.writeText(fs.join(t, "文件/ü.txt"), "")
+
+  println("-- empty directory")
+  println(steps(fs.walker(fs.join(t, "empty"))))
+  println(steps(fs.walker(fs.join(t, "empty"), includeRoot = true)))
+  println(steps(fs.walker(fs.join(t, "empty"), includeRoot = true, postOrder = true)))
+  println(steps(fs.walker(fs.join(t, "empty"), maxDepth = 0)))
+  println(fs.walk(fs.join(t, "empty")).map(es -> es.length))
+
+  println("-- a root that is not a directory")
+  val file = fs.join(t, "a.txt")
+  println(steps(fs.walker(file)))
+  println(steps(fs.walker(file, includeRoot = true)))
+  println(steps(fs.walker(file, includeRoot = true, postOrder = true, maxDepth = 0)))
+  println(fs.walk(file).map(es -> es.length).mapErr(e -> e.kind))
+  println(fs.walk(file, includeRoot = true).map(es -> es.map(e -> e.path == file)))
+  println(steps(fs.walker(at("missing"))))
+  println(steps(fs.walker(at("missing"), includeRoot = true)))
+  println(steps(fs.walker(at("missing"), maxDepth = 0)))
+  println(fs.find(at("missing"), "*").mapErr(e -> e.kind))
+
+  println("-- pre-order and post-order")
+  println(steps(fs.walker(t)))
+  println(steps(fs.walker(t, postOrder = true)))
+  println(steps(fs.walker(t, includeRoot = true)))
+  println(steps(fs.walker(t, includeRoot = true, postOrder = true)))
+  // `path` is the root joined with `relative`; the root's own is the root as given.
+  println(fs.walker(t, includeRoot = true).forall(r -> r.map(e -> e.path == fs.join(t, e.relative)).getOrElse(false)))
+  println(fs.walk(t, includeRoot = true).map(es -> es(0).path == t))
+  // The eager walk is the lazy one gathered, and two walks of an unchanged tree agree.
+  println(
+    fs.walk(t, postOrder = true).map(es -> es.map(shown).mkString(" ")) == Ok(steps(fs.walker(t, postOrder = true)))
+  )
+  println(fs.walk(t) == fs.walk(t))
+
+  println("-- maxDepth")
+  println(steps(fs.walker(t, maxDepth = 0)))
+  println(steps(fs.walker(t, maxDepth = 0, includeRoot = true)))
+  println(steps(fs.walker(t, maxDepth = 1)))
+  println(steps(fs.walker(t, maxDepth = 2)))
+  println(steps(fs.walker(t, maxDepth = 2, postOrder = true)))
+  println(steps(fs.walker(t, maxDepth = 3)))
+  println(steps(fs.walker(t, maxDepth = 4)) == steps(fs.walker(t)))
+  println(steps(fs.walker(t, maxDepth = 5)) == steps(fs.walker(t)))
+  println(steps(fs.walker(t, maxDepth = int.MaxValue)) == steps(fs.walker(t)))
+
+  println("-- prune")
+  val asked = Buffer[string]()
+  val pruneB = (e: Entry) ->
+    asked.addOne(e.relative)
+    e.relative == "b"
+  println(steps(fs.walker(t, prune = pruneB)))
+  println(s"asked: ${asked.mkString(" ")}")
+  println(steps(fs.walker(t, prune = e -> e.relative == "b/d", postOrder = true)))
+  // The root is never asked: pruning everything still lists the root's own entries.
+  println(steps(fs.walker(t, prune = _ -> true, includeRoot = true)))
+  // A directory at maxDepth is not gone into, so it is not asked about either.
+  asked.clear()
+  _ = fs.walk(t, maxDepth = 1, prune = pruneB)
+  println(s"asked at depth 1: ${asked.mkString(" ")}")
+  println(
+    fs.walk(
+      t,
+      prune = e -> fs.fileName(e.path).exists(n -> n.startsWith("."))
+    ).map(es -> es.map(e -> e.relative).filter(r -> r.startsWith(".hid")))
+  )
+
+  println("-- laziness")
+  // Each directory is listed when the walk reaches it: a file made after the first step appears when
+  // it is in a directory not yet listed, and not when it is in one already listed.
+  val lazy = fs.walker(t)
+  println(steps(lazy.take(1)))
+  _ = fs.writeText(fs.join(t, "b/0-new.txt"), "")
+  _ = fs.writeText(fs.join(t, "zz-new.txt"), "")
+  val rest = steps(lazy)
+  println(s"${rest.contains("b/0-new.txt")} ${rest.contains("zz-new.txt")}")
+  _ = fs.remove(fs.join(t, "b/0-new.txt"))
+  _ = fs.remove(fs.join(t, "zz-new.txt"))
+  // Taking the first entry asks about one directory, however many the tree holds.
+  var calls = 0
+  val counting = fs.walker(t, prune = _ ->
+    calls += 1
+    false
+  )
+  println(steps(counting.take(1)))
+  println(s"prune calls after one entry: $calls")
+  // Asking twice whether there is more does not move the walk.
+  val twice = fs.walker(fs.join(t, "b"))
+  println(s"${twice.hasNext()} ${twice.hasNext()} ${steps(twice.take(1))}")
+
+  println("-- find")
+  val rel = (r: Result[Vector[string], IoError]) -> under(t, r)
+  println(rel(fs.find(t, e -> !e.isDir)))
+  println(rel(fs.find(t, e -> e.isDir)))
+  println(rel(fs.find(t, "**/*.txt")))
+  println(rel(fs.find(t, "*")))
+  println(rel(fs.find(t, ".*/*")))
+  println(rel(fs.find(t, "{b,文件}/**/*.txt")))
+  println(rel(fs.find(t, "**/[de]*")))
+  println(rel(fs.find(t, "**/*.txt", maxDepth = 2)))
+  println(rel(fs.find(t, "**/*.txt", prune = e -> e.relative == "b/d")))
+  println(rel(fs.find(t, "nothing")))
+
+  println("-- symbolic links")
+  val s = at("s")
+  _ = fs.createDirAll(fs.join(s, "real"))
+  _ = fs.writeText(fs.join(s, "real/x.txt"), "")
+  _ = fs.symlink("real", fs.join(s, "link"))
+  _ = fs.symlink("real/x.txt", fs.join(s, "file-link"))
+  _ = fs.symlink(".", fs.join(s, "loop"))
+  _ = fs.symlink("..", fs.join(s, "real/up"))
+  _ = fs.symlink(".", fs.join(s, "real/self"))
+  _ = fs.symlink("nowhere", fs.join(s, "dangling"))
+  println(steps(fs.walker(s)))
+  println(steps(fs.walker(s, followLinks = true)))
+  println(steps(fs.walker(s, followLinks = true, postOrder = true)))
+  println(steps(fs.walker(s, followLinks = true, stopOnError = true)))
+  println(fs.walk(s, followLinks = true, stopOnError = true).mapErr(e -> e.kind))
+  val looped = fs.walk(s, followLinks = true).getOrElse(Vector.empty[Entry]()).filter(e -> e.error.nonEmpty)
+  println(looped.map(e -> e.error.map(x -> s"$x".replace(s, "S")).getOrElse("")))
+  // A link as the root is followed, links or not.
+  println(steps(fs.walker(fs.join(s, "link"), includeRoot = true)))
+  println(steps(fs.walker(fs.join(s, "dangling"), includeRoot = true)))
+  // A loop that is not on the walk's own way down is no loop: two links to one directory are both
+  // gone into.
+  _ = fs.symlink("real", fs.join(s, "link2"))
+  println(under(s, fs.find(s, "*/x.txt", followLinks = true)))
+  println(under(s, fs.find(s, "*/x.txt")))
+
+  println("-- a directory that cannot be listed")
+  val u = at("u")
+  _ = fs.createDirAll(fs.join(u, "locked"))
+  _ = fs.writeText(fs.join(u, "a.txt"), "")
+  _ = fs.writeText(fs.join(u, "locked/in.txt"), "")
+  _ = fs.writeText(fs.join(u, "z.txt"), "")
+  _ = Command("chmod", "000", fs.join(u, "locked")).run()
+  if fs.listDir(fs.join(u, "locked")).isOk
+    println("mode does not bind")
+  else
+    println(steps(fs.walker(u)))
+    println(steps(fs.walker(u, postOrder = true)))
+    println(steps(fs.walker(u, stopOnError = true)))
+    println(fs.walk(u).map(es -> es.length))
+    println(fs.walk(u, stopOnError = true).mapErr(e -> e.kind))
+    println(under(u, fs.find(u, "**/*.txt")))
+    println(fs.find(u, "**/*.txt", stopOnError = true).mapErr(e -> e.kind))
+    // Not gone into, it is not listed and nothing fails.
+    println(steps(fs.walker(u, maxDepth = 1, stopOnError = true)))
+    println(steps(fs.walker(u, prune = e -> e.relative == "locked", stopOnError = true)))
+    // A root that cannot be listed is one `Err`, whichever the policy.
+    println(steps(fs.walker(fs.join(u, "locked"))))
+    println(steps(fs.walker(fs.join(u, "locked"), includeRoot = true)))
+    println(steps(fs.walker(fs.join(u, "locked"), stopOnError = true)))
+  _ = Command("chmod", "755", fs.join(u, "locked")).run()
+
+  println(fs.removeDirAll(dir))

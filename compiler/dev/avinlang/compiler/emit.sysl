@@ -121,7 +121,7 @@ emit_llvm_cached(program: MirProgram, texts: Map[string, string], caching: bool)
                             // touches none of the program's memory, so a length read before it is
                             // still known after it.
                             val cold = if symbol == "avin_rt_array_slow" then " cold nounwind memory(inaccessiblemem: readwrite)" else ""
-                            out.push("declare " + c_result(signature) + " @" + symbol + "(" + c_params(signature, shim_extensions(program, symbol)) + ")" + cold + "\n")
+                            out.push("declare " + c_result(*signature) + " @" + symbol + "(" + c_params(*signature, shim_extensions(program, symbol)) + ")" + cold + "\n")
                     Call(_, CFunction(symbol, params, result), _) ->
                         if !contains(declared, symbol)
                             declared.push(symbol)
@@ -140,9 +140,22 @@ emit_llvm_cached(program: MirProgram, texts: Map[string, string], caching: bool)
     var meta = debug_meta()
     val texts_cached = caching && program.debug.len() == 0
     val shims: Map[string, string] = if texts_cached then shim_texts(program) else map()
+    // The module is gathered as its pieces: what comes before the functions, each function's text, and
+    // what comes after them, joined once at the end at their exact length. A function's text taken
+    // from the cache, or kept in it, is a slice of its entry, so the entry and the module's piece are
+    // one copy of it.
+    var whole = text_pieces()
+    whole.push(out.finish())
+    out = str_builder()
+    // Each function is written into the one builder, emptied before it, which keeps the room the
+    // longest function so far needed: a builder per function would grow by doubling each time, and
+    // leave every step of that behind in the allocator.
+    var piece = str_builder()
     for i in 0..<program.functions.len()
         if !texts_cached || i >= program.keys.len()
-            emit_function(&out, &intrinsics, program, graph, plan_roots(program, graph, collects, i), i, &meta)
+            piece.clear()
+            emit_function(&piece, &intrinsics, program, graph, plan_roots(program, graph, collects, i), i, &meta)
+            whole.push(piece.finish())
             continue
         val key = content_key(program.keys[i] + "\n" + emission_facts(program, graph, collects, shims, i))
         if texts.get(key) is Some(payload)
@@ -153,7 +166,7 @@ emit_llvm_cached(program: MirProgram, texts: Map[string, string], caching: bool)
                 needed.push(r.text())
             val text = r.text()
             if !r.failed && r.at == payload.bytes.len
-                out.push(text)
+                whole.push(text)
                 for d in needed
                     need(&intrinsics, d)
                 keys.push(key)
@@ -161,18 +174,21 @@ emit_llvm_cached(program: MirProgram, texts: Map[string, string], caching: bool)
                 reused += 1
                 continue
         var own: Buf[string] = buf()
-        var piece = str_builder()
+        piece.clear()
         emit_function(&piece, &own, program, graph, plan_roots(program, graph, collects, i), i, &meta)
         val text = piece.finish()
-        out.push(text)
-        var w = entry_writer()
+        var w = entry_writer_for(text.bytes.len + 32 * (own.len() + 1))
         w.num(own.len())
         for d in own
             need(&intrinsics, d)
             w.text(d)
         w.text(text)
+        val payload = w.finish()
+        // The text is the entry's last item, followed by its closing space.
+        val end = payload.bytes.len - 1
+        whole.push(payload[end - text.bytes.len..<end])
         keys.push(key)
-        payloads.push(w.finish())
+        payloads.push(payload)
     val outside = called_from_outside(program)
     for g in outside.functions
         emit_c_wrapper(&out, program, g)
@@ -195,7 +211,8 @@ emit_llvm_cached(program: MirProgram, texts: Map[string, string], caching: bool)
     if program.testing
         emit_test_main(&out, program, roots)
         finish_debug_meta(&out, &meta)
-        return Emitted(out.finish(), keys, payloads, reused)
+        whole.push(out.finish())
+        return Emitted(whole.finish(), keys, payloads, reused)
     val entry = program.functions[program.entry.unwrap()]
     out.push("\ndefine i32 @main(i32 %argc, ptr %argv) {\nentry:\n")
     out.push("  %ctx = call ptr @avin_rt_start(i32 %argc, ptr %argv)\n")
@@ -231,7 +248,8 @@ emit_llvm_cached(program: MirProgram, texts: Map[string, string], caching: bool)
     out.push("  %exit = call i32 @avin_rt_finish(ptr %ctx, i32 %status)\n  ret i32 %exit\n")
     out.push("}\n")
     finish_debug_meta(&out, &meta)
-    Emitted(out.finish(), keys, payloads, reused)
+    whole.push(out.finish())
+    Emitted(whole.finish(), keys, payloads, reused)
 
 /** What the whole program decides for the text of function `index` beyond its code: for each call,
  * the callee's symbol and signature, whether it may collect and whether the call may close a cycle of
@@ -478,7 +496,7 @@ private call_result_type(program: MirProgram, f: MirFunction, call: usize) -> st
         for inst in block.insts
             inst match
                 Call(Some(d), Direct(g), _) -> if d == call then return result_type(program.functions[g].signature)
-                Call(Some(d), Indirect(_, s), _) -> if d == call then return result_type(s)
+                Call(Some(d), Indirect(_, s), _) -> if d == call then return result_type(*s)
                 _ -> ()
     panic(s"no call of several words defines value $call of ${f.symbol}")
 
@@ -645,6 +663,17 @@ private emit_function_text(out: *StrBuilder, intrinsics: *Buf[string], program: 
                 else
                     out.push(s"  %s$s = alloca ${llvm_type(f.slots[s])}\n")
                     if plan.slot_zeroed[s] then out.push(s"  store ptr null, ptr %s$s\n")
+            // Each object the function makes in its own frame has its storage here, at the entry, so
+            // one made in a loop reuses it on every pass rather than growing the stack; its header
+            // is a constant object's, the descriptor and a zero word, and never changes.
+            for sb in f.blocks
+                for si in sb.insts
+                    if si is StackObject(dest, d)
+                        val shape = s"{ ptr, i64, [${program.descriptors[d].size} x i8] }"
+                        out.push(s"  %so$dest = alloca $shape, align 16\n")
+                        out.push(s"  store ptr ${desc_symbol(program, d)}, ptr %so$dest, align 16\n")
+                        out.push(s"  %so$dest.word = getelementptr inbounds $shape, ptr %so$dest, i32 0, i32 1\n")
+                        out.push(s"  store i64 0, ptr %so$dest.word, align 8\n")
             for i in 0..<f.signature.params.len()
                 if value_roots[i] is Some(k) then out.push(s"  store ptr %v$i, ptr %root$k\n")
             if scope > 0 then emit_variables(out, intrinsics, program, f, plan, meta, scope, program.debug[index])
@@ -730,7 +759,7 @@ private tail_call_at(program: MirProgram, f: MirFunction, block: MirBlock) -> Op
             args = a
         Call(d, Indirect(_, signature), a) ->
             dest = d
-            callee = signature
+            callee = *signature
             args = a
         _ -> return None
     val result = callee.result
@@ -746,9 +775,19 @@ private tail_call_at(program: MirProgram, f: MirFunction, block: MirBlock) -> Op
     for a in args
         a match
             SlotAddress(_) -> return None
-            Value(id) -> if f.value_types[id] is MPtr && id >= f.signature.params.len() then return None
+            Value(id) ->
+                if f.value_types[id] is MPtr && id >= f.signature.params.len() then return None
+                if made_on_stack(f, id) then return None
             _ -> ()
     Some(c)
+
+/** Whether value `id` of `f` is an object `f` makes in its own frame. */
+private made_on_stack(f: MirFunction, id: usize) -> bool
+    for block in f.blocks
+        for inst in block.insts
+            if inst is StackObject(dest, _)
+                if dest == id then return true
+    false
 
 private same_words(a: Buf[MirType], b: Buf[MirType]) -> bool
     if a.len() != b.len() then return false
@@ -992,7 +1031,13 @@ call_graph(program: MirProgram) -> CallGraph
     var targets: Buf[usize] = buf()
     for g in 0..<n
         if taken[g] then targets.push(g)
-    // The edges of function `v` are `edges[starts[v]..<starts[v + 1]]`.
+    // The edges of node `v` are `edges[starts[v]..<starts[v + 1]]`. Node `n`, past the functions, stands
+    // for every call through a function value: each function that makes one has an edge to it, and it
+    // has an edge to each function whose address is taken. A function reaches another through it
+    // exactly when it would by an edge to each target, so the functions' components are the same; and
+    // the edges are as many as the callers and targets together rather than their product, which for
+    // a large program is hundreds of millions.
+    val hub = n
     var starts: Buf[usize] = buf()
     var edges: Buf[usize] = buf()
     for f in program.functions
@@ -1004,12 +1049,13 @@ call_graph(program: MirProgram) -> CallGraph
                     Call(_, Direct(g), _) -> edges.push(g)
                     Call(_, Indirect(_, _), _) -> indirect = true
                     _ -> ()
-        if indirect
-            for g in targets do edges.push(g)
+        if indirect then edges.push(hub)
     starts.push(edges.len())
-    val component = components(n, starts, edges)
+    for g in targets do edges.push(g)
+    starts.push(edges.len())
+    val component = components(n + 1, starts, edges)
     var reentered: Buf[bool] = buf()
-    for _ in 0..<n do reentered.push(false)
+    for _ in 0..<n + 1 do reentered.push(false)
     for g in targets do reentered[component[g]] = true
     CallGraph(component, reentered)
 
@@ -1041,6 +1087,8 @@ inst_operands(inst: Inst) -> Buf[Operand]
             out.push(address)
             out.push(value)
         Alloc(_, _) -> ()
+        StackObject(_, _) -> ()
+        Keep(values) -> for v in values do out.push(v)
         Publish -> ()
         AtomicLoad(_, address) -> out.push(address)
         AtomicStore(address, value) ->
@@ -1327,7 +1375,8 @@ private struct Cell
 
 private constant_cell(program: MirProgram, f: ConstantField) -> Cell
     val text = f.value match
-        ConstInt(_, digits) -> digits
+        ConstInt(_, value) -> value.to_string()
+        ConstWide(_, digits) -> *digits
         ConstBool(value) -> if value then "1" else "0"
         ConstReal(value) -> real_constant(value)
         ConstStr(index) -> payload_address(str_name(program, index))
@@ -1367,6 +1416,8 @@ inst_dest(inst: Inst) -> Option[usize] = inst match
     Load(dest, _) -> Some(dest)
     Store(_, _) -> None
     Alloc(dest, _) -> Some(dest)
+    StackObject(dest, _) -> Some(dest)
+    Keep(_) -> None
     Publish -> None
     AtomicLoad(dest, _) -> Some(dest)
     AtomicStore(_, _) -> None
@@ -1613,6 +1664,8 @@ private emit_inst(out: *StrBuilder,intrinsics: *Buf[string], program: MirProgram
         Alloc(dest, descriptor) ->
             need(intrinsics, "declare ptr @avin_rt_alloc(ptr, ptr)")
             out.push(s"  %v$dest = call ptr @avin_rt_alloc(ptr %ctx, ptr ${desc_symbol(program, descriptor)})\n")
+        StackObject(dest, _) -> out.push(s"  %v$dest = getelementptr inbounds i8, ptr %so$dest, i64 $KindBack\n")
+        Keep(_) -> ()
         Offset(dest, base, bytes) ->
             out.push(s"  %v$dest = getelementptr inbounds i8, ptr " + operand(program, f, base) + s", i64 $bytes\n")
         Index(dest, base, index) ->
@@ -1644,12 +1697,12 @@ private emit_inst(out: *StrBuilder,intrinsics: *Buf[string], program: MirProgram
             if !tail then first_word(out, callee.signature, dest)
         Call(dest, Indirect(target, signature), args) ->
             out.push("  ")
-            call_dest(out, signature, dest)
-            out.push(call_head(tail, signature) + result_type(signature) + " " + operand(program, f, target) + "(ptr %ctx")
+            call_dest(out, *signature, dest)
+            out.push(call_head(tail, *signature) + result_type(*signature) + " " + operand(program, f, target) + "(ptr %ctx")
             for a in args
                 out.push(", " + typed_operand(program, f, a))
             out.push(")\n")
-            if !tail then first_word(out, signature, dest)
+            if !tail then first_word(out, *signature, dest)
         CallWord(dest, call, word) ->
             out.push(s"  %v$dest = extractvalue ${call_result_type(program, f, call)} %r$call, $word\n")
         // The block's return gathers the later words of its result.
@@ -1679,7 +1732,7 @@ private emit_inst(out: *StrBuilder,intrinsics: *Buf[string], program: MirProgram
             out.push("  ")
             if dest is Some(d)
                 if byte_result then out.push(s"%t$next = ") else out.push(s"%v$d = ")
-            out.push("call " + c_result(signature) + " @" + symbol + "(")
+            out.push("call " + c_result(*signature) + " @" + symbol + "(")
             for i in 0..<parts.len()
                 if i > 0 then out.push(", ")
                 out.push(parts[i])
@@ -1736,6 +1789,7 @@ private foreign_result(result: Option[CScalar]) -> string = result match
 private operand_type(program: MirProgram, f: MirFunction, a: Operand) -> MirType = a match
     Value(id) -> f.value_types[id]
     ConstInt(bits, _) -> MInt(bits)
+    ConstWide(bits, _) -> MInt(bits)
     ConstBool(_) -> MBool
     ConstReal(_) -> MReal
     SlotAddress(_) -> MPtr
@@ -1756,7 +1810,8 @@ private operand_type(program: MirProgram, f: MirFunction, a: Operand) -> MirType
 
 private operand(program: MirProgram, f: MirFunction, a: Operand) -> string = a match
     Value(id) -> s"%v$id"
-    ConstInt(_, digits) -> digits
+    ConstInt(_, value) -> value.to_string()
+    ConstWide(_, digits) -> *digits
     ConstBool(value) -> if value then "true" else "false"
     ConstReal(value) -> real_constant(value)
     SlotAddress(slot) -> s"%s$slot"

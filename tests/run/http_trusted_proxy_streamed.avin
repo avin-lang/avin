@@ -1,0 +1,73 @@
+// expect: exit 0
+// `TrustedProxies` in front of a route whose body is streamed: the request it hands on, with its
+// client's address from a trusted proxy (`withRemote`, then `withValue`) or with the forwarding
+// headers stripped from an untrusted peer (`withHeaderRemoved`), keeps the body unread, so the
+// handler reads all of it through `bodyReader`, past `maxBodyBytes`, by `Content-Length` and chunked.
+import avin.io.IoError
+import avin.net.{TcpServer, TcpStream}
+import avin.net.http
+import avin.net.http.{Response, Route, Router, ServerRequest, TrustedProxies}
+import avin.time
+
+ok[T](r: Result[T, IoError]) -> T = r match
+  Ok(v) -> v
+  Err(e) -> fail(e.message)
+
+// Reads the whole body and answers how much, with what the middleware left of the request.
+counted(r: ServerRequest) -> Response
+  val reader = r.bodyReader(1000)
+  var total = 0
+  loop
+    reader.read(7) match
+      Ok(got) ->
+        if got.length == 0 then break
+        total += got.length
+      Err(e) -> return Response.text(200, s"failed: ${e.message}")
+  val xff = r.header("X-Forwarded-For").getOrElse("-")
+  val client = r.remote.getOrElse("-")
+  val learned = r.forwarding.map(f -> f.peer).getOrElse("-")
+  Response.text(200, s"remote $client, peer $learned, xff $xff, streamed ${r.bodyStreamed}, read $total")
+
+val trusting = TrustedProxies(["127.0.0.1"])
+val doubting = TrustedProxies()
+
+val router = Router(
+  [
+    Route.post("/trusted", trusting.middleware(counted)).streaming(),
+    Route.post("/untrusted", doubting.middleware(counted)).streaming()
+  ]
+)
+
+// Sends `text` on a connection of its own and answers all the server sends back before it closes.
+exchange(server: TcpServer, text: string) -> string
+  val c = ok(TcpStream.connect("127.0.0.1", server.port()))
+  ok(c.setTimeout(time.seconds(5)))
+  _ = c.writeText(text)
+  val out = Buffer[byte]()
+  loop
+    c.read(65536) match
+      Ok(got) ->
+        if got.length == 0 then break
+        out.addAll(got)
+      Err(_) -> break
+  val all = string.fromUtf8Lossy(out.toArray())
+  all.slice(all.indexOf("\r\n\r\n") + 4, all.byteLength)
+
+sized(target: string, body: string) -> string =
+  s"POST $target HTTP/1.1\r\nHost: t\r\nX-Forwarded-For: 203.0.113.9\r\nConnection: close\r\nContent-Length: ${body.byteLength}\r\n\r\n$body"
+
+chunked(target: string, body: string) -> string =
+  val size = body.byteLength.toRadix(16)
+  s"POST $target HTTP/1.1\r\nHost: t\r\nX-Forwarded-For: 203.0.113.9\r\nConnection: close\r\nTransfer-Encoding: chunked\r\n\r\n$size\r\n$body\r\n0\r\n\r\n"
+
+main()
+  val server = ok(
+    http.serve("127.0.0.1", 0, router.handle, maxBodyBytes = 16, date = false, streamsBody = router.streamsBody)
+  )
+  val body = "x".repeat(100)
+  println(exchange(server, sized("/trusted", body)))
+  println(exchange(server, chunked("/trusted", body)))
+  println(exchange(server, sized("/untrusted", body)))
+  println(exchange(server, chunked("/untrusted", body)))
+  println(exchange(server, sized("/trusted", "")))
+  server.stop()

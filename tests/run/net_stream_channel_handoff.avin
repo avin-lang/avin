@@ -1,0 +1,49 @@
+// expect: exit 0
+// A channel's send hands over every handle its value reaches, not only a file's: accepted connections
+// go through a bounded queue to a pool of workers, each of which answers on the connection it
+// received, as a server hands connections out. A connection a mutex keeps is written by whichever
+// thread holds the mutex.
+import avin.io.IoError
+import avin.net.{TcpListener, TcpStream}
+import avin.threads.{Channel, Mutex, scope, spawn}
+
+ok[T](r: Result[T, IoError]) -> T = r match
+  Ok(v) -> v
+  Err(e) -> fail(e.message)
+
+main() -> int
+  val l = ok(TcpListener.bind("127.0.0.1", 0))
+  val port = l.port()
+  val queue = Channel[TcpStream](1)
+  var answers = 0
+  scope(s ->
+    for w in 0 ..< 3
+      s.spawn(() ->
+        for c in queue
+          val line = ok(c.readLine()).get
+          ok(c.writeText(s"echo $line\n"))
+          ok(c.close())
+        ())
+    val clients = spawn(() ->
+      var got = 0
+      for i in 0 ..< 9
+        val c = ok(TcpStream.connect("127.0.0.1", port))
+        ok(c.writeText(s"n$i\n"))
+        if ok(c.readLine()) == Some(s"echo n$i") then got += 1
+        ok(c.close())
+      got)
+    for i in 0 ..< 9
+      queue.send(ok(l.accept()))
+    queue.close()
+    answers = clients.join())
+  println(answers)
+
+  val client = ok(TcpStream.connect("127.0.0.1", port))
+  val shared = Mutex(ok(l.accept()))
+  spawn(() -> shared.with(c -> ok(c.writeText("from a thread\n")))).join()
+  shared.with(c -> ok(c.writeText("from main\n")))
+  println(ok(client.readLine()))
+  println(ok(client.readLine()))
+  shared.with(c -> ok(c.close()))
+  ok(client.close())
+  if answers == 9 then 0 else 1

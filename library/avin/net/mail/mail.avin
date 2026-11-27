@@ -1,0 +1,553 @@
+module avin.net.mail
+
+// Mail messages, as RFC 5322 and MIME (RFC 2045 to 2049) write them, ready for `avin.net.smtp` to
+// send. A `Message` holds who it is from and to, a subject, a plain-text body, an HTML one or both,
+// and attachments; `render()` writes it out, every line ending in CR LF and none longer than 998
+// characters.
+//
+//     val m = Message(
+//       Mailbox("ada@example.com", "Ada Lovelace"),
+//       to = [Mailbox("charles@example.com")],
+//       subject = "Notes on the engine",
+//       text = Some("The notes are attached.")
+//     )
+//     println(m.render()?)
+//
+// What the message writes, it writes so that a reader sees what was given:
+//
+// - A subject, a display name or another header holding anything but printable ASCII is written as
+//   RFC 2047 encoded-words in UTF-8 and base64, each at most 75 characters and holding whole
+//   characters, so any text survives. Plain ASCII is written as itself, folded at its spaces.
+// - A body is `7bit` where it is ASCII with lines of at most 998 characters, and quoted-printable
+//   otherwise; an attachment is base64 in lines of 76. Line breaks in a body, CR LF, CR or LF, are
+//   written CR LF.
+// - An attachment's filename that is not short printable ASCII is written as an RFC 2231 parameter,
+//   `filename*=UTF-8''…`, split into numbered sections where it is long.
+// - A header can never be smuggled in: a CR or LF in any value that goes into a header (a subject,
+//   a name, an address, a filename, a header of the caller's) is an `Err`, never written.
+// - `bcc` is never written: its addresses are recipients and nothing more.
+
+import avin.encoding.{fromBase64, toBase64, toHex, toQuotedPrintable}
+import avin.time.{Instant, now}
+import avin.uuid.Uuid
+
+// Why a message cannot be written.
+data MailError
+  // A CR or LF in what would go into the header `header`: written, it would end that header and
+  // begin another.
+  LineBreak(header: string)
+  // An address that cannot be written in the header `header`, `why` saying what is wrong with it.
+  BadAddress(header: string, address: string, why: string)
+  // A header that cannot be written, `why` saying why: a name that is no field name, one the message
+  // writes itself, a value that cannot be folded within 998 characters, a bad content type, filename,
+  // content ID, message ID or boundary.
+  BadHeader(header: string, why: string)
+
+impl Error for MailError
+  // A sentence saying what is wrong, for a message to a person.
+  message -> string = self match
+    LineBreak(h) -> s"a line break in the $h header, which would begin another header"
+    BadAddress(h, a, why) -> s"the address `$a` in the $h header $why"
+    BadHeader(h, why) -> s"the $h header $why"
+
+// A mailbox: an address and the name a reader sees for it, none where `name` is empty. It is written
+// `Ada Lovelace <ada@example.com>`, or the address alone where there is no name.
+data Mailbox(address: string, name: string = "")
+
+// A file carried by a message: its name, its media type (`application/pdf`, or with parameters,
+// `text/plain; charset=utf-8`) and its bytes. An inline one is shown in the body rather than offered
+// as a download; an HTML body refers to one by its content ID, `<img src="cid:logo">` for one whose
+// `contentId` is `logo`.
+data Attachment(
+    filename: string,
+    contentType: string,
+    content: Vector[byte],
+    inline: bool = false,
+    contentId: string = ""
+)
+
+// A mail message. `to`, `cc` and `bcc` are its recipients; `bcc` is never written. Where `text` and
+// `html` are both given the body is `multipart/alternative` of the two, the plain text first; inline
+// attachments go with the body in `multipart/related`, and the rest after it in `multipart/mixed`.
+// With no body at all it has an empty plain-text one.
+//
+// `headers` are further headers, written after the message's own in the order given; one the message
+// writes itself (`Date`, `From`, `Reply-To`, `To`, `Cc`, `Bcc`, `Subject`, `Message-ID`,
+// `MIME-Version` and the `Content-` ones) is an `Err`. `date` is when it was written, `now()` where
+// none is given; `messageId` is its `Message-ID` without the angle brackets, a random one at the
+// sender's domain where none is given. `boundary` is what each multipart's boundary is made from,
+// a random one where none is given: 1 to 60 letters, digits or `'()+_,-./:=?`.
+data Message(
+    from: Mailbox,
+    to: Vector[Mailbox] = Vector.empty[Mailbox](),
+    cc: Vector[Mailbox] = Vector.empty[Mailbox](),
+    bcc: Vector[Mailbox] = Vector.empty[Mailbox](),
+    replyTo: Vector[Mailbox] = Vector.empty[Mailbox](),
+    subject: string = "",
+    text: Option[string] = None,
+    html: Option[string] = None,
+    attachments: Vector[Attachment] = Vector.empty[Attachment](),
+    headers: Vector[(string, string)] = Vector.empty[(string, string)](),
+    date: Option[Instant] = None,
+    messageId: Option[string] = None,
+    boundary: Option[string] = None
+)
+
+impl Message
+  // Every address the message goes to, `to`, `cc` and `bcc` in that order, each once.
+  recipients -> Vector[string]
+    val out = Buffer[string]()
+    for m in to ++ cc ++ bcc
+      if !out.exists(a -> a == m.address) then out += m.address
+    out.toVector
+
+  // Whether an address of the message, a sender's or a recipient's, is not ASCII, so that a server
+  // must take it as SMTPUTF8 (RFC 6531) has it.
+  needsUtf8 -> bool = ([from] ++ to ++ cc ++ bcc ++ replyTo).exists(m -> !ascii(m.address))
+
+  // The message as it goes over the wire: its headers, a blank line and its body, every line ending
+  // in CR LF. An `Err` says what cannot be written.
+  render() -> Result[string, MailError]
+    val out = StringWriter()
+    out.write(folded("Date", [mailDate(date.getOrElse(now()))])?)
+    out.write(addressHeader("From", [from])?)
+    if replyTo.nonEmpty then out.write(addressHeader("Reply-To", replyTo)?)
+    if to.nonEmpty then out.write(addressHeader("To", to)?)
+    if cc.nonEmpty then out.write(addressHeader("Cc", cc)?)
+    for m in bcc do _ = mailboxWords("Bcc", m)?
+    if subject.nonEmpty then out.write(unstructured("Subject", subject)?)
+    val id = messageId match
+      Some(given) -> checkedId("Message-ID", given)?
+      None -> s"${Uuid.random()}@${idDomain(from.address)}"
+    out.write(folded("Message-ID", [s"<$id>"])?)
+    out.write("MIME-Version: 1.0\r\n")
+    for (name, value) in headers
+      checkName(name)?
+      out.write(unstructured(name, value)?)
+    val base = boundary match
+      Some(b) -> checkedBoundary(b)?
+      None -> toHex(Uuid.random().bytes())
+    val numbered = Boundaries(base)
+    val top = body()?
+    writePart(out, top, numbered)
+    // A multipart ends at its closing delimiter's line; the message ends with that line's break.
+    top match
+      Multi(_, _) -> out.write("\r\n")
+      Leaf(_, _) -> ()
+    Ok(out.text)
+
+  // The body as a tree of parts.
+  private body() -> Result[Part, MailError]
+    var core = (text, html) match
+      (Some(t), Some(h)) -> Multi("alternative", [textPart("plain", t), textPart("html", h)])
+      (Some(t), None) -> textPart("plain", t)
+      (None, Some(h)) -> textPart("html", h)
+      (None, None) -> textPart("plain", "")
+    val inline = Buffer[Part]()
+    val attached = Buffer[Part]()
+    for a in attachments
+      val p = attachmentPart(a)?
+      if a.inline then inline += p else attached += p
+    if inline.nonEmpty then core = Multi("related", [core] ++ inline.toVector)
+    if attached.nonEmpty then core = Multi("mixed", [core] ++ attached.toVector)
+    Ok(core)
+
+// A part of a body: one with its header lines, each ending in CR LF, and its content, already
+// encoded; or a multipart of the given subtype.
+private data Part
+  Leaf(headers: string, content: string)
+  Multi(subtype: string, parts: Vector[Part])
+
+// Each multipart's boundary in turn: the base with `=_` before it, so no quoted-printable or base64
+// content can hold it, and a number after.
+private class Boundaries(val base: string)
+  private var made = 0
+
+  next() -> string
+    made += 1
+    s"=_${base}_$made"
+
+// Writes `part`, its headers, a blank line and its content; a multipart's ends with its closing
+// delimiter, the line break after it being its parent's.
+private writePart(out: StringWriter, part: Part, boundaries: Boundaries)
+  part match
+    Leaf(headers, content) ->
+      out.write(headers)
+      out.write("\r\n")
+      out.write(content)
+    Multi(subtype, parts) ->
+      val b = boundaries.next()
+      out.write(s"Content-Type: multipart/$subtype;\r\n boundary=\"$b\"\r\n\r\n")
+      for p in parts
+        out.write(s"--$b\r\n")
+        writePart(out, p, boundaries)
+        out.write("\r\n")
+      out.write(s"--$b--")
+
+// `text` with every line break, CR LF, CR or LF, written CR LF.
+private crlf(text: string) -> string
+  if !text.contains("\r") && !text.contains("\n") then return text
+  text.replace("\r\n", "\n").replace("\r", "\n").replace("\n", "\r\n")
+
+// Whether `text` can go as `7bit`: ASCII without NUL or a lone CR or LF (its breaks are CR LF
+// already), no line longer than 998, and nothing that could be taken for a boundary.
+private sevenBit(text: string) -> bool
+  if text.contains("=_") then return false
+  var line = 0
+  var i = 0
+  val n = text.byteLength
+  while i < n
+    val b = int(text.byteAt(i))
+    if b == 13 && i + 1 < n && int(text.byteAt(i + 1)) == 10
+      line = 0
+      i += 2
+    else
+      if b == 0 || b == 13 || b == 10 || b >= 128 then return false
+      line += 1
+      if line > 998 then return false
+      i += 1
+  true
+
+// A text body of `text/<subtype>` in UTF-8.
+private textPart(subtype: string, text: string) -> Part
+  val body = crlf(text)
+  if sevenBit(body)
+    Leaf(s"Content-Type: text/$subtype; charset=utf-8\r\nContent-Transfer-Encoding: 7bit\r\n", body)
+  else
+    Leaf(
+      s"Content-Type: text/$subtype; charset=utf-8\r\nContent-Transfer-Encoding: quoted-printable\r\n",
+      toQuotedPrintable(body)
+    )
+
+// `text` in lines of at most 76 characters, each but the last followed by CR LF.
+private wrapped(text: string) -> string
+  val n = text.byteLength
+  if n <= 76 then return text
+  val out = StringWriter()
+  var i = 0
+  while i < n
+    if i > 0 then out.write("\r\n")
+    out.write(text.slice(i, if i + 76 < n then i + 76 else n))
+    i += 76
+  out.text
+
+// An attachment as a part, base64 in lines of 76.
+private attachmentPart(a: Attachment) -> Result[Part, MailError]
+  val type = checkedType(a.contentType)?
+  val name = parameter("Content-Type", "name", a.filename)?
+  val file = parameter("Content-Disposition", "filename", a.filename)?
+  val out = StringWriter()
+  out.write(s"Content-Type: $type")
+  for p in name do out.write(s";\r\n $p")
+  out.write("\r\n")
+  out.write(if a.inline then "Content-Disposition: inline" else "Content-Disposition: attachment")
+  for p in file do out.write(s";\r\n $p")
+  out.write("\r\n")
+  if a.contentId.nonEmpty then out.write(s"Content-ID: <${checkedId("Content-ID", a.contentId)?}>\r\n")
+  out.write("Content-Transfer-Encoding: base64\r\n")
+  Ok(Leaf(out.text, wrapped(toBase64(a.content))))
+
+// Whether the code is a token character of RFC 2045: printable ASCII but a space and `()<>@,;:\"/[]?=`.
+private tokenChar(c: int) -> bool = 33 <= c <= 126 && !"()<>@,;:\\\"/[]?=".contains(char(c).toString())
+
+// Whether `text` is one or more token characters.
+private token(text: string) -> bool
+  if text.isEmpty then return false
+  for i in 0 ..< text.byteLength
+    if !tokenChar(int(text.byteAt(i))) then return false
+  true
+
+// `text` checked for a line break, which would end the header `header`.
+private unbroken(header: string, text: string) -> Result[string, MailError] =
+  if text.contains("\r") || text.contains("\n") then Err(LineBreak(header)) else Ok(text)
+
+// A content type checked: `type/subtype`, each a token, with parameters after a `;` if any, printable
+// ASCII.
+private checkedType(contentType: string) -> Result[string, MailError]
+  unbroken("Content-Type", contentType)?
+  val semi = contentType.indexOf(';')
+  val main = (if semi < 0 then contentType else contentType.slice(0, semi)).trim
+  val slash = main.indexOf('/')
+  if slash < 0 || !token(main.slice(0, slash)) || !token(main.slice(slash + 1, main.byteLength))
+    return Err(BadHeader("Content-Type", s"has `$contentType`, which is not a type/subtype"))
+  if semi < 0 then return Ok(main)
+  val rest = contentType.slice(semi, contentType.byteLength)
+  for i in 0 ..< rest.byteLength
+    val c = int(rest.byteAt(i))
+    if !(32 <= c <= 126) then return Err(BadHeader("Content-Type", "has parameters that are not printable ASCII"))
+  Ok(main + rest)
+
+// Whether the code is one RFC 2231 leaves unescaped in a parameter's value: a letter, a digit or one
+// of `!#$&+-.^_`|~`.
+private attrChar(c: int) -> bool =
+  (
+    'a' <= char(c) <= 'z'
+  ) || ('A' <= char(c) <= 'Z') || ('0' <= char(c) <= '9') || "!#$&+-.^_`|~".contains(char(c).toString())
+
+// The parameter `name` with the value `value`, as the pieces a header writes after its `;`: none for
+// an empty value; `name="value"` for short printable ASCII without `"` or `\`; otherwise RFC 2231's
+// `name*=UTF-8''…`, in numbered sections `name*0*=`, `name*1*=` where that would be long, a `%XX`
+// never split.
+private parameter(header: string, name: string, value: string) -> Result[Vector[string], MailError]
+  unbroken(header, value)?
+  if value.isEmpty then return Ok(Vector.empty[string]())
+  var plain = name.byteLength + value.byteLength + 4 <= 76
+  for i in 0 ..< value.byteLength
+    val c = int(value.byteAt(i))
+    if !(32 <= c <= 126) || c == int('"') || c == int('\\') then plain = false
+  if plain then return Ok([s"$name=\"$value\""])
+  val escaped = StringWriter()
+  escaped.write("UTF-8''")
+  for b in value.utf8
+    val c = int(b)
+    if attrChar(c) then escaped.write(char(c).toString()) else escaped.write("%" + toHex([b]).toUpper)
+  val all = escaped.text
+  if name.byteLength + all.byteLength + 3 <= 76 then return Ok([s"$name*=$all"])
+  val sections = Buffer[string]()
+  var at = 0
+  while at < all.byteLength
+    var end = if at + 60 < all.byteLength then at + 60 else all.byteLength
+    // A `%XX` is never split: an end inside one moves back to its `%`.
+    if end < all.byteLength
+      if all.byteAt(end - 1) == byte(int('%')) then end -= 1
+      elif all.byteAt(end - 2) == byte(int('%')) then end -= 2
+    sections += s"$name*${sections.length}*=${all.slice(at, end)}"
+    at = end
+  Ok(sections.toVector)
+
+// An ID (a `Message-ID`'s or a `Content-ID`'s, without its angle brackets) checked: printable ASCII
+// without spaces, `<`, `>` or `"`, a `Message-ID` with an `@`.
+private checkedId(header: string, id: string) -> Result[string, MailError]
+  unbroken(header, id)?
+  if id.isEmpty then return Err(BadHeader(header, "is empty"))
+  for i in 0 ..< id.byteLength
+    val c = int(id.byteAt(i))
+    if !(33 <= c <= 126) || c == int('<') || c == int('>') || c == int('"')
+      return Err(BadHeader(header, s"has `$id`, which holds a character an ID cannot"))
+  if header == "Message-ID" && !id.contains("@") then return Err(BadHeader(header, s"has `$id`, which has no @"))
+  if id.byteLength > 900 then return Err(BadHeader(header, "is longer than 900 characters"))
+  Ok(id)
+
+// A boundary's base checked: 1 to 60 characters, each a letter, a digit or one of `'()+_,-./:=?`.
+private checkedBoundary(b: string) -> Result[string, MailError]
+  if b.isEmpty || b.byteLength > 60 then return Err(BadHeader("Content-Type", "boundary must be 1 to 60 characters"))
+  for i in 0 ..< b.byteLength
+    val c = char(int(b.byteAt(i)))
+    val fits = ('a' <= c <= 'z') || ('A' <= c <= 'Z') || ('0' <= c <= '9') || "'()+_,-./:=?".contains(c.toString())
+    if !fits then return Err(BadHeader("Content-Type", s"boundary `$b` holds a character a boundary cannot"))
+  Ok(b)
+
+// The domain a generated `Message-ID` names: the sender's, where it is ASCII, else `localhost`.
+private idDomain(address: string) -> string
+  val at = address.lastIndexOf('@')
+  val domain = if at < 0 then "" else address.slice(at + 1, address.byteLength)
+  if domain.nonEmpty && ascii(domain) && checkedId("Content-ID", domain).isOk then domain else "localhost"
+
+// Whether every byte of `text` is ASCII.
+private ascii(text: string) -> bool
+  for i in 0 ..< text.byteLength
+    if int(text.byteAt(i)) >= 128 then return false
+  true
+
+// The names of the headers the message writes itself, in lower case.
+private val OwnHeaders: Vector[string] = [
+  "date", "from", "reply-to", "to", "cc", "bcc", "subject", "message-id", "mime-version", "content-type",
+  "content-transfer-encoding", "content-disposition", "content-id"
+]
+
+// A caller's header name checked: printable ASCII but `:`, and not one the message writes.
+private checkName(name: string) -> Result[unit, MailError]
+  unbroken("header name", name)?
+  if name.isEmpty then return Err(BadHeader("(empty)", "has no name"))
+  for i in 0 ..< name.byteLength
+    val c = int(name.byteAt(i))
+    if !(33 <= c <= 126) || c == int(':') then return Err(BadHeader(name, "has a name that is not a field name"))
+  if OwnHeaders.exists(h -> h == name.toLower) then return Err(BadHeader(name, "is written by the message itself"))
+  Ok(())
+
+// The header `name` holding `words` with a space between each, folded before a word where the line
+// would be longer than 78 characters, each line ending in CR LF. An empty first word, which an empty
+// value or one beginning with a space makes, writes nothing. A line longer than 998, which only a
+// word that long makes, is an `Err`.
+private folded(name: string, words: Vector[string]) -> Result[string, MailError]
+  val out = StringWriter()
+  var line = name.byteLength + 1
+  out.write(name + ":")
+  var first = true
+  for w in words
+    if !first && w.nonEmpty && line + 1 + w.byteLength > 78
+      out.write("\r\n")
+      line = 0
+    if !first || w.nonEmpty
+      out.write(" " + w)
+      line += 1 + w.byteLength
+    first = false
+    if line > 998 then return Err(BadHeader(name, "has a word too long for a line of 998 characters"))
+  out.write("\r\n")
+  Ok(out.text)
+
+// `text` as RFC 2047 encoded-words in UTF-8 and base64, each holding whole characters, at most 39
+// bytes of the text: 52 characters of base64 and 64 in all, so that a word after a header's name
+// (`Subject: `) keeps its line within 76 characters as RFC 2047 asks.
+private encodedWords(text: string) -> Vector[string]
+  val bytes = text.utf8
+  val out = Buffer[string]()
+  var at = 0
+  while at < bytes.length
+    var end = if at + 39 < bytes.length then at + 39 else bytes.length
+    // A UTF-8 character is never split: an end before a continuation byte moves back to its start.
+    while end < bytes.length && end > at && (int(bytes(end)) & 0xC0) == 0x80 do end -= 1
+    out += "=?UTF-8?B?" + toBase64(bytes.slice(at, end).toVector) + "?="
+    at = end
+  out.toVector
+
+// Whether `text` can be written as itself in a header: printable ASCII, spaces and tabs, with
+// nothing a reader would take for an encoded-word.
+private plainText(text: string) -> bool
+  if text.contains("=?") then return false
+  for i in 0 ..< text.byteLength
+    val c = int(text.byteAt(i))
+    if !(32 <= c <= 126) && c != 9 then return false
+  true
+
+// The unstructured header `name` (a subject, or a caller's header) holding `value`: as itself,
+// folded at its spaces, where it is plain text, and as encoded-words otherwise.
+private unstructured(name: string, value: string) -> Result[string, MailError]
+  unbroken(name, value)?
+  folded(name, if plainText(value) then value.split(' ') else encodedWords(value))
+
+// Whether the code is an `atext` character of RFC 5322, which a name may hold unquoted.
+private atext(c: int) -> bool =
+  (
+    'a' <= char(c) <= 'z'
+  ) || ('A' <= char(c) <= 'Z') || ('0' <= char(c) <= '9') || "!#$%&'*+-/=?^_`{|}~".contains(char(c).toString())
+
+// A mailbox's words as a header writes them: the name's (as atoms, as one quoted string, or as
+// encoded-words) and then the address in angle brackets; the address alone where there is no name.
+private mailboxWords(header: string, m: Mailbox) -> Result[Vector[string], MailError]
+  val address = checkedAddress(header, m.address)?
+  unbroken(header, m.name)?
+  if m.name.isEmpty then return Ok([address])
+  Ok(nameWords(m.name) :+ s"<$address>")
+
+// A display name's words: atoms where it is words of `atext` with single spaces between, one quoted
+// string where it is other plain text, and encoded-words otherwise.
+private nameWords(name: string) -> Vector[string]
+  if !plainText(name) then return encodedWords(name)
+  var atoms = !name.startsWith(" ") && !name.endsWith(" ") && !name.contains("  ")
+  for i in 0 ..< name.byteLength
+    val c = int(name.byteAt(i))
+    if c != 32 && !atext(c) then atoms = false
+  if atoms then name.split(' ') else ["\"" + name.replace("\\", "\\\\").replace("\"", "\\\"") + "\""]
+
+// The header `name` listing `boxes`, separated by commas, folded between words.
+private addressHeader(name: string, boxes: Vector[Mailbox]) -> Result[string, MailError]
+  val words = Buffer[string]()
+  for i in 0 ..< boxes.size
+    val ws = mailboxWords(name, boxes(i))?
+    for j in 0 ..< ws.size
+      words += (if j == ws.size - 1 && i < boxes.size - 1 then ws(j) + "," else ws(j))
+  folded(name, words.toVector)
+
+// An address checked: a local part and a domain around its last `@`, the local part at most 64
+// bytes and the whole at most 254, with no space, control character or any of `<>()",;\`. An address
+// beyond ASCII is kept as it is, for a server taking SMTPUTF8.
+checkedAddress(header: string, address: string) -> Result[string, MailError]
+  unbroken(header, address)?
+  val at = address.lastIndexOf('@')
+  if at <= 0 || at == address.byteLength - 1 then return Err(BadAddress(header, address, "is not local-part@domain"))
+  if at > 64 then return Err(BadAddress(header, address, "has a local part longer than 64 bytes"))
+  if address.byteLength > 254 then return Err(BadAddress(header, address, "is longer than 254 bytes"))
+  for i in 0 ..< address.byteLength
+    val c = int(address.byteAt(i))
+    if c <= 32 || c == 127 || "<>()\",;\\".contains(char(c).toString())
+      return Err(BadAddress(header, address, "holds a character an address cannot"))
+  Ok(address)
+
+// `t` as RFC 5322 writes a date, in UTC: `Thu, 01 Jan 1970 00:00:00 +0000`. An instant outside the
+// years 0000 to 9999 traps, as `toHttpDate` does.
+mailDate(t: Instant) -> string = t.toHttpDate().stripSuffix("GMT") + "+0000"
+
+// The value of a header as a reader sees it: its folding removed (each CR LF before a space or a tab
+// dropped) and its RFC 2047 encoded-words decoded, the space between two of them dropped. A word in
+// UTF-8, US-ASCII or ISO-8859-1, in `B` or `Q` encoding, is decoded; one in another character set or
+// that is malformed is kept as it is, as RFC 2047 says.
+decodeHeaderValue(value: string) -> string
+  val text = value.replace("\r\n ", " ").replace("\r\n\t", "\t")
+  val out = StringWriter()
+  var lastWasWord = false
+  var i = 0
+  val n = text.byteLength
+  while i < n
+    val start = text.indexOf("=?", i)
+    if start < 0
+      out.write(text.slice(i, n))
+      i = n
+    else
+      wordAt(text, start) match
+        Some((word, end)) ->
+          val between = text.slice(i, start)
+          // Space between two encoded-words is dropped; anything else between them is kept.
+          if !(lastWasWord && between.forall(c -> c == ' ' || c == '\t')) then out.write(between)
+          out.write(word)
+          lastWasWord = true
+          i = end
+        None ->
+          out.write(text.slice(i, start + 2))
+          lastWasWord = false
+          i = start + 2
+  out.text
+
+// The value of the hexadecimal digit `c`, either case, or -1.
+private hexValue(c: char) -> int
+hexValue(c)
+  | '0' <= c <= '9' = int(c) - int('0')
+  | 'a' <= c <= 'f' = int(c) - int('a') + 10
+  | 'A' <= c <= 'F' = int(c) - int('A') + 10
+  | _ = -1
+
+// The bytes of an encoded-word's `Q` text: `_` a space, `=XX` the byte with those hexadecimal
+// digits, every other character itself; `None` where an `=` has no two digits after it.
+private qDecoded(data: string) -> Option[Vector[byte]]
+  val out = Buffer[byte]()
+  val n = data.byteLength
+  var i = 0
+  while i < n
+    val c = char(int(data.byteAt(i)))
+    if c == '_'
+      out += byte(32)
+      i += 1
+    elif c == '='
+      if i + 2 >= n then return None
+      val hi = hexValue(char(int(data.byteAt(i + 1))))
+      val lo = hexValue(char(int(data.byteAt(i + 2))))
+      if hi < 0 || lo < 0 then return None
+      out += byte(hi * 16 + lo)
+      i += 3
+    else
+      out += data.byteAt(i)
+      i += 1
+  Some(out.toVector)
+
+// The encoded-word at `start` decoded and the offset after it, or `None` where there is none there
+// that can be decoded.
+private wordAt(text: string, start: int) -> Option[(string, int)]
+  val q1 = text.indexOf('?', start + 2)
+  if q1 < 0 then return None
+  val q2 = text.indexOf('?', q1 + 1)
+  if q2 < 0 || q2 != q1 + 2 then return None
+  val close = text.indexOf("?=", q2 + 1)
+  if close < 0 then return None
+  val charset = text.slice(start + 2, q1).toLower
+  val encoding = text.slice(q1 + 1, q2).toUpper
+  val data = text.slice(q2 + 1, close)
+  if data.contains(" ") then return None
+  val bytes: Option[Vector[byte]] =
+    if encoding == "B" then fromBase64(data).toOption elif encoding == "Q" then qDecoded(data) else None
+  val chars: Option[string] = bytes match
+    Some(b) ->
+      if charset == "utf-8" || charset == "us-ascii" then Some(string.fromUtf8Lossy(b.toArray()))
+      elif charset == "iso-8859-1" then Some(b.map(x -> char(int(x)).toString()).mkString(""))
+      else None
+    None -> None
+  chars.map(c -> (c, close + 2))

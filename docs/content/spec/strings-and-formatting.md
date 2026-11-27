@@ -104,7 +104,10 @@ There is no `%%`.
   grouped digits, and the commas and the sign count in the width, so the field is exactly as wide as
   asked unless the number is wider (`${1234}%0,8d` is `0001,234`, `${-1234}%0,8d` is `-001,234`).
   Under any other conversion the flag has no effect, which is an error.
-- **The width** is the least number of characters the field takes; a value wider is written whole.
+- **The width** is the least number of columns of a terminal the field takes, as `displayWidth`
+  counts them ([Display width](/spec/types/#display-width)), so a CJK ideograph fills two and a
+  combining accent none and a column of wide text lines up: `${"日本"}%6s` is `  日本`. A value wider
+  is written whole.
 - **The precision** is, for an integer, the least number of digits, so a precision of 0 writes zero as
   no digits; for `f`, `e` and `E` the number of decimals, and for `g` and `G` of significant digits;
   for `s` and `?` the most characters of the value's text that are written, whatever its type:
@@ -253,7 +256,8 @@ writeDisplayed[T: Display](out: Writer, value: T, spec: FormatSpec)
 writeDebugged[T: Debug](out: Writer, value: T, spec: FormatSpec)
 ```
 
-- `FormatSpec` is the field a value fills: `width` characters, padded with spaces on the left, or on
+- `FormatSpec` is the field a value fills: `width` columns of a terminal, as `displayWidth` counts
+  them, padded with spaces on the left, or on
   the right when `left`; 0 asks for no padding, and wider text is written whole. `precision`, -1 for
   none, is read by a renderer that takes one, in its own terms, under every conversion but `s` and
   `?`. Under those two the precision is the formatter's: `writeDisplayed(out, value, spec)` and

@@ -1,0 +1,338 @@
+module avin.toml
+
+// Encoding and decoding a program's own types. `derives TomlEncoder` and `derives TomlDecoder` give a
+// data type or a class an encoder and a decoder written for its own fields: a value is a table of its
+// fields, by name, and a value of a type of several variants also carries its variant's name under a
+// discriminator key written first.
+
+import avin.time.{Date, DateTime, Instant, Time, Zoned, utc}
+
+// A value that writes itself as TOML. `isTomlNone` is whether the value is an `Option`'s `None`: TOML
+// has no null, so a field holding `None` is left out, and a `None` anywhere else is an error.
+trait TomlEncoder
+  encode() -> Result[Toml, TomlError]
+  isTomlNone() -> bool = false
+
+// A value read from TOML. The value of a field absent from the input is the core's `Missable`
+// answer for its type, the one every format's decoder shares: `Some(None)` for an `Option`, and
+// otherwise `None`, an absence that is an error.
+trait TomlDecoder: Missable
+  static decode(value: Toml) -> Result[Self, TomlError]
+
+// A field's or a variant's name in TOML, in place of its name in the program.
+data TomlKey(name: string)
+impl Annotation for TomlKey
+
+// The discriminator key of a type of several variants, in place of `"type"`.
+data TomlTag(key: string)
+impl Annotation for TomlTag
+
+// A field never written, and skipped where the input has it: a decoded value takes the field's
+// default.
+object TomlOmit: Annotation
+
+// `value` as a TOML document, or why it cannot be one: a value that is not a table, a `None` that is
+// not a field's, or a date TOML cannot write. The error's path names the value at fault.
+encode[A: TomlEncoder](value: A) -> Result[string, TomlError]
+  val tree = toTree(value)?
+  if !tree.isTable then return Err(valueError(s"a TOML document is a table, and this value is ${tree.kind}"))
+  Ok(tree.render)
+
+// The `Toml` value that `encode` writes `value` as.
+toTree[A: TomlEncoder](value: A) -> Result[Toml, TomlError] = value.encode()
+
+// The value of type `A` that the document `text` holds, or the first thing wrong with it: a parse
+// error with its line and column, or a decoding error whose path names the key at fault.
+decode[A: TomlDecoder](text: string, maxDepth: int = defaultMaxDepth) -> Result[A, TomlError] =
+  A.decode(parse(text, maxDepth)?)
+
+// As `decode(text)`, for text given as its UTF-8 bytes.
+decode[A: TomlDecoder](bytes: Array[byte], maxDepth: int = defaultMaxDepth) -> Result[A, TomlError] =
+  A.decode(parse(bytes, maxDepth)?)
+
+// The value of type `A` that the `Toml` value `tree` holds, which may be part of a larger one, such
+// as one table of a document; an error's path begins at `tree`.
+decode[A: TomlDecoder](tree: Toml) -> Result[A, TomlError] = A.decode(tree)
+
+private keyOf(f: FieldShape) -> string = f.annotation[TomlKey]().map(k -> k.name).getOrElse(f.name)
+
+private nameOf(v: VariantShape) -> string = v.annotation[TomlKey]().map(k -> k.name).getOrElse(v.name)
+
+private tagOf(t: TypeShape) -> string = t.annotation[TomlTag]().map(tag -> tag.key).getOrElse("type")
+
+// The error for a value of the wrong kind.
+private expected(what: string, found: Toml) -> TomlError = valueError(s"expected $what, found ${found.kind}")
+
+// The built-in types: a `bool` as a boolean, the integers as integers, a `real` as a float (read
+// from an integer too), a string as a string, a `Toml` as itself.
+
+impl TomlEncoder for bool
+  encode() -> Result[Toml, TomlError] = Ok(Bool(self))
+  isTomlNone() -> bool = false
+
+impl TomlDecoder for bool
+  static decode(value: Toml) -> Result[bool, TomlError] = value match
+    Bool(b) -> Ok(b)
+    _ -> Err(expected("a boolean", value))
+
+impl TomlEncoder for int
+  encode() -> Result[Toml, TomlError] = Ok(Integer(long(self)))
+  isTomlNone() -> bool = false
+
+// An integer outside an `int`'s range is an error naming it.
+impl TomlDecoder for int
+  static decode(value: Toml) -> Result[int, TomlError] = value match
+    Integer(n) -> if value.asInt is Some(i) then Ok(i) else Err(valueError(s"$n does not fit an int"))
+    _ -> Err(expected("an integer", value))
+
+impl TomlEncoder for long
+  encode() -> Result[Toml, TomlError] = Ok(Integer(self))
+  isTomlNone() -> bool = false
+
+impl TomlDecoder for long
+  static decode(value: Toml) -> Result[long, TomlError] = value match
+    Integer(n) -> Ok(n)
+    _ -> Err(expected("an integer", value))
+
+impl TomlEncoder for real
+  encode() -> Result[Toml, TomlError] = Ok(Float(self))
+  isTomlNone() -> bool = false
+
+impl TomlDecoder for real
+  static decode(value: Toml) -> Result[real, TomlError] = value match
+    Float(x) -> Ok(x)
+    Integer(n) -> Ok(real(n))
+    _ -> Err(expected("a float", value))
+
+impl TomlEncoder for string
+  encode() -> Result[Toml, TomlError] = Ok(Str(self))
+  isTomlNone() -> bool = false
+
+impl TomlDecoder for string
+  static decode(value: Toml) -> Result[string, TomlError] = value match
+    Str(s) -> Ok(s)
+    _ -> Err(expected("a string", value))
+
+impl TomlEncoder for Toml
+  encode() -> Result[Toml, TomlError] = Ok(self)
+
+impl TomlDecoder for Toml
+  static decode(value: Toml) -> Result[Toml, TomlError] = Ok(value)
+
+impl Missable for Toml
+
+// The date-time kinds: a `Zoned` as an offset date-time, an `Instant` as one in UTC, a `DateTime` as
+// a local date-time, a `Date` as a local date and a `Time` as a local time. A date outside the years
+// 0 to 9999 cannot be written, and is an error.
+
+impl TomlEncoder for Zoned
+  encode() -> Result[Toml, TomlError] = checkedYear(date, OffsetDateTime(self))
+
+impl TomlDecoder for Zoned
+  static decode(value: Toml) -> Result[Zoned, TomlError] = value match
+    OffsetDateTime(z) -> Ok(z)
+    _ -> Err(expected("an offset date-time", value))
+
+impl TomlEncoder for Instant
+  encode() -> Result[Toml, TomlError] = atZone(utc).encode()
+
+impl TomlDecoder for Instant
+  static decode(value: Toml) -> Result[Instant, TomlError] = value match
+    OffsetDateTime(z) -> Ok(z.toInstant)
+    _ -> Err(expected("an offset date-time", value))
+
+impl TomlEncoder for DateTime
+  encode() -> Result[Toml, TomlError] = checkedYear(date, LocalDateTime(self))
+
+impl TomlDecoder for DateTime
+  static decode(value: Toml) -> Result[DateTime, TomlError] = value match
+    LocalDateTime(dt) -> Ok(dt)
+    _ -> Err(expected("a local date-time", value))
+
+impl TomlEncoder for Date
+  encode() -> Result[Toml, TomlError] = checkedYear(self, LocalDate(self))
+
+impl TomlDecoder for Date
+  static decode(value: Toml) -> Result[Date, TomlError] = value match
+    LocalDate(d) -> Ok(d)
+    _ -> Err(expected("a local date", value))
+
+impl TomlEncoder for Time
+  encode() -> Result[Toml, TomlError] = Ok(LocalTime(self))
+
+impl TomlDecoder for Time
+  static decode(value: Toml) -> Result[Time, TomlError] = value match
+    LocalTime(t) -> Ok(t)
+    _ -> Err(expected("a local time", value))
+
+private checkedYear(d: Date, value: Toml) -> Result[Toml, TomlError] =
+  if writable(d) then Ok(value) else Err(valueError(s"TOML writes the years 0 to 9999, and $d is outside them"))
+
+// An `Option` is its value when it is `Some`; a field holding `None` is left out, and a field of an
+// `Option` type absent from the input is `None`.
+impl[A: TomlEncoder] TomlEncoder for Option[A]
+  encode() -> Result[Toml, TomlError] = self match
+    Some(a) -> a.encode()
+    None -> Err(valueError("TOML has no null, so a None is written only as a field, which is left out"))
+  override isTomlNone() -> bool = self is None
+
+impl[A: TomlDecoder] TomlDecoder for Option[A]
+  static decode(value: Toml) -> Result[Option[A], TomlError] = A.decode(value).map(a -> Some(a))
+
+// A vector and a list are arrays, the path of an error in an element naming its index.
+impl[A: TomlEncoder] TomlEncoder for Vector[A]
+  encode() -> Result[Toml, TomlError] = encodeElements(self)
+
+impl[A: TomlDecoder] TomlDecoder for Vector[A]
+  static decode(value: Toml) -> Result[Vector[A], TomlError] = decodeElements[A](value)
+
+impl[A: TomlEncoder] TomlEncoder for List[A]
+  encode() -> Result[Toml, TomlError] = encodeElements(self)
+
+impl[A: TomlDecoder] TomlDecoder for List[A]
+  static decode(value: Toml) -> Result[List[A], TomlError] = decodeElements[A](value).map(items -> items.toList)
+
+private encodeElements[A: TomlEncoder](items: Iterable[A]) -> Result[Toml, TomlError]
+  val out = Buffer[Toml]()
+  for a in items
+    out.addOne(a.encode().mapErr(e -> e.atIndex(out.length))?)
+  Ok(Arr(out.toVector))
+
+private decodeElements[A: TomlDecoder](value: Toml) -> Result[Vector[A], TomlError]
+  val items = value match
+    Arr(items) -> items
+    _ -> return Err(expected("an array", value))
+  val out = Buffer[A]()
+  for item in items
+    out.addOne(A.decode(item).mapErr(e -> e.atIndex(out.length))?)
+  Ok(out.toVector)
+
+// A type whose values are a table's keys: a string as itself, and an `int` or a `long` as its decimal
+// digits, read back only from exactly what `toLongOption` reads.
+trait TomlMapKey
+  tomlKey() -> string
+  static fromTomlKey(key: string) -> Option[Self]
+
+impl TomlMapKey for string
+  tomlKey() -> string = self
+  static fromTomlKey(key: string) -> Option[string] = Some(key)
+
+impl TomlMapKey for int
+  tomlKey() -> string = s"$self"
+  static fromTomlKey(key: string) -> Option[int] = key.toIntOption()
+
+impl TomlMapKey for long
+  tomlKey() -> string = s"$self"
+  static fromTomlKey(key: string) -> Option[long] = key.toLongOption()
+
+// A map, a `HashMap` or a `TreeMap`, whose keys are a `TomlMapKey`, is a table of its entries in the
+// map's own order; an entry holding `None` is left out.
+impl[K: TomlMapKey, A: TomlEncoder] TomlEncoder for HashMap[K, A]
+  encode() -> Result[Toml, TomlError] = encodeEntries(self.iterator())
+
+impl[K: TomlMapKey, A: TomlDecoder] TomlDecoder for HashMap[K, A]
+  static decode(value: Toml) -> Result[HashMap[K, A], TomlError] = decodeEntries(value, HashMap.newBuilder[K, A]())
+
+impl[K: TomlMapKey, A: TomlEncoder] TomlEncoder for TreeMap[K, A]
+  encode() -> Result[Toml, TomlError] = encodeEntries(self.iterator())
+
+impl[K: TomlMapKey, A: TomlDecoder] TomlDecoder for TreeMap[K, A]
+  static decode(value: Toml) -> Result[TreeMap[K, A], TomlError] = decodeEntries(value, TreeMap.newBuilder[K, A]())
+
+private encodeEntries[K: TomlMapKey, A: TomlEncoder](entries: Iterator[(K, A)]) -> Result[Toml, TomlError]
+  val out = Buffer[(string, Toml)]()
+  for (k, a) in entries
+    if !a.isTomlNone()
+      val key = k.tomlKey()
+      out.addOne((key, a.encode().mapErr(e -> e.inField(key))?))
+  Ok(Table(out.toVector))
+
+private decodeEntries[K: TomlMapKey, A: TomlDecoder, M](
+    value: Toml,
+    entries: Builder[(K, A), M]
+) -> Result[M, TomlError]
+  val members = value match
+    Table(members) -> members
+    _ -> return Err(expected("a table", value))
+  for (name, item) in members
+    val k = K.fromTomlKey(name) match
+      Some(k) -> k
+      None -> return Err(valueError(s"the key \"$name\" is not a key of this map's type").inField(name))
+    entries.addOne((k, A.decode(item).mapErr(e -> e.inField(name))?))
+  Ok(entries.result())
+
+// The derived encoder: a table of the value's fields, by name, each written by its own type's
+// encoder, a field holding `None` left out. A type of several variants writes its variant's name
+// first, under its discriminator key.
+derive TomlEncoder for T
+  encode() -> Result[Toml, TomlError]
+    val w = T.walk(self, FieldWriter(T.shape()))
+    w.result()
+
+private class FieldWriter(shape: TypeShape)
+  private val members = Buffer[(string, Toml)]()
+  private var failure: Option[TomlError] = None
+
+  result() -> Result[Toml, TomlError] = failure match
+    Some(e) -> Err(e)
+    None -> Ok(Table(members.toVector))
+
+impl ShapeVisitor for FieldWriter
+  variant(v: VariantShape) -> FieldWriter
+    if shape.variantCount > 1 then members.addOne((tagOf(shape), Str(nameOf(v))))
+    self
+
+impl FieldWriter
+  field[F: TomlEncoder](f: FieldShape, value: F) -> FieldWriter
+    if failure.isEmpty && !f.has(TomlOmit) && !value.isTomlNone()
+      value.encode() match
+        Ok(item) -> members.addOne((keyOf(f), item))
+        Err(e) -> failure = Some(e.inField(keyOf(f)))
+    self
+
+// The derived decoder: the variant named by the discriminator, where the type has several, then each
+// key, decoding its value at that field's type. A key no field has is skipped, and a field absent
+// from the input takes its default, or its type's `whenMissing`, or is an error naming it. The deriving
+// type keeps `Missable`'s default, `None`, unless it implements `Missable` itself.
+derive TomlDecoder for T
+  static decode(value: Toml) -> Result[T, TomlError] = T.build(FieldReader(value))
+
+private class FieldReader(value: Toml)
+  private var members = Vector.empty[(string, Toml)]()
+  private var at = 0
+  private var tag = ""
+  private var current: Toml = value
+
+impl ShapeBuilder[TomlError] for FieldReader
+  variant(t: TypeShape) -> Result[int, TomlError]
+    members = value match
+      Table(m) -> m
+      _ -> return Err(expected("a table", value))
+    if t.variantCount == 1 then return Ok(0)
+    tag = tagOf(t)
+    val name = value.get(tag) match
+      Some(Str(name)) -> name
+      Some(other) -> return Err(expected("a string naming the variant", other).inField(tag))
+      None -> return Err(valueError(s"missing \"$tag\", naming the variant"))
+    t.variants.find(v -> nameOf(v) == name) match
+      Some(v) -> Ok(v.index)
+      None -> Err(valueError(s"unknown variant \"$name\"").inField(tag))
+
+  next(v: VariantShape) -> Result[Option[int], TomlError]
+    while at < members.length
+      val (key, item) = members(at)
+      at += 1
+      if tag != "" && key == tag then continue
+      if v.fields.find(f -> !f.has(TomlOmit) && keyOf(f) == key) is Some(f)
+        current = item
+        return Ok(Some(f.index))
+    Ok(None)
+
+  duplicate(f: FieldShape) -> TomlError = valueError(s"duplicate field \"${keyOf(f)}\"")
+
+impl FieldReader
+  field[F: TomlDecoder](f: FieldShape) -> Result[F, TomlError] = F.decode(current).mapErr(e -> e.inField(keyOf(f)))
+
+  missing[F: TomlDecoder](f: FieldShape) -> Result[F, TomlError] = F.whenMissing() match
+    Some(value) -> Ok(value)
+    None -> Err(valueError(s"missing field \"${keyOf(f)}\""))

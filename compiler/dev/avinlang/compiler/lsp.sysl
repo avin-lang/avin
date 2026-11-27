@@ -645,14 +645,15 @@ lsp_offset(src: Source, line: int, character: int) -> usize
 
 // The reference written at `offset` in a document: the smallest one covering it, so that a cursor
 // on an argument is on the argument and not the call around it. A cursor just past a name's last
-// character is on that name too, as editors place a cursor after the word it was typed into.
+// character is on that name too, as editors place a cursor after the word it was typed into. A given a
+// call was filled with is recorded at the call's name too, but the name written there is the call's.
 private lsp_reference_at(d: LspDocument, offset: usize) -> Option[Reference]
     var best: Option[Reference] = None
     for pass in 0..<2
         if pass == 1 && (best is Some(_) || offset == 0) then break
         val at = if pass == 0 then offset else offset - 1
         for r in d.references
-            if at < r.at_span.start || at >= r.at_span.end then continue
+            if r.filled != "" || at < r.at_span.start || at >= r.at_span.end then continue
             best = best match
                 Some(b) -> if r.at_span.len() < b.at_span.len() then Some(r) else Some(b)
                 None -> Some(r)
@@ -668,8 +669,19 @@ private lsp_point(server: LspServer, params: Json) -> Option[(LspDocument, usize
     val character = lsp_int_at(params, ["position", "character"]).unwrap_or(0)
     Some((d, lsp_offset(source_of(d.file, d.text), line, character)))
 
+// Whether `o` is recorded at the very place `r` is.
+private lsp_same_place(o: Reference, r: Reference) -> bool = o.at_file == r.at_file && o.at_span.start == r.at_span.start && o.at_span.end == r.at_span.end
+
+// The givens the call named at `r` had its `using` section filled with, in the order of its parameters.
+private lsp_fills_at(d: LspDocument, r: Reference) -> Buf[Reference]
+    var out: Buf[Reference] = buf()
+    for o in d.references
+        if o.filled != "" && lsp_same_place(o, r) then out.push(o)
+    out
+
 /** `textDocument/hover`: what the checker knew about the name under the cursor, as Avin code, and
- * the declaration's doc comment under it. */
+ * the declaration's doc comment under it. On a call whose `using` section was filled, each filled
+ * argument as it would be written, with the given it came from. */
 lsp_hover(server: LspServer, params: Json) -> Json
     val (d, offset) = lsp_point(server, params) match
         Some(p) -> p
@@ -680,10 +692,17 @@ lsp_hover(server: LspServer, params: Json) -> Json
     var value = ""
     // An import of a variant name several types share shows each of them.
     for o in d.references
-        if o.at_file != r.at_file || o.at_span.start != r.at_span.start || o.at_span.end != r.at_span.end then continue
+        if o.filled != "" || !lsp_same_place(o, r) then continue
         if value != "" then value = value + "\n\n"
         value = value + s"```avin\n${o.detail}\n```"
         if o.doc != "" then value = value + "\n\n" + o.doc
+    val fills = lsp_fills_at(d, r)
+    if fills.len() > 0
+        var lines = ""
+        for f in fills
+            val name = lsp_slice(lsp_file_text(server, f.declared_file), f.declared_span.start, f.declared_span.end)
+            lines = lines + s"${f.filled} = $name  // ${f.detail}\n"
+        value = value + s"\n\nFilled from givens:\n\n```avin\n$lines```"
     var contents: Buf[JsonMember] = buf()
     lsp_put(&contents, "kind", Json.Str("markdown"))
     lsp_put(&contents, "value", Json.Str(value))
@@ -740,8 +759,8 @@ lsp_range_formatting(server: LspServer, params: Json) -> Json
 /** `textDocument/completion`: what the checker finds may be written at the cursor
  * (`completion.sysl`). The document's word at the cursor is replaced by a stand-in in a copy of its
  * text, the first copy that parses is analyzed with its program, and what the check recorded at the
- * stand-in is answered, with the keywords that begin an expression where a name in one is being
- * written. Nothing the analysis finds is published or kept: the editor's document, its diagnostics
+ * stand-in is answered, with the keywords that may begin a form there (`completion_keywords`).
+ * Nothing the analysis finds is published or kept: the editor's document, its diagnostics
  * and its references are those of its last change. The editor filters the list by what is typed. */
 lsp_completion(server: LspServer, params: Json) -> Json
     val (d, offset) = lsp_point(server, params) match
@@ -755,13 +774,14 @@ lsp_completion(server: LspServer, params: Json) -> Json
         if !parse(source_of(d.file, t)).report.has_errors()
             chosen = t
             break
-    if chosen == "" then return lsp_completion_list(items)
-    val found = lsp_analyze(server, d.file, chosen, CompletionMarker).completions
-    for c in found.items
-        items.push(lsp_completion_item(server, c))
-    if found.site is ValueSite
-        for k in ["def", "val", "var", "if", "match", "select", "for", "while", "loop", "return", "break", "continue", "defer", "true", "false"]
-            items.push(lsp_keyword_item(k))
+    var site = NoSite
+    if chosen != ""
+        val found = lsp_analyze(server, d.file, chosen, CompletionMarker).completions
+        for c in found.items
+            items.push(lsp_completion_item(server, c))
+        site = found.site
+    for k in completion_keywords(d.text, word, site)
+        items.push(lsp_keyword_item(k))
     lsp_completion_list(items)
 
 private lsp_completion_list(items: Buf[Json]) -> Json
@@ -826,7 +846,8 @@ private lsp_completion_kind(c: Completion) -> long
         GlobalName -> 6
 
 /** `textDocument/definition`: where the name under the cursor was declared, its range the name the
- * declaration spells. */
+ * declaration spells. From a call whose `using` section was filled, the function, then each given
+ * it was filled with. */
 lsp_definition(server: LspServer, params: Json) -> Json
     val (d, offset) = lsp_point(server, params) match
         Some(p) -> p
@@ -837,7 +858,9 @@ lsp_definition(server: LspServer, params: Json) -> Json
     // An import of a variant name several types share means each of them: one location apiece.
     var same: Buf[Reference] = buf()
     for o in d.references
-        if o.at_file == r.at_file && o.at_span.start == r.at_span.start && o.at_span.end == r.at_span.end then same.push(o)
+        if o.filled == "" && lsp_same_place(o, r) then same.push(o)
+    for o in lsp_fills_at(d, r)
+        same.push(o)
     if same.len() > 1
         var places: Buf[Json] = buf()
         for o in same
@@ -872,7 +895,8 @@ private lsp_same_declaration(r: Reference, d: Reference) -> bool =
  * cursor stands for, in every file the last analysis read, the library's included; the declaration's
  * own name among them where `context.includeDeclaration` asks for it. A method's references are
  * those of that method: a call the checker resolved to the method it overrides, or to the trait
- * member it implements, is a reference to that one. */
+ * member it implements, is a reference to that one. A given's references include the calls it
+ * filled, at the call's name. */
 lsp_references(server: LspServer, params: Json) -> Json
     val (d, offset) = lsp_point(server, params) match
         Some(p) -> p
@@ -1080,7 +1104,8 @@ lsp_rename(server: LspServer, params: Json) -> Result[Json, string]
     var edits: Buf[LspEdit] = buf()
     var seen: Buf[(string, usize)] = buf()
     for r in refs
-        if !lsp_declared_in(family, r.declared_file, r.declared_span) then continue
+        // A call a given filled names the call's function, not the given: nothing to rename there.
+        if r.filled != "" || !lsp_declared_in(family, r.declared_file, r.declared_span) then continue
         val place = lsp_name_place(lsp_file_text(server, r.at_file), r, old) match
             Some(p) -> p
             None -> continue
@@ -1195,7 +1220,7 @@ lsp_semantic_tokens(server: LspServer, params: Json) -> Json
     val src = source_of(d.file, d.text)
     var order: Buf[Reference] = buf()
     for r in d.references
-        if r.at_span.end > r.at_span.start && r.at_span.end <= src.bytes.len then order.push(r)
+        if r.filled == "" && r.at_span.end > r.at_span.start && r.at_span.end <= src.bytes.len then order.push(r)
     sort_by(order.view_mut(), lsp_earlier)
     var data: Buf[Json] = buf()
     var last_line = 0usize

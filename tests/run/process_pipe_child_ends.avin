@@ -1,0 +1,84 @@
+// expect: exit 0
+// A child that ends early, one that is killed, and one that runs out of time, with the program in the
+// middle of using its pipes: nothing deadlocks and nothing ends the program. A write to a child that
+// has stopped reading answers `ConnectionReset`, never SIGPIPE; a read of one that has ended answers
+// what it wrote and then the end; output left unread does not keep a child from ending, nor its
+// status from being had; closing the output of a child still writing ends it by SIGPIPE; `kill` ends
+// a read and a write waiting in other threads; `close` stops a child and its output ends; the
+// command's time limit, and an end's own `setTimeout`, end a wait with `TimedOut`; and an output a
+// program the child started still holds ends only when that program does.
+import avin.io.IoError
+import avin.process.Command
+import avin.threads.{sleep, spawn}
+import avin.time.{millis, seconds}
+
+ok[T](r: Result[T, IoError]) -> T = r match
+  Ok(v) -> v
+  Err(e) -> fail(e.message)
+
+text(bytes: Array[byte]) -> string = string.fromUtf8Lossy(bytes)
+
+big() -> Array[byte] = Array.fill(4 * 1024 * 1024, "y".utf8(0))
+
+main() -> int
+  // `head` reads five bytes and exits while a thread is still writing megabytes into its input.
+  val head = Command("head", "-c", "5").pipeInput().pipeOutput().start().ok.get
+  val headIn = head.stdin()
+  val writing = spawn(() -> headIn.write(big()).mapErr(e -> e.kind))
+  println(s"head wrote: ${text(ok(head.stdout().readAll()))}")
+  println(s"the write into it: ${writing.join()}")
+  println(s"head: ${head.waitFor().ok.get}")
+
+  // Output left unread: the child ends, its status is had, and the output is read afterwards.
+  val printf = Command("printf", "hello").pipeOutput().start().ok.get
+  println(s"printf: ${printf.waitFor().ok.get}, then its output: ${text(ok(printf.stdout().readAll()))}")
+
+  // The program stops reading a child that goes on writing: closing its output ends it.
+  val yes = Command("yes").pipeOutput().start().ok.get
+  println(s"yes: ${ok(yes.stdout().readLine()).get}")
+  ok(yes.stdout().close())
+  println(s"yes, its output closed: ${yes.waitFor().ok.get}")
+
+  // `kill` while one thread waits to read and another to write.
+  val cat = Command("cat").pipeInput().pipeOutput().start().ok.get
+  val catOut = cat.stdout()
+  val reading = spawn(() -> catOut.read(10).map(b -> b.length))
+  sleep(millis(50))
+  cat.kill()
+  println(s"a read waiting when cat was killed: ${reading.join()}")
+  println(s"cat: ${cat.waitFor().ok.get}")
+
+  val sleeper = Command("sleep", "30").pipeInput().start().ok.get
+  val sleeperIn = sleeper.stdin()
+  val stuck = spawn(() -> sleeperIn.write(big()).mapErr(e -> e.kind))
+  sleep(millis(100))
+  sleeper.kill()
+  println(s"a write waiting when sleep was killed: ${stuck.join()}")
+  println(s"sleep: ${sleeper.waitFor().ok.get}")
+
+  // `close` stops a child still running; its output then ends.
+  val closing = Command("cat").pipeInput().pipeOutput().start().ok.get
+  ok(closing.close())
+  println(s"after close: ${ok(closing.stdout().read(10)).length}, ${closing.waitFor().ok.get}")
+
+  // The command's time limit ends a read waiting for output; the status says it timed out.
+  val slow = Command("sleep", "30").withTimeout(millis(200)).pipeOutput().start().ok.get
+  println(s"a read past the time limit: ${slow.stdout().readAll().mapErr(e -> e.kind).map(b -> b.length)}")
+  println(s"slow: ${slow.waitFor().ok.get}")
+
+  // An end's own timeout ends one wait; the child goes on, and is killed.
+  val quiet = Command("sleep", "30").pipeInput().pipeOutput().start().ok.get
+  ok(quiet.stdout().setTimeout(millis(100)))
+  println(s"a read past its timeout: ${quiet.stdout().read(1).mapErr(e -> e.kind).map(b -> b.length)}")
+  ok(quiet.stdin().setTimeout(millis(100)))
+  println(s"a write past its timeout: ${quiet.stdin().write(big()).mapErr(e -> e.kind)}")
+  println(s"quiet still running: ${quiet.isAlive()}")
+  ok(quiet.stdout().setTimeout(seconds(0)))
+  quiet.kill()
+  println(s"quiet: ${quiet.waitFor().ok.get}, then its output: ${quiet.stdout().read(1).map(b -> b.length)}")
+
+  // A program the child started holds the output too: it ends when that program does.
+  val parent = Command("/bin/sh", "-c", "sleep 0.3 & echo started").pipeOutput().start().ok.get
+  println(s"sh: ${parent.waitFor().ok.get}")
+  println(s"its output, once the sleep it left ended: ${text(ok(parent.stdout().readAll())).trim}")
+  0

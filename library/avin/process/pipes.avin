@@ -1,0 +1,343 @@
+module avin.process
+
+// The program's ends of the pipes to a started command's standard streams, which `pipeInput()`,
+// `pipeOutput()` and `pipeErrors()` ask for and the `Child`'s `stdin()`, `stdout()` and `stderr()`
+// answer. A `ChildInput` is the writing half of a connection in all but name, a `StreamWriter`, and a
+// `ChildOutput` the reading half, a `StreamReader`, so code that speaks a protocol over a connection
+// speaks it over a child's standard streams unchanged.
+//
+// Each end is non-blocking and waits as a socket does: a lightweight thread parks on the runtime's
+// poller, leaving its worker to the others, and any other thread waits on the descriptor alone, safe
+// for the collector. Each is a Sysl handle, which belongs to one thread at a time and is checked at
+// every operation, so one thread may write a child's input while another reads its output.
+
+import avin.io
+import avin.io.IoError
+import avin.net.{ReadAhead, StreamReader, StreamWriter}
+import avin.time
+import avin.time.Duration
+
+// The program's end of the pipe a child reads its standard input from. Its traps name the
+// `ChildInput`.
+@sysl("sysl.fs.File", named: "ChildInput")
+private class InputEnd
+  // Closes the descriptor; closing again does nothing.
+  @sysl("close")
+  shut() -> Result[unit, SyslError]
+  // The descriptor, which a select's `writable()` arm watches: calling it also checks the end belongs
+  // to the code running.
+  @sysl("fd")
+  held() -> Result[int, SyslError]
+
+// The program's end of a pipe a child writes its standard output or error into. Its traps name the
+// `ChildOutput`.
+@sysl("sysl.fs.File", named: "ChildOutput")
+private class OutputEnd
+  @sysl("close")
+  shut() -> Result[unit, SyslError]
+  // The descriptor, which a select's `readable()` arm watches: calling it also checks the end belongs
+  // to the code running.
+  @sysl("fd")
+  held() -> Result[int, SyslError]
+
+// A pipe for a child's standard input: the end the child reads, and the program's, which it writes.
+// Each end is one handle, so neither is ever closed behind the other's back.
+@sysl("sysl.process.pipe")
+private makeInputPipe() -> Result[(File, InputEnd), SyslError]
+
+// A pipe for a child's standard output or error: the program's end, which it reads, and the child's.
+@sysl("sysl.process.pipe")
+private makeOutputPipe() -> Result[(OutputEnd, File), SyslError]
+
+@sysl("avin.rt.pipe_non_blocking")
+private inputNonBlocking(p: InputEnd) -> Result[unit, SyslError]
+
+@sysl("avin.rt.pipe_non_blocking")
+private outputNonBlocking(p: OutputEnd) -> Result[unit, SyslError]
+
+@sysl("avin.rt.pipe_send_all")
+private pipeSendAll(p: InputEnd, bytes: Array[byte], limitMs: int) -> Result[unit, SyslError]
+
+@sysl("avin.rt.pipe_send_some")
+private pipeSendSome(p: InputEnd, bytes: Array[byte], limitMs: int) -> Result[long, SyslError]
+
+@sysl("avin.rt.pipe_writable")
+private pipeWritable(p: InputEnd) -> bool
+
+@sysl("avin.rt.pipe_receive")
+private pipeReceive(p: OutputEnd, max: int, limitMs: int) -> Result[Array[byte], SyslError]
+
+@sysl("avin.rt.pipe_receive_available")
+private pipeReceiveAvailable(p: OutputEnd, max: int) -> Result[Option[Array[byte]], SyslError]
+
+@sysl("avin.rt.pipe_readable")
+private pipeReadable(p: OutputEnd) -> bool
+
+// Why an operation on a pipe failed, as the runtime tells a connection's failures apart: a reader
+// that has gone is `Reset`, a wait past its limit `TimedOut`.
+@sysl("avin.rt.NetFailure")
+private data PipeFailure
+  Refused
+  Reset
+  TimedOut
+  Failed(message: string)
+
+@sysl("avin.rt.net_failure")
+private pipeFailureOf(e: SyslError) -> PipeFailure
+
+// The error `operation` on the stream `subject` failed with.
+private pipeFailed(operation: string, subject: string) -> (SyslError) -> IoError = e -> pipeFailureOf(e) match
+  Refused -> IoError(io.ConnectionRefused, operation, subject)
+  Reset -> IoError(io.ConnectionReset, operation, subject)
+  TimedOut -> IoError(io.TimedOut, operation, subject)
+  Failed(m) -> IoError(io.Other(m), operation, subject)
+
+// What an operation on a closed end answers.
+private pipeClosed(operation: string, subject: string) -> IoError =
+  IoError(io.Other("the pipe is closed"), operation, subject)
+
+// A cancellation point: stops the calling thread where its scope has cancelled it and it may stop here.
+@intrinsic("cancel_point")
+private stopIfCancelledOnPipe()
+
+// What a pipe operation that waited answered, once the thread has passed a cancellation point where
+// it failed, as a socket's does.
+private afterPipeWait[T, E](r: Result[T, E]) -> Result[T, E]
+  if r.isErr then stopIfCancelledOnPipe()
+  r
+
+// A duration as a pipe's timeout in milliseconds, rounded up, zero for none.
+private pipeMillis(d: Duration) -> int
+  if d.micros <= 0 then return 0
+  val ms = if d.micros % 1000 > 0 then d.micros / 1000 + 1 else d.micros / 1000
+  if ms > long(int.MaxValue) then int.MaxValue else int(ms)
+
+// The limit in milliseconds of one wait on a pipe: the end's own timeout, `limitMs`, zero for none,
+// and the command's time limit, `deadline`, a reading of the monotonic clock, whichever ends first.
+// Past the deadline it is one millisecond, so an operation that need not wait still answers, and one
+// that would wait answers `TimedOut`.
+private waitLimit(limitMs: int, deadline: Option[Duration]) -> int = deadline match
+  None -> limitMs
+  Some(d) ->
+    val left = pipeMillis(d - time.monotonic())
+    val bounded = if left < 1 then 1 else left
+    if limitMs > 0 && limitMs < bounded then limitMs else bounded
+
+// The program's end of the pipe a started command reads its standard input from, which `stdin()` of
+// the `Child` answers for a command started with `pipeInput()`. It is a `StreamWriter`: `write` writes
+// all of its bytes, waiting for the command to read where the pipe is full, `writeSome` what goes
+// without waiting, and a `select` waits for room with a `writable()` arm. Closing it ends the
+// command's input: the command reads the end of it once it has read everything written before.
+//
+// A write to a command that has ended, or has closed its input, answers
+// `Err(IoError(ConnectionReset, "write to", …))` rather than ending the program. A write that waits
+// past the command's time limit, or its own `setTimeout`, answers `TimedOut`.
+@trusted_sendable(
+  "it belongs to one thread at a time: a send hands it over, and every operation first checks its owner, so the code that handed it over traps"
+)
+class ChildInput(
+    private val pipe: InputEnd,
+    private val deadline: Option[Duration],
+    private val subject: string
+): Sendable, StreamWriter
+  private var closed = false
+  private var limitMs = 0
+
+  // Writes all of `bytes`, waiting for room as often as it takes.
+  override write(bytes: Array[byte]) -> Result[unit, IoError]
+    mine()
+    if closed then return Err(pipeClosed("write to", subject))
+    afterPipeWait(pipeSendAll(pipe, bytes, waitLimit(limitMs, deadline))).mapErr(pipeFailed("write to", subject))
+
+  // Writes what of `bytes` goes without waiting, after waiting for room for the first byte where there
+  // is none, and answers how many were written: at least one, unless `bytes` is empty.
+  override writeSome(bytes: Array[byte]) -> Result[int, IoError]
+    mine()
+    if closed then return Err(pipeClosed("write to", subject))
+    afterPipeWait(pipeSendSome(pipe, bytes, waitLimit(limitMs, deadline))).map(n -> int(n)).mapErr(
+      pipeFailed("write to", subject)
+    )
+
+  // Writes `text` as UTF-8.
+  override writeText(text: string) -> Result[unit, IoError] = write(text.utf8)
+
+  // Whether a write would write something now, without waiting: there is room, or the command has
+  // stopped reading, or the end is closed, which the write then reports. Never waits.
+  override writable() -> bool
+    mine()
+    closed || pipeWritable(pipe)
+
+  // The pipe's descriptor, which a select's `writable()` arm watches; -1 once closed.
+  override writabilityDescriptor() -> int
+    mine()
+    if closed then return -1
+    pipe.held() match
+      Ok(fd) -> fd
+      Err(_) -> -1
+
+  // A write that waits longer than `d` fails with `TimedOut` from now on; zero or less takes the limit
+  // away. The command's own time limit still bounds every wait.
+  override setTimeout(d: Duration) -> Result[unit, IoError]
+    mine()
+    if closed then return Err(pipeClosed("set the timeout of", subject))
+    limitMs = pipeMillis(d)
+    Ok(())
+
+  // Closes the pipe, so the command reads the end of its input; closing again does nothing.
+  override close() -> Result[unit, IoError]
+    mine()
+    if !closed
+      closed = true
+      _ = pipe.shut()
+      pipe.close()
+    Ok(())
+
+  // Stops the program where the end belongs to another thread.
+  private mine()
+    if closed then _ = pipe.close() else _ = pipe.held()
+
+// The program's end of a pipe a started command writes its standard output or standard error into,
+// which `stdout()` and `stderr()` of the `Child` answer for a command started with `pipeOutput()` or
+// `pipeErrors()`. It is a `StreamReader`: `read(max)` answers what has arrived, up to `max` bytes,
+// waiting only while nothing has, `readLine` a line, `readAll` everything until the command's last
+// writer has closed it, and a `select` waits for it with a `readable()` arm. Each answers the end of
+// the output, an empty array or `None`, once the command, and every program it started that still
+// holds the stream, has ended or closed it.
+//
+// A read that waits past the command's time limit, or its own `setTimeout`, answers `TimedOut`.
+@trusted_sendable(
+  "it belongs to one thread at a time: a send hands it over, and every operation first checks its owner, so the code that handed it over traps"
+)
+class ChildOutput(
+    private val pipe: OutputEnd,
+    private val buffered: ReadAhead,
+    private val deadline: Option[Duration],
+    private val subject: string
+): Sendable, StreamReader
+  private var closed = false
+  private var limitMs = 0
+
+  // Up to `max` bytes, `max` being at least one, waiting for at least one; an empty array once the
+  // output has ended.
+  override read(max: int) -> Result[Array[byte], IoError]
+    mine()
+    if closed then return Err(pipeClosed("read from", subject))
+    buffered.read(max, received)
+
+  // The next line, without its terminator, or `None` once the output has ended and every line has
+  // been read. A line ends at `\n`, a `\r` just before it being part of the terminator, and the last
+  // line needs none; bytes that are not UTF-8 become U+FFFD.
+  override readLine() -> Result[Option[string], IoError]
+    mine()
+    if closed then return Err(pipeClosed("read from", subject))
+    buffered.readLine(received)
+
+  // Everything the command writes until its output ends, after what earlier reads left.
+  override readAll() -> Result[Array[byte], IoError]
+    mine()
+    if closed then return Err(pipeClosed("read from", subject))
+    buffered.readAll(received)
+
+  // Up to `max` bytes, `max` being at least one, of what `read(max)` would answer without waiting:
+  // `Some` of the bytes a `readLine` read ahead, or of what has arrived, an empty array once the
+  // output has ended; `None` where nothing has arrived yet. Never waits.
+  readAvailable(max: int) -> Result[Option[Array[byte]], IoError]
+    if max < 1 then fail(s"a read of $max bytes: a read takes at least one")
+    mine()
+    if closed then return Err(pipeClosed("read from", subject))
+    if buffered.pending then return buffered.read(max, received).map(b -> Some(b))
+    pipeReceiveAvailable(pipe, max).mapErr(pipeFailed("read from", subject))
+
+  // Whether a read would answer now, without waiting: bytes are read ahead or have arrived, the output
+  // has ended, or the end is closed, which the read then reports. Never waits.
+  override readable() -> bool
+    mine()
+    closed || buffered.pending || pipeReadable(pipe)
+
+  // The pipe's descriptor, which a select's `readable()` arm watches; -1 once closed.
+  override readinessDescriptor() -> int
+    mine()
+    if closed then return -1
+    pipe.held() match
+      Ok(fd) -> fd
+      Err(_) -> -1
+
+  // A read that waits longer than `d` fails with `TimedOut` from now on; zero or less takes the limit
+  // away. The command's own time limit still bounds every wait.
+  override setTimeout(d: Duration) -> Result[unit, IoError]
+    mine()
+    if closed then return Err(pipeClosed("set the timeout of", subject))
+    limitMs = pipeMillis(d)
+    Ok(())
+
+  // Closes the pipe; closing again does nothing. A command that writes to it afterwards is told its
+  // reader has gone.
+  override close() -> Result[unit, IoError]
+    mine()
+    if !closed
+      closed = true
+      _ = pipe.shut()
+      pipe.close()
+    Ok(())
+
+  // Stops the program where the end belongs to another thread.
+  private mine()
+    if closed then _ = pipe.close() else _ = pipe.held()
+
+  // Up to `max` bytes from the pipe itself.
+  private received(max: int) -> Result[Array[byte], IoError]
+    afterPipeWait(pipeReceive(pipe, max, waitLimit(limitMs, deadline))).mapErr(pipeFailed("read from", subject))
+
+// The pipes a started command was asked for, the program's ends of them: its standard input's, its
+// standard output's and its standard error's. Each end belongs to the code it was handed to, not to
+// the `Child`: handing the `Child` over hands over none of them, so a thread that waits for the
+// command leaves its pipes to the code reading and writing them.
+@keeps_owners
+@trusted_sendable("it never changes, and each end it holds checks its own owner at every operation")
+private class Pipes(
+    val input: Option[ChildInput],
+    val output: Option[ChildOutput],
+    val errors: Option[ChildOutput]
+): Sendable
+  // Closes every end, for a command that could not be started.
+  close()
+    if input is Some(p) then _ = p.close()
+    if output is Some(p) then _ = p.close()
+    if errors is Some(p) then _ = p.close()
+
+private object Pipes
+  // A command that asked for no pipe.
+  none -> Pipes = Pipes(None, None, None)
+
+// Gives back the streams and pipes made for a command that could not be started, and answers why.
+private abandoned(streams: Streams, made: Pipes, e: IoError) -> Result[Child, IoError]
+  streams.release()
+  made.close()
+  Err(e)
+
+// A pipe a command named `describe` reads its standard input from: the end the command is given, and
+// the program's, as a `ChildInput`. Where the program's end cannot be made non-blocking, both are
+// closed.
+private inputPipe(deadline: Option[Duration], describe: string) -> Result[(File, ChildInput), IoError]
+  val subject = s"the standard input of $describe"
+  val (from, end) = makeInputPipe().mapErr(pipeFailed("create a pipe for", subject))?
+  inputNonBlocking(end) match
+    Ok(_) -> Ok((from, ChildInput(end, deadline, subject)))
+    Err(e) ->
+      closeFile(Some(from))
+      _ = end.shut()
+      end.close()
+      Err(pipeFailed("create a pipe for", subject)(e))
+
+// A pipe a command named `describe` writes `stream` into: the program's end, as a `ChildOutput`, and
+// the end the command is given.
+private outputPipe(deadline: Option[Duration], stream: string, describe: string) -> Result[(ChildOutput, File), IoError]
+  val subject = s"the $stream of $describe"
+  val (end, into) = makeOutputPipe().mapErr(pipeFailed("create a pipe for", subject))?
+  outputNonBlocking(end) match
+    Ok(_) -> Ok((ChildOutput(end, ReadAhead(Array.empty[byte](), 0), deadline, subject), into))
+    Err(e) ->
+      closeFile(Some(into))
+      _ = end.shut()
+      end.close()
+      Err(pipeFailed("create a pipe for", subject)(e))

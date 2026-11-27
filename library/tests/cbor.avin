@@ -1,0 +1,202 @@
+// `avin.cbor`: the examples of RFC 8949 appendix A read to their trees and written back, floats of
+// every width, definite and indefinite lengths, tags, the limits on hostile input, deterministic
+// encoding, streaming and derived types.
+import avin.cbor
+
+import avin.cbor.{
+  Arr, BigNegative, BigUnsigned, Bool, Bytes, Cbor, CborError, CborOptions, CborReader, CborWriter, Dict, Double, Half,
+  Null, Num, Simple, Single, Tagged, Text, Undefined
+}
+
+// `hexArray` and `hexOf` are in `binary_helpers.avin`, which the MessagePack tests share.
+
+// The tree `text` reads to, `Undefined` where it is not a document.
+treeOf(text: string) -> Cbor = cbor.parse(hexArray(text)).getOrElse(Undefined)
+
+// `text` reads to `tree`, and (unless `readOnly`) `tree` writes back to `text`.
+golden(text: string, tree: Cbor)
+  assertEq(cbor.parse(hexArray(text)), Ok(tree))
+  assertEq(hexOf(cbor.encodeTree(tree)), text)
+
+// `text` reads to `tree` but is not what `tree` writes: an indefinite length or a longer form.
+readsAs(text: string, tree: Cbor) = assertEq(cbor.parse(hexArray(text)), Ok(tree))
+
+kindOf(v: Cbor) -> string = v match
+  Half(_) -> "half"
+  Single(_) -> "single"
+  Double(_) -> "double"
+  _ -> "other"
+
+@test("appendix A: integers, written in their shortest form and read back")
+goldenIntegers()
+  golden("00", Num(0))
+  golden("01", Num(1))
+  golden("0a", Num(10))
+  golden("17", Num(23))
+  golden("1818", Num(24))
+  golden("1819", Num(25))
+  golden("1864", Num(100))
+  golden("1903e8", Num(1000))
+  golden("1a000f4240", Num(1000000))
+  golden("1b000000e8d4a51000", Num(1000000000000))
+  golden("1b7fffffffffffffff", Num(9223372036854775807))
+  golden("1b8000000000000000", BigUnsigned(-9223372036854775808))
+  golden("1bffffffffffffffff", BigUnsigned(-1))
+  golden("20", Num(-1))
+  golden("29", Num(-10))
+  golden("3863", Num(-100))
+  golden("3903e7", Num(-1000))
+  golden("3b7fffffffffffffff", Num(-9223372036854775807 - 1))
+  golden("3b8000000000000000", BigNegative(-9223372036854775808))
+  golden("3bffffffffffffffff", BigNegative(-1))
+
+@test("appendix A: bignums are tagged byte strings, and read as integers")
+goldenBignums()
+  golden("c249010000000000000000", Tagged(2, Bytes(hexArray("010000000000000000"))))
+  golden("c349010000000000000000", Tagged(3, Bytes(hexArray("010000000000000000"))))
+  assertEq(Tagged(2, Bytes(hexArray("010000000000000000"))).asInteger, Some(BigInt("18446744073709551616")))
+  assertEq(Tagged(3, Bytes(hexArray("010000000000000000"))).asInteger, Some(BigInt("-18446744073709551617")))
+  assertEq(BigUnsigned(-1).asInteger, Some(BigInt("18446744073709551615")))
+  assertEq(BigNegative(-1).asInteger, Some(BigInt("-18446744073709551616")))
+  assertEq(Num(-5).asInteger, Some(BigInt(-5)))
+  assertEq(Tagged(2, Bytes(hexArray(""))).asInteger, Some(BigInt(0)))
+  assertEq(Cbor.integer(BigInt("18446744073709551616")), Tagged(2, Bytes(hexArray("010000000000000000"))))
+  assertEq(Cbor.integer(BigInt("-18446744073709551617")), Tagged(3, Bytes(hexArray("010000000000000000"))))
+  assertEq(Cbor.integer(BigInt(-7)), Num(-7))
+  assertEq(Cbor.integer(BigInt("9223372036854775807")), Num(9223372036854775807))
+
+@test("appendix A: floats of every width keep their width")
+goldenFloats()
+  golden("f90000", Half(0.0))
+  golden("f93c00", Half(1.0))
+  golden("fb3ff199999999999a", Double(1.1))
+  golden("f93e00", Half(1.5))
+  golden("f97bff", Half(65504.0))
+  golden("fa47c35000", Single(100000.0))
+  golden("fa7f7fffff", Single(3.4028234663852886e38))
+  golden("fb7e37e43c8800759c", Double(1.0e300))
+  golden("f90001", Half(5.960464477539063e-8))
+  golden("f90400", Half(0.00006103515625))
+  golden("f9c400", Half(-4.0))
+  golden("fbc010666666666666", Double(-4.1))
+  golden("f97c00", Half(1.0 / 0.0))
+  golden("f9fc00", Half(-1.0 / 0.0))
+  golden("fa7f800000", Single(1.0 / 0.0))
+  golden("faff800000", Single(-1.0 / 0.0))
+  golden("fb7ff0000000000000", Double(1.0 / 0.0))
+  golden("fbfff0000000000000", Double(-1.0 / 0.0))
+  assertEq(cbor.parse(hexArray("f98000")).map(v -> v.asReal.get.toBits), Ok(-9223372036854775808))
+  assertEq(cbor.parse(hexArray("f90000")).map(v -> v.asReal.get.toBits), Ok(0))
+
+@test("appendix A: a NaN of every width reads as a NaN of that width and writes back")
+goldenNans()
+  for (text, tree) in [("f97e00", "half"), ("fa7fc00000", "single"), ("fb7ff8000000000000", "double")]
+    val v = treeOf(text)
+    assertEq(v.asReal.get != v.asReal.get, true)
+    assertEq(kindOf(v), tree)
+    assertEq(hexOf(cbor.encodeTree(v)), text)
+
+@test("appendix A: simple values")
+goldenSimple()
+  golden("f4", Bool(false))
+  golden("f5", Bool(true))
+  golden("f6", Null)
+  golden("f7", Undefined)
+  golden("f0", Simple(16))
+  golden("e0", Simple(0))
+  golden("f3", Simple(19))
+  golden("f820", Simple(32))
+  golden("f8ff", Simple(255))
+
+@test("appendix A: tags, the date-times among them, are kept")
+goldenTags()
+  golden("c074323031332d30332d32315432303a30343a30305a", Tagged(0, Text("2013-03-21T20:04:00Z")))
+  golden("c11a514b67b0", Tagged(1, Num(1363896240)))
+  golden("c1fb41d452d9ec200000", Tagged(1, Double(1363896240.5)))
+  golden("d74401020304", Tagged(23, Bytes(hexArray("01020304"))))
+  golden("d818456449455446", Tagged(24, Bytes(hexArray("6449455446"))))
+  golden("d82076687474703a2f2f7777772e6578616d706c652e636f6d", Tagged(32, Text("http://www.example.com")))
+  golden("c0c1c200", Tagged(0, Tagged(1, Tagged(2, Num(0)))))
+  golden("d9010000", Tagged(256, Num(0)))
+  golden("dbffffffffffffffff00", Tagged(-1, Num(0)))
+  assertEq(treeOf("c074323031332d30332d32315432303a30343a30305a").asDateTime, Some("2013-03-21T20:04:00Z"))
+  assertEq(treeOf("c11a514b67b0").asEpoch, Some(1363896240.0))
+  assertEq(treeOf("c1fb41d452d9ec200000").asEpoch, Some(1363896240.5))
+  assertEq(Cbor.dateTime("2013-03-21T20:04:00Z"), Tagged(0, Text("2013-03-21T20:04:00Z")))
+  assertEq(Cbor.epoch(1363896240), Tagged(1, Num(1363896240)))
+  assertEq(Cbor.epochFraction(1363896240.5), Tagged(1, Double(1363896240.5)))
+  assertEq(Text("x").asDateTime, None)
+  assertEq(Tagged(1, Text("x")).asEpoch, None)
+
+@test("appendix A: byte and text strings")
+goldenStrings()
+  golden("40", Bytes(hexArray("")))
+  golden("4401020304", Bytes(hexArray("01020304")))
+  golden("60", Text(""))
+  golden("6161", Text("a"))
+  golden("6449455446", Text("IETF"))
+  golden("62225c", Text("\"\\"))
+  golden("62c3bc", Text("ü"))
+  golden("63e6b0b4", Text("水"))
+  golden("64f0908591", Text("\u{10151}"))
+
+@test("appendix A: arrays and maps")
+goldenCollections()
+  golden("80", Arr([]))
+  golden("83010203", Arr([Num(1), Num(2), Num(3)]))
+  golden("8301820203820405", Arr([Num(1), Arr([Num(2), Num(3)]), Arr([Num(4), Num(5)])]))
+  golden(
+    "98190102030405060708090a0b0c0d0e0f101112131415161718181819",
+    Arr(Vector.tabulate(25, i -> Num(long(i + 1))))
+  )
+  golden("a0", Dict([]))
+  golden("a201020304", Dict([(Num(1), Num(2)), (Num(3), Num(4))]))
+  golden("a26161016162820203", Dict([(Text("a"), Num(1)), (Text("b"), Arr([Num(2), Num(3)]))]))
+  golden("826161a161626163", Arr([Text("a"), Dict([(Text("b"), Text("c"))])]))
+  golden(
+    "a56161614161626142616361436164614461656145",
+    Dict(
+      [
+        (Text("a"), Text("A")),
+        (Text("b"), Text("B")),
+        (Text("c"), Text("C")),
+        (Text("d"), Text("D")),
+        (Text("e"), Text("E"))
+      ]
+    )
+  )
+
+@test("appendix A: indefinite lengths read as the definite value")
+indefiniteLengths()
+  readsAs("5f42010243030405ff", Bytes(hexArray("0102030405")))
+  readsAs("7f657374726561646d696e67ff", Text("streaming"))
+  readsAs("9fff", Arr([]))
+  readsAs("9f018202039f0405ffff", Arr([Num(1), Arr([Num(2), Num(3)]), Arr([Num(4), Num(5)])]))
+  readsAs("9f01820203820405ff", Arr([Num(1), Arr([Num(2), Num(3)]), Arr([Num(4), Num(5)])]))
+  readsAs("83018202039f0405ff", Arr([Num(1), Arr([Num(2), Num(3)]), Arr([Num(4), Num(5)])]))
+  readsAs("83019f0203ff820405", Arr([Num(1), Arr([Num(2), Num(3)]), Arr([Num(4), Num(5)])]))
+  readsAs(
+    "9f0102030405060708090a0b0c0d0e0f101112131415161718181819ff",
+    Arr(Vector.tabulate(25, i -> Num(long(i + 1))))
+  )
+  readsAs("bf61610161629f0203ffff", Dict([(Text("a"), Num(1)), (Text("b"), Arr([Num(2), Num(3)]))]))
+  readsAs("826161bf61626163ff", Arr([Text("a"), Dict([(Text("b"), Text("c"))])]))
+  readsAs("bf6346756ef563416d7421ff", Dict([(Text("Fun"), Bool(true)), (Text("Amt"), Num(-2))]))
+  readsAs("5fff", Bytes(hexArray("")))
+  readsAs("7fff", Text(""))
+  readsAs("bfff", Dict([]))
+  readsAs("5f4040ff", Bytes(hexArray("")))
+  readsAs("7f6061616060ff", Text("a"))
+
+@test("non-shortest integers, lengths and floats are read as they mean")
+nonShortestAccepted()
+  readsAs("1800", Num(0))
+  readsAs("190001", Num(1))
+  readsAs("1a00000001", Num(1))
+  readsAs("1b0000000000000001", Num(1))
+  readsAs("3800", Num(-1))
+  readsAs("5800", Bytes(hexArray("")))
+  readsAs("780161", Text("a"))
+  readsAs("980101", Arr([Num(1)]))
+  readsAs("b800", Dict([]))
+  readsAs("d80000", Tagged(0, Num(0)))

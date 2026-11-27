@@ -1,0 +1,610 @@
+module avin.sqlite
+
+// SQLite databases: a connection opened on a file (or `":memory:"`), statements run with typed
+// parameters, rows read as the program's types, transactions that commit when their body succeeds and
+// roll back when it fails, and SQLite's failures as a code to match on.
+//
+//     val db = sqlite.open(dir + "/app.db")?
+//     db.execute("create table if not exists notes (id integer primary key, body text not null)")?
+//     val added = db.execute("insert into notes (body) values (?)", "hello")?
+//     for row in db.query("select id, body from notes")?
+//       println(s"${row.get[long](0)?} ${row.get[string]("body")?}")
+//
+// The SQLite is the machine's: the one macOS ships, `libsqlite3-dev` on Debian and Ubuntu, 3.37 or
+// newer. A program that never imports this module never links it.
+//
+// A connection belongs to the thread that opened it, as any handle does, and moves with what is
+// handed to another thread; two threads never use one connection at once. A program whose threads all
+// use a database gives each its own connection, or shares a `threads.Pool` of them. A call that waits
+// for SQLite, on a lock another connection holds or on the disk, is a blocking call: the thread
+// waiting leaves its place to the others, and a collection does not wait for it.
+
+import avin.time.{Duration, seconds}
+
+// ---- Failures ----
+
+// Which constraint a `Constraint` failure broke.
+@sysl("avin.sqlite.ConstraintKind")
+data ConstraintKind
+  Check
+  CommitHook
+  ForeignKey
+  UserFunction
+  NotNull
+  PrimaryKey
+  Trigger
+  Unique
+  VirtualTable
+  RowId
+  Pinned
+  DataType
+  // SQLite named no particular constraint.
+  Unspecified
+
+// What kind of failure SQLite reported, by its primary result code.
+@sysl("avin.sqlite.Code")
+data SqliteCode
+  // `SQLITE_ERROR`: SQL that does not compile, a missing table, and most other mistakes in the SQL.
+  Failed
+  Internal
+  Permission
+  Abort
+  // Another connection holds a lock the statement needs, for longer than the busy timeout waited.
+  Busy
+  // A table this connection itself is using is locked.
+  Locked
+  NoMemory
+  // A write to a database opened read-only, or one the file system will not let the program write.
+  ReadOnly
+  Interrupted
+  IoFailure
+  Corrupt
+  NotFound
+  Full
+  CantOpen
+  Protocol
+  Empty
+  Schema
+  TooBig
+  // A constraint the schema declares was broken: a duplicate key, a NULL in a `NOT NULL` column, a
+  // `CHECK` or a foreign key.
+  Constraint(kind: ConstraintKind)
+  // A value is not of the type asked for: a column read as another type, a datatype a `STRICT`
+  // table refuses.
+  Mismatch
+  // The library was used in a way its interface does not allow: a closed connection, SQL holding
+  // no statement or two.
+  Misuse
+  NoLfs
+  Auth
+  Format
+  // A parameter the statement does not have, or one it has that was given no value.
+  ParameterRange
+  NotADatabase
+  Notice
+  Warning
+  // A result code this module does not name, as SQLite gave it.
+  Other(code: int)
+
+// A failure: what kind it is, SQLite's extended result code for it, and SQLite's sentence about it.
+@sysl("avin.sqlite.Failure")
+data SqliteError(code: SqliteCode, extendedCode: int, message: string)
+
+impl SqliteError
+  // The constraint the failure broke, or `None` where it is not a constraint's.
+  constraint -> Option[ConstraintKind] = code match
+    Constraint(k) -> Some(k)
+    _ -> None
+
+  // Whether a constraint was broken, of any kind.
+  isConstraint -> bool = constraint.isDefined
+
+  // Whether a `UNIQUE` or `PRIMARY KEY` constraint was broken: the row is already there.
+  isUniqueViolation -> bool = constraint match
+    Some(Unique) | Some(PrimaryKey) -> true
+    _ -> false
+
+  // Whether another connection held the database for longer than the busy timeout: running the
+  // statement again later may succeed.
+  isBusy -> bool = code match
+    Busy | Locked -> true
+    _ -> false
+
+impl Error for SqliteError
+
+@sysl("avin.sqlite.misuse")
+private misuse(message: string) -> SqliteError
+
+@sysl("avin.sqlite.parameter_range")
+private parameterRange(message: string) -> SqliteError
+
+@sysl("avin.sqlite.mismatch")
+private mismatch(message: string) -> SqliteError
+
+@sysl("avin.sqlite.aborted")
+private aborted(message: string) -> SqliteError
+
+private badColumn(column: string, reason: string) -> SqliteError =
+  mismatch(s"cannot read column `$column`: $reason")
+
+// ---- The Sysl handles ----
+
+@sysl("avin.sqlite.Connection", named: "Connection")
+private class Db
+  @sysl(blocking)
+  prepare(sql: string, persistent: bool) -> Result[Stmt, SqliteError]
+  @sysl(blocking)
+  exec(sql: string) -> Result[unit, SqliteError]
+  busyTimeout(ms: int) -> Result[unit, SqliteError]
+  changes() -> long
+  totalChanges() -> long
+  lastInsertRowid() -> long
+  autocommit() -> bool
+  openStatements() -> long
+
+@sysl("avin.sqlite.Statement", named: "Statement")
+private class Stmt
+  @sysl(blocking)
+  step() -> Result[bool, SqliteError]
+  row() -> Result[Vector[SqlValue], SqliteError]
+  columnNames() -> Vector[string]
+  parameterCount() -> int
+  parameterIndex(name: string) -> int
+  parameterName(index: int) -> string
+  bindNull(index: int) -> Result[unit, SqliteError]
+  bindLong(index: int, value: long) -> Result[unit, SqliteError]
+  bindReal(index: int, value: real) -> Result[unit, SqliteError]
+  bindText(index: int, value: string) -> Result[unit, SqliteError]
+  bindBlob(index: int, value: Vector[byte]) -> Result[unit, SqliteError]
+  reset() -> unit
+  clearBindings() -> unit
+  readonly() -> bool
+  sql() -> string
+
+@sysl("avin.sqlite.open", blocking)
+private openDb(path: string, flags: int) -> Result[Db, SqliteError]
+
+@sysl("avin.sqlite.open_flags")
+private openFlags(mode: int, uri: bool) -> int
+
+// The version of the SQLite the program runs with, as `3.45.1`.
+@sysl("avin.sqlite.version")
+version() -> string
+
+// ---- Opening ----
+
+// How a connection is opened. `readOnly` opens an existing database to read; otherwise `create`
+// makes the file where it is not there. `wal` puts a database that is written into write-ahead
+// logging, where readers and a writer do not block one another. `busyTimeout` is how long a
+// statement waits for a lock another connection holds before failing with `Busy`. `foreignKeys`
+// enforces the schema's foreign keys. `statementCacheSize` is how many statements the connection
+// keeps prepared, by their text, for `execute` and `query` to run again without compiling them; 0
+// keeps none. `uri` reads the path as a `file:` URI, with its query parameters.
+data OpenOptions(
+    readOnly: bool = false,
+    create: bool = true,
+    wal: bool = true,
+    busyTimeout: Duration = seconds(5),
+    foreignKeys: bool = true,
+    statementCacheSize: int = 64,
+    uri: bool = false
+)
+
+// The longest busy timeout SQLite takes, in milliseconds.
+private val MaxBusyMillis: long = 2147483647
+
+// Opens the database at `path`, `":memory:"` for a private database in memory, as `options` say.
+open(path: string, options: OpenOptions = OpenOptions()) -> Result[Connection, SqliteError]
+  if options.statementCacheSize < 0 then return Err(
+    misuse(s"the statement cache's size is ${options.statementCacheSize}: give 0 or more")
+  )
+  if options.busyTimeout.isNegative then return Err(misuse("the busy timeout is negative"))
+  val mode = if options.readOnly then 0 else if options.create then 2 else 1
+  val db = openDb(path, openFlags(mode, options.uri))?
+  configure(db, options) match
+    Ok(_) -> Ok(Connection(db, path, options.statementCacheSize))
+    Err(e) ->
+      db.close()
+      Err(e)
+
+// Applies what `options` ask of a connection just opened.
+private configure(db: Db, options: OpenOptions) -> Result[unit, SqliteError]
+  val ms = options.busyTimeout.toMillis
+  db.busyTimeout(int(if ms > MaxBusyMillis then MaxBusyMillis else ms))?
+  if options.foreignKeys then db.exec("pragma foreign_keys = on")?
+  if options.wal && !options.readOnly then db.exec("pragma journal_mode = wal")?
+  Ok(())
+
+// ---- Running statements ----
+
+// What a statement that changes rows did: how many rows it inserted, updated or deleted (0 for a
+// statement that only reads), and the rowid of the last row inserted on the connection.
+data Changes(rows: long, lastInsertRowid: long)
+
+// A transaction's way of taking its locks: `Deferred` when the first statement needs them,
+// `Immediate` takes the write lock at once (so a transaction that will write never fails part way
+// with `Busy` for want of upgrading its lock), `Exclusive` keeps readers out too, outside WAL.
+data TransactionMode
+  Deferred
+  Immediate
+  Exclusive
+
+// The parameters a statement is run with: by position, `?` and `?NNN`, or by name, `:name`, `@name`
+// and `$name`.
+private data Params
+  Positional(values: Vector[ToSql])
+  Named(values: Map[string, ToSql])
+
+// A statement the connection keeps prepared, by its text, and whether a run is using it now.
+private class Cached(val stmt: Stmt)
+  var used: long = 0
+  var busy = false
+
+// A connection to one database. Statements run through `execute` and `query` are prepared once and
+// kept, up to the cache's size, the least recently used given up first.
+class Connection(private val db: Db, val path: string, private val cacheSize: int)
+  private var cache = HashMap.empty[string, Cached]()
+  private var clock: long = 0
+  private var depth = 0
+  private var closed = false
+
+  // ---- One statement ----
+
+  // Runs `sql`, its parameters bound to `params` in order, and answers what it changed. A
+  // statement that returns rows, `insert … returning` among them, is run to its end.
+  execute(sql: string, params: ToSql*) -> Result[Changes, SqliteError] = execute(sql, Positional(params))
+
+  // Runs `sql` with its parameters bound by name: `{":id": 7}`. A name may leave out its `:`.
+  execute(sql: string, named: Map[string, ToSql]) -> Result[Changes, SqliteError] = execute(sql, Named(named))
+
+  private execute(sql: string, params: Params) -> Result[Changes, SqliteError] =
+    run(sql, params, s -> changesOf(self, s))
+
+  // The rows `sql` returns, its parameters bound to `params` in order.
+  query(sql: string, params: ToSql*) -> Result[Vector[Row], SqliteError] = run(sql, Positional(params), rowsOf)
+
+  // The rows `sql` returns, its parameters bound by name.
+  query(sql: string, named: Map[string, ToSql]) -> Result[Vector[Row], SqliteError] = run(sql, Named(named), rowsOf)
+
+  // The first row `sql` returns, or `None` where it returns none.
+  queryOne(sql: string, params: ToSql*) -> Result[Option[Row], SqliteError] = run(sql, Positional(params), firstRow)
+
+  queryOne(
+      sql: string,
+      named: Map[string, ToSql]
+  ) -> Result[Option[Row], SqliteError] = run(sql, Named(named), firstRow)
+
+  // The rows `sql` returns, each read as a `T`.
+  queryAs[T: FromRow](
+      sql: string,
+      params: ToSql*
+  ) -> Result[Vector[T], SqliteError] = decodeAll[T](query(sql, params*)?)
+
+  queryAs[T: FromRow](
+      sql: string,
+      named: Map[string, ToSql]
+  ) -> Result[Vector[T], SqliteError] = decodeAll[T](query(sql, named)?)
+
+  // The first column of the first row `sql` returns, read as a `T`; a statement that returns no
+  // row is a `Mismatch`.
+  queryValue[T: FromSql](sql: string, params: ToSql*) -> Result[T, SqliteError] = valueOf[T](queryOne(sql, params*)?)
+
+  queryValue[T: FromSql](
+      sql: string,
+      named: Map[string, ToSql]
+  ) -> Result[T, SqliteError] = valueOf[T](queryOne(sql, named)?)
+
+  // Hands each row `sql` returns to `f` as it is read, without holding them all, and answers how
+  // many there were.
+  each(sql: string, params: Vector[ToSql], f: (Row) -> unit) -> Result[long, SqliteError] =
+    run(sql, Positional(params), s -> eachRow(s, f))
+
+  // Runs every statement `sql` holds, in order, without parameters, stopping at the first that
+  // fails: a schema, or a migration.
+  executeScript(sql: string) -> Result[unit, SqliteError]
+    usable()?
+    db.exec(sql)
+
+  // A statement of the program's own, prepared once to run many times, and kept until it is closed.
+  prepare(sql: string) -> Result[Statement, SqliteError]
+    usable()?
+    Ok(Statement(self, db.prepare(sql, true)?))
+
+  // Runs `sql` with a statement from the cache, or a new one, and gives it back however `f` ends.
+  private run[R](sql: string, params: Params, f: (Stmt) -> Result[R, SqliteError]) -> Result[R, SqliteError]
+    usable()?
+    val entry = acquire(sql)?
+    defer release(entry)
+    bindParams(entry.stmt, params)?
+    f(entry.stmt)
+
+  // A statement for `sql`: the cached one where it is not in use, and otherwise one prepared now,
+  // kept where the cache has room or a statement to give up.
+  private acquire(sql: string) -> Result[Cached, SqliteError]
+    clock += 1
+    cache.get(sql) match
+      Some(e) ->
+        if !e.busy
+          e.busy = true
+          e.used = clock
+          return Ok(e)
+      None -> ()
+    val entry = Cached(db.prepare(sql, cacheSize > 0)?)
+    entry.busy = true
+    entry.used = clock
+    if cacheSize > 0 && !cache.contains(sql)
+      if cache.size >= cacheSize then evict()
+      if cache.size < cacheSize then cache = cache.updated(sql, entry)
+    Ok(entry)
+
+  // Gives up the least recently used statement no run is using.
+  private evict()
+    var oldest: Option[(string, Cached)] = None
+    for (k, e) in cache
+      if !e.busy
+        oldest match
+          None -> oldest = Some((k, e))
+          Some((_, o)) -> if e.used < o.used then oldest = Some((k, e))
+    oldest match
+      Some((k, e)) ->
+        cache = cache.removed(k)
+        e.stmt.close()
+      None -> ()
+
+  // A statement back from a run: reset, its parameters cleared, and closed where the cache does not
+  // hold it.
+  private release(entry: Cached)
+    entry.stmt.reset()
+    entry.stmt.clearBindings()
+    entry.busy = false
+    val kept = cache.get(entry.stmt.sql()) match
+      Some(e) -> e === entry
+      None -> false
+    if !kept then entry.stmt.close()
+
+  private usable() -> Result[unit, SqliteError] =
+    if closed then Err(misuse("the connection is closed")) else Ok(())
+
+  // ---- Transactions ----
+
+  // Runs `f` in a transaction: `BEGIN` first, then `COMMIT` where `f` answers `Ok`, and `ROLLBACK`
+  // where it answers `Err`, or where the thread running it is cancelled. Inside another transaction
+  // it is a savepoint, released or rolled back to in the same way, so transactions nest.
+  transaction[T](f: (Connection) -> Result[T, SqliteError]) -> Result[T, SqliteError] = transaction(Deferred, f)
+
+  // Runs `f` in a transaction that takes its locks as `mode` says; inside another, `mode` is the
+  // outer transaction's.
+  transaction[T](mode: TransactionMode, f: (Connection) -> Result[T, SqliteError]) -> Result[T, SqliteError] =
+    within(if depth == 0 then Some(mode) else None, f)
+
+  // Runs `f` under a savepoint, which a transaction or savepoint inside it may roll back to without
+  // ending the whole: released where `f` answers `Ok`, rolled back to where it answers `Err`.
+  // Outside a transaction a savepoint begins one, as `transaction` does.
+  savepoint[T](f: (Connection) -> Result[T, SqliteError]) -> Result[T, SqliteError] = within(None, f)
+
+  // Runs `f` in a transaction begun with `mode`, or under a savepoint where `mode` is `None`.
+  private within[T](mode: Option[TransactionMode], f: (Connection) -> Result[T, SqliteError]) -> Result[T, SqliteError]
+    usable()?
+    val level = depth
+    val name = s"avin_savepoint_$level"
+    mode match
+      Some(m) -> db.exec(beginOf(m))?
+      None -> db.exec(s"savepoint $name")?
+    depth = level + 1
+    var settled = false
+    defer
+      if !settled
+        depth = level
+        _ = undo(mode, name)
+    val result = f(self)
+    settled = true
+    depth = level
+    result match
+      Ok(v) ->
+        // SQLite rolls a transaction back by itself after some failures (a full disk, an
+        // interrupt), and then nothing is left to commit.
+        if db.autocommit()
+          return Err(aborted("SQLite rolled the transaction back after an error, so nothing was committed"))
+        val ended = if mode.isDefined then db.exec("commit") else db.exec(s"release $name")
+        ended match
+          Ok(_) -> Ok(v)
+          Err(e) ->
+            _ = undo(mode, name)
+            Err(e)
+      Err(e) ->
+        _ = undo(mode, name)
+        Err(e)
+
+  // Rolls back the transaction, or to the savepoint `name` and releases it.
+  private undo(mode: Option[TransactionMode], name: string) -> Result[unit, SqliteError] =
+    if db.autocommit() then Ok(())
+    else if mode.isDefined then db.exec("rollback")
+    else db.exec(s"rollback to $name; release $name")
+
+  // ---- The connection ----
+
+  // Whether a transaction is open, by `transaction` or by the program's own `BEGIN`.
+  inTransaction -> bool = !closed && !db.autocommit()
+
+  // How many rows the last statement inserted, updated or deleted, and how many every statement has
+  // since the connection opened.
+  changes -> long = db.changes()
+
+  totalChanges -> long = db.totalChanges()
+
+  // The rowid of the last row inserted on the connection, 0 before any.
+  lastInsertRowid -> long = db.lastInsertRowid()
+
+  // How many statements are prepared on the connection and not yet finalized: those the cache keeps,
+  // those of the program's own not closed, and those a run is using.
+  openStatements -> long = if closed then 0 else db.openStatements()
+
+  // How many statements the cache keeps.
+  cachedStatements -> int = cache.size
+
+  isClosed -> bool = closed
+
+  // Closes the connection: the statements the cache keeps are finalized, and the database is closed
+  // once the program's own statements are closed or collected too. Closing again does nothing; any
+  // other use after it fails with `Misuse`.
+  close()
+    if closed then return
+    closed = true
+    for (_, e) in cache
+      e.stmt.close()
+    cache = HashMap.empty[string, Cached]()
+    db.close()
+
+// `BEGIN` as `mode` asks.
+private beginOf(mode: TransactionMode) -> string = mode match
+  Deferred -> "begin deferred"
+  Immediate -> "begin immediate"
+  Exclusive -> "begin exclusive"
+
+// ---- Statements of the program's own ----
+
+// A statement prepared by `Connection.prepare`, run as often as needed with new parameters each time.
+class Statement(private val conn: Connection, private val stmt: Stmt)
+  private var closed = false
+  private var busy = false
+
+  // The statement's text.
+  sql -> string = stmt.sql()
+
+  // How many parameters it takes: the largest index, for `?NNN`.
+  parameterCount -> int = stmt.parameterCount()
+
+  // The names of its result's columns.
+  columnNames -> Vector[string] = stmt.columnNames()
+
+  // Whether it changes nothing in the database.
+  isReadOnly -> bool = stmt.readonly()
+
+  execute(params: ToSql*) -> Result[Changes, SqliteError] = run(Positional(params), s -> changesOf(conn, s))
+
+  execute(named: Map[string, ToSql]) -> Result[Changes, SqliteError] = run(Named(named), s -> changesOf(conn, s))
+
+  query(params: ToSql*) -> Result[Vector[Row], SqliteError] = run(Positional(params), rowsOf)
+
+  query(named: Map[string, ToSql]) -> Result[Vector[Row], SqliteError] = run(Named(named), rowsOf)
+
+  queryOne(params: ToSql*) -> Result[Option[Row], SqliteError] = run(Positional(params), firstRow)
+
+  queryOne(named: Map[string, ToSql]) -> Result[Option[Row], SqliteError] = run(Named(named), firstRow)
+
+  queryAs[T: FromRow](params: ToSql*) -> Result[Vector[T], SqliteError] = decodeAll[T](query(params*)?)
+
+  queryAs[T: FromRow](named: Map[string, ToSql]) -> Result[Vector[T], SqliteError] = decodeAll[T](query(named)?)
+
+  queryValue[T: FromSql](params: ToSql*) -> Result[T, SqliteError] = valueOf[T](queryOne(params*)?)
+
+  queryValue[T: FromSql](named: Map[string, ToSql]) -> Result[T, SqliteError] = valueOf[T](queryOne(named)?)
+
+  each(
+      params: Vector[ToSql],
+      f: (Row) -> unit
+  ) -> Result[long, SqliteError] = run(Positional(params), s -> eachRow(s, f))
+
+  isClosed -> bool = closed
+
+  // Finalizes the statement. Closing again does nothing; running it after fails with `Misuse`.
+  close()
+    if closed then return
+    closed = true
+    stmt.close()
+
+  private run[R](params: Params, f: (Stmt) -> Result[R, SqliteError]) -> Result[R, SqliteError]
+    if closed then return Err(misuse("the statement is closed"))
+    if conn.isClosed then return Err(misuse("the connection is closed"))
+    if busy then return Err(misuse("the statement is already running: a row's `each` cannot run it again"))
+    busy = true
+    defer
+      busy = false
+      stmt.reset()
+      stmt.clearBindings()
+    bindParams(stmt, params)?
+    f(stmt)
+
+// ---- Running a statement ----
+
+// Binds `params` to `s`, every parameter it has given a value and nothing given that it lacks.
+private bindParams(s: Stmt, params: Params) -> Result[unit, SqliteError] = params match
+  Positional(values) ->
+    val n = s.parameterCount()
+    if values.length != n then return Err(
+      parameterRange(
+        s"the statement takes ${counted(n, "parameter")} and was given ${values.length}"
+      )
+    )
+    for i in 0 ..< n
+      bindValue(s, i + 1, values(i).toSql)?
+    Ok(())
+  Named(values) ->
+    val n = s.parameterCount()
+    val given = Array.fill[bool](n + 1, false)
+    for (name, v) in values
+      val index = indexOfName(s, name)
+      if index == 0 then return Err(parameterRange(s"the statement has no parameter `$name`"))
+      given(index) = true
+      bindValue(s, index, v.toSql)?
+    for i in 1 ..< n + 1
+      if !given(i)
+        val name = s.parameterName(i)
+        return Err(
+          parameterRange(
+            if name == "" then s"parameter $i has no name, so it cannot be given by name" else s"the parameter `$name` was given no value"
+          )
+        )
+    Ok(())
+
+// The index of the parameter `name` names, written with its `:`, `@` or `$` or without, or 0.
+private indexOfName(s: Stmt, name: string) -> int
+  if name.isEmpty then return 0
+  if name.startsWith(":") || name.startsWith("@") || name.startsWith("$") then return s.parameterIndex(name)
+  for prefix in [":", "@", "$"]
+    val i = s.parameterIndex(prefix + name)
+    if i != 0 then return i
+  0
+
+private bindValue(s: Stmt, index: int, v: SqlValue) -> Result[unit, SqliteError] = v match
+  SqlNull -> s.bindNull(index)
+  SqlInteger(n) -> s.bindLong(index, n)
+  SqlReal(x) -> s.bindReal(index, x)
+  SqlText(t) -> s.bindText(index, t)
+  SqlBlob(b) -> s.bindBlob(index, b)
+
+private counted(n: int, noun: string) -> string = if n == 1 then s"1 $noun" else s"$n ${noun}s"
+
+// Runs `s`, a statement of `c`, to its end and answers what it changed.
+private changesOf(c: Connection, s: Stmt) -> Result[Changes, SqliteError]
+  while s.step()?
+    ()
+  Ok(Changes(if s.readonly() then 0 else c.changes, c.lastInsertRowid))
+
+private rowsOf(s: Stmt) -> Result[Vector[Row], SqliteError]
+  val names = s.columnNames()
+  val out = Buffer[Row]()
+  while s.step()?
+    out.addOne(Row(names, s.row()?))
+  Ok(out.toVector)
+
+private firstRow(s: Stmt) -> Result[Option[Row], SqliteError] =
+  if s.step()? then Ok(Some(Row(s.columnNames(), s.row()?))) else Ok(None)
+
+private eachRow(s: Stmt, f: (Row) -> unit) -> Result[long, SqliteError]
+  val names = s.columnNames()
+  var n: long = 0
+  while s.step()?
+    f(Row(names, s.row()?))
+    n += 1
+  Ok(n)
+
+private decodeAll[T: FromRow](rows: Vector[Row]) -> Result[Vector[T], SqliteError]
+  val out = Buffer[T]()
+  for row in rows
+    out.addOne(T.fromRow(row)?)
+  Ok(out.toVector)
+
+private valueOf[T: FromSql](row: Option[Row]) -> Result[T, SqliteError] = row match
+  Some(r) -> r.get[T](0)
+  None -> Err(badColumn("#0", "the statement returned no rows"))

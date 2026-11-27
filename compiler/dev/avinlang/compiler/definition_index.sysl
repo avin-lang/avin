@@ -46,6 +46,10 @@ struct Reference
     readonly: bool
     static_member: bool
     library: bool
+    /** For an argument a call's `using` section was filled with, the contextual parameter's name: the
+     * place is then the call's name, which does not spell the given it stands for. Empty for a name
+     * written where it stands. */
+    filled: string
 
     /** Whether this is the declaration's own name rather than a use of it. */
     declares(self) -> bool = self.at_file == self.declared_file && self.at_span.start == self.declared_span.start && self.at_span.end == self.declared_span.end
@@ -99,6 +103,26 @@ struct Noted
     /** Where the declaration begins, which its doc comment is above. */
     starts: usize
     target: Target
+    /** The contextual parameter a given was passed to, for a call's filled argument; or empty. */
+    filled: string
+
+/** A given a call's contextual parameter `param` was filled with, kept until the call is recorded: the
+ * checker fills a call before it knows where the call's name is written. */
+struct Fill
+    param: string
+    from: FilledFrom
+
+/** Where a filled argument was read from. */
+enum FilledFrom
+    /** A local of the function being checked: a block's given, or a local function's or a lambda's
+     * contextual parameter. */
+    FilledLocal(index: usize)
+    /** A parameter of the top-level function being checked. */
+    FilledParam(index: usize, ty: &Type)
+    /** Field `index` of class `class`: a class's contextual parameter, or an object's given. */
+    FilledField(class: usize, index: usize)
+    /** A module-level given. */
+    FilledGlobal(global: usize)
 
 /** Where a local's name is written. */
 struct LocalPlace
@@ -142,10 +166,15 @@ struct DefinitionIndex
      * checker found could be written there (`completion.sysl`). */
     completing: string
     probe: CompletionProbe
+    /** The givens each call filled its section with, by the call's place, until the call is recorded
+     * (`index_fills`); and, while one is recorded, the parameter it was passed to. */
+    fills: Map[string, Buf[Fill]]
+    filling: string
 
     note(*self, n: Noted)
         val place = s"${n.at_unit}:${n.at.start}:${n.at.end}"
-        val key = if self.sharing then s"$place:${n.declared_unit}:${n.declared.start}" else place
+        // A call's name stands for the function and for each given its section was filled with.
+        val key = if n.filled != "" then s"$place:using:${n.filled}" elif self.sharing then s"$place:${n.declared_unit}:${n.declared.start}" else place
         if self.places.get(key) is Some(i)
             self.noted[i] = n
         else
@@ -154,7 +183,7 @@ struct DefinitionIndex
 
 /** An index with nothing in it, for an analysis an editor is asking for: completing at the stand-in
  * name `completing` where it is not empty. */
-definition_index(completing: string = "") -> &DefinitionIndex = DefinitionIndex(buf(), buf(), map(), map(), false, false, completing, completion_probe())
+definition_index(completing: string = "") -> &DefinitionIndex = DefinitionIndex(buf(), buf(), map(), map(), false, false, completing, completion_probe(), map(), "")
 
 /** Records that method `m` overrides or implements `base`. */
 index_tie(c: *Checker, m: usize, base: usize)
@@ -221,8 +250,32 @@ private local_key(c: *Checker, index: usize) -> string = s"${c.body.root}:$index
 private index_note(c: *Checker, unit: usize, at: Span, declared_unit: usize, declared: Span, starts: usize, target: Target)
     if c.index is Some(ix)
         if at.end <= at.start then return
-        if !ix.renaming && !(target is ModuleTarget(_)) && !spells(c.units[unit].src.bytes, at, c.units[declared_unit].src.bytes, declared) && !written_as_binding(c, unit, at) then return
-        ix.note(Noted(unit, at, declared_unit, declared, starts, target))
+        if ix.filling == "" && !ix.renaming && !(target is ModuleTarget(_)) && !spells(c.units[unit].src.bytes, at, c.units[declared_unit].src.bytes, declared) && !written_as_binding(c, unit, at) then return
+        ix.note(Noted(unit, at, declared_unit, declared, starts, target, ix.filling))
+
+private call_key(unit: usize, at: Span) -> string = s"$unit:${at.start}:${at.end}"
+
+/** Records the givens the call written at `at` filled its section with, replacing what an earlier
+ * check of the same call recorded: none, where the section was not filled. */
+index_filled_call(c: *Checker, at: Span, fills: Buf[Fill])
+    if c.index is Some(ix) then ix.fills.put(call_key(current_unit(c), at), fills)
+
+// Records each given the call `call` filled its section with as a reference at the call's name `at`.
+private index_fills(c: *Checker, unit: usize, call: Span, at: Span)
+    val ix = c.index match
+        Some(i) -> i
+        None -> return
+    val fills = ix.fills.get(call_key(unit, call)) match
+        Some(f) -> f
+        None -> return
+    for f in fills
+        ix.filling = f.param
+        f.from match
+            FilledLocal(i) -> index_local(c, unit, at, i, c.body.locals[i].ty)
+            FilledParam(i, ty) -> index_param(c, unit, at, i, ty)
+            FilledField(k, i) -> index_class_field(c, unit, at, k, i)
+            FilledGlobal(g) -> index_global(c, unit, at, g, global_shown_type(c, g))
+        ix.filling = ""
 
 // Whether the text at `at` can be a name for the declaration whose name is at `declared`: the name
 // itself, a path ending in it, or an operator. Code the compiler writes for a declaration -- the
@@ -403,6 +456,7 @@ index_expr(c: *Checker, e: &Expr, t: &TExpr)
         _ -> return
     if at.end <= at.start then return
     index_typed(c, unit, at, t)
+    if e.kind is Call(_, _) || e.kind is InfixCall(_, _, _, _) then index_fills(c, unit, e.span, at)
 
 // The module a member is read from, where the name before the dot is one the file imported.
 private index_module_prefix(c: *Checker, unit: usize, target: &Expr)
@@ -520,7 +574,7 @@ finish_index(c: *Checker) -> Buf[Reference]
         val module_name = c.units[n.declared_unit].file.module_name
         val library = module_name == CoreModule || module_name.starts_with(CoreModule + ".")
         val (kind, readonly, static_member) = target_kind(c, n.target)
-        out.push(Reference(c.units[n.at_unit].src.name, n.at, home.name, n.declared, render_target(c, n.target), doc_before(home.bytes, n.starts), kind, readonly, static_member, library))
+        out.push(Reference(c.units[n.at_unit].src.name, n.at, home.name, n.declared, render_target(c, n.target), doc_before(home.bytes, n.starts), kind, readonly, static_member, library, n.filled))
     out
 
 // What sort of thing a target is, whether it cannot be assigned, and whether it is a static member.
@@ -614,8 +668,12 @@ private function_header(c: *Checker, id: usize) -> string
     // A method declared without a parameter list is shown without one.
     if !s.decl.parameterless
         out.push("(")
+        // The `using` section is last, and `using` is written once, before it.
+        val section = section_size(s.decl)
+        val using_at = if section > 0 && s.params.len() >= section then s.params.len() - section else s.params.len()
         for i in first..<s.params.len()
             if i > first then out.push(", ")
+            if i == using_at then out.push("using ")
             val name = if i < s.param_names.len() then s.param_names[i] else "_"
             out.push(s"$name: ${type_name(shown_type(c, s.params[i]))}")
         out.push(")")
@@ -624,8 +682,11 @@ private function_header(c: *Checker, id: usize) -> string
         if !(*result is Unit) then out.push(" -> " + type_name(result))
     out.finish()
 
-private class_header(c: *Checker, k: usize) -> string
-    val d = c.classes[k].decl
+private class_header(c: *Checker, k: usize) -> string = class_decl_header(c.classes[k].decl)
+
+/** A class, trait or object's header as its declaration would be written: modifiers, type and value
+ * parameters, parents and derived traits. */
+class_decl_header(d: &ClassDecl) -> string
     if d.object then return "object " + d.name
     var out = str_builder()
     if d.modifier == "trait" then out.push("trait ")
@@ -642,6 +703,7 @@ private class_header(c: *Checker, k: usize) -> string
             if cp.mutable && !cp.public then out.push("private ")
             if cp.mutable then out.push("var ")
             elif cp.public then out.push("val ")
+            if cp.param.contextual && (i == 0 || !d.params[i - 1].param.contextual) then out.push("using ")
             out.push(param_text(cp.param))
         out.push(")")
     for i in 0..<d.parents.len()
@@ -665,19 +727,28 @@ private parent_text(e: &Expr) -> string = e.kind match
     _ -> show_expr(e)
 
 /** An alias as its declaration would be written: `type Parsed[T] = Result[T, ParseError]`. */
-private alias_header(d: &AliasDecl) -> string = (if d.opaque then "opaque type " else "type ") + d.name + type_params_text(d.type_params) + " = " + show_type(d.body)
+alias_header(d: &AliasDecl) -> string = (if d.opaque then "opaque type " else "type ") + d.name + type_params_text(d.type_params) + " = " + show_type(d.body)
 
 private data_header(c: *Checker, id: usize) -> string
     val d = c.data[id].decl
     var out = str_builder()
-    out.push("data " + d.name + type_params_text(d.type_params))
-    for i in 0..<d.derives.len()
-        out.push((if i == 0 then " derives " else ", ") + show_type(d.derives[i]))
+    out.push(data_head(d))
     for v in d.variants
         out.push("\n    " + variant_header(v))
     out.finish()
 
-private variant_header(v: Variant) -> string
+/** A data type's first line as its declaration would be written: its name, type parameters and
+ * derived traits, without its variants. */
+data_head(d: &DataDecl) -> string
+    var out = str_builder()
+    out.push("data " + d.name + type_params_text(d.type_params))
+    for i in 0..<d.derives.len()
+        out.push((if i == 0 then " derives " else ", ") + show_type(d.derives[i]))
+    out.finish()
+
+/** A variant as its declaration would be written: its name, its own type parameters, its fields and
+ * the instance of its type it makes. */
+variant_header(v: Variant) -> string
     val head = v.name + type_params_text(v.type_params)
     var out = head
     if v.fields.len() > 0

@@ -1,0 +1,88 @@
+// expect: exit 0
+// TOML, CBOR and MessagePack imported together: each format's decoder requires the core's `Missable`,
+// so the built-in types have one `whenMissing` that all three share. One derived record goes through
+// each format, both ways, with its `Option` field left out of the encoding, and decodes back with that
+// field `None`; a record with the field present comes back with it. A field absent from the input of
+// a type that is no `Option` is an error naming it, in each format.
+import avin.cbor
+import avin.cbor.{CborDecoder, CborEncoder, CborOmitNone}
+import avin.msgpack
+import avin.msgpack.{MsgpackDecoder, MsgpackEncoder, MsgpackOmitNone}
+import avin.toml
+import avin.toml.{TomlDecoder, TomlEncoder}
+import avin.time.{Date, DateTime, Instant, Time, Zoned, date}
+
+data Profile(
+    name: string,
+    age: int,
+    @CborOmitNone @ MsgpackOmitNone nick: Option[string],
+    tags: Vector[string] = []
+) derives TomlEncoder, TomlDecoder, CborEncoder, CborDecoder, MsgpackEncoder, MsgpackDecoder
+
+// The same record without `nick` or `age`: what it encodes is a `Profile`'s input with them absent.
+data Partial(name: string) derives TomlEncoder, CborEncoder, MsgpackEncoder
+
+// TOML's date-time kinds take `Missable`'s default through TOML's own impls of its decoder, with no
+// impl of `Missable` in `avin.time`: an absent `Date` is an error, an absent `Option[Date]` is `None`.
+data Dated(name: string, due: Option[Date], start: Date) derives TomlEncoder, TomlDecoder
+
+report[E: Display](label: string, r: Result[Profile, E]) = r match
+  Ok(p) -> println(s"$label: ${p.name} ${p.age} ${p.nick} ${p.tags}")
+  Err(e) -> println(s"$label: error: $e")
+
+main()
+  val absent = Profile("Ada", 36, None, ["x"])
+  val present = Profile("Bea", 7, Some("b"), [])
+
+  val text = toml.encode(absent).ok.get
+  println(text.contains("nick"))
+  report("toml absent", toml.decode[Profile](text))
+  report("toml present", toml.decode[Profile](toml.encode(present).ok.get))
+
+  val c = cbor.encode(absent)
+  println(s"${cbor.toTree(absent)}".contains("nick"))
+  report("cbor absent", cbor.decode[Profile](c))
+  report("cbor present", cbor.decode[Profile](cbor.encode(present)))
+
+  val m = msgpack.encode(absent)
+  println(s"${msgpack.toTree(absent)}".contains("nick"))
+  report("msgpack absent", msgpack.decode[Profile](m))
+  report("msgpack present", msgpack.decode[Profile](msgpack.encode(present)))
+
+  println(toml.decode[Profile](text).ok.get == absent)
+  println(cbor.decode[Profile](c).ok.get == absent)
+  println(msgpack.decode[Profile](m).ok.get == absent)
+
+  // `age` is an `int`, whose `whenMissing` is `None`: its absence is an error in every format.
+  report("toml partial", toml.decode[Profile](toml.encode(Partial("Cy")).ok.get))
+  report("cbor partial", cbor.decode[Profile](cbor.encode(Partial("Cy"))))
+  report("msgpack partial", msgpack.decode[Profile](msgpack.encode(Partial("Cy"))))
+
+  // The shared answers, read through each format's bound and through the core trait.
+  println(viaToml[Option[int]]())
+  println(viaCbor[Option[int]]())
+  println(viaMsgpack[Option[int]]())
+  println(viaToml[int]())
+  println(viaCbor[string]())
+  println(viaMsgpack[Vector[int]]())
+  println(Option[Option[string]].whenMissing())
+  println(Profile.whenMissing().isEmpty)
+
+  // TOML's date-time kinds.
+  toml.decode[Dated](toml.encode(Partial("d")).ok.get) match
+    Ok(d) -> println(s"dated: ${d.name}")
+    Err(e) -> println(s"dated: error: $e")
+  val back = toml.decode[Dated](toml.encode(Dated("d", None, date(2026, 11, 26))).ok.get).ok.get
+  println(s"${back.due} ${back.start}")
+  println(viaToml[Date]().isEmpty)
+  println(viaToml[Zoned]().isEmpty)
+  println(viaToml[Instant]().isEmpty)
+  println(viaToml[DateTime]().isEmpty)
+  println(viaToml[Time]().isEmpty)
+  println(viaToml[Option[Time]]().map(o -> o.isEmpty))
+
+viaToml[A: TomlDecoder]() -> Option[A] = A.whenMissing()
+
+viaCbor[A: CborDecoder]() -> Option[A] = A.whenMissing()
+
+viaMsgpack[A: MsgpackDecoder]() -> Option[A] = A.whenMissing()

@@ -398,7 +398,11 @@ whose type is not sendable. Avin compiles the whole program, so every function a
 known: the one a call names, every implementation a call through a trait method or an operator may
 reach, every closure made on the way, an extractor a pattern calls, and the initializer of every
 `lazy val`, module-level or a field, that it reads, since its first read runs the initializer on
-whichever thread makes it. A module-level `val` of an
+whichever thread makes it. Which implementations a call may reach follows the types its receiver may
+have: a data type's own, a class's and its subclasses', those of the types conforming to a trait or
+to a type parameter's bounds, and, in a generic function called at known type arguments, those of
+the types it is called at. So `Map[int, string]` in a body never reaches a program's own `hash`, and
+`[Money(1), Money(2)].sum` reaches `Money`'s `+`. A module-level `val` of an
 `Atomic`, a `Mutex`, a `Channel` or immutable data is the way to share state between threads; a
 `lazy val` of a sendable type is initialized once whichever threads read it. A local `lazy val` a
 body captures brings its initializer along, so what that initializer captures and reaches is held to
@@ -430,7 +434,9 @@ A [Sysl handle](/spec/sysl-bindings/#handles) is the exception: it belongs to on
 and a use by any other code traps. The handles a thread's body or a future's body reaches move to
 it when it starts, and are in transit, for the next code to use them, once it returns, before a
 future's value is published, so its awaiter may use them at once; an actor
-will own its handles across every message, whichever thread runs it.
+will own its handles across every message, whichever thread runs it. A value sent on a channel has
+its handles in transit from the send, for the receiver, and a lock's value has them in transit
+between its bodies (below).
 
 ## Synchronization
 
@@ -449,7 +455,14 @@ will own its handles across every message, whichever thread runs it.
   there, in a module-level collection or in an object's field would let the program change it later
   without the lock. A body reads such a `var` through a local read before it. For a sendable
   value, `get()` reads it, `set(v)` replaces it and `update(f)` replaces it with `f` of it
-  under the lock, giving back the new value. A mutex is not reentrant: a thread that takes one it
+  under the lock, giving back the new value. The [Sysl handles](/spec/sysl-bindings/#handles) the
+  value reaches, an open file or a connection, belong to whichever thread holds the lock: they are
+  in transit once the mutex is made and whenever a body ends or waits on the mutex's condition, and
+  the first body to use one takes it, so any thread may write a file a mutex keeps. Only the handles
+  the value's type shows are handed on — the value itself, or what its fields, a tuple's parts or a
+  collection's elements are declared to be — and a type that shows none costs nothing for this, the
+  compiler knowing it of the type; a handle reached only through a function value, an `Any` or a
+  trait's object stays where it was, and another thread's use of it traps. A mutex is not reentrant: a thread that takes one it
   already holds, from inside a body, would wait for ever, so it traps instead.
 - **`Condition`**, made by a mutex's `condition()` and waited for inside that mutex's `with`; like
   its mutex, it is sendable.
@@ -563,8 +576,14 @@ parked on a lock, a condition, a channel or a join, blocked on standard input, o
 output or standard error where they lead to a full pipe, its own trap report included, never holds up
 a collection. A lightweight thread waiting for standard input from a pipe, a socket or a terminal
 parks and leaves its worker to the others; that wait is not a cancellation point.
-A Sysl binding [declared `blocking`](/spec/sysl-bindings/#calls-that-wait) does the same. A thread
-waiting for a mutex takes it in turn: the mutex goes to the thread that has waited longest. A thread
+A Sysl binding [declared `blocking`](/spec/sysl-bindings/#calls-that-wait) does the same. A free
+mutex is taken by whichever thread asks first: a thread that finds it busy spins for a moment and then
+parks, and letting it go wakes the thread that has waited longest, which competes for it with any
+thread asking meanwhile, so that threads taking a mutex in turn never wait for a parked thread to be
+scheduled. **No thread is overtaken for ever**: a thread that has waited longer than about a
+millisecond is handed the mutex directly once it is first in line, so a stream of other threads
+taking it cannot keep that thread out. Waiters are not served strictly in the order they came; a
+[pool](#pools) serves its own waiters in that order. A thread
 taking a lock it already holds traps at once. A program whose threads, `main` among them, all wait for
 each other stops with a [deadlock report](#deadlock); threads that wait for each other while another
 still runs sleep for ever.
