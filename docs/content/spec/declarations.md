@@ -1359,7 +1359,10 @@ built-in type implements every method of the trait, defaults included.
   out, as `impl[A] (A, int)` adds to the pairs whose second part is an `int`.
 - **An impl without `for` whose type is a trait adds methods to the trait** (`impl[T] Seq[T]`,
   `impl[T: Display] Seq[T]`). Every value whose type conforms to the trait has
-  them: a class or `data` type implementing it, the trait's own type, a type parameter it bounds.
+  them: a class or `data` type implementing it, a built-in, opaque or tuple type implementing it
+  (`impl Plain for int` gives `5.loud(1)` the `loud` an `impl Plain` adds), the trait's own type, a
+  type parameter it bounds. They are called and taken as function values as the type's own methods
+  are: `val f = 5.loud` is an `(int) -> string`.
   Inside them `self` is the value and `Self` its type; the trait's methods, and those other impls add
   to it, are in scope by bare name. They reach the value only through the trait's methods, so they
   are not variance positions: `contains(element: T)` is written on `Seq[+T]`. The methods an impl

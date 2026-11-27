@@ -10479,6 +10479,23 @@ Settled on the user's delegation 2026-11-11 (built on branch `json-derive`): **J
   random pairs checked against the quadratic table for minimality. Review with the user: the names
   `Edit`, `Keep`, `Insert`, `Delete`, `diffLines`, `unifiedDiff` and `changes`, and whether a
   patience diff should join this one as `diffLines`' option.
+- Settled on the user's delegation 2026-11-20 (branch `extension-value`): **the methods an impl adds
+  to a trait reach a built-in, opaque or tuple type implementing it**, as they reach a class or `data`
+  type: with `impl Plain for int` and `impl Plain` adding `loud(k: int)`, `5.loud(1)` is a call and
+  `val f = 5.loud` an `(int) -> string`, extensions of core traits included (`impl Display` adding
+  `framed` gives `2.5.framed` and `7.framed`); every integer is an `Integer`, so what is added to
+  `Integer` and the traits it requires reaches it too. The rule "every value whose type conforms to
+  the trait has them" already said so; the checker saw a built-in type's conformances only for bounds,
+  so both the call and the method value reported "int has no field `loud`". The type's own method of
+  the name and parameter types is still found first (`"ab".repeat(2)` is `string`'s), the
+  extension's visibility is unchanged (an `impl Display` in a module a file does not import is refused
+  there by name), and an added method's value is taken exactly as a type's own: its `using` section
+  filled where it is taken, an overload chosen by the expected function type and ambiguous without
+  one, a method declared with `()` a value only where a function type is expected. Alternative
+  weighed: keeping added methods to user and library types only, which would leave a trait's added
+  methods missing exactly on the types most programs implement it for, with no way to call them but
+  through a generic function. Review with the user: it is a widening; no core impl adds methods to a
+  trait a built-in type implements today, so no existing call changes meaning.
 - **`io.inputs` and `io.inputLines`: the files named, or standard input when none.** Settled on the
   user's delegation 2026-11-19: `io.inputs(paths: Vector[string]) -> Iterator[Result[(string, string),
   IoError]]` yields each input as its name and all its text, and `io.inputLines(paths)` yields the
