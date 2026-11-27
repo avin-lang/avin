@@ -3225,6 +3225,303 @@ twice, a name made again, or a `maxSeries` below one traps where the family is m
 [`avin.net.http`](#http-server) serves a registry (`metricsHandler`, `metricsRoute`) and keeps its
 request metrics in one (`Metrics`, `ServerMetrics`).
 
+## `avin.reactive`
+
+Reactive values. A program keeps its state in **atoms**, computes from them **derived values**,
+whose sources are tracked as they are read, and reacts with **effects**, which run again whenever
+what they read changes. A **`Graph`** holds them, and one execution owns it: a thread, the main
+thread's event loop, or an actor, which keeps its graph in its state.
+
+```avin run
+import avin.reactive.Graph
+
+main()
+  val g = Graph()
+  val width = g.atom(3)
+  val height = g.atom(4)
+  val area = g.derived(get -> get(width) * get(height))
+  val shown = g.effect(get -> println(s"area ${get(area)}"))
+  width.set(5)
+  g.batch(() ->
+    width.set(6)
+    height.set(5))
+  height.set(5)
+  println(area.computed())
+  shown.dispose()
+  width.set(1)
+  println(area.get())
+```
+
+```text output
+area 12
+area 20
+area 30
+3
+5
+```
+
+- **Reads are tracked as they run.** A derived value's computation and an effect's body are given a
+  **`Get`**. `get(node)` reads a node and records it as a source, so a node's sources are what its
+  last run read. A computation that reads different nodes on different runs depends on exactly the
+  ones it read last, and a branch it no longer takes is never computed. There is no ambient "current
+  computation": the `Get` is the tracker, which is why the module reaches no module-level mutable
+  state and any actor may use it.
+- **No observer sees a mix of old and new values.**
+  - A write finds the effects it reaches through the nodes they observe.
+  - The effects run only once the write, or the batch it is in, is complete.
+  - A derived value is computed when it is read, after its sources have been brought up to date in
+    the order it last read them, and never during a write.
+  - A derived value's computation may not write, so nothing changes between two of its reads.
+- **An equal value changes nothing.** `set` compares with `==`. A derived value whose computation
+  answers a value equal to its last is unchanged, and its readers are left alone. So an effect runs
+  only when a value it read is different.
+- **`batch(body)`** holds back the effects its writes reach until the outermost batch returns, then
+  runs each of them once; batches nest, and `batch` answers what `body` does.
+- **A write from inside an effect is queued.** It takes effect at once, and an effect that writes and
+  then reads sees its write. The effects it reaches run after the writing effect returns, in the same
+  flush. An effect whose run wrote is checked again at the end of the flush, and runs again only
+  where something it read changed. An effect that writes what it reads never settles: its hundred
+  and first run in one flush traps with `an effect ran 100 times in one flush: it writes what it reads, directly or through other effects`.
+- **What traps.**
+  - A write from a derived value's computation (`a derived value's computation writes to its graph;
+    write from an effect instead`).
+  - A derived value reading itself, directly or through others.
+  - A `Get` kept and used after its computation returned.
+  - A write to a disposed graph.
+
+| `Graph` | |
+| --- | --- |
+| `atom(initial)` | A new `Atom[T]` holding `initial` |
+| `derived(compute)` | A new `Derived[T]`, `compute` a `(Get) -> T`, computed when first read |
+| `effect(body)` | An `Effect` the graph owns, run now (or at the end of the batch or flush under way) and whenever a node it read changes |
+| `scope()` | A `Scope` the graph owns |
+| `port(atom)` | A `Port[T]` the graph owns, through which any thread writes to `atom` |
+| `machine(handle, initial)` | A `Machine[E, S]` in state `initial`, whose events `handle` applies |
+| `batch(body)` | Runs `body` with its effects held back, then runs them once each |
+| `drain()` | Applies each port's latest value in one batch; answers how many ports had one |
+| `awaitWrites(timeout)` | Waits at most `timeout` for a port to be written, then drains |
+| `flushes()`, `isFlushing()` | How many flushes have run; whether effects are running now |
+| `dispose()` | Disposes every effect, scope and port, newest first |
+
+| Nodes | |
+| --- | --- |
+| `Atom.set(v)`, `Atom.update(f)` | Writes `v`, or `f` of the value held |
+| `Readable.get()` | The value, brought up to date, read without being recorded as a source |
+| `Readable.map(f)` | The derived value of `f` of the node's value |
+| `Readable.observers()` | How many effects and observed derived values observe the node now |
+| `Derived.computed()` | How many times it has been computed |
+| `Get.apply(node)` | `get(node)`: the value, recorded as a source |
+| `Get.onCleanup(f)`, `Get.effect(body)`, `Get.scope()` | In an effect's body: what runs before the next run and at disposal, and effects and scopes that the run owns |
+| `Effect.dispose()`, `Effect.runs()`, `Effect.isDisposed()` | Stops it; how many times it ran; whether it is disposed |
+| `Scope.effect(body)`, `Scope.scope()`, `Scope.port(atom)`, `Scope.onDispose(f)`, `Scope.dispose()` | What a scope owns, and its end |
+
+### Owners and lifetimes
+
+**Every effect has an owner that disposes it**:
+
+- the graph;
+- a `Scope`;
+- the run of an effect that made it with `get.effect`, which disposes it before running again.
+
+Disposing an owner disposes what it owns, newest first, and runs each effect's cleanups, newest
+first, then a scope's `onDispose` functions.
+
+- **Only effects keep nodes in the graph.** A source refers to a derived value only while an effect
+  observes that value, directly or through other derived values. When the last observer leaves, the
+  value lets go of its own sources in turn. A derived value nobody observes is referred to by nothing
+  in the graph, so it is collected once the program lets go of it, and so is a whole graph, effects
+  and all.
+- **Disposing while effects run is defined.**
+  - An effect disposed while it waits to run never runs.
+  - One disposed inside its own body finishes that run, cleans up once and never runs again.
+  - A graph disposed from inside an effect runs none of the effects still waiting.
+  - The atoms keep their values and may still be read.
+
+```avin run
+import avin.reactive.Graph
+
+main()
+  val g = Graph()
+  val signedIn = g.atom(false)
+  val name = g.atom("guest")
+  val greeting = g.derived(get -> if get(signedIn) then s"hello, ${get(name)}" else "please sign in")
+  val view = g.scope()
+  _ = view.effect(get ->
+    val text = get(greeting)
+    println(s"show: $text")
+    get.onCleanup(() -> println(s"hide: $text")))
+  name.set("ada")
+  println(name.observers())
+  signedIn.set(true)
+  println(name.observers())
+  view.dispose()
+  println(signedIn.observers())
+```
+
+```text output
+show: please sign in
+0
+hide: please sign in
+show: hello, ada
+1
+hide: hello, ada
+0
+```
+
+### Threads and actors
+
+**A graph is not sendable.** Its nodes are mutable, so the compiler refuses to let another thread
+reach one. A closure given to `spawn` or to `Future`, a `@sendable` function, a `@threaded`
+callback, and an actor's messages and parameters cannot carry a graph or a node:
+
+```text
+error: what is passed for `body` of `spawn` may use only sendable values from around it, but it uses `g`, a `Graph`, which is not made to be shared between threads
+```
+
+The execution that made a graph is therefore the only one that reads and writes it, effects
+included. A lightweight thread may move between workers, and an actor between turns, but the
+handoffs order every access, so the graph takes no lock and no access races.
+
+**Another thread writes through a `Port[T]`**, for a sendable `T`:
+
+- A port is sendable. `port.set(v)` keeps the latest value written and wakes the owner. It never
+  waits, and it answers `false` once the port's owner has been disposed.
+- The owner applies what has arrived with `drain()`, every port's latest value in one batch, or
+  `awaitWrites(timeout)`, which waits first. Its effects run there, on the owner.
+- A port holds one value, so a fast writer never makes the owner fall behind or grow its memory, and
+  the owner sees each atom's newest value. That is the meaning state needs. A stream in which every
+  item counts is a `Channel` or an actor's mailbox.
+- A thread holding a port keeps nothing of the graph alive.
+
+```avin run
+import avin.reactive.Graph
+import avin.threads.spawn
+import avin.time
+
+main()
+  val g = Graph()
+  val progress = g.atom(0)
+  val done = progress.map(p -> p >= 100)
+  _ = g.effect(get -> if get(done) then println("finished"))
+  val report = g.port(progress)
+  val worker = spawn(() ->
+    for p in 1 .. 100 do _ = report.set(p))
+  while !done.get() do _ = g.awaitWrites(time.millis(10))
+  worker.join()
+  println(progress.get())
+```
+
+```text output
+finished
+100
+```
+
+**An actor owns a graph** by making it in its body.
+
+- Its arms turn messages into writes, each message a flush of its own.
+- An effect tells other actors what changed, once per change. A receiver that wants only the latest
+  takes them in a `Bounded(n, DropOldest)` mailbox.
+- The effects are made after the actor's last field
+  ([declaring an actor](/spec/actors/#declaring-an-actor)).
+- `stop()` from an effect ends the actor once the message is handled, so the flush under way
+  finishes.
+- A trap in an effect fails the actor, and the rest of that flush never runs.
+- The `stopping` block disposes the graph. After a failure, which
+  [`failure()`](/spec/actors/#lifecycle) reports, `dispose` takes the computations the trap stopped
+  part-way to have ended, so the effect that trapped is cleaned up as every other is.
+- A restart makes a fresh graph from the body. The messages still in the mailbox write to it.
+- Values are consistent within one graph. An actor combining what two others tell it may see one's
+  newer value beside the other's older one, as any two senders' messages interleave.
+
+```avin run
+import avin.actors.spawn
+import avin.reactive.Graph
+import avin.threads.Promise
+
+data Temp
+  Reading(celsius: int)
+  Report(seen: Promise[string])
+
+actor Thermostat receives Temp
+  val g = Graph()
+  val celsius = g.atom(20)
+  val heating = celsius.map(c -> c < 18)
+  val log = Buffer[string]()
+  _ = g.effect(get -> log.append(if get(heating) then "on" else "off"))
+  receive
+    Reading(c) -> celsius.set(c)
+    Report(p) -> p.complete(s"$log")
+  stopping
+    g.dispose()
+
+main()
+  val t = spawn(Thermostat())
+  for c in [17, 16, 19] do t.tell(Reading(c))
+  val seen = Promise[string]()
+  t.tell(Report(seen))
+  println(seen.future.await())
+```
+
+```text output
+[off, on, off]
+```
+
+### State machines
+
+`g.machine(m.handle, m.state())` drives a [`machine`](/spec/actors/#state-machines) through the
+graph:
+
+- `fire(event)` hands it an event. Every event fired is handled exactly once, in the order fired.
+  One fired while another is being handled (from an `enter` or `leave` block, a listener or an
+  effect) waits its turn, where calling `handle` there would trap.
+- `state()` is a readable of the state, and `lastStep()` one of the last `Step(number, event, from,
+  to)`. Each event's two are written in one batch, so effects see them agree, and the step changes
+  with every event, a `stay` included.
+- `onStep(f)` calls `f` with every step, in order, as it is taken. An effect sees the state after a
+  batch, but a listener sees each step.
+- `steps()` counts the events handled.
+
+```avin run
+import avin.reactive.Graph
+
+data Ev
+  Coin
+  Push
+
+machine Turnstile receives Ev
+  state Locked
+    Coin -> Unlocked
+    Push -> stay
+
+  state Unlocked
+    Push -> Locked
+    Coin -> stay
+
+main()
+  val g = Graph()
+  val gate = Turnstile()
+  val m = g.machine(gate.handle, gate.state())
+  m.onStep(s -> println(s"step ${s.number}: ${s.from} -> ${s.to} on ${s.event}"))
+  _ = g.effect(get -> println(s"gate is ${get(m.state())}"))
+  val events: Vector[Ev] = [Coin, Coin, Push, Push]
+  for e in events do m.fire(e)
+```
+
+```text output
+gate is Locked
+step 1: Locked -> Unlocked on Coin
+gate is Unlocked
+step 2: Unlocked -> Unlocked on Coin
+step 3: Unlocked -> Locked on Push
+gate is Locked
+step 4: Locked -> Locked on Push
+```
+
+Asynchronous values, derived from a `Future`, are not part of the module. A late answer for an old
+input must never win, and the value must be cancelled when it is superseded. Cancelling needs a
+cancellation that `Future` does not have, so the module waits for that choice
+([decisions](/spec/decisions/)).
+
 ## `avin.net`
 
 TCP connections, TLS over them, servers, URLs, and a small HTTP client and server that speak `https`

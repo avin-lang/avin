@@ -450,6 +450,9 @@ private trait Core: Sendable
   // Tells the actor that a child escalated a failure for `reason` to it, which fails it in turn.
   childFailed(reason: string) -> unit
 
+  // While its `stopping` blocks run, the reason of the failure they run after; read by its own code.
+  stoppingFailure() -> Option[string]
+
 // A running actor: its mailbox, whether it is queued on its executor or running there, its owner of
 // Sysl handles, its handler, made by its behaviour's start on its first turn, and its place in the
 // tree of actors. Its turns are the only code that reads or changes its handler, its timers, its
@@ -503,6 +506,13 @@ private class Actor[M: Sendable](
   private val escalated = Atomic[Option[string]](None)
   // Set from a failure that restarts the actor until its children have ended and it starts again.
   private var restarting = false
+  // The reason of the failure that is restarting the actor.
+  private var restartFailure: Option[string] = None
+  // While the `stopping` blocks run, the reason of the failure they run after, which `failure()`
+  // answers.
+  private var stoppingAfter: Option[string] = None
+
+  override stoppingFailure() -> Option[string] = stoppingAfter
   // Set once the actor has escalated a failure to its parent: it handles nothing more, and waits
   // for the parent's failure to stop it.
   private var halted = false
@@ -711,7 +721,7 @@ private class Actor[M: Sendable](
 
   // Takes a trap's failure, for `reason`, as the actor's supervision says.
   private failed(reason: string) = supervision match
-    Restart(limit, within) -> if mayRestart(limit, within) then restart() else escalate(reason)
+    Restart(limit, within) -> if mayRestart(limit, within) then restart(reason) else escalate(reason)
     Stop -> endFailed(reason)
     Escalate -> escalate(reason)
 
@@ -739,10 +749,11 @@ private class Actor[M: Sendable](
     restarts.append(now)
     true
 
-  // Begins a restart: it is reported, the timers and watches are cancelled and every child is
-  // asked to end; the messages stay.
-  private restart()
+  // Begins a restart after a failure for `reason`: it is reported, the timers and watches are
+  // cancelled and every child is asked to end; the messages stay.
+  private restart(reason: string)
     restarting = true
+    restartFailure = Some(reason)
     eprintln(s"avin: restarting $label")
     cancelAll()
     for c in children.load() do c.requestStop()
@@ -752,25 +763,31 @@ private class Actor[M: Sendable](
   private restarted()
     restarting = false
     handler = None
-    if runStoppings() || stopAsked.load() then closing()
+    val after = restartFailure
+    restartFailure = None
+    if runStoppings(after) || stopAsked.load() then closing()
 
   // Runs the `stopping` blocks in the order they were given and forgets them, answering whether one
   // trapped: that one is reported and fails the actor where nothing had, and the rest do not run.
-  private runStoppings() -> bool
+  // While they run, `failure()` answers `after`, the failure they run after.
+  private runStoppings(after: Option[string]) -> bool
+    stoppingAfter = after
     var i = 0
     while i < stoppings.length
       if guarded(stoppings(i), label, outcome)
         if failure.isEmpty then failure = Some(outcome(0))
         stoppings.clear()
+        stoppingAfter = None
         return true
       i += 1
     stoppings.clear()
+    stoppingAfter = None
     false
 
   // Ends, every child having ended: the `stopping` blocks run, the end is told to whoever waits for
   // it, and the parent is told after.
   private ended()
-    runStoppings()
+    _ = runStoppings(failure)
     phase.store(Gone)
     mailbox.shut()
     unstashed.clear()
@@ -798,6 +815,22 @@ private class Registry(): Sendable
     actors.with(m -> m.get(me))
 
 private lazy val registry: Registry = Registry()
+
+// In an actor's `stopping` block, and in whatever it calls, the reason of the trap that is ending
+// or restarting the actor, as its `Failed` reason has it; `None` where the actor stops without a
+// failure, and in any code that is not running a `stopping` block. A library a `stopping` block
+// calls reads it to know that the state it was handed was left half changed by a trap.
+//
+//     actor Connection receives Msg
+//       receive
+//         _ -> ()
+//       stopping
+//         failure() match
+//           Some(reason) -> log.warn(s"closing after $reason")
+//           None -> log.info("closing")
+failure() -> Option[string] = registry.current() match
+  Some(a) -> a.stoppingFailure()
+  None -> None
 
 // What an actor is before it starts: a name, which its references are shown by, and its start, run
 // once on the actor's own execution before it handles any message, which makes the actor's state and

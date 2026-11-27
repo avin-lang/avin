@@ -1,0 +1,634 @@
+module avin.reactive
+
+// Reactive values: atoms a program writes, derived values computed from them, and effects that run
+// whenever what they read changes. A `Graph` holds them, and one execution owns it: a thread, the
+// main thread's event loop, or an actor, which keeps its graph in its state.
+//
+//     val g = Graph()
+//     val width = g.atom(3)
+//     val height = g.atom(4)
+//     val area = g.derived(get -> get(width) * get(height))
+//     val shown = g.effect(get -> println(s"area ${get(area)}"))
+//     g.batch(() ->
+//       width.set(5)
+//       height.set(6))
+//
+// prints `area 12` when the effect is made, and `area 30` once, after the batch.
+//
+// - **Reads are tracked as they run.** A derived value's computation and an effect's body are given a
+//   `Get`; `get(node)` reads a node and records it as a source, so the sources are whatever the last
+//   run read, and a computation that reads different nodes on different runs depends on exactly the
+//   ones it read last.
+// - **No observer sees a mix of old and new values.** A derived value is computed when it is read,
+//   after its sources have been brought up to date, never while a write is under way; effects run
+//   only once a write, or a batch of them, is complete.
+// - **A write to an equal value changes nothing.** `set` compares with `==`, and a derived value
+//   whose computation gives a value equal to the last one leaves its readers alone.
+// - **Writes made by an effect are queued**: they take effect at once, and the effects they reach run
+//   after the effect that wrote returns, in the same flush. A derived value's computation may not
+//   write at all, and doing so traps.
+// - **Every effect has an owner** that disposes it: the graph, a `Scope`, or the run of an effect
+//   that made it, which disposes it before running again. Only effects keep nodes in the graph: a
+//   derived value nobody observes is referred to by nothing in the graph, so it is collected once
+//   the program lets go of it.
+// - **A graph is mutable, so it is not sendable**, and the compiler keeps it with its owner. Another
+//   thread writes to an atom through a `Port`, which is sendable; the owner applies what has arrived
+//   with `drain` or `awaitWrites`.
+
+import avin.actors.failure
+import avin.collections.mutable.LinkedSet
+import avin.threads.{Atomic, Channel, Mutex}
+import avin.time.Duration
+
+// How many times one effect may run in a single flush before the flush is taken to be a loop: an
+// effect that writes what it reads, directly or through other effects, never settles.
+private val RerunLimit: int = 100
+
+// The state a graph's nodes share: the clock of writes, the batch and flush in progress, and the
+// effects waiting to run.
+private class Core()
+  // Advanced by every write that changes a value.
+  var clock: long = 0
+  var batching: int = 0
+  var flushing: bool = false
+  // The derived values computing now, nested.
+  var computing: int = 0
+  var flushes: long = 0
+  var disposed: bool = false
+  val queue = Deque[Effect]()
+  val wake = Channel[unit](1)
+  val ports = LinkedSet[Drainable]()
+  // The derived values computing and the effects running now, innermost last.
+  val active = Buffer[Node]()
+
+  // Ends what a trap stopped part-way: every computation under way, and the flush and batches.
+  unwind()
+    for n in active do n.unwound()
+    active.clear()
+    flushing = false
+    batching = 0
+    computing = 0
+
+  tick() -> long
+    clock += 1
+    clock
+
+  // Traps where a write is not allowed now.
+  writable()
+    if computing > 0 then fail("a derived value's computation writes to its graph; write from an effect instead")
+    if disposed then fail("a write to a graph that has been disposed")
+
+  // Runs the effects waiting, unless a batch or a flush will.
+  settle() = if batching == 0 && !flushing then flush()
+
+  flush()
+    flushing = true
+    flushes += 1
+    while !queue.isEmpty do queue.removeHead().settle()
+    flushing = false
+
+  batch[R](body: () -> R) -> R
+    batching += 1
+    val r = body()
+    batching -= 1
+    settle()
+    r
+
+// What a node is to the graph: it counts its changes in `version`, and knows the nodes observing it.
+// Only an effect, or a derived value an effect observes, observes anything.
+private abstract class Node
+  var version: long = 0
+  val targets = LinkedSet[Node]()
+
+  // Brings the node up to date with every write so far.
+  refresh() -> unit
+
+  // A source of this node has changed.
+  stale() -> unit
+
+  // The first observer has arrived, or the last has left.
+  mounted() -> unit
+  unmounted() -> unit
+
+  // A trap stopped its computation part-way.
+  unwound() -> unit
+
+  observe(target: Node)
+    val first = targets.isEmpty
+    if targets.add(target) && first then mounted()
+
+  unobserve(target: Node)
+    if targets.remove(target) && targets.isEmpty then unmounted()
+
+// What an owner disposes.
+private trait Disposable
+  dispose() -> unit
+
+// The effects and scopes an owner has made, disposed newest first.
+private class Children()
+  val items = LinkedSet[Disposable]()
+  var closed = false
+
+  adopt(child: Disposable)
+    if closed then fail("an effect or a scope is made in a scope that has been disposed")
+    _ = items.add(child)
+
+  disposeAll()
+    while !items.isEmpty do items.removeLast().dispose()
+
+  close()
+    closed = true
+    disposeAll()
+
+// The reads of one computation, each node once, with its version when read.
+private class Reads(val core: Core)
+  val nodes = Buffer[Node]()
+  val seen = Buffer[long]()
+  var open = true
+
+  record(n: Node)
+    for i in 0 ..< nodes.length do if nodes(i) === n then return
+    nodes.append(n)
+    seen.append(n.version)
+
+// Whether a source has changed since it was read: each is brought up to date, in the order it was
+// read, stopping at the first that has, since a computation run again may not read the rest.
+private changed(sources: Buffer[Node], seen: Buffer[long]) -> bool
+  for i in 0 ..< sources.length
+    val s = sources(i)
+    s.refresh()
+    if s.version != seen(i) then return true
+  false
+
+private holds(nodes: Buffer[Node], n: Node) -> bool
+  for m in nodes do if m === n then return true
+  false
+
+// Moves `target` from observing `old` to observing `fresh`, observing the new first, so a source in
+// both is never left unobserved between.
+private resubscribe(target: Node, old: Buffer[Node], fresh: Buffer[Node])
+  for n in fresh do if !holds(old, n) then n.observe(target)
+  for o in old do if !holds(fresh, o) then o.unobserve(target)
+
+private runCleanups(cleanups: Buffer[() -> unit])
+  var i = cleanups.length - 1
+  while i >= 0
+    cleanups(i)()
+    i -= 1
+
+// A node whose value may be read: an `Atom` or a `Derived`.
+abstract class Readable[T]: Node
+  // The value now, brought up to date, read without being recorded as a source.
+  get() -> T
+
+  // How many effects and observed derived values observe this node now.
+  observers() -> int = targets.size
+
+  // The derived value of `f` of this node's value.
+  map[U](f: (T) -> U) -> Derived[U]
+
+  // The value, once `refresh` has run.
+  current() -> T
+
+// A value the program writes. Made by `Graph.atom`.
+class Atom[T](private val core: Core, private var value: T): Readable[T]
+  override refresh() = ()
+  override stale() = ()
+  override mounted() = ()
+  override unmounted() = ()
+  override unwound() = ()
+  override current() -> T = value
+  override get() -> T = value
+  override map[U](f: (T) -> U) -> Derived[U] = Derived(core, get -> f(get(self)))
+
+  // Writes `v`. Where it equals the value already held nothing changes; otherwise the effects that
+  // read this atom, directly or through derived values, run once the write is complete: at once, at
+  // the end of the batch it is in, or after the effect that wrote it.
+  set(v: T)
+    core.writable()
+    if v == value then return
+    value = v
+    core.tick()
+    version += 1
+    for t in targets do t.stale()
+    core.settle()
+
+  // Writes `f` of the value held.
+  update(f: (T) -> T) = set(f(value))
+
+// A value computed from other nodes, which `Graph.derived` makes. It is computed when it is read and
+// a source has changed since the last computation, and not otherwise.
+class Derived[T](private val core: Core, private val compute: (Get) -> T): Readable[T]
+  private var value: Option[T] = None
+  private var sources = Buffer[Node]()
+  private var seen = Buffer[long]()
+  // The clock when it was last seen to be up to date.
+  private var checked: long = -1
+  // The clock when a change last passed through it to its observers.
+  private var marked: long = -1
+  private var running = false
+  private var computations: long = 0
+
+  // How many times it has been computed.
+  computed() -> long = computations
+
+  override current() -> T = value match
+    Some(v) -> v
+    None -> fail("a derived value is read before it is computed")
+
+  override get() -> T
+    refresh()
+    current()
+
+  override map[U](f: (T) -> U) -> Derived[U] = Derived(core, get -> f(get(self)))
+
+  override refresh()
+    if running then fail("a derived value reads itself, directly or through other derived values")
+    if value is Some(_) && checked == core.clock then return
+    if value is Some(_) && !changed(sources, seen)
+      checked = core.clock
+      return
+    recompute()
+
+  private recompute()
+    val reads = Reads(core)
+    running = true
+    core.computing += 1
+    core.active.append(self)
+    val v = compute(Get(reads, None))
+    _ = core.active.remove(core.active.length - 1)
+    core.computing -= 1
+    running = false
+    reads.open = false
+    computations += 1
+    if !targets.isEmpty then resubscribe(self, sources, reads.nodes)
+    sources = reads.nodes
+    seen = reads.seen
+    checked = core.clock
+    val same = value match
+      Some(old) -> old == v
+      None -> false
+    if !same
+      value = Some(v)
+      version += 1
+
+  override stale()
+    if marked == core.clock then return
+    marked = core.clock
+    for t in targets do t.stale()
+
+  override mounted()
+    for s in sources do s.observe(self)
+
+  override unmounted()
+    for s in sources do s.unobserve(self)
+
+  override unwound()
+    running = false
+
+// What a computation or an effect's body reads with: `get(node)` is the node's value, recorded as a
+// source. In an effect's body it also registers what to do before the next run (`onCleanup`) and makes
+// effects and scopes that the run owns, disposed before the next run.
+class Get(private val reads: Reads, private val run: Option[EffectRun])
+  // The value of `node`, brought up to date, recorded as a source of the computation.
+  apply[T](node: Readable[T]) -> T
+    if !reads.open then fail("a `Get` is used after the computation it was given to has returned")
+    node.refresh()
+    reads.record(node)
+    node.current()
+
+  // Runs `f` before the effect runs again and when it is disposed; traps outside an effect's body.
+  onCleanup(f: () -> unit) = within("onCleanup").cleanups.append(f)
+
+  // An effect that this run owns: it is disposed before the effect running now runs again.
+  effect(body: (Get) -> unit) -> Effect = makeEffect(reads.core, body, within("effect").children)
+
+  // A scope that this run owns.
+  scope() -> Scope = makeScope(reads.core, within("scope").children)
+
+  private within(what: string) -> EffectRun
+    if !reads.open then fail("a `Get` is used after the computation it was given to has returned")
+    run match
+      Some(r) -> r
+      None -> fail(s"`$what` is called in a derived value's computation, which may only read")
+
+// What one run of an effect owns.
+private class EffectRun()
+  val children = Children()
+  val cleanups = Buffer[() -> unit]()
+
+  // Disposes what the run made and runs its cleanups, newest first.
+  end()
+    children.close()
+    runCleanups(cleanups)
+
+private makeEffect(core: Core, body: (Get) -> unit, owner: Children) -> Effect
+  val e = Effect(core, body, owner)
+  owner.adopt(e)
+  e.stale()
+  core.settle()
+  e
+
+private makeScope(core: Core, owner: Children) -> Scope
+  val s = Scope(core, owner)
+  owner.adopt(s)
+  s
+
+// Code that runs once when it is made and again whenever a node it read changes. Made by
+// `Graph.effect`, `Scope.effect` or `Get.effect`.
+class Effect(private val core: Core, private val body: (Get) -> unit, private val owner: Children): Node, Disposable
+  private var sources = Buffer[Node]()
+  private var seen = Buffer[long]()
+  private var queued = false
+  private var disposed = false
+  private var running = false
+  private var hasRun = false
+  private var runCount: long = 0
+  private var flushSeen: long = -1
+  private var inFlush: int = 0
+  private var last: Option[EffectRun] = None
+
+  // How many times the body has run.
+  runs() -> long = runCount
+
+  // Whether it has been disposed.
+  isDisposed() -> bool = disposed
+
+  override refresh() = ()
+  override mounted() = ()
+  override unmounted() = ()
+  override unwound()
+    running = false
+
+  override stale()
+    if queued || disposed then return
+    queued = true
+    core.queue.append(self)
+
+  // Taken from the queue by a flush: runs the body where it has never run or a source has changed.
+  settle()
+    queued = false
+    if disposed then return
+    if hasRun && !changed(sources, seen) then return
+    run()
+
+  private run()
+    if flushSeen != core.flushes
+      flushSeen = core.flushes
+      inFlush = 0
+    inFlush += 1
+    if inFlush > RerunLimit then fail(
+      s"an effect ran $RerunLimit times in one flush: it writes what it reads, directly or through other effects"
+    )
+    endRun()
+    val reads = Reads(core)
+    val thisRun = EffectRun()
+    last = Some(thisRun)
+    val before = core.clock
+    running = true
+    core.active.append(self)
+    body(Get(reads, Some(thisRun)))
+    _ = core.active.remove(core.active.length - 1)
+    running = false
+    reads.open = false
+    hasRun = true
+    runCount += 1
+    if disposed
+      endRun()
+      return
+    resubscribe(self, sources, reads.nodes)
+    sources = reads.nodes
+    seen = reads.seen
+    if core.clock != before then stale()
+
+  private endRun()
+    last match
+      Some(r) ->
+        last = None
+        r.end()
+      None -> ()
+
+  // Stops the effect: it never runs again, its cleanups run and what its last run made is disposed.
+  // Disposed while its body runs, it finishes that run first. Disposing it again does nothing.
+  override dispose()
+    if disposed then return
+    disposed = true
+    for s in sources do s.unobserve(self)
+    sources = Buffer[Node]()
+    seen = Buffer[long]()
+    _ = owner.items.remove(self)
+    if !running then endRun()
+
+// An owner of effects and of other scopes, disposed together. Made by `Graph.scope`, `Scope.scope`
+// or `Get.scope`.
+class Scope(private val core: Core, private val owner: Children): Disposable
+  private val children = Children()
+  private val cleanups = Buffer[() -> unit]()
+  private var disposed = false
+
+  // An effect this scope owns.
+  effect(body: (Get) -> unit) -> Effect = makeEffect(core, body, children)
+
+  // A scope this scope owns.
+  scope() -> Scope = makeScope(core, children)
+
+  // A port through which any thread writes to `atom`, closed when this scope is disposed.
+  port[T: Sendable](atom: Atom[T]) -> Port[T] = makePort(core, atom, children)
+
+  // Runs `f` when the scope is disposed, after what it owns is disposed.
+  onDispose(f: () -> unit)
+    if disposed then fail("`onDispose` on a scope that has been disposed")
+    cleanups.append(f)
+
+  // Whether it has been disposed.
+  isDisposed() -> bool = disposed
+
+  // Disposes every effect, port and scope it owns, newest first, then runs its `onDispose`
+  // functions, newest first. Disposing it again does nothing.
+  override dispose()
+    if disposed then return
+    disposed = true
+    children.close()
+    _ = owner.items.remove(self)
+    runCleanups(cleanups)
+
+private makePort[T: Sendable](core: Core, atom: Atom[T], owner: Children) -> Port[T]
+  val p = Port[T](Mutex(Buffer[T]()), Atomic(false), core.wake)
+  val link = PortLink(core, atom, p, owner)
+  owner.adopt(link)
+  _ = core.ports.add(link)
+  p
+
+// What the owner of a graph drains: a port's latest value, applied to its atom.
+private trait Drainable
+  drain() -> bool
+
+// The owner's side of a port.
+private class PortLink[T: Sendable](
+    private val core: Core,
+    private val atom: Atom[T],
+    private val port: Port[T],
+    private val owner: Children
+): Drainable, Disposable
+  override drain() -> bool = port.take() match
+    Some(v) ->
+      atom.set(v)
+      true
+    None -> false
+
+  override dispose()
+    port.close()
+    _ = owner.items.remove(self)
+    _ = core.ports.remove(self)
+
+// A sendable way to write to an atom from any thread, made by `Scope.port` or `Graph.port`. A port
+// holds the latest value written and not yet applied: the graph's owner applies it with
+// `Graph.drain` or `Graph.awaitWrites`, so a fast writer never makes the owner fall behind, and the
+// owner sees each atom's latest value, all of them applied in one batch.
+class Port[T: Sendable](
+    private val slot: Mutex[Buffer[T]],
+    private val closed: Atomic[bool],
+    private val wake: Channel[unit]
+)
+  // Writes `v`, to be applied by the graph's owner; answers `false`, writing nothing, where the port
+  // has been closed because its scope was disposed. The wake is offered after the value is in place,
+  // so an owner woken always finds it.
+  set(v: T) -> bool
+    if closed.load() then return false
+    slot.with(held ->
+      held.clear()
+      held.append(v))
+    _ = wake.trySend(())
+    true
+
+  // Whether the port has been closed.
+  isClosed() -> bool = closed.load()
+
+  // The value written and not yet applied, taken.
+  take() -> Option[T] = slot.with(held ->
+    if held.isEmpty then None
+    else
+      val v = held(0)
+      held.clear()
+      Some(v))
+
+  close() = closed.store(true)
+
+// The steps of a `Machine`: the event, and the states before and after it.
+data Step[E, S](number: long, event: E, from: S, to: S)
+
+// A state machine driven by events through the graph, made by `Graph.machine` from the machine's
+// `handle` and its first state. Every event fired is handled exactly once, in the order fired: one
+// fired while another is handled, from a machine's `enter` or `leave` block or from a step's
+// listener, waits for it. Each event is handled in a batch with the writes of its state and its
+// step, so effects see the two agree.
+class Machine[E, S](
+    private val core: Core,
+    private val handle: (E) -> S,
+    private val stateAtom: Atom[S],
+    private val stepAtom: Atom[Option[Step[E, S]]]
+)
+  private val pending = Deque[E]()
+  private val listeners = Buffer[(Step[E, S]) -> unit]()
+  private var handling = false
+  private var count: long = 0
+
+  // The state the machine is in.
+  state() -> Readable[S] = stateAtom
+
+  // The last step taken, if any: it changes with every event, so a state that stays or moves to
+  // itself is still seen to have taken a step.
+  lastStep() -> Readable[Option[Step[E, S]]] = stepAtom
+
+  // How many events have been handled.
+  steps() -> long = count
+
+  // Calls `f` with every step, in order, as the step is taken, before the effects run: a listener
+  // sees every step, where an effect sees the state after the last write of a batch.
+  onStep(f: (Step[E, S]) -> unit) = listeners.append(f)
+
+  // Hands `event` to the machine, after any events already waiting.
+  fire(event: E)
+    core.writable()
+    pending.append(event)
+    if handling then return
+    handling = true
+    while !pending.isEmpty
+      val ev = pending.removeHead()
+      core.batch(() ->
+        val from = stateAtom.get()
+        val to = handle(ev)
+        count += 1
+        val step = Step(count, ev, from, to)
+        stateAtom.set(to)
+        stepAtom.set(Some(step))
+        for f in listeners do f(step))
+    handling = false
+
+// A graph of atoms, derived values and effects, owned by one execution. Its effects run on that
+// execution, inside the call that wrote: a `set` outside any batch, the end of a `batch`, a `drain`.
+class Graph()
+  private val core = Core()
+  private val root = Children()
+
+  // A new atom holding `initial`.
+  atom[T](initial: T) -> Atom[T] = Atom(core, initial)
+
+  // A new derived value, computed by `compute` when first read.
+  derived[T](compute: (Get) -> T) -> Derived[T] = Derived(core, compute)
+
+  // An effect the graph owns, run once now (or at the end of the batch or flush under way) and again
+  // whenever a node it read changes.
+  effect(body: (Get) -> unit) -> Effect = makeEffect(core, body, root)
+
+  // A scope the graph owns.
+  scope() -> Scope = makeScope(core, root)
+
+  // A port the graph owns, for writing to `atom` from any thread.
+  port[T: Sendable](atom: Atom[T]) -> Port[T] = makePort(core, atom, root)
+
+  // A machine driven by `fire`, in state `initial`, whose events `handle` applies and answers the
+  // next state of: for a `machine` declaration, its `handle` method and its `state()`.
+  machine[E, S](handle: (E) -> S, initial: S) -> Machine[E, S] = Machine(
+    core,
+    handle,
+    Atom(core, initial),
+    Atom(core, None)
+  )
+
+  // Runs `body` with the effects its writes reach held back until it returns, then runs them once
+  // each; batches nest, and only the outermost one runs them.
+  batch[R](body: () -> R) -> R = core.batch(body)
+
+  // Applies, in one batch, the latest value of each port written since the last drain, and answers
+  // how many ports had one.
+  drain() -> int
+    var n = 0
+    core.batch(() ->
+      for link in core.ports.toVector do if link.drain() then n += 1)
+    n
+
+  // Waits at most `timeout` for a port to be written, then drains: answers how many ports had a value.
+  awaitWrites(timeout: Duration) -> int
+    _ = core.wake.receive(timeout)
+    drain()
+
+  // How many flushes of effects have run.
+  flushes() -> long = core.flushes
+
+  // Whether effects are running now.
+  isFlushing() -> bool = core.flushing
+
+  // Disposes every effect, scope and port, newest first. The atoms keep their values and may still
+  // be read; writing to one traps. Disposed while effects run, the flush under way runs none of the
+  // effects still waiting. Disposing it again does nothing.
+  //
+  // In an actor's `stopping` block after a trap (`avin.actors.failure()` answers the reason), the
+  // computations the trap stopped part-way are taken to have ended: an effect whose body trapped is
+  // disposed as any other, its cleanups run, and a flush or a batch the trap left under way is over.
+  dispose()
+    if core.disposed then return
+    core.disposed = true
+    if failure().isDefined then core.unwind()
+    root.close()
+    core.queue.clear()
