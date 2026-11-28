@@ -593,7 +593,11 @@ struct TraitImpl
  * by matching the receiver's static type against it.
  *
  * An `extension`, added by an impl outside the module of the type or trait it adds to, is seen only
- * by code of that module and by files importing the module or a declaration of it. */
+ * by code of that module and by files importing the module or a declaration of it.
+ *
+ * `own` marks a member of an impl of a trait for a trait type, whose conformance is the trait type's
+ * own: a receiver has it where its static type is that trait, and not where it is a type implementing
+ * the trait. */
 struct TraitMethod
     function: usize
     trait_id: usize
@@ -601,6 +605,7 @@ struct TraitMethod
     on_trait: bool
     target: &Type
     extension: bool
+    own: bool
 
 /** One name a member export presents, or one wildcard export, of a class (`class_id`) or of a data
  * type an impl of it exports from (`data_id`): `x.name` on a value of the type is `x.via.member`.
@@ -2154,6 +2159,15 @@ private constructor_impl_written_out(c: *Checker, unit: usize, d: &ImplDecl) -> 
     val trait_expr = TypeExpr(written_trait.span, Named(trait_path, args))
     ImplDecl(d.span, params, Some(trait_expr), target, d.members, d.template, d.derived)
 
+/** The name of the constructor trait impl `d` names before `for`, where it names one. */
+private written_constructor_trait_name(c: *Checker, unit: usize, d: &ImplDecl) -> Option[string]
+    val written = d.trait_name?
+    val trait_path = written.kind match
+        Named(p, _) -> p
+        _ -> return None
+    val k = c.class_types.get(resolve_name(c, unit, trait_path))?
+    if bounds_constructors(c, k) then Some(c.classes[k].name) else None
+
 /** Names joined with commas: `A, B`. */
 private join_names(names: Buf[string]) -> string
     var out = ""
@@ -2227,8 +2241,13 @@ private resolve_impl(c: *Checker, unit: usize, module_name: string, written_decl
     elif c.class_types.get(key) is Some(id)
         if is_trait(c, id)
             if d.trait_name is None then resolve_trait_impl(c, unit, module_name, d, id)
-            elif names_static_only_trait(c, unit, d) then resolve_instance_impl(c, unit, module_name, d, path, c.classes[id].module_name, true)
-            else c.note(unit, d.target.span, s"`$path` is a trait; an impl of a trait is for a data type, a class, an object or a built-in type")
+            // A trait type's impl is its own conformance, at the trait type's parameters. Named
+            // without them, a generic trait is a constructor, which only a data type or a class is
+            // for a constructor trait.
+            elif written_constructor_trait_name(c, unit, d) is Some(name) then c.note(unit, d.target.span, s"`$path` is a trait, and only a data type or a class implements the constructor trait `$name`")
+            elif written.len() == 0 && c.classes[id].decl.type_params.len() > 0
+                c.note(unit, d.target.span, s"`$path` is a trait, named here without its type parameters; an impl of a trait for a trait type names them, as in `impl[T] Show for $path[T]`, and only a data type or a class implements a constructor trait")
+            else resolve_instance_impl(c, unit, module_name, d, path, c.classes[id].module_name, true)
             return invalid
         owner = class_owner(id)
         home = c.classes[id].module_name
@@ -2621,6 +2640,14 @@ private resolve_instance_impl(c: *Checker, unit: usize, module_name: string, d: 
         c.note(unit, d.target.span, s"neither `$path` nor `${type_name(t)}` is declared in this module; an impl belongs in the module of its type or of its trait")
         return
     // Equality, hashing, sending and crossing to Sysl are a type's at every instance alike.
+    // A value of a trait type has these through the type it is of at run time, so the trait type
+    // states none of its own.
+    if own
+        if *t is Class(k, _, _)
+            for name in ["Eq", "Hash", "Display", "Debug", "Sendable", "Boundary"]
+                if is_class_named(c, k, qualified(CoreModule, name))
+                    c.note(unit, written_trait_span(d), s"a value of the trait `$path` is of a type implementing it and has that type's `$name`, so an impl of `$name` is for the types implementing `$path`, not for the trait")
+                    return
     if *t is Class(k, _, _)
         for name in ["Eq", "Hash", "Sendable", "Boundary"]
             if is_class_named(c, k, qualified(CoreModule, name))
@@ -2811,7 +2838,10 @@ private declare_trait_method(c: *Checker, i: usize, f: &Function, public: bool, 
     c.bodies.push(None)
     c.locals.push(buf())
     declare_defaults(c, id)
-    c.trait_methods.push(TraitMethod(id, k, impl_params, block.on_trait, target, block.extension))
+    val own = block.instance match
+        Some(n) -> c.instances[n].own
+        None -> false
+    c.trait_methods.push(TraitMethod(id, k, impl_params, block.on_trait, target, block.extension, own))
     if block.instance is Some(n)
         var methods = c.instances[n].methods
         methods.push(id)
@@ -2889,6 +2919,7 @@ trait_method_of(c: *Checker, m: usize) -> Option[TraitMethod]
 private added_applies(c: *Checker, t: &Type, tm: TraitMethod) -> bool
     if tm.on_trait then return trait_view(c, t, tm.trait_id) is Some(_)
     val x = zonk(c, t)
+    if tm.own then return same_head(tm.target, x)
     *tm.target match
         Data(d, _, _) -> *x match
             Data(e, _, _) -> d == e
@@ -2918,6 +2949,7 @@ added_args(c: *Checker, t: &Type, tm: TraitMethod) -> Option[Buf[&Type]]
     var binds: Buf[Option[&Type]] = buf()
     for _ in 0..<tm.impl_params
         binds.push(None)
+    if tm.own && !same_head(tm.target, zonk(c, t)) then return None
     if !match_target(c, tm.target, t, tm.function, &binds, true) then return None
     var out: Buf[&Type] = buf()
     for b in binds
@@ -4548,8 +4580,10 @@ private is_trait_class(f: Conformances, t: &Type) -> bool = *t match
     Class(k, _, _) -> f.classes[k].decl.modifier == "trait"
     _ -> false
 
+// A trait type's own conformance is no way to see a value: the value is of some type implementing
+// the trait type, and is of the conformance's trait only where that type is.
 private view_as_type(f: Conformances, x: &Type, to: &Type) -> &Type = *to match
-    Class(k, name, ys) -> holding_ancestor(f, x, k) match
+    Class(k, name, ys) -> holding_ancestor_from(f, x, k, false) match
         Some(up) -> *up match
             Class(_, _, xs) -> Class(k, name, vary_args(f, f.classes[k].decl.type_params, xs, ys))
             _ -> up
@@ -6460,6 +6494,7 @@ private build_instance_table(c: *Checker, n: usize, conformed: Buf[usize])
         _ -> return
     val outer_seen = c.seen_instance
     var used: Buf[usize] = buf()
+    var unmet: Buf[usize] = buf()
     for t in conformed
         val methods = c.classes[t].methods
         for j in 0..<methods.len()
@@ -6494,12 +6529,35 @@ private build_instance_table(c: *Checker, n: usize, conformed: Buf[usize])
                         c.seen_instance = outer_seen
                         used.push(m)
                         c.note(c.symbols[m].unit, c.symbols[m].decl.name_span, s"`${c.symbols[m].name}` implements `${c.symbols[methods[j]].name}`, $text")
-                    elif t != k then ()
+                    elif t != k
+                        // A trait the impl's trait requires is the trait type's through this impl, or
+                        // through what the trait type requires or states of its own.
+                        // A static member's default belongs to no value, so it is the trait type's.
+                        if x.own && c.symbols[methods[j]].static_member && !is_abstract_method(c.symbols[methods[j]]) && !own_elsewhere(c, n, t) then table[c.classes[t].base + j] = Some(methods[j])
+                        elif x.own && !contains_id(unmet, t) && !own_elsewhere(c, n, t)
+                            unmet.push(t)
+                            c.note(x.unit, x.span, s"`$name_of` does not implement ${c.classes[t].name}'s `$name`, which `${c.classes[k].name}` requires; a trait type's impl implements every method of the trait and of those it requires")
+                    // A default body is shared by the objects of every type conforming to the trait,
+                    // and calls the trait's other methods through the object's table. A value of a
+                    // trait type is an object of some implementing type, which need not conform, so
+                    // the trait type's impl implements every method of a value.
+                    elif x.own && !c.symbols[methods[j]].static_member && !is_abstract_method(c.symbols[methods[j]]) && !is_trait_field(c, methods[j])
+                        c.note(x.unit, x.span, s"`$name_of` does not implement ${c.classes[t].name}'s `$name`; a trait type takes no default bodies, so its impl implements every method of the trait")
                     elif !is_abstract_method(c.symbols[methods[j]]) && !is_trait_field(c, methods[j]) then table[c.classes[t].base + j] = Some(methods[j])
                     else
                         val what = if is_trait_field(c, methods[j]) then s"`val $name`" else s"`$name`"
                         c.note(x.unit, x.span, s"`$name_of` does not implement ${c.classes[t].name}'s $what")
     c.instances[n].table = table
+
+/** Whether the trait type of own conformance `n` is a `t` without that conformance: through the
+ * traits it requires, or through another impl for the trait type. */
+private own_elsewhere(c: *Checker, n: usize, t: usize) -> bool
+    val x = c.instances[n]
+    if ancestor_type(c.classes, c.data, x.ty, t) is Some(_) then return true
+    for e in 0..<c.instances.len()
+        if e == n || !c.instances[e].own || !same_head(c.instances[e].ty, x.ty) then continue
+        if ancestor_type(c.classes, c.data, c.instances[e].trait_type, t) is Some(_) then return true
+    false
 
 /** The instance of trait `t`, the impl's trait or one it requires, that the instance conformance `n`
  * states, naming the impl's parameters as method `m` does: what `Self` and the trait's parameters
@@ -14865,6 +14923,12 @@ private impl_member(c: *Checker, name: string) -> Option[MemberRef]
             if field_visible(c, c.classes[k].fields[i]) then return Some(FieldOf(i))
         val own = methods_named(c, k, name)
         if own.len() > 0 then return Some(MethodOf(own[0]))
+    // An impl of a trait for a trait type works on a value of that trait, whose `val`s and methods
+    // are in scope.
+    if trait_receiver(c, t) is Some(k)
+        if trait_field_named(c, k, name) is Some(m) then return Some(TraitFieldOf(m))
+        val own = methods_named(c, k, name)
+        if own.len() > 0 then return Some(MethodOf(own[0]))
     if receiver_method(c, t, name) is Some(m)
         if method_visible(c, m) then return Some(MethodOf(m))
     // Inside a method an impl adds to a trait, the receiver is a `Self`: the trait's `val`s and
@@ -14884,8 +14948,15 @@ private bare_methods(c: *Checker, name: string) -> Buf[usize]
             // A `Self`, or an application of a constructor parameter, has its bounds' methods.
             var own = if is_trait_self(t) || *t is Applied(_, _) then bound_methods(c, t, name) else visible_methods(c, receiver_methods(c, t, name))
             if fields_class(c) is Some(k) then own = methods_named(c, k, name)
+            elif trait_receiver(c, t) is Some(k) then own = methods_named(c, k, name)
             with_trait_methods(c, t, name, own)
         None -> buf()
+
+/** The trait a receiver of type `t` is a value of, where `t` is a trait type: the receiver of a method
+ * of an impl of a trait for that trait type. */
+private trait_receiver(c: *Checker, t: &Type) -> Option[usize] = *t match
+    Class(k, _, _) -> if is_trait(c, k) then Some(k) else None
+    _ -> None
 
 /** Whether receiver type `t` is the `Self` of a method an impl adds to a trait: a type parameter, but
  * not the integer family's. */
