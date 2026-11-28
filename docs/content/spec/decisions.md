@@ -218,7 +218,8 @@ a decision changes, this page and the chapter change together.
   `Eq`, `Hash`, `Display`, `Debug`, `Sendable` and `Boundary` stay a value's through its own type,
   and an impl of one for a trait type is refused saying so. Tests: `trait_type_impl`,
   `trait_type_impl_generic`, `trait_type_impl_refusals`, `trait_type_impl_values`,
-  `trait_type_impl_missing`, `programs/run/trait_type_impl_modules`,
+  `trait_type_impl_missing`, `trait_type_impl_derived` (run and reject),
+  `trait_type_impl_generic_trait`, `programs/run/trait_type_impl_modules`,
   `programs/reject/trait_type_impl_modules`, and two in `bound_tests.sysl`.
 - A type pattern matches an object whose type conforms to the pattern's type through variance, as
   the checker's subtyping does: a `List[Dog]` held as an `Any` matches `List[Animal]`.

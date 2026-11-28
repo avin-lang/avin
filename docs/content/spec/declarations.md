@@ -1316,7 +1316,13 @@ instance](/spec/generics/#bounds).
 - `Eq`, `Hash`, `Display`, `Debug`, `Sendable` and `Boundary` are a value's through the type it is
   of, so a trait type states no impl of them. A
   [constructor trait](/spec/generics/#implementing-a-constructor-trait) is implemented by a `data`
-  type or a class only.
+  type or a class only. A generic trait for types is implemented at its arguments, `impl
+  Into[Map[int, int]] for Shape`, which meet the trait's bounds as anywhere; named without them
+  (`impl Into for Shape`) it would be a constructor's impl, which a trait type has none of.
+- **A derived impl finds it as a written one does**: a [template](/spec/derivation/)'s hook takes each field at
+  its static type, so a field typed `Map[K, A]`, `Vector[Map[K, A]]` or `Option[Map[K, A]]` derives
+  where the trait type has the impl at those arguments, and a field that falls short is reported
+  by its type (`` field `own` has type `HashMap[int, int]`, which does not implement `Describe` ``).
 
 It lives in the module of the trait type or of the trait, as any conformance does. A conformance
 to a trait whose members are all static is also no [variance](/spec/generics/#variance) position of
