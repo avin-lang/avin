@@ -10,6 +10,7 @@ import avin.io.Source
 import avin.process
 import avin.process.Command
 import avin.threads
+import avin.threads.Channel
 
 // How many lines the generator writes, and how many threads read lines at once.
 val count = 4000
@@ -51,31 +52,56 @@ report(way: string, taken: Vector[Vector[string]])
   val torn = numbers.filter(n -> n is None).length
   val sorted = numbers.filter(n -> n is Some(_)).map(n -> n.getOrElse(-1)).sorted
   val busy = taken.filter(t -> !t.isEmpty).length
-  println(s"$way: ${all.length} lines, $torn torn, sorted union is the input: ${sorted == (0 ..< count).toVector}, some reader took a line: ${busy > 0}")
+  println(
+    s"$way: ${all.length} lines, $torn torn, sorted union is the input: ${sorted == (0 ..< count).toVector}, some reader took a line: ${busy > 0}"
+  )
 
 // The bytes of the input, its terminators included.
 inputBytes() -> int = (0 ..< count).map(i -> lineText(i).byteLength + 1).sum
 
-// One thread reads a thousand characters and then everything left while two others read lines: the
-// bytes they take together are the input's.
+// Up to a thousand characters read one at a time, then everything left. `begun` is told once the first
+// character is taken.
+byCharacters(begun: Channel[bool]) -> (string, string)
+  val each = Source.stdin().chars()
+  val one = each.take(1).mkString("")
+  begun.send(true)
+  val more = each.take(999).mkString("")
+  (one + more, io.readAll())
+
+// One thread reads a thousand characters and then everything left while two others read lines, which
+// start once the first character is taken. Which reader gets how much is for the readers' turns to
+// decide, and nothing says the characters come before the lines run the input out; what holds
+// whatever the turns are is that the bytes they take together are the input's, that every line's end
+// is read once, and that the character reader stops short of its thousand only where the input ended,
+// which leaves nothing for its `readAll`.
 mixed()
-  val chars = threads.spawn(() -> Source.stdin().chars().take(1000).mkString("") + io.readAll())
+  val begun = Channel[bool]()
+  val chars = threads.spawn(() -> byCharacters(begun))
+  begun.receive()
   val lines = (0 ..< 2).map(_ -> threads.spawn(() -> byReadLine())).toVector
-  val first = chars.join()
+  val (head, tail) = chars.join()
   val rest = lines.map(t -> t.join())
-  val taken = first.byteLength + rest.map(ls -> ls.map(l -> l.byteLength + 1).sum).sum
-  println(s"mixed: bytes taken ${taken == inputBytes()}, characters taken: ${first.byteLength >= 1000}")
+  val taken = head.byteLength + tail.byteLength + rest.map(ls -> ls.map(l -> l.byteLength + 1).sum).sum
+  val ends = (head + tail).count(c -> c == '\n') + rest.map(ls -> ls.length).sum
+  val share = 1 <= head.charCount <= 1000 && (head.charCount == 1000 || tail.isEmpty)
+  println(
+    s"mixed: bytes taken ${taken == inputBytes()}, line ends taken ${ends == count}, a thousand characters or the input's end: $share"
+  )
 
 child(way: string)
   if way == "mixed" then return mixed()
-  val started = (0 ..< readers).map(_ -> threads.spawn(() -> if way == "readLine" then byReadLine() else byIterator())).toVector
+  val started = (0 ..< readers).map(
+    _ -> threads.spawn(() -> if way == "readLine" then byReadLine() else byIterator())
+  ).toVector
   report(way, started.map(t -> t.join()))
 
 main(args: Vector[string])
   if args.length == 2 && args(0) == "child" then return child(args(1))
   if !args.isEmpty then fail(s"unexpected arguments $args")
   val program = process.executable().getOrElse("")
-  val generate = "awk 'BEGIN { for (i = 0; i < " + count.toString() + "; i++) { s = \"line-\" i \"-\"; for (j = 0; j < i % 50; j++) s = s \"x\"; if (i % 7 == 0) s = s \"\\303\\251\"; print s } }'"
+  val generate = "awk 'BEGIN { for (i = 0; i < "
+    + count.toString()
+    + "; i++) { s = \"line-\" i \"-\"; for (j = 0; j < i % 50; j++) s = s \"x\"; if (i % 7 == 0) s = s \"\\303\\251\"; print s } }'"
   for way in ["readLine", "lines", "mixed"]
     val status = Command("/bin/sh", "-c", generate + " | \"$0\" child " + way, program).run()
     if !status.map(s -> s.isSuccess).getOrElse(false) then println(s"$way child: $status")
