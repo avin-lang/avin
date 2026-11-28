@@ -1213,7 +1213,7 @@ value: `Add`'s `zero` and `Mul`'s `one` are the identities of their operators.
 - **A trait with a static member is a bound and not a type**, as one mentioning `Self` is: a value of
   the trait's type would have no type to give the member.
 - **A trait has no static members of its own**, except those of an impl stating its own conformance
-  to a trait whose members are all static ([impl](#impl)): `Set[int].newBuilder()`.
+  to a trait ([impl](#impl)): `Set[int].newBuilder()`.
 - **A static member named without a call is a function value** of its parameters, as a method of a
   value is: `xs.map(string.fromUtf8Lossy)`, `val zero = Point.zero`. Where the member is overloaded,
   the function type expected says which, and without one the value is an error. Through a type
@@ -1290,16 +1290,51 @@ by several instances, `T: Make[int] & Make[string]`, the instance whose member t
 Each conformance gives every member of the trait at its own type arguments. Any other trait is
 implemented once, at one list of type arguments.
 
-**A trait type may implement a trait whose members are all static** (with those of the traits it
-requires), as its **own** conformance: `impl[A] Buildable[A] for Set[A]`, with `static
-newBuilder() -> Builder[A, Set[A]]`. It holds of the trait type itself, where `Set[A]` is the type
-a call names (`Set[int].newBuilder()`) or a bound's argument (`build[Set[int], int](…)`), and of no
-type implementing the trait: a `HashSet[A]` does not get `Set`'s impl, but has its own or none, and
-a type parameter bounded by `Set[A]` does not reach it, since its argument may be any set. It lives
-in the module of the trait type or of the static trait, as any conformance does. An impl of a trait
-with a member of a value for a trait type is an error: every value of the trait type is of some
-implementing type, whose methods the trait's are. A conformance to such a trait is also no
-[variance](/spec/generics/#variance) position of a class or `data` type.
+**A trait type may implement a trait**, as its **own** conformance: `impl[K: JsonMapKey, A:
+JsonEncoder] JsonEncoder for Map[K, A]`, or `impl[A] Buildable[A] for Set[A]` with `static
+newBuilder() -> Builder[A, Set[A]]`. The impl names the trait type's parameters, in order, and may
+bound them, as an impl for a `data` type does; one for an instance of the trait type
+(`impl[A] Sized for Map[string, A]`) follows the rules of [an impl for an
+instance](/spec/generics/#bounds).
+
+- **It holds of the trait type itself**, where the static type is the trait: where `Map[K, A]` is the
+  type of the value a method is called on, a bound's argument (`encode[Map[string, int]](m)`, and so
+  `Vector[Map[string, int]]` and `Option[Map[string, int]]` where their impls ask it of their
+  parameter), the type of a field a template or a written impl encodes, or the type a call names
+  (`Set[int].newBuilder()`).
+- **It holds of no type implementing the trait**: a `HashMap[K, A]` does not get `Map`'s impl, but has
+  its own or none, so the two never both hold of a type, and the missing one is reported against the
+  type that lacks it (`` `TreeMap[string, int]` does not conform to `Show` ``). A value of a
+  `HashMap` seen as a `Map` has `Map`'s impl, by its static type. A type parameter bounded by
+  `Map[K, A]` does not reach it, since its argument may be any map. Two impls of a trait for one
+  trait type overlap as two for any type do, and a trait that requires the trait has it already, so
+  an impl of it for that trait is an overlap too.
+- **Its methods work on the value as the trait**: `self` is a `Map[K, A]`, and the trait type's own
+  members are in scope by bare name and are called through the value's method table. The impl's own
+  methods are called directly, by a call on a value of the trait type and in each instance of
+  generic code whose type argument is the trait type.
+- **It implements every method of a value** that the trait and the traits it requires declare, those
+  with default bodies included, unless the trait type has the required trait already: a default
+  body is shared by the objects of every conforming type and calls the trait's other methods through
+  the object's table, and the object here is of some type implementing the trait type, which need
+  not conform. A static member's default, which belongs to no value, stays.
+- **A value of the trait type is not thereby a value of the trait**: it converts to it, alone or as
+  a covariant type argument, and matches a type pattern of it, only where the type its object is of
+  conforms. Meeting a bound is what the conformance gives.
+- `Eq`, `Hash`, `Display`, `Debug`, `Sendable` and `Boundary` are a value's through the type it is
+  of, so a trait type states no impl of them. A
+  [constructor trait](/spec/generics/#implementing-a-constructor-trait) is implemented by a `data`
+  type or a class only. A generic trait for types is implemented at its arguments, `impl
+  Into[Map[int, int]] for Shape`, which meet the trait's bounds as anywhere; named without them
+  (`impl Into for Shape`) it would be a constructor's impl, which a trait type has none of.
+- **A derived impl finds it as a written one does**: a [template](/spec/derivation/)'s hook takes each field at
+  its static type, so a field typed `Map[K, A]`, `Vector[Map[K, A]]` or `Option[Map[K, A]]` derives
+  where the trait type has the impl at those arguments, and a field that falls short is reported
+  by its type (`` field `own` has type `HashMap[int, int]`, which does not implement `Describe` ``).
+
+It lives in the module of the trait type or of the trait, as any conformance does. A conformance
+to a trait whose members are all static is also no [variance](/spec/generics/#variance) position of
+a class or `data` type.
 
 A built-in type conforms to a trait only through an impl, and meets the trait as a bound: each
 instance of generic code calls the impl's method directly. A built-in value is not an object, so a

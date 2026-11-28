@@ -174,14 +174,53 @@ a decision changes, this page and the chapter change together.
   Set[A]`. It holds of the trait type itself, as the type a call names (`Set[int].newBuilder()`) or
   a bound's argument, and is not inherited by the trait's implementers (a `HashSet[A]` has its own
   or none) nor reached through a type parameter bounded by the trait type, whose argument may be
-  any implementer. An impl of a trait with a member of a value for a trait type is still refused
-  with the old message. Why: a collection literal typed by a trait (`val s: Set[int] = {1, 2}`)
+  any implementer. An impl of a trait with a member of a value for a trait type follows the same
+  rule (the next entry). Why: a collection literal typed by a trait (`val s: Set[int] = {1, 2}`)
   needs a builder the trait type names, and a trait's conformance cannot be its implementers'
   (each builds its own collection). It is built on the impls for instances of a type, matched
   against the trait type exactly rather than through its subtypes. Alternatives: inheriting it
   (wrong: `HashSet`'s literal would build through `Set`'s builder); a companion object's
   `newBuilder` reached by name (the convention `Buildable` replaces). Tests:
   `trait_own_static_conformance`, `trait_own_static_refusals`, `programs/run/static_trait_modules`.
+- Decided by the user 2026-11-26 (a library trait can be implemented for a trait type), its rules
+  **Proposed** (branch `impl-for-trait`): **a trait type may implement any trait, as its own
+  conformance**, `impl[K: JsonMapKey, A: JsonEncoder] JsonEncoder for Map[K, A]`. The rule for
+  all-static traits above carries over unchanged: the conformance holds of the trait type itself,
+  where the static type is the trait (the receiver of a call, a bound's argument, a field's type, a
+  type argument however nested), is not inherited by the types implementing the trait, and is not
+  reached through a type parameter bounded by the trait type. So a `HashMap` with its own impl and
+  `Map`'s impl never both hold of one type, and "two impls of one trait never both hold of a type;
+  there is no more specific wins" stands as written; two impls for one trait type, or one for a
+  trait that already requires the trait, are overlaps under the existing check. The impl's methods
+  take the value as the trait and reach the trait's own members through the object's table; they
+  themselves are called directly, since the static type names them. Why: the type a map literal
+  gets, `Map[string, A]`, has to be encodable by a library, and each implementing type keeps one
+  answer of its own. Three points the existing rules did not decide, each taking the simplest
+  answer:
+  - **Types implementing the trait do not get the trait type's impl.** *Alternatives*: letting it
+    reach every implementing type that has no impl of its own, with the type's own impl preferred,
+    which would serve a program's own `class Cache : Map[K, A]` without an impl or a widening, but
+    brings "more specific wins" into impl resolution, makes a type's conformance depend on impls
+    its module never sees, and needs a rule for a type implementing two traits that each have an
+    impl. **Review with the user**: whether that reach is wanted; today such a value is encoded by
+    typing it as the trait (`val m: Map[string, int] = cache`).
+  - **A value of the trait type is no value of the conformance's trait** (`val e: JsonEncoder = m`
+    is refused unless `Map` requires it), and the impl gives every method of a value, default bodies
+    included. Its object is of some implementing type, whose method table has that type's own
+    entries for the trait or none, so the trait type's impl cannot be found from the object.
+    *Alternatives*: wrapping the value in an object that carries the trait type's impl, which costs
+    an allocation at each conversion and gives the wrapped value another identity and run-time
+    type. **Review with the user**: whether the conversion is worth that.
+  - **The static type decides**: a `HashMap` held as a `Map[string, int]` is encoded by `Map`'s
+    impl, and held as a `HashMap` by its own, as a method an impl adds to a trait is chosen.
+    *Alternatives*: dispatching on the object's type where it has an impl, which only the
+    inheriting design above can do. **Review with the user** with the first point.
+  `Eq`, `Hash`, `Display`, `Debug`, `Sendable` and `Boundary` stay a value's through its own type,
+  and an impl of one for a trait type is refused saying so. Tests: `trait_type_impl`,
+  `trait_type_impl_generic`, `trait_type_impl_refusals`, `trait_type_impl_values`,
+  `trait_type_impl_missing`, `trait_type_impl_derived` (run and reject),
+  `trait_type_impl_generic_trait`, `programs/run/trait_type_impl_modules`,
+  `programs/reject/trait_type_impl_modules`, and two in `bound_tests.sysl`.
 - A type pattern matches an object whose type conforms to the pattern's type through variance, as
   the checker's subtyping does: a `List[Dog]` held as an `Any` matches `List[Animal]`.
 - Settled by the user 2026-11-04: [lower bounds](/spec/generics/#lower-bounds) on a function's or a
@@ -6278,13 +6317,15 @@ Settled on the user's delegation 2026-11-11 (built on branch `json-derive`): **J
   field silently nullable.
 - **`Option[Option[A]]`**: `Some(None)` and `None` both write `null` and read back as `None`. *Why*:
   JSON has one null. *Alternatives*: refusing to derive for nested options.
-- **Maps** are `HashMap[K, A]` and `TreeMap[K, A]` with `K: JsonMapKey`, a trait the package
-  implements for `string`, `int` and `long` (the digits, read back only from what `toLongOption`
-  reads); a key written twice keeps its last value. *Why*: an impl of a trait is for a data type or
-  a class, not for the `Map` trait, and must take its type's parameters in order, so `Map[string, A]`
-  cannot be named. *Alternatives*: string keys only. **Review with the user**: a field typed as the
-  `Map` trait (what a map literal is typed as) cannot derive the JSON traits; covering it needs the
-  language to let a library trait be implemented for a trait type.
+- **Maps** are `Map[K, A]`, `HashMap[K, A]` and `TreeMap[K, A]` with `K: JsonMapKey`, a trait the
+  package implements for `string`, `int` and `long` (the digits, read back only from what
+  `toLongOption` reads); a key written twice keeps its last value. A field typed as the `Map` trait
+  (what a map literal is typed as) is covered by the trait type's own impl
+  ([impl](/spec/declarations/#impl)): it writes whatever map the value is, in that map's order, and
+  reads a hash map, the map a literal of the type builds (`Map.newBuilder`). Each of the three
+  types has its own impl, since a trait type's impl is not its implementers'; a program's own map
+  class is given one, or is held in a field typed `Map[K, A]`. *Alternatives*: string keys only;
+  reading a `Map` as a `TreeMap`, which would order the keys but not match what a literal builds.
 - **Unknown keys are skipped** and a field written twice is an error (as the chapter says); a second
   discriminator key after the first is an unknown key. A missing field's error is at the object's
   closing brace, with the object's path. The nesting limit counts a skipped value's containers too.
