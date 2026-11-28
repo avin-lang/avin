@@ -1200,7 +1200,9 @@ value: `Add`'s `zero` and `Mul`'s `one` are the identities of their operators.
 - **Every implementation gives it, with a body, unless the trait's member has a default**, marked
   `static` as the trait's member is: an impl, and a class's body with `override static`. An abstract
   class gives it too, since it belongs to the type and not to a subclass's objects. A built-in type
-  takes a static default, as any type does, since no value is involved. The default is reached on the
+  takes a static default, as any type does, since no value is involved. A type implementing a generic
+  trait at several type arguments has one member per instance, which one default cannot be, so it
+  gives each itself; a type implementing the trait at one takes the default. The default is reached on the
   type's name, through a bound by the trait, and through a bound by a trait requiring it. A static
   member is static exactly where the trait's member is, and is a trait's member, an implementation of
   one, or a
@@ -1214,7 +1216,13 @@ value: `Add`'s `zero` and `Mul`'s `one` are the identities of their operators.
   to a trait whose members are all static ([impl](#impl)): `Set[int].newBuilder()`.
 - **A static member named without a call is a function value** of its parameters, as a method of a
   value is: `xs.map(string.fromUtf8Lossy)`, `val zero = Point.zero`. Where the member is overloaded,
-  the function type expected says which, and without one the value is an error.
+  the function type expected says which, and without one the value is an error. Through a type
+  parameter's bound it is the same: `xs.map(T.parse)` in `f[T: Parse]`, each instance making it of
+  its type argument's member: the type's own body, or the trait's default compiled for that type
+  where it gives none. On `Self` it is a value wherever `Self.parse()` may be called: in a static
+  member's default body, and not in a method's. A trait the parameter is bounded by at several type arguments
+  (`T: Make[int] & Make[string]`) has one `make` per instance, which only a call's arguments choose
+  between, so `T.make` there is an error; a lambda, `x -> T.make(x)`, is the value.
 
 ### Static members of built-in types
 

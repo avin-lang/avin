@@ -7810,6 +7810,11 @@ private check_conformance_members(c: *Checker, self_type: &Type, t: &Type, unit:
                 if result_mismatch(c, self_type, m, tm) is Some(text) then c.note(c.symbols[m].unit, c.symbols[m].decl.name_span, s"`$name` implements `$name` of ${type_name(t)}, $text")
                 elif bound_mismatch(c, self_type, m, tm) is Some(text) then c.note(c.symbols[m].unit, c.symbols[m].decl.name_span, s"`$name` implements `$name` of ${type_name(t)}, $text")
             None ->
+                // A static member with a default body is given by the trait where the type gives none.
+                // A type implementing the trait at several type arguments has one member per
+                // instance, which one default compiled for the type cannot be, so it gives each; and so
+                // does a built-in type, whose table holds no default of such a trait.
+                if c.symbols[tm].static_member && !is_abstract_method(c.symbols[tm]) && !is_builtin_or_opaque(self_type) && from_sources(c, self_type, tid).len() <= 1 then continue
                 var shown = ""
                 val want = c.symbols[tm].params
                 for i in 1..<want.len()
@@ -23349,7 +23354,16 @@ private static_value(c: *Checker, at: Span, target: &Expr, name: string, expecte
             if bound.len() == 0 then no_constructor_static(c, at, t, name)
             else c.note(unit_of(c), at, s"`${type_name(t)}.$name` has several overloads, and nothing here says which is meant")
             return Some(TExpr(at, ErrorType, UnitConst))
-        return None
+        // `T.plain` is a function value of its bound's static member, as `T.plain(x)` calls it; each
+        // instance of the code makes it of its type argument's member. With none, the error is the
+        // call's.
+        if bound.len() == 0 then return Some(static_call(c, at, at, target, ty, name, buf(), None, expected, false))
+        // In a method's default body, which every type implementing the trait shares, `Self` is no
+        // one type whose member `Self.plain` could be a value of: the error is the call's too.
+        if c.self_trait is Some(k)
+            if *t is TypeVar(owner, _, _)
+                if owner == self_owner(k) && !is_constructor_trait(c, k) && !in_static(c) then return Some(static_call(c, at, at, target, ty, name, buf(), None, expected, false))
+        return Some(bound_static_value(c, at, TExpr(target.span, t, TypeReceiver), name, bound, expected))
     if *t is Constructor(_, _)
         val found = constructor_statics(c, at, t, name)
         if found.len() == 1 then return Some(method_value(c, at, TExpr(target.span, t, TypeReceiver), found[0], None, expected))
@@ -23373,6 +23387,20 @@ private static_value(c: *Checker, at: Span, target: &Expr, name: string, expecte
                     if fits then return Some(method_value(c, at, receiver, m, None, expected))
     c.note(unit_of(c), at, s"`${type_name(t)}.$name` has several overloads, and nothing here says which is meant; give it a function type, as in `val f: (int) -> int = ${type_name(t)}.$name`")
     Some(TExpr(at, ErrorType, UnitConst))
+
+/** `T.name` without a call, `ms` the static members of that name `T`'s bounds declare: a function value
+ * of the one meant, an overload chosen by the function type expected as on a value. A trait `T` is
+ * bounded by at several type arguments has one member per instance, which only a call's arguments
+ * choose between, so as a value it is an error. */
+private bound_static_value(c: *Checker, at: Span, receiver: &TExpr, name: string, ms: Buf[usize], expected: Option[&Type]) -> &TExpr
+    if ms.len() == 1
+        if c.symbols[ms[0]].owner_class is Some(k)
+            if implemented_several_times(c, k) && c.symbols[ms[0]].decl.type_params.len() == 0
+                if from_sources(c, receiver.ty, k).len() > 1
+                    val t = type_name(receiver.ty)
+                    c.note(unit_of(c), at, s"`$t` is bounded by several instances of `${c.classes[k].decl.name}`, whose `$name` only a call's arguments choose between, so `$t.$name` is no function value; write a lambda, as in `x -> $t.$name(x)`")
+                    return TExpr(at, ErrorType, UnitConst)
+    overloaded_method_value(c, at, receiver, name, ms, None, expected)
 
 // `bare` is a read of a member declared without a parameter list, `T.values`, where no parentheses
 // were written.
